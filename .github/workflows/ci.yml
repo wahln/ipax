@@ -46,9 +46,10 @@ jobs:
         env:
           IPAX_BACKENDS: numpy,torch,array_api_strict
         run: pytest -q --cov=ipax --cov-report=xml -n auto
-      - uses: codecov/codecov-action@v4
+      - uses: codecov/codecov-action@v5
         with:
           files: coverage.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
         if: always()
 
   qc:

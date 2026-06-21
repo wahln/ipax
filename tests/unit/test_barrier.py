@@ -36,3 +36,29 @@ def test_fraction_to_boundary_returns_one_for_nonnegative_step(namespace):
         alpha = fraction_to_boundary(v, dv, tau=0.99)
 
     assert alpha == 1.0
+
+
+def test_fraction_to_boundary_empty_vector_is_unconstrained(namespace):
+    v = array(namespace, [])
+    dv = array(namespace, [])
+    assert fraction_to_boundary(v, dv, tau=0.99) == 1.0
+
+
+def test_fraction_to_boundary_matches_elementwise_reference(namespace):
+    """Vectorized rule equals the scalar loop it replaced (regression).
+
+    The element-wise loop was O(n) host syncs/call and dominated GPU iteration
+    time; this pins the vectorized form to identical results on mixed signs.
+    """
+    raw_v = [1.0, 2.0, 0.5, 3.0, 0.25, 10.0]
+    raw_dv = [-0.5, 4.0, -4.0, 0.0, -0.1, -2.0]
+    tau = 0.95
+
+    expected = 1.0
+    for vi, dvi in zip(raw_v, raw_dv, strict=True):
+        if dvi < 0.0:
+            expected = min(expected, tau * vi / (-dvi))
+    expected = max(0.0, min(1.0, expected))
+
+    alpha = fraction_to_boundary(array(namespace, raw_v), array(namespace, raw_dv), tau)
+    assert_scalar_close(alpha, expected)

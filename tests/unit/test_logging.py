@@ -63,6 +63,7 @@ def test_format_result_reports_status_and_sources():
         constraint_violation=0.0,
         solve_time=0.042,
         linear_solver="sparse [Feral LDL^T (CPU)]",
+        device="cpu",
         derivative_sources=DerivativeSources(gradient="analytic", hessian="lbfgs"),
         message="converged",
     )
@@ -71,6 +72,7 @@ def test_format_result_reports_status_and_sources():
     assert "iterations    = 7" in text
     assert "solve time    = 4.200e-02s" in text
     assert "linear solver = sparse [Feral LDL^T (CPU)]" in text
+    assert "device        = cpu" in text
     assert "grad:analytic" in text and "hess:lbfgs" in text
 
 

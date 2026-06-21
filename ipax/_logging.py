@@ -209,6 +209,7 @@ def format_result(result: Result) -> str:
         f"  infeasibility = {result.constraint_violation:.3e}\n"
         f"  solve time    = {result.solve_time:.3e}s\n"
         f"  linear solver = {result.linear_solver}\n"
+        f"  device        = {result.device}\n"
         f"  derivatives   = grad:{src.gradient} eq_jac:{src.eq_jacobian} "
         f"ineq_jac:{src.ineq_jacobian} hess:{src.hessian}"
     )
