@@ -406,6 +406,89 @@ class Composite(LinearOperator):
         return result
 
 
+class VStack(LinearOperator):
+    """Vertical stack of operators sharing the variable (column) dimension.
+
+    The adjoint sums each block's contribution; the optional structure-exposing
+    capabilities (``to_coo``, ``row_gram_diagonal``, ``row_inf_norms``) propagate
+    block-wise so a stacked Jacobian keeps the sparse-direct, Krylov-preconditioner
+    and gradient-scaling routes available when every block supports them.
+    """
+
+    def __init__(self, ops: tuple[LinearOperator, ...]) -> None:
+        if not ops:
+            raise ValueError("VStack requires at least one operator")
+        self._n = ops[0].shape[1]
+        for op in ops:
+            if op.shape[1] != self._n:
+                raise ValueError("VStack operators must share the column dimension")
+        self._ops = ops
+        self._rows = tuple(op.shape[0] for op in ops)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return sum(self._rows), self._n
+
+    def matvec(self, v: Array) -> Array:
+        xp = array_namespace(v)
+        return xp.concat(tuple(op.matvec(v) for op in self._ops))
+
+    def rmatvec(self, v: Array) -> Array:
+        xp = array_namespace(v)
+        result = None
+        offset = 0
+        for op, rows in zip(self._ops, self._rows, strict=True):
+            piece = op.rmatvec(v[offset : offset + rows])
+            result = piece if result is None else result + piece
+            offset += rows
+        assert result is not None
+        return xp.asarray(result)
+
+    def row_gram_diagonal(self, weights: Array) -> Array:
+        # Rows are stacked, so the weighted row energies concatenate. Propagates
+        # NotImplementedError if any block cannot supply them cheaply.
+        xp = array_namespace(weights)
+        return xp.concat(tuple(op.row_gram_diagonal(weights) for op in self._ops))
+
+    def row_inf_norms(self, like: Array | None = None) -> Array:
+        # Stacked rows ⇒ concatenate each block's row norms (used by scaling).
+        xp = None
+        parts: list[Array] = []
+        for op in self._ops:
+            piece = op.row_inf_norms(like)
+            if xp is None:
+                xp = array_namespace(piece)
+            parts.append(piece)
+        assert xp is not None
+        return xp.concat(tuple(parts))
+
+    def to_coo(
+        self, like: Array | None = None
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        # Vertically stacked blocks ⇒ concatenate triplets with row offsets.
+        del like
+        rows_parts: list[Array] = []
+        cols_parts: list[Array] = []
+        vals_parts: list[Array] = []
+        offset = 0
+        xp = None
+        for op, n_rows in zip(self._ops, self._rows, strict=True):
+            r, c, v, _ = op.to_coo()
+            if xp is None:
+                xp = array_namespace(v)
+            rows_parts.append(r + offset)
+            cols_parts.append(c)
+            vals_parts.append(v)
+            offset += n_rows
+        assert xp is not None
+        return (
+            xp.concat(tuple(rows_parts)),
+            xp.concat(tuple(cols_parts)),
+            xp.concat(tuple(vals_parts)),
+            (offset, self._n),
+        )
+
+
 def as_operator(obj: Array | LinearOperator) -> LinearOperator:
     """Normalize a rank-2 dense array or existing operator."""
     if isinstance(obj, LinearOperator):
@@ -425,5 +508,6 @@ __all__ = [
     "LinearOperator",
     "LowRank",
     "MatrixFreeJacobian",
+    "VStack",
     "as_operator",
 ]

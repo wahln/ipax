@@ -11,6 +11,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `HEADER_REPEAT_INTERVAL` (10) rows so it stays readable on long runs, and marks
   any iterate that already satisfies every enabled acceptable-stopping criterion
   (before the required consecutive count) with a trailing `*`.
+- Expanded the Hock–Schittkowski analytic-oracle set in `ipax.testing.problems`
+  with `HS9`, `HS21`, `HS28`, and `HS71`, covering active bound multipliers, a
+  degenerate (zero) equality multiplier, a non-unique periodic optimum, and the
+  full equality+inequality+bounds constraint mix. Each is exercised across every
+  backend in the integration suite, wired into the QC benchmark corpus, and
+  checked by a new finite-difference derivative-consistency test that also
+  back-fills the previously untested HS oracles.
+- Two-sided linear inequalities (`Problem.linear_ineq`, `l ≤ A x ≤ u`) are now
+  solved: the constant-data block is lowered into the standard one-sided
+  inequality machinery (finite lower rows → `l − A x ≤ 0`, finite upper rows →
+  `A x − u ≤ 0`, both-finite rows yield a range pair), so the IPM, gradient
+  scaling, and every solver route handle it with no special-casing and the block
+  contributes no Lagrangian-Hessian term. Previously `solve` raised
+  `NotImplementedError` despite the interface being documented. A matrix-free
+  (operator) `linear_ineq` matrix still raises with guidance to use
+  `ineq_constraints` instead.
+
+### Changed
+- Promoted the driver's private vertical-stack operator to a public
+  `ipax.backend.operators.VStack` (now also exposing `row_inf_norms` for
+  gradient scaling), reused by both the equality assembly and the new
+  linear-inequality lowering.
 
 ### Fixed
 - `configure_verbosity` no longer attaches a second console handler when the
