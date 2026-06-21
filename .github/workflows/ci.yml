@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[lint]"
+      - name: Ruff
+        run: ruff check . && ruff format --check .
+      - name: mypy
+        run: mypy ipax
+      - name: Import-purity gate
+        run: python scripts/check_purity.py
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[numpy,torch,strict,sparse-cpu,test]"
+      - name: Run tests (NumPy + Torch + array-api-strict purity gate)
+        env:
+          IPAX_BACKENDS: numpy,torch,array_api_strict
+        run: pytest -q --cov=ipax --cov-report=xml -n auto
+      - uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+        if: always()
+
+  qc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[numpy,torch,sparse-cpu]"
+      - name: Quality-control benchmark sweep (correctness/robustness gate)
+        run: python -m benchmarks.runners.qc --out benchmarks/reports/qc
+      - name: Reference cross-check vs SciPy (advisory)
+        # Informational: flags divergence from an established solver but does not
+        # gate (the QC sweep already gates accuracy on known optima).
+        run: python -m benchmarks.runners.crosscheck --out benchmarks/reports/crosscheck
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qc-report
+          path: benchmarks/reports/
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[docs]"
+      - run: mkdocs build --strict

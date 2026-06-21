@@ -1,0 +1,21 @@
+{
+    "version": 1,
+    "project": "ipax",
+    "project_url": "https://github.com/wahln/ipax",
+    "repo": "..",
+    "branches": ["main"],
+    "environment_type": "virtualenv",
+    "show_commit_url": "https://github.com/wahln/ipax/commit/",
+    "pythons": ["3.11"],
+    "matrix": {
+        "req": {
+            "numpy": [""],
+            "torch": [""],
+            "scipy": [""]
+        }
+    },
+    "benchmark_dir": "runners",
+    "env_dir": ".asv/env",
+    "results_dir": "results",
+    "html_dir": "html"
+}

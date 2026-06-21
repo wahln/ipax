@@ -1,0 +1,41 @@
+# Run: pre-commit install
+# Mirrors the CI hygiene gates (ruff + mypy + codespell + import-purity).
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.18
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.1.0
+    hooks:
+      - id: mypy
+        files: ^ipax/
+        additional_dependencies: [array-api-compat, array-api-extra]
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.2
+    hooks:
+      - id: codespell
+        args: [--toml, pyproject.toml]
+
+  - repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.6
+    hooks:
+      - id: insert-license
+        name: apache license header
+        files: ^ipax/.*\.py$
+        args:
+          - --license-filepath=.license-header.txt
+          - --use-current-year
+
+  - repo: local
+    hooks:
+      - id: ipax-import-purity
+        name: ipax import-purity gate
+        entry: python scripts/check_purity.py
+        language: python
+        pass_filenames: false
+        files: ^ipax/

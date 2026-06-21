@@ -1,0 +1,178 @@
+# Copyright 2026 Niklas Wahl
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Primal/dual initialization (Breedveld §3.1, generalized).
+
+- Slacks/duals floored to a positive constant; ``x_0`` projected strictly inside
+  ``[x_L, x_U]`` (Wächter & Biegler 2006, §3.6).
+- Optional least-squares dual initialization ``∇g(x_0)ᵀ y_0 = −∇f(x_0)`` (LSQR
+  in the matrix-free path) — not currently implemented.
+- Warm-start hook (the RT layer may inject an application-specific start).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ipax.result import WarmStart
+    from ipax.typing import Array, Namespace
+
+# Wächter & Biegler 2006, §3.6: relative/absolute push keeping x_0 interior.
+_KAPPA1 = 1e-2
+_KAPPA2 = 1e-2
+# Floor so slacks/duals start strictly positive (Breedveld 2017, §3.1).
+_SLACK_FLOOR = 1e-2
+# Floor for warm-started slacks/duals: just strictly interior, so supplied
+# near-active values are preserved rather than pushed back toward μ-scale.
+_WARM_FLOOR = 1e-8
+
+
+@dataclass(frozen=True, slots=True)
+class InitialPoint:
+    """Strictly-feasible-interior starting point for the IPM."""
+
+    x: Array
+    s: Array
+    y_eq: Array
+    y_ineq: Array
+    z_lower: Array
+    z_upper: Array
+
+
+def project_interior(
+    xp: Namespace,
+    x0: Array,
+    lower_safe: Array,
+    upper_safe: Array,
+    mask_l: Array,
+    mask_u: Array,
+) -> Array:
+    """Push ``x0`` strictly inside the bounds (Wächter & Biegler 2006, §3.6)."""
+    both = xp.logical_and(mask_l, mask_u)
+    span = xp.where(both, upper_safe - lower_safe, xp.ones_like(x0))
+
+    push_l = _KAPPA1 * xp.maximum(xp.ones_like(x0), xp.abs(lower_safe))
+    push_l = xp.where(both, xp.minimum(push_l, _KAPPA2 * span), push_l)
+    push_u = _KAPPA1 * xp.maximum(xp.ones_like(x0), xp.abs(upper_safe))
+    push_u = xp.where(both, xp.minimum(push_u, _KAPPA2 * span), push_u)
+
+    x = xp.where(mask_l, xp.maximum(x0, lower_safe + push_l), x0)
+    x = xp.where(mask_u, xp.minimum(x, upper_safe - push_u), x)
+    return x
+
+
+def initialize(
+    *,
+    xp: Namespace,
+    x0: Array,
+    lower_safe: Array,
+    upper_safe: Array,
+    mask_l: Array,
+    mask_u: Array,
+    ineq_fn: Callable[[Array], Array] | None,
+    mu_init: float,
+    m: int,
+) -> InitialPoint:
+    """Build the strictly-interior initial point for the condensed route.
+
+    Slacks satisfy ``g(x) + s = 0`` where that keeps ``s`` positive, otherwise
+    they are floored (Breedveld 2017, §3.1). Duals start at ``μ`` complementarity
+    so ``S Λ e ≈ μ e`` and the bound complementarities match at iteration 0.
+    """
+    dtype = x0.dtype
+    x = project_interior(xp, x0, lower_safe, upper_safe, mask_l, mask_u)
+
+    if m > 0 and ineq_fn is not None:
+        g = ineq_fn(x)
+        floor = xp.full((m,), _SLACK_FLOOR, dtype=dtype)
+        s = xp.maximum(-g, floor)
+        y_ineq = mu_init / s
+    else:
+        s = xp.zeros((0,), dtype=dtype)
+        y_ineq = xp.zeros((0,), dtype=dtype)
+
+    x_minus_l = xp.where(mask_l, x - lower_safe, xp.ones_like(x))
+    u_minus_x = xp.where(mask_u, upper_safe - x, xp.ones_like(x))
+    zero = xp.zeros_like(x)
+    z_lower = xp.where(mask_l, mu_init / x_minus_l, zero)
+    z_upper = xp.where(mask_u, mu_init / u_minus_x, zero)
+
+    return InitialPoint(
+        x=x,
+        s=s,
+        y_eq=xp.zeros((0,), dtype=dtype),
+        y_ineq=y_ineq,
+        z_lower=z_lower,
+        z_upper=z_upper,
+    )
+
+
+def _floor_positive(xp: Namespace, arr: Array) -> Array:
+    """Push ``arr`` up to the warm-start interiority floor where it falls below."""
+    return xp.maximum(arr, xp.full_like(arr, _WARM_FLOOR))
+
+
+def apply_warm_start(
+    *,
+    xp: Namespace,
+    warm: WarmStart,
+    s: Array,
+    y_eq: Array,
+    y_ineq: Array,
+    z_lower: Array,
+    z_upper: Array,
+    m: int,
+    m_eq: int,
+    n: int,
+    mask_l: Array,
+    mask_u: Array,
+) -> tuple[Array, Array, Array, Array, Array]:
+    """Override the default start with user-supplied slacks/multipliers.
+
+    Each provided block must match the problem's dimensions. Slacks and bound /
+    inequality multipliers are floored strictly positive (interiority); bound
+    multipliers are re-masked to zero off their active bounds; equality
+    multipliers pass through. Returns ``(s, y_eq, y_ineq, z_lower, z_upper)``.
+    """
+
+    def _check(name: str, arr: Array | None, length: int) -> None:
+        if arr is not None and int(arr.shape[0]) != length:
+            raise ValueError(
+                f"warm-start {name} has length {int(arr.shape[0])}, expected {length}"
+            )
+
+    _check("s", warm.s, m)
+    _check("y_ineq", warm.y_ineq, m)
+    _check("y_eq", warm.y_eq, m_eq)
+    _check("z_lower", warm.z_lower, n)
+    _check("z_upper", warm.z_upper, n)
+
+    zero = xp.zeros((n,), dtype=z_lower.dtype)
+    if warm.s is not None:
+        s = _floor_positive(xp, warm.s)
+    if warm.y_ineq is not None:
+        y_ineq = _floor_positive(xp, warm.y_ineq)
+    if warm.y_eq is not None:
+        y_eq = warm.y_eq
+    if warm.z_lower is not None:
+        z_lower = xp.where(mask_l, _floor_positive(xp, warm.z_lower), zero)
+    if warm.z_upper is not None:
+        z_upper = xp.where(mask_u, _floor_positive(xp, warm.z_upper), zero)
+    return s, y_eq, y_ineq, z_lower, z_upper
+
+
+__all__ = ["InitialPoint", "apply_warm_start", "initialize", "project_interior"]

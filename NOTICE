@@ -1,0 +1,28 @@
+ipax
+Copyright 2026 Niklas Wahl
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+full terms.
+
+------------------------------------------------------------------------------
+Algorithmic attribution
+------------------------------------------------------------------------------
+
+ipax is an independent, clean-room implementation written from the published
+literature. It contains no source code from the works below; they are cited as
+the academic sources of the algorithms it implements:
+
+  - Wächter, A. & Biegler, L. T. (2006). "On the implementation of an
+    interior-point filter line-search algorithm for large-scale nonlinear
+    programming." Mathematical Programming 106(1), 25-57.
+    https://doi.org/10.1007/s10107-004-0559-y
+
+  - Breedveld, S., van den Berg, B. & Heijmen, B. (2017). "An interior-point
+    implementation developed and tuned for radiation therapy treatment
+    planning." Computational Optimization and Applications 68(2), 209-242.
+    https://doi.org/10.1007/s10589-017-9919-4
+
+  - Friedlander, M. P. & Orban, D. (2012). "A primal-dual regularized
+    interior-point method for convex quadratic programs." Mathematical
+    Programming Computation 4(1), 71-107.
+    https://doi.org/10.1007/s12532-012-0035-2

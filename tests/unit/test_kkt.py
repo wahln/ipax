@@ -1,0 +1,162 @@
+"""Unit tests for KKT operator assembly."""
+
+from __future__ import annotations
+
+from ipax.backend.operators import Dense, Diagonal
+from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
+from ipax.linalg.regularize import RegularizationState
+from tests._helpers import array, assert_allclose, implemented, transpose
+
+
+def test_condensed_operator_matches_dense_formula(namespace, tol):
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x_dense = array(namespace, [[0.25, 0.0], [0.0, 0.75]])
+    J_dense = array(namespace, [[1.0, 2.0], [-1.0, 0.5]])
+    sigma_s_dense = array(namespace, [[2.0, 0.0], [0.0, 0.5]])
+    v = array(namespace, [0.25, -1.0])
+
+    with implemented("KKT assembly"):
+        op = build_condensed_operator(
+            Dense(W_dense),
+            Dense(sigma_x_dense),
+            Diagonal(array(namespace, [2.0, 0.5])),
+            Dense(J_dense),
+            RegularizationState(delta_w=1e-6, delta_c=1e-8),
+        )
+        actual = op.matvec(v)
+
+    expected_dense = (
+        W_dense
+        + sigma_x_dense
+        + namespace.matmul(
+            transpose(namespace, J_dense),
+            namespace.matmul(sigma_s_dense, J_dense),
+        )
+        + 1e-6 * namespace.eye(2, dtype=v.dtype)
+    )
+    assert_allclose(namespace, actual, namespace.matmul(expected_dense, v), **tol)
+
+
+def test_condensed_operator_diagonal_matches_materialized(namespace, tol):
+    """The cheap Jacobi diagonal equals the materialized operator's diagonal."""
+    W = Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]]))
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    J = Dense(array(namespace, [[1.0, 2.0], [-1.0, 0.5]]))
+
+    op = build_condensed_operator(
+        W, sigma_x, sigma_s, J, RegularizationState(delta_w=1e-6)
+    )
+    dense = op.matmat(namespace.eye(2, dtype=array(namespace, [0.0]).dtype))
+    assert_allclose(namespace, op.diagonal(), namespace.linalg.diagonal(dense), **tol)
+
+
+def test_condensed_diagonal_without_inequalities(namespace, tol):
+    """With no inequalities the Gram term drops out cleanly."""
+    W = Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]]))
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 2), dtype=array(namespace, [0.0]).dtype))
+
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState()
+    )
+    expected = array(namespace, [4.0 + 0.25, 3.0 + 0.75])
+    assert_allclose(namespace, op.diagonal(), expected, **tol)
+
+
+def test_saddle_operator_matches_dense_bordered_matrix(namespace, tol):
+    n_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    eq_jac = array(namespace, [[1.0, 1.0]])
+    delta_c = 1e-8
+    v = array(namespace, [0.25, -1.0, 0.5])
+
+    op = build_saddle_operator(Dense(n_dense), Dense(eq_jac), delta_c)
+    actual = op.matvec(v)
+
+    top = namespace.concat((n_dense, transpose(namespace, eq_jac)), axis=1)
+    bottom = namespace.concat(
+        (eq_jac, -delta_c * namespace.eye(1, dtype=v.dtype)), axis=1
+    )
+    expected_dense = namespace.concat((top, bottom), axis=0)
+    assert_allclose(namespace, actual, namespace.matmul(expected_dense, v), **tol)
+    assert op.shape == (3, 3)
+
+
+def _empty_ineq(namespace):
+    dtype = array(namespace, [0.0]).dtype
+    return (
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 2), dtype=dtype)),
+    )
+
+
+def test_condensed_expected_inertia_assemblable(namespace):
+    """Assemblable Hessian: (n positive, m_I negative) for the bordered system."""
+    W = Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]]))
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+
+    empty_sigma_s, empty_jac = _empty_ineq(namespace)
+    no_ineq = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState()
+    )
+    assert no_ineq.expected_inertia() == (2, 0, 0)
+
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    jac = Dense(array(namespace, [[1.0, 2.0], [-1.0, 0.5]]))
+    with_ineq = build_condensed_operator(
+        W, sigma_x, sigma_s, jac, RegularizationState()
+    )
+    assert with_ineq.expected_inertia() == (2, 2, 0)
+
+
+def test_condensed_expected_inertia_none_for_low_rank_hessian(namespace):
+    """A diagonal-plus-low-rank (L-BFGS-style) Hessian disables the inertia check."""
+
+    class _LowRankW(Dense):
+        def diagonal_low_rank_form(self):  # presence alone is the signal
+            raise NotImplementedError
+
+    W = _LowRankW(array(namespace, [[4.0, 0.5], [0.5, 3.0]]))
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    empty_sigma_s, empty_jac = _empty_ineq(namespace)
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState()
+    )
+    assert op.expected_inertia() is None
+
+
+def test_saddle_expected_inertia_adds_equalities(namespace):
+    """The equality border adds m_E negatives: (n, m_E + m_I, 0)."""
+    W = Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]]))
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    jac = Dense(array(namespace, [[1.0, 2.0], [-1.0, 0.5]]))
+    condensed = build_condensed_operator(
+        W, sigma_x, sigma_s, jac, RegularizationState()
+    )
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, 1.0]])), 1e-8
+    )
+    assert saddle.expected_inertia() == (2, 3, 0)  # n=2, m_E=1, m_I=2
+
+
+def test_saddle_expected_inertia_none_propagates(namespace):
+    """A low-rank condensed block propagates ``None`` through the saddle."""
+
+    class _LowRankW(Dense):
+        def diagonal_low_rank_form(self):
+            raise NotImplementedError
+
+    empty_sigma_s, empty_jac = _empty_ineq(namespace)
+    condensed = build_condensed_operator(
+        _LowRankW(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        Diagonal(array(namespace, [0.25, 0.75])),
+        empty_sigma_s,
+        empty_jac,
+        RegularizationState(),
+    )
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, 1.0]])), 1e-8
+    )
+    assert saddle.expected_inertia() is None

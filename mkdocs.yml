@@ -1,0 +1,50 @@
+site_name: ipax
+site_description: Array-API interior-point solver for nonlinear constrained optimization
+repo_url: https://github.com/wahln/ipax
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - content.code.copy
+  palette:
+    - scheme: default
+      primary: indigo
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - User guide:
+      - Defining a problem: guide/problems.md
+      - Configuring the solver: guide/options.md
+      - Interpreting results: guide/results.md
+      - Backends & hardware: guide/backends.md
+      - Monitoring & re-solving: guide/diagnostics.md
+  - Concepts:
+      - Problem interface: concepts/problem.md
+      - Linear-algebra layer: concepts/linalg.md
+      - Algorithm: concepts/algorithm.md
+  - Architecture & invariants: architecture.md
+  - API reference: reference.md
+  - Contributing: contributing.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: numpy
+            show_source: false
+            members_order: source
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.arithmatex:
+      generic: true
+
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js

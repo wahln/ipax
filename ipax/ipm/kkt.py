@@ -1,0 +1,523 @@
+# Copyright 2026 Niklas Wahl
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Assemble KKT systems behind ``LinearOperator`` interfaces."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
+
+from ipax.backend.namespace import array_namespace
+from ipax.backend.operators import LinearOperator
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from ipax.linalg.regularize import RegularizationState
+    from ipax.typing import Array
+
+
+@dataclass(frozen=True, slots=True)
+class _Border:
+    """A symmetric border block appended to a KKT system, with **zero RHS**.
+
+    Couples ``size`` new auxiliary variables to existing ones: the connection
+    triplets ``(conn_rows, conn_cols, conn_values)`` give ``C`` (auxiliary-local
+    row × existing-column), placed symmetrically as ``C`` and ``Cᵀ``; the inner
+    triplets give the auxiliary diagonal block ``E``. Eliminating the auxiliaries
+    contributes the Schur term ``−Cᵀ E⁻¹ C`` to the logical block. Two uses:
+
+    - **Inequalities** (indefinite augmented route): ``C = ∇g``, ``E = −Σ_s⁻¹`` ⇒
+      Schur term ``+∇gᵀ Σ_s ∇g`` — the condensed Gram term, *never formed densely*.
+    - **Limited-memory Hessian**: ``C = Uᵀ``, ``E = M`` ⇒ Schur term
+      ``−U M⁻¹ Uᵀ`` (IPOPT limited-memory; Byrd–Nocedal–Schnabel 1994).
+
+    ``conn_cols`` index existing variables (the primal block ``[0, n)``), so a
+    border composes unchanged when the logical block grows (e.g. the condensed
+    block bordered into the equality saddle).
+    """
+
+    size: int
+    conn_rows: Array
+    conn_cols: Array
+    conn_values: Array
+    inner_rows: Array
+    inner_cols: Array
+    inner_values: Array
+
+
+@dataclass(frozen=True, slots=True)
+class _Assembly:
+    """A logical sparse COO block plus zero-RHS symmetric :class:`_Border` blocks.
+
+    The assembled matrix nests every border after the logical block; its Schur
+    complement onto the logical block is the true KKT operator the driver solves
+    (the condensed ``N`` / the equality saddle). The auxiliary variables have a
+    zero right-hand side and are discarded, so :class:`SparseDirectSolver` just
+    pads the RHS and truncates the solution across the size gap.
+    """
+
+    rows: Array
+    cols: Array
+    values: Array
+    logical_size: int
+    borders: tuple[_Border, ...] = ()
+
+
+def _grid_indices(xp: object, n_rows: int, n_cols: int) -> tuple[Array, Array]:
+    """Row- and column-index vectors of a dense ``n_rows × n_cols`` block (COO)."""
+    rows = xp.reshape(  # type: ignore[attr-defined]
+        xp.broadcast_to(  # type: ignore[attr-defined]
+            xp.expand_dims(xp.arange(n_rows), axis=1),  # type: ignore[attr-defined]
+            (n_rows, n_cols),
+        ),
+        (n_rows * n_cols,),
+    )
+    cols = xp.reshape(  # type: ignore[attr-defined]
+        xp.broadcast_to(  # type: ignore[attr-defined]
+            xp.expand_dims(xp.arange(n_cols), axis=0),  # type: ignore[attr-defined]
+            (n_rows, n_cols),
+        ),
+        (n_rows * n_cols,),
+    )
+    return rows, cols
+
+
+def _lowrank_border(xp: object, u: Array, m: Array) -> _Border:
+    """Border for the L-BFGS low-rank term ``−U M⁻¹ Uᵀ`` (``C = Uᵀ``, ``E = M``)."""
+    n_primal = int(u.shape[0])
+    r = int(u.shape[1])
+    # U entry (i, j) couples primal column i to auxiliary row j: C = Uᵀ.
+    grid_rows, grid_cols = _grid_indices(xp, n_primal, r)
+    conn_rows = grid_cols  # auxiliary-local (rank) index j
+    conn_cols = grid_rows  # existing primal index i
+    conn_values = xp.reshape(u, (n_primal * r,))  # type: ignore[attr-defined]
+    m_rows, m_cols = _grid_indices(xp, r, r)
+    return _Border(
+        r,
+        conn_rows,
+        conn_cols,
+        conn_values,
+        m_rows,
+        m_cols,
+        xp.reshape(m, (r * r,)),  # type: ignore[attr-defined]
+    )
+
+
+def _inequality_border(ineq_jac: LinearOperator, sigma_s: LinearOperator) -> _Border:
+    """Border keeping ``∇g`` explicit with the ``−Σ_s⁻¹`` block (augmented route).
+
+    ``C = ∇g`` couples each slack multiplier ``Δλ`` to the primal variables, and
+    ``E = −Σ_s⁻¹`` (``Σ_s = Λ/S`` strictly positive in the interior) is the slack
+    block. The Schur term is the condensed ``∇gᵀ Σ_s ∇g`` — assembled implicitly,
+    so the sparse factor stays as sparse as ``∇g`` itself.
+    """
+    g_rows, g_cols, g_values, shape = ineq_jac.to_coo()
+    m_ineq = shape[0]
+    xp = array_namespace(g_values)
+    diag = xp.arange(m_ineq)
+    inner = -1.0 / sigma_s.diagonal()  # −Σ_s⁻¹
+    return _Border(m_ineq, g_rows, g_cols, g_values, diag, diag, inner)
+
+
+def _border(a: _Assembly) -> tuple[Array, Array, Array, tuple[int, int]]:
+    """Materialize the bordered COO matrix and its (augmented) shape."""
+    xp = array_namespace(a.values)
+    rows, cols, values = a.rows, a.cols, a.values
+    offset = a.logical_size
+    for border in a.borders:
+        # Connection C at (offset + conn_rows, conn_cols) and its transpose Cᵀ.
+        rows = xp.concat((rows, offset + border.conn_rows, border.conn_cols))
+        cols = xp.concat((cols, border.conn_cols, offset + border.conn_rows))
+        values = xp.concat((values, border.conn_values, border.conn_values))
+        # Inner auxiliary block E on the trailing diagonal corner.
+        rows = xp.concat((rows, offset + border.inner_rows))
+        cols = xp.concat((cols, offset + border.inner_cols))
+        values = xp.concat((values, border.inner_values))
+        offset += border.size
+    return rows, cols, values, (offset, offset)
+
+
+def _logical_assembly(op: LinearOperator) -> _Assembly:
+    """Logical COO block (+ any borders) for a KKT sub-block operator."""
+    if isinstance(op, _CondensedOperator):
+        return op.assemble()
+    rows, cols, values, shape = op.to_coo()
+    return _Assembly(rows, cols, values, logical_size=shape[0])
+
+
+class _CondensedOperator(LinearOperator):
+    """Lazy ``W + Sigma_x + J.T @ Sigma_s @ J + delta_w * I`` operator."""
+
+    def __init__(
+        self,
+        W: LinearOperator,
+        sigma_x: LinearOperator,
+        sigma_s: LinearOperator,
+        ineq_jac: LinearOperator,
+        delta_w: float,
+    ) -> None:
+        if W.shape[0] != W.shape[1]:
+            raise ValueError("W must be square")
+        if sigma_x.shape != W.shape:
+            raise ValueError("sigma_x must match W")
+        if ineq_jac.shape[1] != W.shape[0]:
+            raise ValueError("ineq_jac has incompatible variable dimension")
+        if sigma_s.shape != (ineq_jac.shape[0], ineq_jac.shape[0]):
+            raise ValueError("sigma_s must match the inequality dimension")
+        self._W = W
+        self._sigma_x = sigma_x
+        self._sigma_s = sigma_s
+        self._ineq_jac = ineq_jac
+        self._delta_w = delta_w
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self._W.shape
+
+    def matvec(self, v: Array) -> Array:
+        result = self._W.matvec(v) + self._sigma_x.matvec(v)
+        jv = self._ineq_jac.matvec(v)
+        result = result + self._ineq_jac.rmatvec(self._sigma_s.matvec(jv))
+        if self._delta_w != 0.0:
+            result = result + self._delta_w * v
+        return result
+
+    def rmatvec(self, v: Array) -> Array:
+        return self.matvec(v)
+
+    def diagonal(self, like: Array | None = None) -> Array:
+        """Cheap diagonal for Jacobi preconditioning.
+
+        ``diag(W) + diag(Σ_x) + diag(∇gᵀ Σ_s ∇g) + δ_w``. Propagates
+        ``NotImplementedError`` when any block lacks a cheap diagonal (e.g. an
+        L-BFGS ``W`` with no curvature pairs yet), so the solver falls back to no
+        preconditioning rather than paying ``n`` matvecs.
+        """
+        d = self._W.diagonal(like) + self._sigma_x.diagonal(like)
+        if self._ineq_jac.shape[0] > 0:
+            d = d + self._ineq_jac.gram_diagonal(self._sigma_s.diagonal())
+        if self._delta_w != 0.0:
+            d = d + self._delta_w
+        return d
+
+    def assemble(self) -> _Assembly:
+        """Assemble the condensed Newton operator ``N`` as a bordered system.
+
+        The logical block holds the diagonal-ish primal part; every dense product
+        ``N`` would otherwise form is kept implicit as a zero-RHS :class:`_Border`
+        whose Schur complement reproduces it exactly:
+
+        - **Hessian ``W``.** A *diagonal-plus-low-rank* ``W = diag(d) − U M⁻¹ Uᵀ``
+          (it exposes ``diagonal_low_rank_form``: the L-BFGS compact Hessian, or a
+          matrix-free RT-like ``diag(h) + C Cᵀ``) contributes only ``d`` to the
+          logical block and a low-rank border for ``−U M⁻¹ Uᵀ`` (IPOPT limited-
+          memory; §4.3) — the dense term is never formed. Otherwise an assemblable
+          (analytic/sparse) ``W`` emits its triplets directly. A ``W`` that is
+          neither (e.g. an autodiff-HVP black box) propagates ``NotImplementedError``.
+        - **Inequalities.** The Gram term ``∇gᵀ Σ_s ∇g`` is kept implicit as the
+          indefinite augmented border (``∇g`` with the ``−Σ_s⁻¹`` slack block), so
+          the factor stays as sparse as ``∇g`` instead of densifying the product.
+
+        With both present (the RT case: low-rank Hessian + inequality caps) the two
+        borders stack — their Schur terms add, recovering ``N`` exactly.
+        """
+        n = self._W.shape[0]
+        sigma_x_diag = self._sigma_x.diagonal()
+        xp = array_namespace(sigma_x_diag)
+        idx = xp.arange(n)
+        borders: list[_Border] = []
+
+        low_rank_form = getattr(self._W, "diagonal_low_rank_form", None)
+        if low_rank_form is not None:
+            # Diagonal-plus-low-rank Hessian: diagonal d + low-rank border −U M⁻¹ Uᵀ.
+            try:
+                d, u, m = low_rank_form()
+            except NotImplementedError:
+                # L-BFGS before the first curvature pair: W = I, no low-rank part.
+                d = xp.ones((n,), dtype=sigma_x_diag.dtype)
+                u = m = None
+            rows, cols, values = idx, idx, d + sigma_x_diag + self._delta_w
+            if u is not None and m is not None and int(u.shape[1]) > 0:
+                borders.append(_lowrank_border(xp, u, m))
+        else:
+            # Assemblable Hessian: W triplets + the Σ_x and δ_w diagonals.
+            wr, wc, wv, _ = self._W.to_coo()
+            rows = xp.concat((wr, idx))
+            cols = xp.concat((wc, idx))
+            values = xp.concat((wv, sigma_x_diag))
+            if self._delta_w != 0.0:
+                delta = xp.full((n,), self._delta_w, dtype=values.dtype)
+                rows = xp.concat((rows, idx))
+                cols = xp.concat((cols, idx))
+                values = xp.concat((values, delta))
+
+        if self._ineq_jac.shape[0] > 0:
+            borders.append(_inequality_border(self._ineq_jac, self._sigma_s))
+
+        return _Assembly(rows, cols, values, logical_size=n, borders=tuple(borders))
+
+    def to_coo(
+        self, like: Array | None = None
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        """Emit the condensed block as COO triplets (invariant #4).
+
+        Borders the :meth:`assemble` logical block with its low-rank / inequality
+        borders, if any; the returned shape is the *augmented* size, while
+        :attr:`shape` stays the logical ``n × n``.
+        """
+        del like
+        return _border(self.assemble())
+
+    def expected_inertia(self) -> tuple[int, int, int] | None:
+        """IPOPT target inertia ``(n₊, n₋, n₀)`` of the assembled bordered system.
+
+        For an *assemblable* Hessian the condensed block ``N`` is positive
+        definite once regularized (``n`` positive eigenvalues), and each
+        inequality contributes one negative ``−Σ_s⁻¹`` border row, so the matrix
+        the sparse solver actually factors should have inertia ``(n, m_I, 0)``.
+        A correct LDLᵀ factorization can *succeed* with the wrong inertia (a
+        non-descent step), which is exactly what the inertia check catches.
+
+        Returns ``None`` for a diagonal-plus-low-rank Hessian (L-BFGS /
+        matrix-free): its low-rank border carries an inner block whose inertia is
+        not known cheaply, and Powell-damped L-BFGS keeps ``W`` PD anyway, so the
+        factorization-failure escalation suffices there.
+        """
+        if getattr(self._W, "diagonal_low_rank_form", None) is not None:
+            return None
+        return (self._W.shape[0], self._ineq_jac.shape[0], 0)
+
+    def primal_block(self) -> LinearOperator | None:
+        """The condensed block ``N`` that must be PD, or ``None`` to skip the check.
+
+        ``N`` (this operator) is what the regularized Newton step needs positive
+        definite; a dense solver can probe it with a Cholesky factorization. As
+        with :meth:`expected_inertia`, a diagonal-plus-low-rank Hessian
+        (L-BFGS / matrix-free) returns ``None``: it is PD by Powell damping and a
+        Cholesky on its *materialized* form would defeat the matrix-free intent.
+        """
+        if getattr(self._W, "diagonal_low_rank_form", None) is not None:
+            return None
+        return self
+
+    def lbfgs_inverse_apply(self) -> Callable[[Array], Array]:
+        """L-BFGS-aware approximate inverse via Sherman–Morrison–Woodbury (§5.2).
+
+        With ``W = ξI − U M⁻¹ Uᵀ`` (the compact L-BFGS Hessian) the condensed
+        operator is ``N = D̃ − U M⁻¹ Uᵀ`` for the diagonal
+
+            D̃ = ξ + diag(Σ_x) + δ_w + diag(∇gᵀ Σ_s ∇g),
+
+        approximating only the *off-diagonal* of the inequality Gram term. The
+        Woodbury identity then gives the exact inverse of that approximation::
+
+            N⁻¹ r = D̃⁻¹ (r + U z),   z = (M − Uᵀ D̃⁻¹ U)⁻¹ (Uᵀ D̃⁻¹ r),
+
+        an SPD operator costing one ``2k×2k`` solve plus ``O(n·k)`` per apply, with
+        ``D̃`` and the inner factor precomputed once. Raises ``NotImplementedError``
+        when ``W`` exposes no L-BFGS compact form (e.g. a matrix-free Hessian or
+        no curvature pairs yet).
+        """
+        compact_form = getattr(self._W, "compact_form", None)
+        if compact_form is None:
+            raise NotImplementedError(
+                "L-BFGS-aware preconditioner requires an L-BFGS Hessian block"
+            )
+        xi, u, m_lbfgs = compact_form()
+        xp = array_namespace(u)
+
+        d_tilde = xi + self._sigma_x.diagonal()
+        if self._ineq_jac.shape[0] > 0:
+            d_tilde = d_tilde + self._ineq_jac.gram_diagonal(self._sigma_s.diagonal())
+        if self._delta_w != 0.0:
+            d_tilde = d_tilde + self._delta_w
+
+        inv_dt = 1.0 / d_tilde
+        u_t = xp.permute_dims(u, (1, 0))  # (2k, n)
+        # Inner factor M − Uᵀ D̃⁻¹ U (2k×2k), nonsingular for PD N.
+        inner = m_lbfgs - xp.matmul(u_t * inv_dt, u)
+
+        def apply(r: Array) -> Array:
+            w = xp.matmul(u_t, inv_dt * r)
+            z = xp.linalg.solve(inner, w)
+            return inv_dt * (r + xp.matmul(u, z))
+
+        return apply
+
+
+def build_condensed_operator(
+    W: LinearOperator,
+    sigma_x: LinearOperator,
+    sigma_s: LinearOperator,
+    ineq_jac: LinearOperator,
+    reg: RegularizationState,
+) -> LinearOperator:
+    """Assemble the condensed normal-equations operator."""
+    return _CondensedOperator(W, sigma_x, sigma_s, ineq_jac, reg.delta_w)
+
+
+class _SaddleOperator(LinearOperator):
+    """Bordered ``(Δx, Δy)`` quasidefinite saddle for equality constraints.
+
+    Wraps the condensed inequality/bound block ``N`` (already carrying
+    ``δ_w I``) and borders it with the equality Jacobian and the negative
+    ``δ_c`` regularization on the (2,2) block (Friedlander–Orban 2012)::
+
+        ┌ N        ∇cᵀ ┐
+        └ ∇c    −δ_c I ┘
+    """
+
+    def __init__(
+        self,
+        condensed_n: LinearOperator,
+        eq_jac: LinearOperator,
+        delta_c: float,
+    ) -> None:
+        n = condensed_n.shape[0]
+        if condensed_n.shape[1] != n:
+            raise ValueError("condensed block must be square")
+        if eq_jac.shape[1] != n:
+            raise ValueError("eq_jac has incompatible variable dimension")
+        self._n = n
+        self._m = eq_jac.shape[0]
+        self._condensed = condensed_n
+        self._eq_jac = eq_jac
+        self._delta_c = delta_c
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        size = self._n + self._m
+        return size, size
+
+    def matvec(self, v: Array) -> Array:
+        xp = array_namespace(v)
+        v_x = v[: self._n]
+        v_y = v[self._n :]
+        top = self._condensed.matvec(v_x) + self._eq_jac.rmatvec(v_y)
+        bottom = self._eq_jac.matvec(v_x) - self._delta_c * v_y
+        return xp.concat((top, bottom))
+
+    def rmatvec(self, v: Array) -> Array:
+        return self.matvec(v)
+
+    def preferred_krylov_method(self) -> Literal["minres"]:
+        """The equality saddle is symmetric indefinite, so MINRES is the route."""
+        return "minres"
+
+    def assemble(self) -> _Assembly:
+        """Assemble the bordered quasidefinite saddle in ``[Δx | Δy]`` order.
+
+        Extends the condensed block's logical assembly (size ``n``) with the
+        equality Jacobian's symmetric off-diagonal blocks ``∇c`` / ``∇cᵀ`` and the
+        ``−δ_c`` (2,2) diagonal, growing the logical size to ``n + m``. Any borders
+        from the condensed block (L-BFGS low-rank, inequalities) are carried
+        through unchanged — their connections live in the primal range ``[0, n)``,
+        which the equality rows sit *after*, so they still border the full saddle
+        correctly.
+        """
+        inner = _logical_assembly(self._condensed)
+        xp = array_namespace(inner.values)
+        n, m = self._n, self._m
+        er, ec, ev, _ = self._eq_jac.to_coo()
+        # ∇c at rows [n, n+m) × cols [0, n); ∇cᵀ is its transpose block.
+        rows = xp.concat((inner.rows, er + n, ec))
+        cols = xp.concat((inner.cols, ec, er + n))
+        values = xp.concat((inner.values, ev, ev))
+        if self._delta_c != 0.0:
+            didx = xp.arange(m) + n
+            delta = xp.full((m,), -self._delta_c, dtype=values.dtype)
+            rows = xp.concat((rows, didx))
+            cols = xp.concat((cols, didx))
+            values = xp.concat((values, delta))
+        return _Assembly(rows, cols, values, logical_size=n + m, borders=inner.borders)
+
+    def to_coo(
+        self, like: Array | None = None
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        """Emit the bordered saddle as COO triplets (invariant #4).
+
+        Propagates ``NotImplementedError`` only from a non-L-BFGS matrix-free
+        ``W`` or a matrix-free Jacobian (``∇c`` / ``∇g``). The returned shape is
+        the *augmented* size when L-BFGS / inequality borders are present.
+        """
+        del like
+        return _border(self.assemble())
+
+    def expected_inertia(self) -> tuple[int, int, int] | None:
+        """IPOPT target inertia of the assembled saddle, or ``None``.
+
+        The equality border adds the ``−δ_c`` (2,2) block, contributing ``m``
+        more negative eigenvalues than the condensed block, so the target is the
+        condensed target with ``m`` extra negatives — ``(n, m_E + m_I, 0)``.
+        Propagates ``None`` when the condensed block does (low-rank Hessian).
+        """
+        inner = getattr(self._condensed, "expected_inertia", None)
+        target = inner() if inner is not None else None
+        if target is None:
+            return None
+        n_pos, n_neg, n_zero = target
+        return (n_pos, n_neg + self._m, n_zero)
+
+    def primal_block(self) -> LinearOperator | None:
+        """The condensed ``N`` block of the saddle that must be PD, or ``None``.
+
+        With ``N`` PD and ``δ_c > 0`` the saddle is quasidefinite (Friedlander–
+        Orban), so probing ``N`` is sufficient for the dense PD guard.
+        """
+        fn = getattr(self._condensed, "primal_block", None)
+        return fn() if fn is not None else None
+
+    def spd_preconditioner_diagonal(self) -> Array:
+        """SPD block-diagonal preconditioner for MINRES.
+
+        The saddle is symmetric *indefinite*, so its own diagonal (with the
+        ``−δ_c`` block) is not a valid symmetric preconditioner. We instead return
+        the diagonal of the SPD block preconditioner
+
+            ┌ diag(N)                              0 ┐
+            └ 0        δ_c + diag(∇c diag(N)⁻¹ ∇cᵀ)  ┘
+
+        — the PD primal Jacobi block stacked with a positive approximate-Schur
+        dual block (Murphy–Golub–Wathen 2000). Propagates ``NotImplementedError``
+        when ``diag(N)`` is unavailable (e.g. a matrix-free Hessian); the dual
+        block falls back to the SPD identity when ``∇c`` cannot supply its row
+        energies cheaply. The Krylov solver applies this by symmetric scaling.
+        """
+        diag_n = self._condensed.diagonal()
+        xp = array_namespace(diag_n)
+        try:
+            schur = self._eq_jac.row_gram_diagonal(1.0 / diag_n)
+            dual = self._delta_c + schur
+        except NotImplementedError:
+            # Primal-only preconditioning: SPD identity on the (strictly positive)
+            # dual block keeps the whole preconditioner SPD.
+            dual = xp.ones((self._m,), dtype=diag_n.dtype)
+        return xp.concat((diag_n, dual))
+
+
+def build_saddle_operator(
+    condensed_n: LinearOperator,
+    eq_jac: LinearOperator,
+    delta_c: float,
+) -> LinearOperator:
+    """Border the condensed block with equalities into the quasidefinite saddle."""
+    return _SaddleOperator(condensed_n, eq_jac, delta_c)
+
+
+__all__ = [
+    "build_condensed_operator",
+    "build_saddle_operator",
+]
