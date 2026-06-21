@@ -103,6 +103,26 @@ class Capabilities:
     default_float: str  # "float64" preferred; read from inputs in practice
 
 
+def _detect_devices(xp: Namespace) -> tuple[str, ...]:
+    """Available devices via the Array-API info namespace, stringified.
+
+    Uses ``xp.__array_namespace_info__().devices()`` (Array API 2023.12 inspection
+    API) so the probe stays inside the standard — no ``cupy.cuda``/``torch.cuda``
+    in the core. Backends expose device objects (``<CUDA Device 0>``,
+    ``device(type='cpu')``, ``'cpu'``); we stringify them for reporting. Falls
+    back to ``("cpu",)`` for namespaces lacking the inspection API.
+    """
+    info_fn = getattr(xp, "__array_namespace_info__", None)
+    if info_fn is None:
+        return ("cpu",)
+    try:
+        devices = info_fn().devices()
+    except Exception:  # best-effort probe; never fail capability detection
+        return ("cpu",)
+    names = tuple(str(d) for d in devices)
+    return names or ("cpu",)
+
+
 def capabilities(xp: Namespace) -> Capabilities:
     """Probe ``xp`` for optional Array-API features and adapter availability.
 
@@ -131,7 +151,7 @@ def capabilities(xp: Namespace) -> Capabilities:
         linalg_functions=linalg_functions,
         has_sparse_adapter=name in _SPARSE_ADAPTER_BACKENDS,
         supports_autodiff=name in _AUTODIFF_BACKENDS,
-        devices=("cpu",),
+        devices=_detect_devices(xp),
         default_float=default_float,
     )
 

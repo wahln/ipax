@@ -16,7 +16,10 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
+
+from ipax.backend.namespace import array_namespace
 
 if TYPE_CHECKING:
     from ipax.options import BarrierOptions
@@ -43,11 +46,19 @@ def fraction_to_boundary(v: Array, dv: Array, tau: float) -> float:
     if not 0.0 < tau <= 1.0:
         raise ValueError("tau must be in (0, 1]")
 
-    alpha = 1.0
-    for idx in range(int(v.shape[0])):
-        step = float(dv[idx])
-        if step < 0.0:
-            alpha = min(alpha, tau * float(v[idx]) / (-step))
+    if int(v.shape[0]) == 0:
+        return 1.0
+
+    # Only components moving toward the boundary (dv < 0) limit the step; for
+    # those alpha_i = tau * v_i / (-dv_i) (Wachter & Biegler 2006, eq. 15).
+    # Vectorized so the whole rule costs a single host<->device sync (the final
+    # float()) rather than one per element — the element-wise Python loop made
+    # this O(n) syncs/call and dominated GPU iteration time.
+    xp = array_namespace(v, dv)
+    blocking = dv < 0.0
+    safe_denom = xp.where(blocking, -dv, xp.ones_like(dv))
+    ratios = xp.where(blocking, tau * v / safe_denom, xp.full_like(v, math.inf))
+    alpha = float(xp.min(ratios))
     return max(0.0, min(1.0, alpha))
 
 

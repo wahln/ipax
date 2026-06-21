@@ -73,3 +73,21 @@ def test_capabilities_flags_jax_as_autodiff_not_sparse_numpy():
     caps = capabilities(types.ModuleType("jax.numpy"))
     assert caps.name == "jax"
     assert caps.supports_autodiff is True
+
+
+def test_capabilities_reports_real_devices(namespace):
+    """Devices come from the Array-API info namespace, not a hardcoded ``cpu``."""
+    with implemented("device probe"):
+        caps = capabilities(namespace)
+
+    assert isinstance(caps.devices, tuple)
+    assert len(caps.devices) >= 1
+    assert all(isinstance(d, str) for d in caps.devices)
+    # Every installed CI backend (numpy/torch/array_api_strict) exposes a CPU.
+    assert any("cpu" in d.lower() for d in caps.devices)
+
+
+def test_capabilities_devices_falls_back_when_info_missing():
+    """A bare namespace without ``__array_namespace_info__`` degrades to ``cpu``."""
+    caps = capabilities(types.ModuleType("numpy"))
+    assert caps.devices == ("cpu",)

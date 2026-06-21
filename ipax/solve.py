@@ -228,6 +228,7 @@ def solve(
         result,
         solve_time=perf_counter() - start_time,
         linear_solver=_describe_solver(solver),
+        device=_describe_device(result.x),
     )
 
     # Post-solve summary (tier 1) and the timing split (tier 2).
@@ -284,6 +285,16 @@ def _describe_solver(solver: object) -> str:
     """
     describe = getattr(solver, "describe", None)
     return describe() if callable(describe) else type(solver).__name__
+
+
+def _describe_device(x: Array) -> str:
+    """Stringified device of the solution array (e.g. ``"cpu"``, CUDA device).
+
+    Read from the array's standard ``.device`` attribute so it reflects where the
+    solve actually ran without importing any concrete backend.
+    """
+    device = getattr(x, "device", None)
+    return "" if device is None else str(device)
 
 
 def _count_finite(xp: Namespace, bound: Array | None) -> int:

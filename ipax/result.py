@@ -156,6 +156,7 @@ class Result:
     constraint_violation: float = float("inf")
     solve_time: float = 0.0  # total wall-clock seconds for the solve
     linear_solver: str = ""  # the linear solver used internally (e.g. "dense")
+    device: str = ""  # device the solve ran on (e.g. "cpu", "<CUDA Device 0>")
 
     derivative_sources: DerivativeSources = field(default_factory=DerivativeSources)
     history: tuple[IterationRecord, ...] = ()
