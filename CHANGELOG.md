@@ -33,9 +33,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   toolchain) and bridges their NumPy/SciPy evaluation onto any CPU Array-API
   backend, mapping S2MPJ's two-sided `clower ≤ c(x) ≤ cupper` constraints onto
   ipax's eq/ineq split. A `benchmarks/runners/s2mpj.py` L-BFGS accuracy sweep
-  consumes it. Download-gated (`IPAX_S2MPJ_DIR`); not vendored (S2MPJ has no
-  license) and not part of per-PR CI — the loader returns `[]` and the gated
-  tests skip when no checkout is present.
+  consumes it. `list_s2mpj_problems()` enumerates a checkout and the runner's
+  `--all` flag sweeps the **entire CUTEst set**, with `--max-vars`/`--max-iter`/
+  `--max-time` caps, per-problem isolation, automatic skipping of objective-free
+  problems, and a status summary. Download-gated (`IPAX_S2MPJ_DIR`); not vendored
+  (S2MPJ has no license) and not part of per-PR CI — the loader returns `[]` and
+  the gated tests skip when no checkout is present.
 
 ### Changed
 - Promoted the driver's private vertical-stack operator to a public

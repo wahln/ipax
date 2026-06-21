@@ -18,10 +18,15 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 import ipax
-from benchmarks.corpus.s2mpj import s2mpj_dir, s2mpj_problems
+from benchmarks.corpus.s2mpj import (
+    list_s2mpj_problems,
+    s2mpj_dir,
+    s2mpj_problems,
+)
 from benchmarks.harness import (
     CaseResult,
     capture_environment,
@@ -32,13 +37,28 @@ from benchmarks.harness import (
 from ipax.testing.backends import import_namespace
 
 
-def default_configs() -> list[tuple[str, ipax.Options]]:
+def default_configs(
+    max_iter: int, max_time: float | None
+) -> list[tuple[str, ipax.Options]]:
     """L-BFGS configurations (no analytic Hessian crosses the NumPy bridge)."""
     options = ipax.Options
+    common = {"hessian": "lbfgs", "max_iter": max_iter, "max_time": max_time}
     return [
-        ("lbfgs/dense", options(hessian="lbfgs", linsolve="dense")),
-        ("lbfgs/krylov", options(hessian="lbfgs", linsolve="krylov")),
+        ("lbfgs/dense", options(linsolve="dense", **common)),
+        ("lbfgs/krylov", options(linsolve="krylov", **common)),
     ]
+
+
+def _select_names(args: argparse.Namespace, root: str) -> tuple[str, ...] | None:
+    """Resolve the problem selection: explicit names, the whole set, or curated."""
+    if args.names:
+        return tuple(n.strip() for n in args.names.split(",") if n.strip())
+    if args.all:
+        names = list_s2mpj_problems(root)
+        if args.limit:
+            names = names[: args.limit]
+        return tuple(names)
+    return None  # curated default in s2mpj_problems
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,6 +77,26 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="comma-separated S2MPJ problem names (else a curated default set)",
     )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="sweep every problem in the checkout (the full CUTEst set)",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=0, help="cap the number of problems (0 = all)"
+    )
+    parser.add_argument(
+        "--max-vars",
+        type=int,
+        default=1000,
+        help="skip problems with more than this many variables (0 = no cap)",
+    )
+    parser.add_argument(
+        "--max-iter", type=int, default=1000, help="solver iteration cap"
+    )
+    parser.add_argument(
+        "--max-time", type=float, default=60.0, help="per-solve wall-time cap (seconds)"
+    )
     args = parser.parse_args(argv)
 
     root = s2mpj_dir(args.dir)
@@ -68,22 +108,42 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
-    names = (
-        tuple(n.strip() for n in args.names.split(",") if n.strip())
-        if args.names
-        else None
-    )
-    configs = default_configs()
+    names = _select_names(args, root)
+    configs = default_configs(args.max_iter, args.max_time)
     environment = capture_environment()
 
     results: list[CaseResult] = []
+    skipped_no_objective = 0
+    skipped_too_large = 0
     for backend in backends:
         try:
             xp = import_namespace(backend)
         except ImportError:
             continue
-        corpus = s2mpj_problems(names, directory=root, backends=(backend,))
-        for case in corpus:
+        for case in s2mpj_problems(names, directory=root, backends=(backend,)):
+            # One guarded build to gate applicability/size before running configs:
+            # objective-free problems are not minimization problems, and the size
+            # cap keeps the full sweep tractable. Genuine build errors fall through
+            # to run_case so their traceback is recorded as a row.
+            try:
+                problem, _x0 = case.build(xp)
+            except NotImplementedError:
+                skipped_no_objective += 1
+                continue
+            except Exception:
+                results.append(
+                    run_case(
+                        case,
+                        config=configs[0][0],
+                        options=configs[0][1],
+                        xp=xp,
+                        backend=backend,
+                    )
+                )
+                continue
+            if args.max_vars and int(problem.n_vars) > args.max_vars:
+                skipped_too_large += 1
+                continue
             for label, options in configs:
                 results.append(
                     run_case(
@@ -100,15 +160,16 @@ def main(argv: list[str] | None = None) -> int:
         format_markdown(results, environment), encoding="utf-8"
     )
 
+    by_status: Counter[str] = Counter(r.status for r in results)
     n_correct = sum(1 for r in results if r.correct)
-    flagged = [r for r in results if not r.correct]
     print(
-        f"S2MPJ sweep: {n_correct}/{len(results)} correct -> {out.with_suffix('.json')}"
+        f"S2MPJ sweep: {n_correct}/{len(results)} correct "
+        f"(skipped {skipped_no_objective} objective-free, {skipped_too_large} oversized)"
+        f" -> {out.with_suffix('.json')}, {out.with_suffix('.md')}"
     )
-    for r in flagged:
-        reason = r.error.splitlines()[-1] if r.error else f"status={r.status}"
-        print(f"  FAIL {r.problem} [{r.backend}] {r.config}: {reason}")
-    return 0 if not flagged else 1
+    for status, count in sorted(by_status.items()):
+        print(f"  {status:16s} {count}")
+    return 0 if n_correct == len(results) else 1
 
 
 if __name__ == "__main__":

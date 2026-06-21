@@ -72,34 +72,57 @@ class _S2MPJProblem(Problem):
     def __init__(self, instance: Any, xp: Namespace) -> None:
         import numpy as np
 
+        # Reject feasibility/least-squares problems with no objective group: they
+        # are not minimization problems and cannot be benchmarked as such (S2MPJ's
+        # ``fx`` would error). ``H`` is the optional explicit quadratic objective.
+        if len(getattr(instance, "objgrps", ())) == 0 and not hasattr(instance, "H"):
+            raise NotImplementedError("S2MPJ problem has no objective function")
+
         self._inst = instance
         self.xp = xp
         self._n = int(instance.n)
         m = int(getattr(instance, "m", 0))
-
-        clower = np.reshape(np.asarray(instance.clower, dtype=float), (-1,))
-        cupper = np.reshape(np.asarray(instance.cupper, dtype=float), (-1,))
-        finite_l = np.isfinite(clower)
-        finite_u = np.isfinite(cupper)
-        eq_mask = finite_l & finite_u & (clower == cupper)
-        self._eq_idx = np.where(eq_mask)[0]
-        self._eq_rhs = clower[self._eq_idx]
-        self._lo_idx = np.where(finite_l & ~eq_mask)[0]  # clower ≤ c  ⇒ clower − c ≤ 0
-        self._up_idx = np.where(finite_u & ~eq_mask)[0]  # c ≤ cupper  ⇒ c − cupper ≤ 0
-        self._lo_rhs = clower[self._lo_idx]
-        self._up_rhs = cupper[self._up_idx]
         self._m = m
 
-        lower = np.reshape(np.asarray(instance.xlower, dtype=float), (-1,))
-        upper = np.reshape(np.asarray(instance.xupper, dtype=float), (-1,))
-        self._lower = _from_numpy(xp, lower)
-        self._upper = _from_numpy(xp, upper)
+        # ``clower``/``cupper`` exist only when the problem has constraints.
+        clower_attr = getattr(instance, "clower", None)
+        cupper_attr = getattr(instance, "cupper", None)
+        if m > 0 and clower_attr is not None and cupper_attr is not None:
+            clower = np.reshape(np.asarray(clower_attr, dtype=float), (-1,))
+            cupper = np.reshape(np.asarray(cupper_attr, dtype=float), (-1,))
+            finite_l = np.isfinite(clower)
+            finite_u = np.isfinite(cupper)
+            eq_mask = finite_l & finite_u & (clower == cupper)
+            self._eq_idx = np.where(eq_mask)[0]
+            self._eq_rhs = clower[self._eq_idx]
+            self._lo_idx = np.where(finite_l & ~eq_mask)[0]  # clower ≤ c ⇒ clower−c ≤ 0
+            self._up_idx = np.where(finite_u & ~eq_mask)[0]  # c ≤ cupper ⇒ c−cupper ≤ 0
+            self._lo_rhs = clower[self._lo_idx]
+            self._up_rhs = cupper[self._up_idx]
+        else:
+            empty_i = np.zeros((0,), dtype=int)
+            empty_f = np.zeros((0,), dtype=float)
+            self._eq_idx = self._lo_idx = self._up_idx = empty_i
+            self._eq_rhs = self._lo_rhs = self._up_rhs = empty_f
+
+        lower_attr = getattr(instance, "xlower", None)
+        upper_attr = getattr(instance, "xupper", None)
+        self._lower = (
+            None
+            if lower_attr is None
+            else _from_numpy(xp, np.reshape(np.asarray(lower_attr, dtype=float), (-1,)))
+        )
+        self._upper = (
+            None
+            if upper_attr is None
+            else _from_numpy(xp, np.reshape(np.asarray(upper_attr, dtype=float), (-1,)))
+        )
 
     @property
     def n_vars(self) -> int:
         return self._n
 
-    def bounds(self) -> tuple[Array, Array]:
+    def bounds(self) -> tuple[Array | None, Array | None]:
         return self._lower, self._upper
 
     def objective(self, x: Array) -> Scalar:
@@ -169,6 +192,29 @@ def s2mpj_dir(directory: str | None = None) -> str | None:
     return root
 
 
+def list_s2mpj_problems(directory: str | None = None) -> list[str]:
+    """All S2MPJ problem names available in the checkout (sorted).
+
+    Globs ``python_problems/*.py`` (the actual files present, more reliable than
+    the repo's ``list_of_python_problems`` which can include editor backups),
+    dropping the ``s2mpjlib`` support module. Returns ``[]`` when no checkout is
+    found. Note: not every name is benchmarkable — objective-free problems are
+    rejected at build time, and the runner caps problem size.
+    """
+    import glob
+
+    root = s2mpj_dir(directory)
+    if root is None:
+        return []
+    pattern = os.path.join(root, "python_problems", "*.py")
+    names = sorted(
+        os.path.splitext(os.path.basename(path))[0]
+        for path in glob.glob(pattern)
+        if os.path.basename(path) != "s2mpjlib.py"
+    )
+    return names
+
+
 def _ensure_on_path(root: str) -> None:
     problems = os.path.join(root, "python_problems")
     for entry in (root, problems):
@@ -227,4 +273,4 @@ def s2mpj_problems(
     return [_make(name) for name in selected]
 
 
-__all__ = ["s2mpj_dir", "s2mpj_problems"]
+__all__ = ["list_s2mpj_problems", "s2mpj_dir", "s2mpj_problems"]

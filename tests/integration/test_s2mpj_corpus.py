@@ -56,6 +56,35 @@ def test_s2mpj_problem_reaches_known_optimum(bridge_namespace, name):
     assert abs(float(result.objective) - _KNOWN_F[case.name]) <= 1e-4
 
 
+def test_list_s2mpj_problems_enumerates_the_checkout():
+    names = s2mpj.list_s2mpj_problems()
+    assert names == sorted(names)
+    assert "s2mpjlib" not in names
+    # The curated set is drawn from the full listing.
+    assert set(_NAMES).issubset(set(names))
+
+
+def test_unconstrained_problem_solves_when_available(bridge_namespace):
+    xp = bridge_namespace
+    if "ROSENBR" not in s2mpj.list_s2mpj_problems():
+        pytest.skip("ROSENBR not in this S2MPJ checkout")
+    (case,) = s2mpj.s2mpj_problems(("ROSENBR",), backends=(xp.__name__.split(".")[-1],))
+    problem, x0 = case.build(xp)
+    # Unconstrained: no clower/cupper attrs on the S2MPJ instance.
+    result = solve(problem, x0, options=Options(hessian="lbfgs", linsolve="dense"))
+    assert result.status is Status.OPTIMAL
+    assert abs(float(result.objective)) <= 1e-6
+
+
+def test_objective_free_problem_is_rejected_at_build(bridge_namespace):
+    xp = bridge_namespace
+    if "ARGLALE" not in s2mpj.list_s2mpj_problems():
+        pytest.skip("ARGLALE not in this S2MPJ checkout")
+    (case,) = s2mpj.s2mpj_problems(("ARGLALE",), backends=(xp.__name__.split(".")[-1],))
+    with pytest.raises(NotImplementedError, match="no objective"):
+        case.build(xp)
+
+
 def test_s2mpj_bridge_derivatives_match_finite_differences(bridge_namespace):
     # HS71 exercises objective gradient + a nonlinear inequality and equality, so
     # FD agreement confirms the bridge and the constraint-lowering signs.
