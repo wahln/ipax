@@ -157,6 +157,7 @@ def solve(
             kkt_error=float("inf"),
             constraint_violation=_bound_violation(xp, x0, lower, upper),
             solve_time=perf_counter() - start_time,
+            device=_describe_device(x0),
             message="infeasible bounds: x_L > x_U",
         )
 
