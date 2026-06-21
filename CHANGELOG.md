@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- The per-iteration log table reprints its column header every
+  `HEADER_REPEAT_INTERVAL` (10) rows so it stays readable on long runs, and marks
+  any iterate that already satisfies every enabled acceptable-stopping criterion
+  (before the required consecutive count) with a trailing `*`.
+
+### Fixed
+- `configure_verbosity` no longer attaches a second console handler when the
+  application has already configured its own handler on the `"ipax"` logger,
+  which previously printed every iteration record twice. Propagation to ancestor
+  handlers (and `caplog`) is unchanged.
+
 ## [0.2.0] - 2026-06-21
 
 ### Added

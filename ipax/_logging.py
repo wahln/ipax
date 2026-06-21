@@ -80,6 +80,10 @@ logger.addHandler(logging.NullHandler())
 # (e.g. nested ``solve`` invocations) reuse it instead of stacking duplicates.
 _VERBOSE_HANDLER_ATTR = "_ipax_verbose_handler"
 
+# Reprint the column header every this many iteration rows so the table stays
+# readable on long runs that scroll past the original header.
+HEADER_REPEAT_INTERVAL = 10
+
 _HEADER = (
     f"{'iter':>4} {'objective':>15} {'infeas':>10} {'kkt':>10} "
     f"{'mu':>10} {'alpha_pr':>9} {'alpha_du':>9} {'reg':>9} "
@@ -114,15 +118,25 @@ def configure_verbosity(verbose: int) -> None:
     if verbose <= 0:
         return
     threshold = verbosity_threshold(verbose)
+    # Reuse the handler this module owns; if the application has attached its own
+    # handler to the ``"ipax"`` logger, defer to it entirely rather than adding a
+    # second console handler — that duplicate is what prints every record twice.
+    # Propagation stays on so ancestor handlers (and ``caplog``) keep receiving
+    # records regardless of ``verbose``.
+    owned: logging.Handler | None = None
+    app_configured = False
     for handler in logger.handlers:
         if getattr(handler, _VERBOSE_HANDLER_ATTR, False):
-            break
-    else:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        setattr(handler, _VERBOSE_HANDLER_ATTR, True)
-        logger.addHandler(handler)
-    handler.setLevel(threshold)
+            owned = handler
+        elif not isinstance(handler, logging.NullHandler):
+            app_configured = True
+    if owned is None and not app_configured:
+        owned = logging.StreamHandler()
+        owned.setFormatter(logging.Formatter("%(message)s"))
+        setattr(owned, _VERBOSE_HANDLER_ATTR, True)
+        logger.addHandler(owned)
+    if owned is not None:
+        owned.setLevel(threshold)
     if logger.level == logging.NOTSET or logger.level > threshold:
         logger.setLevel(threshold)
 
@@ -132,15 +146,22 @@ def format_header() -> str:
     return _HEADER
 
 
-def format_record(record: IterationRecord) -> str:
-    """One iteration-table row matching :func:`format_header`."""
-    return (
+def format_record(record: IterationRecord, *, acceptable: bool = False) -> str:
+    """One iteration-table row matching :func:`format_header`.
+
+    When ``acceptable`` is true the row is tagged with a trailing ``*`` to mark
+    an iterate that already satisfies every enabled acceptable-stopping
+    criterion, even though the required consecutive-iteration count has not yet
+    been reached.
+    """
+    row = (
         f"{record.iteration:>4d} {record.objective:>15.7e} "
         f"{record.theta:>10.3e} {record.kkt_error:>10.3e} {record.mu:>10.3e} "
         f"{record.alpha_primal:>9.2e} {record.alpha_dual:>9.2e} "
         f"{record.regularization:>9.2e} "
         f"{record.problem_time:>9.2e} {record.step_solve_time:>9.2e}"
     )
+    return f"{row} *" if acceptable else row
 
 
 def format_problem(
@@ -226,6 +247,7 @@ def format_timing(history: tuple[IterationRecord, ...]) -> str:
 
 
 __all__ = [
+    "HEADER_REPEAT_INTERVAL",
     "ITERATION",
     "LOGGER_NAME",
     "OPTIONS",

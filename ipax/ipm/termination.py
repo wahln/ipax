@@ -122,6 +122,17 @@ class ConditionChecker:
             status=Status.ACCEPTABLE,
         )
 
+    def conditions_hold(self, record: IterationRecord) -> bool:
+        """Whether ``record`` already meets every enabled criterion.
+
+        Non-mutating, so the driver can flag an iterate that satisfies the
+        acceptable-stopping criteria before the required consecutive count is
+        reached. Returns ``False`` when the checker is disabled. Must be called
+        before :meth:`observe` for the same record so the relative-objective
+        comparison still sees the previous iterate.
+        """
+        return self._enabled and self._conditions_hold(record)
+
     def observe(self, record: IterationRecord) -> TerminationDecision | None:
         """Observe one accepted iterate and return an optional exit decision."""
         if not self._enabled:

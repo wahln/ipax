@@ -38,7 +38,13 @@ from collections.abc import Callable
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from ipax._logging import ITERATION, format_header, format_record, logger
+from ipax._logging import (
+    HEADER_REPEAT_INTERVAL,
+    ITERATION,
+    format_header,
+    format_record,
+    logger,
+)
 from ipax.backend.namespace import array_namespace
 from ipax.backend.operators import (
     Dense,
@@ -529,8 +535,8 @@ class IPMDriver:
             u_minus_x = xp.where(mask_u, upper_safe - x, ones)
             return x_minus_l, u_minus_x
 
-        if logger.isEnabledFor(ITERATION):
-            logger.log(ITERATION, format_header())
+        # Count of logged rows, used to reprint the header periodically.
+        rows_logged = 0
 
         for it in range(opts.max_iter + 1):
             self._step_solve_seconds = 0.0
@@ -602,7 +608,15 @@ class IPMDriver:
             problem_time_mark = self._problem_time_total
             history.append(record)
             if logger.isEnabledFor(ITERATION):
-                logger.log(ITERATION, format_record(record))
+                if rows_logged % HEADER_REPEAT_INTERVAL == 0:
+                    logger.log(ITERATION, format_header())
+                logger.log(
+                    ITERATION,
+                    format_record(
+                        record, acceptable=acceptable.conditions_hold(record)
+                    ),
+                )
+                rows_logged += 1
 
             stop_requested = self._invoke_callback(
                 record, x, s, y_eq, y_ineq, z_lower, z_upper, m, m_eq
