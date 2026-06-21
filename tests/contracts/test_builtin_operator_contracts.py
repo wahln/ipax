@@ -10,6 +10,7 @@ from ipax.backend.operators import (
     Identity,
     LowRank,
     MatrixFreeJacobian,
+    VStack,
 )
 from ipax.backend.sparse import get_sparse_adapter
 from tests._helpers import array, float_dtype, transpose
@@ -69,6 +70,17 @@ class TestMatrixFreeJacobian(LinearOperatorContract):
             matvec=lambda v: namespace.matmul(A, v),
             rmatvec=lambda v: namespace.matmul(transpose(namespace, A), v),
         )
+
+
+class TestVStackOperator(LinearOperatorContract):
+    # Stack of [[2, -1, 0.5]] (Dense) over [[0, 3, 4], [1, 0, -2]] (Dense).
+    def make_dense(self, namespace):
+        return array(namespace, [[2.0, -1.0, 0.5], [0.0, 3.0, 4.0], [1.0, 0.0, -2.0]])
+
+    def make_operator(self, namespace):
+        top = Dense(array(namespace, [[2.0, -1.0, 0.5]]))
+        bottom = Dense(array(namespace, [[0.0, 3.0, 4.0], [1.0, 0.0, -2.0]]))
+        return VStack((top, bottom))
 
 
 @pytest.mark.sparse

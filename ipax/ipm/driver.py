@@ -45,12 +45,12 @@ from ipax._logging import (
     format_record,
     logger,
 )
-from ipax.backend.namespace import array_namespace
 from ipax.backend.operators import (
     Dense,
     Diagonal,
     LinearOperator,
     MatrixFreeJacobian,
+    VStack,
     as_operator,
 )
 from ipax.ipm.barrier import fraction_to_boundary, update_mu
@@ -84,66 +84,6 @@ if TYPE_CHECKING:
 
 
 T = TypeVar("T")
-
-
-class _VStack(LinearOperator):
-    """Vertical stack of operators sharing the variable dimension."""
-
-    def __init__(self, ops: tuple[LinearOperator, ...]) -> None:
-        self._ops = ops
-        self._n = ops[0].shape[1]
-        self._rows = tuple(op.shape[0] for op in ops)
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        return sum(self._rows), self._n
-
-    def matvec(self, v: Array) -> Array:
-        xp = array_namespace(v)
-        return xp.concat(tuple(op.matvec(v) for op in self._ops))
-
-    def rmatvec(self, v: Array) -> Array:
-        xp = array_namespace(v)
-        result = None
-        offset = 0
-        for op, rows in zip(self._ops, self._rows, strict=True):
-            piece = op.rmatvec(v[offset : offset + rows])
-            result = piece if result is None else result + piece
-            offset += rows
-        assert result is not None
-        return xp.asarray(result)
-
-    def row_gram_diagonal(self, weights: Array) -> Array:
-        # Rows are stacked, so the weighted row energies concatenate. Propagates
-        # NotImplementedError if any block cannot supply them cheaply.
-        xp = array_namespace(weights)
-        return xp.concat(tuple(op.row_gram_diagonal(weights) for op in self._ops))
-
-    def to_coo(
-        self, like: Array | None = None
-    ) -> tuple[Array, Array, Array, tuple[int, int]]:
-        # Vertically stacked blocks ⇒ concatenate triplets with row offsets.
-        del like
-        rows_parts: list[Array] = []
-        cols_parts: list[Array] = []
-        vals_parts: list[Array] = []
-        offset = 0
-        xp = None
-        for op, n_rows in zip(self._ops, self._rows, strict=True):
-            r, c, v, _ = op.to_coo()
-            if xp is None:
-                xp = array_namespace(v)
-            rows_parts.append(r + offset)
-            cols_parts.append(c)
-            vals_parts.append(v)
-            offset += n_rows
-        assert xp is not None
-        return (
-            xp.concat(tuple(rows_parts)),
-            xp.concat(tuple(cols_parts)),
-            xp.concat(tuple(vals_parts)),
-            (offset, self._n),
-        )
 
 
 # IPOPT (Wächter & Biegler 2006) constants kept out of the loop body.
@@ -275,7 +215,7 @@ class IPMDriver:
             return Dense(self._xp.zeros((0, self._n), dtype=x.dtype))
         if len(ops) == 1:
             return ops[0]
-        return _VStack(tuple(ops))
+        return VStack(tuple(ops))
 
     def _lagrangian_gradient(
         self,

@@ -40,6 +40,7 @@ from ipax.ipm.driver import IPMDriver
 from ipax.linalg.solver import select_solver
 from ipax.options import Options, ScalingOptions
 from ipax.problem.derivatives import resolve
+from ipax.problem.linear_ineq import lower_linear_inequalities
 from ipax.problem.scaling import ProblemScaling, ScaledProblem, compute_scaling
 from ipax.result import (
     IterationInfo,
@@ -145,9 +146,6 @@ def solve(
     xp = array_namespace(x0)
     lower, upper = problem.bounds()
 
-    if problem.linear_ineq() is not None:
-        raise NotImplementedError("two-sided linear inequalities are not supported")
-
     if lower is not None and upper is not None and bool(xp.any(lower > upper)):
         return Result(
             status=Status.INFEASIBLE,
@@ -163,7 +161,11 @@ def solve(
 
     # Bind gradient/Jacobian/Hessian sources by precedence (§3.2). The driver
     # consumes the resolved problem, so it always has the derivatives it needs.
-    resolved = resolve(problem, xp, opts)
+    resolved: Problem = resolve(problem, xp, opts)
+    # Lower any two-sided ``l ≤ A x ≤ u`` block into the one-sided inequality
+    # machinery so the driver and every solver route handle it unchanged. A
+    # no-op when the problem declares no ``linear_ineq``.
+    resolved = lower_linear_inequalities(resolved, x0, xp)
 
     has_ineq = _has_inequalities(resolved, x0)
     has_eq = _has_nonlinear_equalities(resolved, x0)
