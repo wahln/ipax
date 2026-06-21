@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-21
+
+### Added
+- GPU/device-efficiency profiling harness: `DeviceMetrics` and
+  `measure_device_solve` in `benchmarks/harness` (host↔device sync counter plus a
+  CuPy GPU/CPU time split), the `benchmarks/runners/device_efficiency.py` CLI
+  runner (GPU-gated, a no-op on CI), and kernel micro-benchmarks (matvec / dense
+  solve / one Newton step) parametrized over every installed backend.
+- Device reporting: backend `capabilities()` now discovers available devices via
+  the Array-API inspection API (`__array_namespace_info__().devices()`) instead of
+  assuming CPU, and `Result.device` records where the solve ran — surfaced in the
+  tier-1 result summary.
+
+### Changed
+- Vectorized `fraction_to_boundary`, removing a per-element Python loop that forced
+  `O(n)` host↔device synchronizations per call (and it is called six times per
+  iteration). On a CUDA backend this cut the per-iteration sync count from
+  thousands — scaling linearly with `n` — to a small constant, speeding up
+  matrix-free GPU iterations by roughly 20× at scale; iterates and results are
+  unchanged (CPU behavior is identical).
+- CI uploads coverage with `codecov/codecov-action@v5` using a repository
+  `CODECOV_TOKEN`.
+
 ## [0.1.1] - 2026-06-21
 
 ### Fixed
@@ -62,6 +85,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/wahln/ipax/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/wahln/ipax/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/wahln/ipax/releases/tag/v0.1.0

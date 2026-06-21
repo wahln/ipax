@@ -2,6 +2,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/ipax.svg)](https://pypi.org/project/ipax/)
 [![CI](https://github.com/wahln/ipax/actions/workflows/ci.yml/badge.svg)](https://github.com/wahln/ipax/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/wahln/ipax/branch/main/graph/badge.svg)](https://codecov.io/gh/wahln/ipax)
 [![Documentation](https://readthedocs.org/projects/ipax/badge/?version=latest)](https://ipax.readthedocs.io/en/latest/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)

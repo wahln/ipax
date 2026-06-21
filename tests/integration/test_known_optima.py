@@ -171,6 +171,9 @@ def test_infeasible_problem_reports_infeasible(namespace):
     assert result.status is Status.INFEASIBLE
     assert not result.success
     assert "infeasible" in result.message.lower()
+    # device must be reported on the early-return failure path too, consistent
+    # with the main solve path (Copilot PR #2 review).
+    assert result.device == str(array(namespace, [0.5]).device)
 
 
 def test_inconsistent_equalities_report_infeasible(namespace):
