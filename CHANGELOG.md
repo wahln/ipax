@@ -28,6 +28,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (operator) `linear_ineq` matrix still raises with guidance to use
   `ineq_constraints` instead.
 
+- S2MPJ benchmark corpus: `benchmarks/corpus/s2mpj.py` loads the pure-Python
+  S2MPJ translations of the CUTEst/Hock–Schittkowski problems (no Fortran/SIF
+  toolchain) and bridges their NumPy/SciPy evaluation onto any CPU Array-API
+  backend, mapping S2MPJ's two-sided `clower ≤ c(x) ≤ cupper` constraints onto
+  ipax's eq/ineq split. A `benchmarks/runners/s2mpj.py` L-BFGS accuracy sweep
+  consumes it. Download-gated (`IPAX_S2MPJ_DIR`); not vendored (S2MPJ has no
+  license) and not part of per-PR CI — the loader returns `[]` and the gated
+  tests skip when no checkout is present.
+
 ### Changed
 - Promoted the driver's private vertical-stack operator to a public
   `ipax.backend.operators.VStack` (now also exposing `row_inf_norms` for
