@@ -117,6 +117,7 @@ packages = ["ipax"]
 include = [
     "ipax",
     "tests",
+    "conftest.py",      # root pytest config: required for the suite to collect
     "examples",
     "benchmarks",
     "docs",
