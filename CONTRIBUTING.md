@@ -63,7 +63,7 @@ python scripts/check.py --list     # show the gates and the raw commands they wr
 
 ## Direction
 
-`ipax` is **beta** (`0.1.0`) and **looking for adopters** — trying it on a real
+`ipax` is **beta** and **looking for adopters** — trying it on a real
 workload and reporting back is one of the most valuable contributions right now.
 The solver surface is complete; near-term work is **maintenance and measurement**
 rather than new features:

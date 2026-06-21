@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
 
 concurrency:
@@ -24,6 +24,10 @@ jobs:
         run: mypy ipax
       - name: Import-purity gate
         run: python scripts/check_purity.py
+      - name: Validate pyproject.toml (pre-commit)
+        run: pre-commit run --all-files --show-diff-on-failure validate-pyproject
+      - name: Verify changelog format (pre-commit)
+        run: pre-commit run --all-files --show-diff-on-failure kacl-verify
 
   test:
     runs-on: ${{ matrix.os }}
@@ -76,3 +80,25 @@ jobs:
           python-version: "3.11"
       - run: pip install -e ".[docs]"
       - run: mkdocs build --strict
+
+  # Build the distribution on every standard pipeline (main/develop/PR) so a
+  # packaging break is caught before a release tag is cut. The tag-triggered
+  # `release.yml` workflow does the actual PyPI upload + GitHub release.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+      - name: Check distribution metadata
+        run: twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error

@@ -200,7 +200,7 @@ mind, but the RT-specific kernels belong in a separate downstream layer.
 
 ## Direction
 
-`ipax` is **beta** (`0.1.0`). The solver surface above is complete; near-term work
+`ipax` is **beta**. The solver surface above is complete; near-term work
 is **maintenance and measurement**, not new features. The project is also actively
 **looking for adopters** — early real-world use on the `Problem`/`solve` API is what
 drives the road to `1.0.0`.

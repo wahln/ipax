@@ -21,6 +21,18 @@ repos:
       - id: codespell
         args: [--toml, pyproject.toml]
 
+  # Validate pyproject.toml against the PEP 621 / build-backend schemas.
+  - repo: https://github.com/abravalheri/validate-pyproject
+    rev: v0.25
+    hooks:
+      - id: validate-pyproject
+
+  # Enforce the Keep a Changelog format of CHANGELOG.md.
+  - repo: https://gitlab.com/schmieder.matthias/python-kacl
+    rev: v0.7.3
+    hooks:
+      - id: kacl-verify
+
   - repo: https://github.com/Lucas-C/pre-commit-hooks
     rev: v1.5.6
     hooks:
