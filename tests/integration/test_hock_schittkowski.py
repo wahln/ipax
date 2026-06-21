@@ -6,7 +6,7 @@ import math
 
 from ipax import Options, Status, solve
 from ipax.problem.base import Problem
-from ipax.testing.problems import HS6, HS7, HS8, HS35, HS43
+from ipax.testing.problems import HS6, HS7, HS8, HS9, HS21, HS28, HS35, HS43, HS71
 from tests._helpers import array, assert_allclose, assert_scalar_close, implemented
 
 _EXACT_DENSE = {"hessian": "exact", "linsolve": "dense"}
@@ -95,3 +95,54 @@ def test_hs43_rosen_suzuki_inequalities(namespace):
         problem, array(namespace, [0.0, 0.0, 0.0, 0.0]), options=Options(**_EXACT_DENSE)
     )
     _assert_solved(result, namespace, problem.known_solution(), -44.0)
+
+
+def test_hs21_active_bound_with_linear_inequality(namespace):
+    problem = HS21(namespace)
+    result = solve(
+        problem, array(namespace, [3.0, 1.0]), options=Options(**_EXACT_DENSE)
+    )
+    _assert_solved(result, namespace, problem.known_solution(), -99.96)
+    z_lower, z_upper = problem.known_bound_multipliers()
+    assert_allclose(namespace, result.z_lower, z_lower, rtol=1e-6, atol=1e-6)
+    assert_allclose(namespace, result.z_upper, z_upper, rtol=1e-6, atol=1e-6)
+
+
+def test_hs28_equality_qp_degenerate_multiplier(namespace):
+    problem = HS28(namespace)
+    result = solve(
+        problem, array(namespace, [-1.0, 0.5, 0.5]), options=Options(**_EXACT_DENSE)
+    )
+    _assert_solved(result, namespace, problem.known_solution(), 0.0)
+    assert_allclose(
+        namespace, result.y_eq, problem.known_multiplier(), rtol=1e-6, atol=1e-6
+    )
+
+
+def test_hs9_nonunique_periodic_optimum(namespace):
+    # The optimum is non-unique (periodic); assert the optimal value and KKT
+    # satisfaction rather than a specific x*.
+    problem = HS9(namespace)
+    result = solve(
+        problem, array(namespace, [0.0, 0.0]), options=Options(**_EXACT_DENSE)
+    )
+
+    assert result.status is Status.OPTIMAL
+    assert result.kkt_error <= 1e-6
+    assert result.constraint_violation <= 1e-6
+    assert_scalar_close(result.objective, -0.5, atol=1e-6)
+
+
+def test_hs71_full_constraint_mix(namespace):
+    # Published optimum carries ~9 significant figures; relax the primal/objective
+    # tolerance accordingly while still gating KKT/feasibility tightly.
+    problem = HS71(namespace)
+    result = solve(
+        problem, array(namespace, [1.0, 5.0, 5.0, 1.0]), options=Options(**_EXACT_DENSE)
+    )
+
+    assert result.status is Status.OPTIMAL
+    assert result.kkt_error <= 1e-6
+    assert result.constraint_violation <= 1e-6
+    assert_allclose(namespace, result.x, problem.known_solution(), rtol=1e-5, atol=1e-5)
+    assert_scalar_close(result.objective, 17.0140173, atol=1e-4)

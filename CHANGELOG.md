@@ -11,6 +11,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `HEADER_REPEAT_INTERVAL` (10) rows so it stays readable on long runs, and marks
   any iterate that already satisfies every enabled acceptable-stopping criterion
   (before the required consecutive count) with a trailing `*`.
+- Expanded the Hock–Schittkowski analytic-oracle set in `ipax.testing.problems`
+  with `HS9`, `HS21`, `HS28`, and `HS71`, covering active bound multipliers, a
+  degenerate (zero) equality multiplier, a non-unique periodic optimum, and the
+  full equality+inequality+bounds constraint mix. Each is exercised across every
+  backend in the integration suite, wired into the QC benchmark corpus, and
+  checked by a new finite-difference derivative-consistency test that also
+  back-fills the previously untested HS oracles.
 
 ### Fixed
 - `configure_verbosity` no longer attaches a second console handler when the
