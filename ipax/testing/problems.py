@@ -465,7 +465,7 @@ class HS21(Problem):
     ``min 0.01 x1² + x2² - 100`` s.t. ``10 x1 - x2 ≥ 10``, ``2 ≤ x1 ≤ 50``,
     ``-50 ≤ x2 ≤ 50``. Optimum ``(2, 0)`` — the lower bound on ``x1`` is active
     while the inequality stays slack — ``f* = -99.96``. Exercises an active bound
-    multiplier (``z_L``) alongside an (affine) inequality constraint.
+    multiplier (``z_L``) alongside a two-sided ``linear_ineq`` block.
     """
 
     def __init__(self, xp: Namespace) -> None:
@@ -484,16 +484,11 @@ class HS21(Problem):
     def gradient(self, x: Array) -> Array:
         return self.xp.stack((0.02 * x[0], 2.0 * x[1]))
 
-    def ineq_constraints(self, x: Array) -> Array:
-        # 10 x1 - x2 ≥ 10  ⇒  g = 10 - 10 x1 + x2 ≤ 0 (linear, constant Jacobian
-        # declared through the nonlinear interface — the driver has no two-sided
-        # ``linear_ineq`` route yet).
-        return self.xp.stack((10.0 - 10.0 * x[0] + x[1],))
-
-    def ineq_jacobian(self, x: Array) -> Array:
+    def linear_ineq(self) -> tuple[Array, Array, Array]:
+        # 10 x1 - x2 ≥ 10  ⇒  l ≤ A x ≤ u with l = 10, u = +∞.
         xp = self.xp
-        one = 1.0 + xp.zeros_like(x[0])
-        return _mat(xp, ((-10.0 * one, one),))
+        a = _array(xp, [[10.0, -1.0]])
+        return a, _array(xp, [10.0]), _array(xp, [float("inf")])
 
     def lagrangian_hessian(
         self, x: Array, y_eq: Array, y_ineq: Array, sigma: Scalar = 1.0
