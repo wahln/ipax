@@ -1,5 +1,6 @@
 # ipax
 
+[![PyPI version](https://img.shields.io/pypi/v/ipax.svg)](https://pypi.org/project/ipax/)
 [![CI](https://github.com/niklaswahl/ipax/actions/workflows/ci.yml/badge.svg)](https://github.com/niklaswahl/ipax/actions/workflows/ci.yml)
 [![Documentation](https://readthedocs.org/projects/ipax/badge/?version=latest)](https://ipax.readthedocs.io/en/latest/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -32,7 +33,7 @@ Design draws on **Wächter & Biegler (2006)** (IPOPT) for globalization and on
 
 The solver surface is complete: equality/inequality/bound constraints, the
 dense / matrix-free / sparse-direct solve routes, filter line search with
-restoration, and multi-backend support. `ipax` is **beta** (`0.1.0`) — the
+restoration, and multi-backend support. `ipax` is **beta** — the
 algorithm is feature-complete and tested, and the road to a stable `1.0.0` is
 about hardening the public API, docs, and verification rather than new features
 (see [Status and roadmap](#status-and-roadmap)). **We are looking for adopters**
@@ -157,7 +158,7 @@ These are enforced in CI (`scripts/check_purity.py` + `array-api-strict`).
 
 ## Status and roadmap
 
-`ipax` is **beta** (`0.1.0`). The solver surface is complete and tested across
+`ipax` is **beta**. The solver surface is complete and tested across
 NumPy and PyTorch, but the public API has not yet been hardened against real-world
 use — expect refinements across the `0.x` series before it is frozen at `1.0.0`.
 

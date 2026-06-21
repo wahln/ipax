@@ -7,7 +7,8 @@ build-backend = "hatchling.build"
 # ---------------------------------------------------------------------------
 [project]
 name = "ipax"
-version = "0.0.0"
+# Single source of truth: ``ipax.__version__`` (see [tool.hatch.version]).
+dynamic = ["version"]
 description = "Array-API-conformant primal–dual interior-point solver for large-scale nonlinear constrained optimization."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -104,6 +105,11 @@ dev = [
 # ---------------------------------------------------------------------------
 # Hatch build configuration (src-layout)
 # ---------------------------------------------------------------------------
+# Derive the project version from ``__version__`` in the package itself, so the
+# version is declared in exactly one place.
+[tool.hatch.version]
+path = "ipax/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["ipax"]
 
@@ -168,9 +174,11 @@ files = ["ipax"]
 strict = true
 warn_unreachable = true
 disallow_any_generics = true
-# Backends are optional; their stubs may be missing in a minimal env.
+# Backends are optional; their stubs may be missing in a minimal env (e.g. the
+# CI `lint` job installs only `[lint]`, so the numpy/scipy sparse adapter is
+# type-checked without numpy present).
 [[tool.mypy.overrides]]
-module = ["torch.*", "jax.*", "cupy.*", "scipy.*", "array_api_strict.*"]
+module = ["numpy.*", "torch.*", "jax.*", "cupy.*", "scipy.*", "array_api_strict.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
