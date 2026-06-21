@@ -44,6 +44,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   linear-inequality lowering.
 
 ### Fixed
+- Feasibility restoration no longer crashes on a numerically singular or
+  extreme-scale Gauss-Newton system. The damped (Levenberg–Marquardt) step now
+  treats a failed/non-finite linear solve as a rejected step — growing the
+  damping (up to a ceiling) and retrying — instead of letting the backend's
+  ``solve`` raise (e.g. numpy ``LinAlgError: Singular matrix`` when a constraint
+  Jacobian blows up far from feasibility). Surfaced by the S2MPJ HS7 sweep; the
+  solve now degrades to a reported status rather than raising.
 - `configure_verbosity` no longer attaches a second console handler when the
   application has already configured its own handler on the `"ipax"` logger,
   which previously printed every iteration record twice. Propagation to ancestor
