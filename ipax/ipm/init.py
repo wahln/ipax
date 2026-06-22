@@ -95,9 +95,14 @@ def relax_fixed_bounds(
     if lower is None or upper is None:
         return lower, upper
     both = xp.logical_and(xp.isfinite(lower), xp.isfinite(upper))
-    mid = 0.5 * (lower + upper)
+    # Finite stand-ins off the two-sided pairs so ±inf bounds don't produce
+    # inf/nan arithmetic (the results are masked out, but would still warn).
+    zero = xp.zeros_like(lower)
+    safe_lower = xp.where(both, lower, zero)
+    safe_upper = xp.where(both, upper, zero)
+    mid = 0.5 * (safe_lower + safe_upper)
     scale = xp.maximum(xp.ones_like(mid), xp.abs(mid))
-    needs = xp.logical_and(both, (upper - lower) <= _BOUND_RELAX * scale)
+    needs = xp.logical_and(both, (safe_upper - safe_lower) <= _BOUND_RELAX * scale)
     relax = _BOUND_RELAX * scale
     lower = xp.where(needs, mid - relax, lower)
     upper = xp.where(needs, mid + relax, upper)
