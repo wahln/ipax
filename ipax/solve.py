@@ -37,6 +37,7 @@ from ipax._logging import (
 )
 from ipax.backend.namespace import array_namespace, capabilities
 from ipax.ipm.driver import IPMDriver
+from ipax.ipm.init import relax_fixed_bounds
 from ipax.linalg.solver import select_solver
 from ipax.options import Options, ScalingOptions
 from ipax.problem.derivatives import resolve
@@ -158,6 +159,10 @@ def solve(
             device=_describe_device(x0),
             message="infeasible bounds: x_L > x_U",
         )
+
+    # Relax fixed / near-degenerate bound pairs (x_L == x_U) so the barrier has a
+    # strict interior; without this the first Newton step is non-finite (§3.6).
+    lower, upper = relax_fixed_bounds(xp, lower, upper)
 
     # Bind gradient/Jacobian/Hessian sources by precedence (§3.2). The driver
     # consumes the resolved problem, so it always has the derivatives it needs.

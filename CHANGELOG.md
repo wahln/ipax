@@ -47,6 +47,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   linear-inequality lowering.
 
 ### Fixed
+- Fixed variables (`x_L == x_U`) — common in CUTEst-style models — no longer make
+  the solve fail at the first iteration. Such a variable has no strict barrier
+  interior, so `z = μ/(x − x_L)` was singular and the first Newton step came out
+  non-finite (`numerical_error`). The solver now relaxes fixed / near-degenerate
+  bound pairs symmetrically about their midpoint (IPOPT
+  `fixed_variable_treatment='relax_bounds'`), leaving well-separated bounds
+  untouched. Surfaced by the S2MPJ sweep, where it accounted for the bulk of the
+  first-iteration `numerical_error` failures.
 - The filter line-search switching condition no longer raises `OverflowError` on
   a badly-scaled iterate. Python's `float ** s_phi` raises instead of returning
   `inf` once the result exceeds the double range (an enormous directional

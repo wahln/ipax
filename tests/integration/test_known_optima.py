@@ -150,6 +150,39 @@ def test_mixed_linear_and_nonlinear_equalities_slice_hessian_multipliers(namespa
     assert_allclose(namespace, result.x, array(namespace, [1.0, 0.0]), atol=1e-6)
 
 
+def test_fixed_variable_solves_via_bound_relaxation(namespace):
+    # A fixed variable (x_L == x_U) has no strict barrier interior; without bound
+    # relaxation the first Newton step is non-finite and the solve fails. Here x1
+    # is pinned at 2, so the optimum is x0=3, x1=2, f = 0.5·(0 + (2-5)²) = 4.5.
+    class FixedVarProblem(Problem):
+        @property
+        def n_vars(self) -> int:
+            return 2
+
+        def bounds(self):
+            return array(namespace, [-10.0, 2.0]), array(namespace, [10.0, 2.0])
+
+        def objective(self, x):
+            return 0.5 * ((x[0] - 3.0) ** 2 + (x[1] - 5.0) ** 2)
+
+        def gradient(self, x):
+            return namespace.stack((x[0] - 3.0, x[1] - 5.0))
+
+        def lagrangian_hessian(self, x, y_eq, y_ineq, sigma=1.0):
+            del y_eq, y_ineq
+            return sigma * namespace.eye(2, dtype=x.dtype)
+
+    result = solve(
+        FixedVarProblem(),
+        array(namespace, [0.0, 2.0]),
+        options=Options(hessian="exact", linsolve="dense"),
+    )
+
+    _assert_optimal_result(result)
+    assert_allclose(namespace, result.x, array(namespace, [3.0, 2.0]), atol=1e-5)
+    assert_scalar_close(result.objective, 4.5, atol=1e-5)
+
+
 def test_infeasible_problem_reports_infeasible(namespace):
     class InfeasibleBounds(Problem):
         @property

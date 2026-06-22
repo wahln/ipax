@@ -34,6 +34,9 @@ if TYPE_CHECKING:
 # Wächter & Biegler 2006, §3.6: relative/absolute push keeping x_0 interior.
 _KAPPA1 = 1e-2
 _KAPPA2 = 1e-2
+# IPOPT ``bound_relax_factor`` (fixed_variable_treatment='relax_bounds'): widen a
+# fixed / near-degenerate bound pair so the strict interior is non-empty.
+_BOUND_RELAX = 1e-8
 # Floor so slacks/duals start strictly positive (Breedveld 2017, §3.1).
 _SLACK_FLOOR = 1e-2
 # Floor for warm-started slacks/duals: just strictly interior, so supplied
@@ -73,6 +76,32 @@ def project_interior(
     x = xp.where(mask_l, xp.maximum(x0, lower_safe + push_l), x0)
     x = xp.where(mask_u, xp.minimum(x, upper_safe - push_u), x)
     return x
+
+
+def relax_fixed_bounds(
+    xp: Namespace,
+    lower: Array | None,
+    upper: Array | None,
+) -> tuple[Array | None, Array | None]:
+    """Widen fixed / near-degenerate finite bound pairs to admit an interior.
+
+    A fixed variable (``x_L == x_U``) — common in CUTEst problems — has no strict
+    interior, so the barrier dual ``z = μ/(x − x_L)`` is singular and the first
+    Newton step is non-finite. Relax only pairs whose gap is within
+    :data:`_BOUND_RELAX` of degenerate, symmetrically about their midpoint
+    (IPOPT ``fixed_variable_treatment='relax_bounds'``); well-separated bounds are
+    returned untouched. One-sided bounds (the other side ``±inf``) are unaffected.
+    """
+    if lower is None or upper is None:
+        return lower, upper
+    both = xp.logical_and(xp.isfinite(lower), xp.isfinite(upper))
+    mid = 0.5 * (lower + upper)
+    scale = xp.maximum(xp.ones_like(mid), xp.abs(mid))
+    needs = xp.logical_and(both, (upper - lower) <= _BOUND_RELAX * scale)
+    relax = _BOUND_RELAX * scale
+    lower = xp.where(needs, mid - relax, lower)
+    upper = xp.where(needs, mid + relax, upper)
+    return lower, upper
 
 
 def initialize(
@@ -175,4 +204,10 @@ def apply_warm_start(
     return s, y_eq, y_ineq, z_lower, z_upper
 
 
-__all__ = ["InitialPoint", "apply_warm_start", "initialize", "project_interior"]
+__all__ = [
+    "InitialPoint",
+    "apply_warm_start",
+    "initialize",
+    "project_interior",
+    "relax_fixed_bounds",
+]
