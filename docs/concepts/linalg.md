@@ -24,6 +24,20 @@ Selection is automatic (size + density + namespace capabilities) and
 user-overridable via `Options.linsolve`. Adding a solver never touches
 `ipm/driver.py` (invariant #3).
 
+!!! warning "Known limitation: matrix-free Krylov on equality saddles"
+
+    On **equality-constrained** problems the matrix-free `KrylovSolver` borders
+    the condensed system into an indefinite saddle and solves it with MINRES. Its
+    only preconditioner there is a diagonal (Jacobi) one, which is too weak for
+    *ill-conditioned* saddles: MINRES (and GMRES) can stall, and the solve is
+    reported as `numerical_error`. This affects a number of equality-heavy CUTEst
+    problems (optimal-control / network models) when `linsolve="krylov"` is
+    forced. Those same problems solve through the **dense** route, which is the
+    automatic choice below ~1e4 variables — so default usage is unaffected; the
+    gap is for large, matrix-free, equality-constrained models. A stronger saddle
+    preconditioner (constraint / block-Schur) is tracked future work; until then,
+    prefer `linsolve="dense"` or the sparse-direct route for such problems.
+
 ## Sparsity as an adapter concern
 
 The standard has no sparse type. The core emits structure as Array-API
