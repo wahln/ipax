@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from ipax.ipm.driver import _STEP_FAILURE_ACCEPT_FACTOR, _classify_step_failure
+from ipax.ipm.driver import (
+    _STEP_FAILURE_ACCEPT_FACTOR,
+    _classify_step_failure,
+    _within_relaxed_tol,
+)
 from ipax.options import OptimalityConditionOptions
 from ipax.result import IterationRecord, Status
 
@@ -57,6 +61,16 @@ def test_salvage_boundary_tracks_the_accept_factor():
         _classify_step_failure(_OPT, _record(just_over, 0.0, 0.0))[0]
         is Status.NUMERICAL_ERROR
     )
+
+
+def test_within_relaxed_tol_gates_both_salvage_paths():
+    # The shared near-optimal check used by both the step-failure and the
+    # restoration-handoff salvage paths.
+    assert _within_relaxed_tol(_OPT, _record(2.6e-7, 1e-10, 5e-8))
+    assert not _within_relaxed_tol(_OPT, _record(9.8e2, 0.0, 1.0))
+    # Feasibility matters too: a near-zero dual residual but a violated
+    # constraint (large primal infeasibility) is not near-optimal.
+    assert not _within_relaxed_tol(_OPT, _record(1e-10, 5.0, 1e-10))
 
 
 def test_no_enabled_kkt_conditions_do_not_salvage():

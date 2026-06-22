@@ -111,17 +111,15 @@ def _norm1(xp: Namespace, v: Array) -> float:
     return float(xp.sum(xp.abs(v)))
 
 
-def _classify_step_failure(
+def _within_relaxed_tol(
     optimality: OptimalityConditionOptions, record: IterationRecord
-) -> tuple[Status, str]:
-    """Classify a failed step solve as ACCEPTABLE (near-optimal) or an error.
+) -> bool:
+    """Whether every enabled scaled KKT component is within the relaxed tolerance.
 
-    Near a solution the condensed system becomes ill-conditioned and the Newton
-    step can be non-finite even when the iterate is essentially optimal (e.g. μ
-    driven well below the achieved KKT residual). If every enabled scaled KKT
-    component is within :data:`_STEP_FAILURE_ACCEPT_FACTOR` of its optimality
-    tolerance, salvage the iterate as ACCEPTABLE rather than discarding a usable
-    solution; otherwise the failure is a genuine numerical error.
+    "Relaxed" is :data:`_STEP_FAILURE_ACCEPT_FACTOR` × the optimality tolerance
+    (IPOPT ``acceptable_tol``). Used to decide whether a stall — a failed step
+    solve, or a line search handing off to restoration — sits at an essentially
+    optimal iterate that should be accepted rather than discarded.
     """
     factor = _STEP_FAILURE_ACCEPT_FACTOR
     checks = (
@@ -130,7 +128,21 @@ def _classify_step_failure(
         (optimality.compl_inf_tol, record.complementarity),
     )
     enabled = [(tol, value) for tol, value in checks if tol is not None]
-    if enabled and all(value <= factor * tol for tol, value in enabled):
+    return bool(enabled) and all(value <= factor * tol for tol, value in enabled)
+
+
+def _classify_step_failure(
+    optimality: OptimalityConditionOptions, record: IterationRecord
+) -> tuple[Status, str]:
+    """Classify a failed step solve as ACCEPTABLE (near-optimal) or an error.
+
+    Near a solution the condensed system becomes ill-conditioned and the Newton
+    step can be non-finite even when the iterate is essentially optimal (e.g. μ
+    driven well below the achieved KKT residual). Salvage such an iterate as
+    ACCEPTABLE rather than discarding a usable solution; otherwise the failure is
+    a genuine numerical error.
+    """
+    if _within_relaxed_tol(optimality, record):
         return (
             Status.ACCEPTABLE,
             "acceptable: step solve failed at a point within the relaxed KKT tolerance",
@@ -868,6 +880,16 @@ class IPMDriver:
                     filt.augment(theta0, phi0)
 
             if restoration:
+                # A line search that stalls at an already near-optimal iterate
+                # (ill-conditioning near the solution) should accept it rather
+                # than enter restoration and risk a false "infeasible".
+                if _within_relaxed_tol(self._options.optimality, record):
+                    status = Status.ACCEPTABLE
+                    message = (
+                        "acceptable: line search stalled at a point within the "
+                        "relaxed KKT tolerance"
+                    )
+                    break
                 logger.debug("iter %d: entering feasibility restoration", it)
                 filt.augment(theta0, phi0)
                 x, s, infeasible = self._restore(
