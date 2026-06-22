@@ -38,11 +38,16 @@ from ipax.testing.backends import import_namespace
 
 
 def default_configs(
-    max_iter: int, max_time: float | None
+    max_iter: int, max_time: float | None, scaling: str = "none"
 ) -> list[tuple[str, ipax.Options]]:
     """L-BFGS configurations (no analytic Hessian crosses the NumPy bridge)."""
     options = ipax.Options
-    common = {"hessian": "lbfgs", "max_iter": max_iter, "max_time": max_time}
+    common = {
+        "hessian": "lbfgs",
+        "max_iter": max_iter,
+        "max_time": max_time,
+        "scaling": scaling,
+    }
     return [
         ("lbfgs/dense", options(linsolve="dense", **common)),
         ("lbfgs/krylov", options(linsolve="krylov", **common)),
@@ -97,6 +102,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-time", type=float, default=60.0, help="per-solve wall-time cap (seconds)"
     )
+    parser.add_argument(
+        "--scaling",
+        default="none",
+        help="problem scaling: 'none' or 'gradient-based'",
+    )
     args = parser.parse_args(argv)
 
     root = s2mpj_dir(args.dir)
@@ -109,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
 
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
     names = _select_names(args, root)
-    configs = default_configs(args.max_iter, args.max_time)
+    configs = default_configs(args.max_iter, args.max_time, args.scaling)
     environment = capture_environment()
 
     results: list[CaseResult] = []
