@@ -41,6 +41,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   the gated tests skip when no checkout is present.
 
 ### Changed
+- **Gradient-based scaling is now the default** (`ScalingOptions.method`
+  `"none"` → `"gradient-based"`), matching IPOPT. Across the full CUTEst/S2MPJ
+  corpus this solves a net **+67** problems (≈92 recovered, mostly from the
+  slow-converging `max_iter` bucket; ≈23 regressed, of which only 3–4 genuinely
+  fail — hard nonconvex/minimax cases that diverge under scaling — and the rest
+  merely converge slower). The returned `x`, objective, and multipliers are
+  reported in the original problem's units; pass `scaling="none"` to opt out.
 - Promoted the driver's private vertical-stack operator to a public
   `ipax.backend.operators.VStack` (now also exposing `row_inf_norms` for
   gradient scaling), reused by both the equality assembly and the new

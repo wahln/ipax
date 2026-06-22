@@ -128,14 +128,16 @@ class KrylovOptions:
 class ScalingOptions:
     """NLP auto-scaling (IPOPT ``nlp_scaling_method``; Wächter & Biegler 2006 §3.8).
 
-    ``"gradient-based"`` rescales the objective and each constraint once at the
-    starting point so their gradients have an ∞-norm of at most ``max_gradient``
-    (factor ``min(1, max_gradient / ‖∇·‖∞)``); variables/bounds are left
-    unscaled. ``"none"`` (default) disables scaling and the solver sees the
-    problem verbatim.
+    ``"gradient-based"`` (default) rescales the objective and each constraint once
+    at the starting point so their gradients have an ∞-norm of at most
+    ``max_gradient`` (factor ``min(1, max_gradient / ‖∇·‖∞)``); variables/bounds
+    are left unscaled. This matches IPOPT's default and markedly improves
+    convergence on badly-scaled problems; the returned ``x``, objective, and
+    multipliers are reported in the original problem's units. ``"none"`` disables
+    scaling so the solver sees the problem verbatim.
     """
 
-    method: ScalingMethod = "none"
+    method: ScalingMethod = "gradient-based"
     max_gradient: float = 100.0  # IPOPT nlp_scaling_max_gradient
 
     def __post_init__(self) -> None:
