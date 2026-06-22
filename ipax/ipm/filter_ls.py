@@ -35,6 +35,21 @@ if TYPE_CHECKING:
 _SWITCH_DELTA = 1.0
 
 
+def _safe_pow(base: float, exponent: float) -> float:
+    """``base ** exponent`` with IEEE overflow semantics (→ ``inf``, never raise).
+
+    Python's ``float.__pow__`` raises ``OverflowError`` instead of returning
+    ``inf`` when the result exceeds the double range, which crashes the switching
+    test on a badly-scaled iterate (e.g. an enormous directional derivative
+    ``dphi``). Treat such an overflow as ``+inf`` so the comparison still has a
+    meaningful, finite-safe answer.
+    """
+    try:
+        return float(base**exponent)
+    except OverflowError:
+        return float("inf")
+
+
 @dataclass(slots=True)
 class Filter:
     """The ``(θ, φ)`` filter set."""
@@ -127,10 +142,9 @@ class FilterLineSearch:
 
     def _switching(self, dphi: float, alpha: float, theta0: float) -> bool:
         o = self._o
-        return (
-            dphi < 0.0
-            and alpha * (-dphi) ** o.s_phi > _SWITCH_DELTA * theta0**o.s_theta
-        )
+        return dphi < 0.0 and alpha * _safe_pow(
+            -dphi, o.s_phi
+        ) > _SWITCH_DELTA * _safe_pow(theta0, o.s_theta)
 
     def _accept(
         self,

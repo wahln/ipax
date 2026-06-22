@@ -128,16 +128,27 @@ class _S2MPJProblem(Problem):
     def objective(self, x: Array) -> Scalar:
         import numpy as np
 
-        # Return an xp float64 0-d (not a Python float) so the value keeps the
-        # target backend's dtype — a Python float re-cast via ``xp.asarray`` would
-        # silently drop to float32 on some backends (e.g. Torch).
-        return _from_numpy(self.xp, np.asarray(self._inst.fx(_to_numpy(x))))
+        # S2MPJ's auto-generated evaluations use Python ``float**`` and can raise
+        # OverflowError on the wild trial points a line search probes (e.g.
+        # LUKVLE4C's ``100*GVAR**6``). Return +inf so the solver simply rejects
+        # the trial rather than crashing. Also return an xp float64 0-d (not a
+        # Python float) so the value keeps the backend dtype — a Python float
+        # re-cast via ``xp.asarray`` would silently drop to float32 on Torch.
+        try:
+            val = np.asarray(self._inst.fx(_to_numpy(x)))
+        except (OverflowError, FloatingPointError):
+            val = np.asarray(np.inf)
+        return _from_numpy(self.xp, val)
 
     def gradient(self, x: Array) -> Array:
         import numpy as np
 
-        _f, g = self._inst.fgx(_to_numpy(x))
-        return _from_numpy(self.xp, np.reshape(g, (-1,)))
+        try:
+            _f, g = self._inst.fgx(_to_numpy(x))
+            g = np.reshape(g, (-1,))
+        except (OverflowError, FloatingPointError):
+            g = np.full((self._n,), np.inf)
+        return _from_numpy(self.xp, g)
 
     # -- equalities (present only when S2MPJ has clower == cupper rows) ----
     def eq_constraints(self, x: Array) -> Array:

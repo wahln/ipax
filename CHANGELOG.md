@@ -47,6 +47,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   linear-inequality lowering.
 
 ### Fixed
+- The filter line-search switching condition no longer raises `OverflowError` on
+  a badly-scaled iterate. Python's `float ** s_phi` raises instead of returning
+  `inf` once the result exceeds the double range (an enormous directional
+  derivative `dphi`), which crashed the whole solve; the power now uses IEEE
+  overflow semantics (`→ inf`). Surfaced by the S2MPJ INDEF sweep. The S2MPJ
+  benchmark adapter likewise sanitizes overflow in its NumPy-bridged
+  objective/gradient (returning `inf`), so a trial point that overflows the
+  problem's own generated `float**` is rejected rather than crashing
+  (e.g. LUKVLE4C, which then solves).
 - Feasibility restoration no longer crashes on a numerically singular or
   extreme-scale Gauss-Newton system. The damped (Levenberg–Marquardt) step now
   treats a failed/non-finite linear solve as a rejected step — growing the
