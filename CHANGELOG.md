@@ -47,6 +47,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   linear-inequality lowering.
 
 ### Fixed
+- A step solve that fails at a near-optimal iterate is now reported `ACCEPTABLE`
+  instead of `NUMERICAL_ERROR`. Near a solution the condensed system is
+  ill-conditioned (μ driven below the achieved KKT residual), so the Newton step
+  can come out non-finite even though the iterate is essentially optimal; the
+  solver now salvages such an iterate when its scaled KKT components are within a
+  relaxed multiple (IPOPT `acceptable_tol` ≈ 1e2 × `tol`) of the optimality
+  tolerances, rather than discarding a usable solution.
 - Fixed variables (`x_L == x_U`) — common in CUTEst-style models — no longer make
   the solve fail at the first iteration. Such a variable has no strict barrier
   interior, so `z = μ/(x − x_L)` was singular and the first Newton step came out

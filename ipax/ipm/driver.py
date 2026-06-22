@@ -77,7 +77,7 @@ from ipax.result import (
 
 if TYPE_CHECKING:
     from ipax.linalg.solver import LinearSolver
-    from ipax.options import Options
+    from ipax.options import OptimalityConditionOptions, Options
     from ipax.problem.base import Problem
     from ipax.result import IterationCallback, WarmStart
     from ipax.typing import Array, Namespace
@@ -91,6 +91,12 @@ _S_MAX = 100.0  # eq. (5): cap on the dual/complementarity scaling factors
 _KAPPA_EPSILON = 10.0  # eq. (7): barrier sub-problem tolerance factor κ_ε
 _MAX_REG_ATTEMPTS = 40
 _MAX_MU_REDUCTIONS = 64
+# A step solve that fails at a point already within this multiple of the
+# optimality tolerances is reported ACCEPTABLE rather than NUMERICAL_ERROR: near
+# a solution the condensed system is ill-conditioned, so the step can be
+# non-finite even though the iterate is essentially optimal (IPOPT
+# ``acceptable_tol`` ≈ 1e2 × ``tol``).
+_STEP_FAILURE_ACCEPT_FACTOR = 1e2
 
 
 def _norm_inf(xp: Namespace, v: Array) -> float:
@@ -103,6 +109,36 @@ def _norm1(xp: Namespace, v: Array) -> float:
     if int(v.shape[0]) == 0:
         return 0.0
     return float(xp.sum(xp.abs(v)))
+
+
+def _classify_step_failure(
+    optimality: OptimalityConditionOptions, record: IterationRecord
+) -> tuple[Status, str]:
+    """Classify a failed step solve as ACCEPTABLE (near-optimal) or an error.
+
+    Near a solution the condensed system becomes ill-conditioned and the Newton
+    step can be non-finite even when the iterate is essentially optimal (e.g. μ
+    driven well below the achieved KKT residual). If every enabled scaled KKT
+    component is within :data:`_STEP_FAILURE_ACCEPT_FACTOR` of its optimality
+    tolerance, salvage the iterate as ACCEPTABLE rather than discarding a usable
+    solution; otherwise the failure is a genuine numerical error.
+    """
+    factor = _STEP_FAILURE_ACCEPT_FACTOR
+    checks = (
+        (optimality.dual_inf_tol, record.dual_infeasibility),
+        (optimality.constr_viol_tol, record.primal_infeasibility),
+        (optimality.compl_inf_tol, record.complementarity),
+    )
+    enabled = [(tol, value) for tol, value in checks if tol is not None]
+    if enabled and all(value <= factor * tol for tol, value in enabled):
+        return (
+            Status.ACCEPTABLE,
+            "acceptable: step solve failed at a point within the relaxed KKT tolerance",
+        )
+    return (
+        Status.NUMERICAL_ERROR,
+        "condensed factorization failed despite regularization",
+    )
 
 
 class IPMDriver:
@@ -661,8 +697,9 @@ class IPMDriver:
                     recover_kwargs=recover_kwargs,
                 )
                 if corrected is None:
-                    status = Status.NUMERICAL_ERROR
-                    message = "condensed factorization failed despite regularization"
+                    status, message = _classify_step_failure(
+                        self._options.optimality, record
+                    )
                     break
                 mu, step, reg_applied = corrected
             else:
@@ -672,8 +709,9 @@ class IPMDriver:
                     w, sigma_x, sigma_s, ineq_jac, rhs, eq_jac, m_eq, -c, delta_c
                 )
                 if not ok:
-                    status = Status.NUMERICAL_ERROR
-                    message = "condensed factorization failed despite regularization"
+                    status, message = _classify_step_failure(
+                        self._options.optimality, record
+                    )
                     break
                 step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
 
