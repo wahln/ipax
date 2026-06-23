@@ -13,10 +13,17 @@ license to vendor), so it returns early with nothing to do when ``IPAX_S2MPJ_DIR
 The default sweep exercises both Hessian routes (default L-BFGS *and* the exact
 Lagrangian Hessian S2MPJ supplies) over the dense, matrix-free Krylov, and
 sparse-direct linear solvers. Scaling defaults to ``gradient-based`` to match the
-solver default (the configuration users actually get). The exact + sparse pairing
-factors true sparsity and is the route intended for the large, sparse models — run
-it with a raised ``--max-vars`` to reach them. Exits non-zero if any case is not
-"correct".
+solver default (the configuration users actually get).
+
+Because the routes have very different size ceilings, each config carries its own
+**per-route variable cap** rather than one global ``--max-vars``: a problem runs a
+config only when it fits that route's cap. Small problems are therefore
+cross-validated across every route, mid-size ones fall through to Krylov + sparse,
+and the largest run on the sparse-direct route alone — so a single full-corpus run
+(`--all`) gives each route the size range it can actually carry. ``--max-vars``
+remains as a global ceiling for quick restricted runs; the per-route caps are
+``--dense-max-vars`` / ``--krylov-max-vars`` / ``--sparse-max-vars``. Exits
+non-zero if any case is not "correct".
 """
 
 from __future__ import annotations
@@ -41,15 +48,40 @@ from benchmarks.harness import (
 )
 from ipax.testing.backends import import_namespace
 
+# Per-route variable caps. The linear-solver routes have very different size
+# ceilings, so one global cap is the wrong knob: it either starves the sparse route
+# of the large models it exists for, or it lets the dense route attempt sizes it
+# cannot afford. The dense route forms and factors an ``n×n`` matrix (O(n²) memory,
+# O(n³) factorization); the matrix-free Krylov route is O(n) memory but
+# iteration-capped; the sparse-direct route factors only the nonzeros. Each config
+# carries its route's cap, and a problem runs a config only when ``n ≤`` that cap —
+# so a small problem is cross-validated on every route while progressively larger
+# ones fall through to just the routes that can carry them.
+_DENSE_MAX_VARS = 2000
+_KRYLOV_MAX_VARS = 10000
+_SPARSE_MAX_VARS = 25000
+
+# (label, options, per-route variable cap). A cap of 0 means "no cap".
+ConfigSpec = tuple[str, ipax.Options, int]
+
 
 def default_configs(
-    max_iter: int, max_time: float | None, scaling: str = "gradient-based"
-) -> list[tuple[str, ipax.Options]]:
+    max_iter: int,
+    max_time: float | None,
+    scaling: str = "gradient-based",
+    *,
+    dense_max_vars: int = _DENSE_MAX_VARS,
+    krylov_max_vars: int = _KRYLOV_MAX_VARS,
+    sparse_max_vars: int = _SPARSE_MAX_VARS,
+) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
     ``lbfgs/dense`` is the default a user gets below ~1e4 vars; the others add the
     matrix-free Krylov route, the exact-Hessian accuracy ceiling, and the
-    sparse-direct route (exact + sparse, which factors true COO sparsity).
+    sparse-direct route (exact + sparse, which factors true COO sparsity). Each
+    config is tagged with its route's variable cap so a single full-corpus run
+    stays tractable: dense problems stay small, while the sparse route reaches the
+    large models it is meant for.
     """
     options = ipax.Options
     common = {
@@ -58,16 +90,38 @@ def default_configs(
         "scaling": scaling,
     }
     return [
-        ("lbfgs/dense", options(hessian="lbfgs", linsolve="dense", **common)),
-        ("lbfgs/krylov", options(hessian="lbfgs", linsolve="krylov", **common)),
-        ("exact/dense", options(hessian="exact", linsolve="dense", **common)),
-        ("exact/sparse", options(hessian="exact", linsolve="sparse", **common)),
+        (
+            "lbfgs/dense",
+            options(hessian="lbfgs", linsolve="dense", **common),
+            dense_max_vars,
+        ),
+        (
+            "lbfgs/krylov",
+            options(hessian="lbfgs", linsolve="krylov", **common),
+            krylov_max_vars,
+        ),
+        (
+            "exact/dense",
+            options(hessian="exact", linsolve="dense", **common),
+            dense_max_vars,
+        ),
+        (
+            "exact/sparse",
+            options(hessian="exact", linsolve="sparse", **common),
+            sparse_max_vars,
+        ),
     ]
 
 
 def _problem_mode(options: ipax.Options) -> tuple[str, bool]:
     """``(hessian, sparse)`` the S2MPJ build needs for a given solver config."""
     return options.hessian, options.linsolve == "sparse"
+
+
+def _effective_cap(route_cap: int, global_cap: int) -> int:
+    """Tighter of the route cap and the global ceiling (0 on either = no cap)."""
+    caps = [c for c in (route_cap, global_cap) if c > 0]
+    return min(caps) if caps else 0
 
 
 def _select_names(args: argparse.Namespace, root: str) -> tuple[str, ...] | None:
@@ -109,8 +163,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-vars",
         type=int,
-        default=1000,
-        help="skip problems with more than this many variables (0 = no cap)",
+        default=0,
+        help="global variable ceiling over every route (0 = use per-route caps)",
+    )
+    parser.add_argument(
+        "--dense-max-vars",
+        type=int,
+        default=_DENSE_MAX_VARS,
+        help=f"variable cap for the dense routes (default {_DENSE_MAX_VARS}; 0 = none)",
+    )
+    parser.add_argument(
+        "--krylov-max-vars",
+        type=int,
+        default=_KRYLOV_MAX_VARS,
+        help=f"variable cap for the Krylov route (default {_KRYLOV_MAX_VARS}; 0 = none)",
+    )
+    parser.add_argument(
+        "--sparse-max-vars",
+        type=int,
+        default=_SPARSE_MAX_VARS,
+        help=f"variable cap for the sparse route (default {_SPARSE_MAX_VARS}; 0 = none)",
     )
     parser.add_argument(
         "--max-iter", type=int, default=1000, help="solver iteration cap"
@@ -135,14 +207,21 @@ def main(argv: list[str] | None = None) -> int:
 
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
     names = _select_names(args, root)
-    configs = default_configs(args.max_iter, args.max_time, args.scaling)
+    configs = default_configs(
+        args.max_iter,
+        args.max_time,
+        args.scaling,
+        dense_max_vars=args.dense_max_vars,
+        krylov_max_vars=args.krylov_max_vars,
+        sparse_max_vars=args.sparse_max_vars,
+    )
     environment = capture_environment()
 
     # Each config may need a differently-built problem (exact vs L-BFGS Hessian,
     # dense vs sparse operators), so build one case set per distinct mode and look
     # the problem up by name. The gate mode (default L-BFGS/dense) is always built.
     gate_mode = ("lbfgs", False)
-    modes = {_problem_mode(options) for _, options in configs} | {gate_mode}
+    modes = {_problem_mode(options) for _, options, _ in configs} | {gate_mode}
 
     results: list[CaseResult] = []
     skipped_no_objective = 0
@@ -186,16 +265,24 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 continue
-            if args.max_vars and int(problem.n_vars) > args.max_vars:
-                skipped_too_large += 1
-                continue
-            for label, options in configs:
+            # Run each config only when the problem fits that route's variable cap
+            # (tightened by the global --max-vars ceiling). A problem too large for
+            # every route is counted oversized and contributes no rows.
+            n_vars = int(problem.n_vars)
+            ran_any = False
+            for label, options, route_cap in configs:
+                cap = _effective_cap(route_cap, args.max_vars)
+                if cap and n_vars > cap:
+                    continue
                 case = cases_by_mode[_problem_mode(options)][case_name]
                 results.append(
                     run_case(
                         case, config=label, options=options, xp=xp, backend=backend
                     )
                 )
+                ran_any = True
+            if not ran_any:
+                skipped_too_large += 1
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -215,6 +302,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     for status, count in sorted(by_status.items()):
         print(f"  {status:16s} {count}")
+    # Per-config coverage: each route ran a different problem count (its cap).
+    per_config_total: Counter[str] = Counter(r.config for r in results)
+    per_config_correct: Counter[str] = Counter(r.config for r in results if r.correct)
+    for label, _options, _cap in configs:
+        total = per_config_total.get(label, 0)
+        print(f"  {label:16s} {per_config_correct.get(label, 0)}/{total} correct")
     return 0 if n_correct == len(results) else 1
 
 
