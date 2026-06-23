@@ -1,8 +1,8 @@
 """S2MPJ accuracy sweep runner (download-gated, opt-in).
 
-Solves the S2MPJ-translated CUTEst problems with ipax's default L-BFGS Hessian
-across the host-bridgeable backends, scoring each case and writing a JSON +
-Markdown report — the broad-coverage complement to the curated QC corpus.
+Solves the S2MPJ-translated CUTEst problems across several solver configurations
+and host-bridgeable backends, scoring each case and writing a JSON + Markdown
+report — the broad-coverage complement to the curated QC corpus.
 
 This is **not** part of the per-PR pipeline: it needs a local S2MPJ checkout (no
 license to vendor), so it returns early with nothing to do when ``IPAX_S2MPJ_DIR``
@@ -10,8 +10,13 @@ license to vendor), so it returns early with nothing to do when ``IPAX_S2MPJ_DIR
 
     IPAX_S2MPJ_DIR=/path/to/S2MPJ python -m benchmarks.runners.s2mpj
 
-S2MPJ problems carry no analytic Lagrangian Hessian through the bridge, so only
-L-BFGS configurations are swept. Exits non-zero if any case is not "correct".
+The default sweep exercises both Hessian routes (default L-BFGS *and* the exact
+Lagrangian Hessian S2MPJ supplies) over the dense, matrix-free Krylov, and
+sparse-direct linear solvers. Scaling defaults to ``gradient-based`` to match the
+solver default (the configuration users actually get). The exact + sparse pairing
+factors true sparsity and is the route intended for the large, sparse models — run
+it with a raised ``--max-vars`` to reach them. Exits non-zero if any case is not
+"correct".
 """
 
 from __future__ import annotations
@@ -38,20 +43,31 @@ from ipax.testing.backends import import_namespace
 
 
 def default_configs(
-    max_iter: int, max_time: float | None, scaling: str = "none"
+    max_iter: int, max_time: float | None, scaling: str = "gradient-based"
 ) -> list[tuple[str, ipax.Options]]:
-    """L-BFGS configurations (no analytic Hessian crosses the NumPy bridge)."""
+    """The regular sweep matrix: both Hessian routes over the solver routes.
+
+    ``lbfgs/dense`` is the default a user gets below ~1e4 vars; the others add the
+    matrix-free Krylov route, the exact-Hessian accuracy ceiling, and the
+    sparse-direct route (exact + sparse, which factors true COO sparsity).
+    """
     options = ipax.Options
     common = {
-        "hessian": "lbfgs",
         "max_iter": max_iter,
         "max_time": max_time,
         "scaling": scaling,
     }
     return [
-        ("lbfgs/dense", options(linsolve="dense", **common)),
-        ("lbfgs/krylov", options(linsolve="krylov", **common)),
+        ("lbfgs/dense", options(hessian="lbfgs", linsolve="dense", **common)),
+        ("lbfgs/krylov", options(hessian="lbfgs", linsolve="krylov", **common)),
+        ("exact/dense", options(hessian="exact", linsolve="dense", **common)),
+        ("exact/sparse", options(hessian="exact", linsolve="sparse", **common)),
     ]
+
+
+def _problem_mode(options: ipax.Options) -> tuple[str, bool]:
+    """``(hessian, sparse)`` the S2MPJ build needs for a given solver config."""
+    return options.hessian, options.linsolve == "sparse"
 
 
 def _select_names(args: argparse.Namespace, root: str) -> tuple[str, ...] | None:
@@ -104,8 +120,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--scaling",
-        default="none",
-        help="problem scaling: 'none' or 'gradient-based'",
+        default="gradient-based",
+        help="problem scaling: 'gradient-based' (default, matches solver) or 'none'",
     )
     args = parser.parse_args(argv)
 
@@ -122,6 +138,12 @@ def main(argv: list[str] | None = None) -> int:
     configs = default_configs(args.max_iter, args.max_time, args.scaling)
     environment = capture_environment()
 
+    # Each config may need a differently-built problem (exact vs L-BFGS Hessian,
+    # dense vs sparse operators), so build one case set per distinct mode and look
+    # the problem up by name. The gate mode (default L-BFGS/dense) is always built.
+    gate_mode = ("lbfgs", False)
+    modes = {_problem_mode(options) for _, options in configs} | {gate_mode}
+
     results: list[CaseResult] = []
     skipped_no_objective = 0
     skipped_too_large = 0
@@ -130,20 +152,33 @@ def main(argv: list[str] | None = None) -> int:
             xp = import_namespace(backend)
         except ImportError:
             continue
-        for case in s2mpj_problems(names, directory=root, backends=(backend,)):
+        cases_by_mode = {
+            mode: {
+                case.name: case
+                for case in s2mpj_problems(
+                    names,
+                    directory=root,
+                    backends=(backend,),
+                    hessian=mode[0],
+                    sparse=mode[1],
+                )
+            }
+            for mode in modes
+        }
+        for case_name, gate_case in cases_by_mode[gate_mode].items():
             # One guarded build to gate applicability/size before running configs:
             # objective-free problems are not minimization problems, and the size
             # cap keeps the full sweep tractable. Genuine build errors fall through
             # to run_case so their traceback is recorded as a row.
             try:
-                problem, _x0 = case.build(xp)
+                problem, _x0 = gate_case.build(xp)
             except NotImplementedError:
                 skipped_no_objective += 1
                 continue
             except Exception:
                 results.append(
                     run_case(
-                        case,
+                        gate_case,
                         config=configs[0][0],
                         options=configs[0][1],
                         xp=xp,
@@ -155,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
                 skipped_too_large += 1
                 continue
             for label, options in configs:
+                case = cases_by_mode[_problem_mode(options)][case_name]
                 results.append(
                     run_case(
                         case, config=label, options=options, xp=xp, backend=backend

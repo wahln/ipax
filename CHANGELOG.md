@@ -28,6 +28,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (operator) `linear_ineq` matrix still raises with guidance to use
   `ineq_constraints` instead.
 
+- S2MPJ benchmark sweep now exercises the **exact Lagrangian Hessian** and the
+  **sparse-direct route**, not only L-BFGS. The adapter (`_S2MPJExactProblem`) wires
+  S2MPJ's `LgHxy`/`LHxyv` (convention `L = f + yᵀc`) into ipax's exact-Hessian route,
+  mapping `(σ, y_eq, y_ineq)` onto S2MPJ's single multiplier vector with the correct
+  signs for lowered inequality sides (lower `−y`, upper `+y`) and honoring `σ` on the
+  objective term so it stays correct under gradient-based scaling. With `sparse=True`
+  the Jacobians and Hessian cross as `SparseOperator`s (true COO sparsity) for the
+  sparse-direct (Feral/cuDSS) factorization. The runner's regular matrix is now
+  `{lbfgs, exact} × {dense, krylov, sparse}` (`exact/sparse` factors true sparsity —
+  raise `--max-vars` to reach the large, sparse models), and its `--scaling` now
+  defaults to `gradient-based` to match the solver default rather than benchmarking a
+  scaling-off configuration users do not get.
 - S2MPJ benchmark corpus: `benchmarks/corpus/s2mpj.py` loads the pure-Python
   S2MPJ translations of the CUTEst/Hock–Schittkowski problems (no Fortran/SIF
   toolchain) and bridges their NumPy/SciPy evaluation onto any CPU Array-API

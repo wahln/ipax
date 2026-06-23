@@ -21,9 +21,18 @@ returns ``[]`` when it is absent, mirroring the other external corpora.
 S2MPJ stores each constraint as a two-sided range ``clower ≤ c(x) ≤ cupper`` with
 an equality when the two coincide. The adapter maps that onto ipax's eq/ineq
 split, lowering finite inequality sides to one-sided rows (``c − cupper ≤ 0`` and
-``clower − c ≤ 0``) exactly as the native ``linear_ineq`` lowering does. No
-Lagrangian Hessian is supplied, so the solver uses its default L-BFGS — the path
-this sweep is meant to exercise across the corpus.
+``clower − c ≤ 0``) exactly as the native ``linear_ineq`` lowering does.
+
+S2MPJ also exposes the **exact Lagrangian Hessian** (``LgHxy``/``LHxyv``, convention
+``L = f + yᵀc``), so the adapter can drive ipax's exact-Hessian route — not only the
+default L-BFGS. :class:`_S2MPJExactProblem` implements ``lagrangian_hessian`` by
+mapping ipax's ``(σ, y_eq, y_ineq)`` onto S2MPJ's single multiplier vector ``Y``
+(equality rows ``+y_eq``; lowered lower-side rows ``−y_ineq`` because their curvature
+is ``−∇²c``; lowered upper-side rows ``+y_ineq``) and honoring ``σ`` on the objective
+term (so it stays correct under gradient-based scaling, where ``σ ≠ 1``). With
+``sparse=True`` the Jacobians and the Hessian are returned as
+:class:`~ipax.backend.sparse.numpy_scipy.SparseOperator` (true COO sparsity, for the
+sparse-direct route) rather than densified arrays.
 """
 
 from __future__ import annotations
@@ -39,6 +48,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from benchmarks.corpus import BenchmarkProblem
+    from ipax.backend.operators import LinearOperator
     from ipax.typing import Array, Namespace, Scalar
 
 
@@ -67,10 +77,18 @@ class _S2MPJProblem(Problem):
     The wrapped ``instance`` is a CUTEst_problem from S2MPJ; ``xp`` is the target
     namespace. Equality vs inequality constraints and the finite inequality sides
     are precomputed once from ``clower``/``cupper``.
+
+    ``sparse`` controls how Jacobians (and, in :class:`_S2MPJExactProblem`, the
+    Hessian) cross the bridge: ``False`` densifies to Array-API arrays; ``True``
+    wraps the native ``scipy.sparse`` structure in a ``SparseOperator`` so the
+    sparse-direct route factors true sparsity. This base class supplies no
+    Lagrangian Hessian, so the solver uses its default L-BFGS.
     """
 
-    def __init__(self, instance: Any, xp: Namespace) -> None:
+    def __init__(self, instance: Any, xp: Namespace, *, sparse: bool = False) -> None:
         import numpy as np
+
+        self._sparse = sparse
 
         # Reject feasibility/least-squares problems with no objective group: they
         # are not minimization problems and cannot be benchmarked as such (S2MPJ's
@@ -159,10 +177,12 @@ class _S2MPJProblem(Problem):
         c = np.reshape(np.asarray(self._inst.cx(_to_numpy(x)), dtype=float), (-1,))
         return _from_numpy(self.xp, c[self._eq_idx] - self._eq_rhs)
 
-    def eq_jacobian(self, x: Array) -> Array:
+    def eq_jacobian(self, x: Array) -> Array | LinearOperator:
         if self._eq_idx.shape[0] == 0:
             raise NotImplementedError
         _c, jac = self._inst.cJx(_to_numpy(x))
+        if self._sparse:
+            return self._sparse_op(jac.tocsr()[self._eq_idx, :])
         return _from_numpy(self.xp, jac.toarray()[self._eq_idx, :])
 
     # -- inequalities (lowered finite sides of the two-sided ranges) -------
@@ -176,15 +196,105 @@ class _S2MPJProblem(Problem):
         up = c[self._up_idx] - self._up_rhs
         return _from_numpy(self.xp, np.concatenate((lo, up)))
 
-    def ineq_jacobian(self, x: Array) -> Array:
+    def ineq_jacobian(self, x: Array) -> Array | LinearOperator:
         if self._lo_idx.shape[0] == 0 and self._up_idx.shape[0] == 0:
             raise NotImplementedError
         import numpy as np
 
         _c, jac = self._inst.cJx(_to_numpy(x))
+        # Lower side ``clower − c`` contributes ``−∇c``; upper side ``c − cupper``
+        # contributes ``+∇c`` (matches the constraint-value lowering above).
+        if self._sparse:
+            import scipy.sparse as sp
+
+            jcsr = jac.tocsr()
+            rows = sp.vstack((-jcsr[self._lo_idx, :], jcsr[self._up_idx, :]))
+            return self._sparse_op(rows)
         dense = jac.toarray()
-        rows = np.concatenate((-dense[self._lo_idx, :], dense[self._up_idx, :]), axis=0)
-        return _from_numpy(self.xp, rows)
+        rows_d = np.concatenate(
+            (-dense[self._lo_idx, :], dense[self._up_idx, :]), axis=0
+        )
+        return _from_numpy(self.xp, rows_d)
+
+    # -- shared Hessian helpers (used by the exact subclass) ---------------
+    def _sparse_op(self, matrix: Any) -> LinearOperator:
+        """Wrap a host ``scipy.sparse`` matrix as a COO-exposing operator."""
+        from ipax.backend.sparse.numpy_scipy import SparseOperator
+
+        return SparseOperator(matrix, self.xp)
+
+    def _s2mpj_multipliers(self, y_eq: Array, y_ineq: Array) -> Any:
+        """Map ipax ``(y_eq, y_ineq)`` onto S2MPJ's per-constraint vector ``Y``.
+
+        S2MPJ's Lagrangian is ``f + Σ_i Y_i c_i`` over the *original* constraint
+        rows, so ``Σ_i Y_i ∇²c_i`` must reproduce ipax's curvature term
+        ``Σ y_eq·∇²c + Σ y_ineq·∇²g``. Equality rows take ``+y_eq``; lowered
+        lower-side rows take ``−y_ineq`` (their ``g = clower − c`` has
+        ``∇²g = −∇²c``); lowered upper-side rows take ``+y_ineq``. A range
+        constraint that appears in both blocks accumulates both contributions.
+        """
+        import numpy as np
+
+        Y = np.zeros((self._m,), dtype=float)
+        if self._m == 0:
+            return Y
+        yeq = _to_numpy(y_eq)
+        yineq = _to_numpy(y_ineq)
+        n_lo = int(self._lo_idx.shape[0])
+        if self._eq_idx.shape[0]:
+            np.add.at(Y, self._eq_idx, yeq)
+        if n_lo:
+            np.add.at(Y, self._lo_idx, -yineq[:n_lo])
+        if self._up_idx.shape[0]:
+            np.add.at(Y, self._up_idx, yineq[n_lo:])
+        return Y
+
+    def _lagrangian_hessian_matrix(
+        self, x: Array, y_eq: Array, y_ineq: Array, sigma: Scalar
+    ) -> Any:
+        """Assemble ``σ∇²f + Σ y·∇²c`` as a host ``scipy.sparse`` matrix.
+
+        ``LgHxy`` returns ``∇²f + Σ Y_i ∇²c_i`` (no objective scaling); the
+        ``σ ≠ 1`` correction adds ``(σ−1)∇²f`` via a constraint-free call, so the
+        result is correct under gradient-based scaling, where the driver passes
+        ``σ = s_f`` through the scaling wrapper.
+        """
+        import numpy as np
+
+        s = float(sigma)
+        xcol = np.reshape(_to_numpy(x), (-1, 1))
+        Y = self._s2mpj_multipliers(y_eq, y_ineq)
+        _lval, _grad, hess = self._inst.LgHxy(xcol, np.reshape(Y, (-1, 1)))
+        if s != 1.0:
+            _l0, _g0, hess_f = self._inst.LgHxy(xcol, np.zeros((self._m, 1)))
+            hess = hess + (s - 1.0) * hess_f
+        return hess
+
+
+class _S2MPJExactProblem(_S2MPJProblem):
+    """S2MPJ bridge that also supplies the **exact Lagrangian Hessian**.
+
+    Defining ``lagrangian_hessian`` on the class advertises it through ipax's
+    derivative resolution (``_provides`` compares against the base ``Problem``),
+    so the solver takes the exact-Hessian route instead of L-BFGS. The matrix is
+    returned dense or as a ``SparseOperator`` per the ``sparse`` flag.
+    """
+
+    def lagrangian_hessian(
+        self,
+        x: Array,
+        y_eq: Array,
+        y_ineq: Array,
+        sigma: Scalar = 1.0,
+    ) -> Array | LinearOperator:
+        import numpy as np
+
+        hess = self._lagrangian_hessian_matrix(x, y_eq, y_ineq, sigma)
+        if self._sparse:
+            import scipy.sparse as sp
+
+            return self._sparse_op(sp.csr_matrix(hess))
+        return _from_numpy(self.xp, np.asarray(hess.toarray()))
 
 
 def s2mpj_dir(directory: str | None = None) -> str | None:
@@ -249,12 +359,17 @@ def s2mpj_problems(
     *,
     directory: str | None = None,
     backends: tuple[str, ...] = ("numpy",),
+    hessian: str = "lbfgs",
+    sparse: bool = False,
 ) -> list[BenchmarkProblem]:
     """Return :class:`BenchmarkProblem`s for the named S2MPJ problems.
 
     Returns ``[]`` when no S2MPJ checkout is available (so callers may extend the
     corpus unconditionally). ``backends`` restricts each case to host-bridgeable
-    namespaces (CPU NumPy/Torch); the default is NumPy only.
+    namespaces (CPU NumPy/Torch); the default is NumPy only. ``hessian="exact"``
+    builds problems that supply the analytic Lagrangian Hessian (else default
+    L-BFGS); ``sparse=True`` returns Jacobians/Hessian as ``SparseOperator`` for
+    the sparse-direct route.
     """
     from benchmarks.corpus import BenchmarkProblem
 
@@ -263,13 +378,14 @@ def s2mpj_problems(
         return []
 
     selected = tuple(names) if names is not None else _DEFAULT_NAMES
+    cls = _S2MPJExactProblem if hessian == "exact" else _S2MPJProblem
 
     def _make(name: str) -> BenchmarkProblem:
         def build(xp: Namespace) -> tuple[Problem, Array]:
             import numpy as np
 
             instance = _instantiate(root, name)
-            problem = _S2MPJProblem(instance, xp)
+            problem = cls(instance, xp, sparse=sparse)
             x0 = _from_numpy(xp, np.reshape(instance.x0, (-1,)))
             return problem, x0
 

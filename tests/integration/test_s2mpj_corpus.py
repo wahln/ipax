@@ -85,6 +85,49 @@ def test_objective_free_problem_is_rejected_at_build(bridge_namespace):
         case.build(xp)
 
 
+@pytest.mark.parametrize("name", ("HS71", "HS35", "HS6"))
+def test_exact_hessian_route_reaches_known_optimum(bridge_namespace, name):
+    # The exact Lagrangian Hessian S2MPJ supplies must drive the dense exact-Newton
+    # route to the same optima the L-BFGS path finds — validating the multiplier
+    # sign-mapping and σ handling end-to-end (scaling on, the solver default).
+    xp = bridge_namespace
+    (case,) = s2mpj.s2mpj_problems(
+        (name,), backends=(xp.__name__.split(".")[-1],), hessian="exact"
+    )
+    problem, x0 = case.build(xp)
+    result = solve(problem, x0, options=Options(hessian="exact", linsolve="dense"))
+
+    assert result.status is Status.OPTIMAL
+    assert result.kkt_error <= 1e-6
+    assert result.derivative_sources.hessian == "exact"
+    assert abs(float(result.objective) - _KNOWN_F[case.name]) <= 1e-4
+
+
+@pytest.mark.parametrize("name", ("HS71", "HS35"))
+def test_exact_sparse_route_matches_exact_dense(bridge_namespace, name):
+    # The sparse-direct route factors the COO Jacobians/Hessian; it must agree with
+    # the dense exact route to solver tolerance on the same problem.
+    xp = bridge_namespace
+    backend = xp.__name__.split(".")[-1]
+    (dense_case,) = s2mpj.s2mpj_problems(
+        (name,), backends=(backend,), hessian="exact", sparse=False
+    )
+    (sparse_case,) = s2mpj.s2mpj_problems(
+        (name,), backends=(backend,), hessian="exact", sparse=True
+    )
+    dense_problem, x0 = dense_case.build(xp)
+    sparse_problem, _ = sparse_case.build(xp)
+
+    dense = solve(dense_problem, x0, options=Options(hessian="exact", linsolve="dense"))
+    sparse = solve(
+        sparse_problem, x0, options=Options(hessian="exact", linsolve="sparse")
+    )
+
+    assert dense.status is Status.OPTIMAL
+    assert sparse.status is Status.OPTIMAL
+    assert_allclose(xp, sparse.x, dense.x, rtol=1e-5, atol=1e-5)
+
+
 def test_s2mpj_bridge_derivatives_match_finite_differences(bridge_namespace):
     # HS71 exercises objective gradient + a nonlinear inequality and equality, so
     # FD agreement confirms the bridge and the constraint-lowering signs.
