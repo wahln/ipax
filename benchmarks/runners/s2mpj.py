@@ -124,6 +124,40 @@ def _effective_cap(route_cap: int, global_cap: int) -> int:
     return min(caps) if caps else 0
 
 
+def _probe_build_n(root: str, name: str, size: int | None, queue: object) -> None:
+    """Worker: instantiate one (sized) problem and report its variable count.
+
+    Runs in a spawned subprocess so a pathological O(n²) pure-Python build can be
+    abandoned by killing the process — there is no cross-platform way to interrupt
+    a GIL-bound construction loop in-process.
+    """
+    from benchmarks.corpus.s2mpj import _instantiate
+
+    try:
+        queue.put(int(_instantiate(root, name, size).n))  # type: ignore[attr-defined]
+    except Exception:
+        queue.put(None)
+
+
+def _build_within(root: str, name: str, size: int | None, timeout: float) -> bool:
+    """Whether the (sized) build of ``name`` completes within ``timeout`` seconds."""
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_probe_build_n, args=(root, name, size, queue))
+    proc.start()
+    proc.join(timeout)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        return False
+    try:
+        return queue.get_nowait() is not None
+    except Exception:
+        return False
+
+
 def _select_names(args: argparse.Namespace, root: str) -> tuple[str, ...] | None:
     """Resolve the problem selection: explicit names, the whole set, or curated."""
     if args.names:
@@ -185,6 +219,21 @@ def main(argv: list[str] | None = None) -> int:
         help=f"variable cap for the sparse route (default {_SPARSE_MAX_VARS}; 0 = none)",
     )
     parser.add_argument(
+        "--size",
+        type=int,
+        default=0,
+        help="target variable count for scalable problems (0 = SIF defaults); the "
+        "lever for a scaling sweep that reaches the sparse route's regime",
+    )
+    parser.add_argument(
+        "--max-build-seconds",
+        type=float,
+        default=0.0,
+        help="skip a problem whose (sized) build exceeds this wall-time, probed in "
+        "a subprocess (0 = no build guard); use it for large --size sweeps where "
+        "some problems build in O(n²) pure Python",
+    )
+    parser.add_argument(
         "--max-iter", type=int, default=1000, help="solver iteration cap"
     )
     parser.add_argument(
@@ -207,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
 
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
     names = _select_names(args, root)
+    size = args.size or None
     configs = default_configs(
         args.max_iter,
         args.max_time,
@@ -226,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     results: list[CaseResult] = []
     skipped_no_objective = 0
     skipped_too_large = 0
+    skipped_slow_build = 0
     for backend in backends:
         try:
             xp = import_namespace(backend)
@@ -240,11 +291,19 @@ def main(argv: list[str] | None = None) -> int:
                     backends=(backend,),
                     hessian=mode[0],
                     sparse=mode[1],
+                    size=size,
                 )
             }
             for mode in modes
         }
         for case_name, gate_case in cases_by_mode[gate_mode].items():
+            # Optional build guard: abandon a problem whose sized build is too slow
+            # (pure-Python O(n²) construction) before it stalls an unattended sweep.
+            if args.max_build_seconds > 0 and not _build_within(
+                root, case_name.split("/", 1)[-1], size, args.max_build_seconds
+            ):
+                skipped_slow_build += 1
+                continue
             # One guarded build to gate applicability/size before running configs:
             # objective-free problems are not minimization problems, and the size
             # cap keeps the full sweep tractable. Genuine build errors fall through
@@ -297,7 +356,8 @@ def main(argv: list[str] | None = None) -> int:
     n_correct = sum(1 for r in results if r.correct)
     print(
         f"S2MPJ sweep: {n_correct}/{len(results)} correct "
-        f"(skipped {skipped_no_objective} objective-free, {skipped_too_large} oversized)"
+        f"(skipped {skipped_no_objective} objective-free, {skipped_too_large} oversized,"
+        f" {skipped_slow_build} slow-build)"
         f" -> {out.with_suffix('.json')}, {out.with_suffix('.md')}"
     )
     for status, count in sorted(by_status.items()):

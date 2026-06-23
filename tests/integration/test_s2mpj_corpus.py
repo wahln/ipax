@@ -128,6 +128,23 @@ def test_exact_sparse_route_matches_exact_dense(bridge_namespace, name):
     assert_allclose(xp, sparse.x, dense.x, rtol=1e-5, atol=1e-5)
 
 
+def test_sized_instantiation_scales_and_falls_back(bridge_namespace):
+    # ``size`` requests a scalable problem's dimension (the scaling-sweep lever); a
+    # fixed-size problem ignores it and keeps its SIF default.
+    xp = bridge_namespace
+    backend = xp.__name__.split(".")[-1]
+    if "ARWHEAD" not in s2mpj.list_s2mpj_problems():
+        pytest.skip("ARWHEAD not in this S2MPJ checkout")
+
+    (scaled,) = s2mpj.s2mpj_problems(("ARWHEAD",), backends=(backend,), size=500)
+    problem, _x0 = scaled.build(xp)
+    assert problem.n_vars == 500  # scalable: honored the requested size
+
+    (fixed,) = s2mpj.s2mpj_problems(("HS71",), backends=(backend,), size=500)
+    fixed_problem, _ = fixed.build(xp)
+    assert fixed_problem.n_vars == 4  # not size-parametrized: fell back to default
+
+
 def test_s2mpj_bridge_derivatives_match_finite_differences(bridge_namespace):
     # HS71 exercises objective gradient + a nonlinear inequality and equality, so
     # FD agreement confirms the bridge and the constraint-lowering signs.

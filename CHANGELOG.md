@@ -28,6 +28,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (operator) `linear_ineq` matrix still raises with guidance to use
   `ineq_constraints` instead.
 
+- S2MPJ sweep gained a size-aware run strategy for tractable full-corpus runs:
+  **per-route variable caps** (dense 2000, Krylov 10000, sparse 25000) so each
+  config runs only on problems that fit its route — small problems are
+  cross-validated across every route while larger ones fall through to Krylov and
+  the sparse-direct route — with `--max-vars` kept as a global ceiling; **sized
+  instantiation** (`--size N`, with `PROBLEM(N)` for the scalable problems and a
+  SIF-default fallback for the rest) to reach the sparse route's intended large-`n`
+  regime; an optional subprocess **build-time guard** (`--max-build-seconds`) that
+  abandons a pathological O(n²) pure-Python construction before it stalls an
+  unattended sweep; and per-problem instance **caching** so the per-config fan-out
+  rebuilds each problem once instead of up to five times.
 - S2MPJ benchmark sweep now exercises the **exact Lagrangian Hessian** and the
   **sparse-direct route**, not only L-BFGS. The adapter (`_S2MPJExactProblem`) wires
   S2MPJ's `LgHxy`/`LHxyv` (convention `L = f + yᵀc`) into ipax's exact-Hessian route,

@@ -37,6 +37,7 @@ sparse-direct route) rather than densified arrays.
 
 from __future__ import annotations
 
+import functools
 import importlib
 import os
 import sys
@@ -343,10 +344,25 @@ def _ensure_on_path(root: str) -> None:
             sys.path.insert(0, entry)
 
 
-def _instantiate(root: str, name: str) -> Any:
+@functools.lru_cache(maxsize=8)
+def _instantiate(root: str, name: str, size: int | None = None) -> Any:
+    """Instantiate an S2MPJ problem, optionally at a target variable count.
+
+    Cached (small LRU) because the runner builds the same problem once per config
+    (gate + every linear-solver route), and S2MPJ's pure-Python construction is the
+    sweep's bottleneck — sharing the read-only instance across the per-problem
+    config fan-out turns ~5 builds into one. ``size`` selects a scalable problem's
+    dimension (``PROBLEM(N)``); a problem that is not size-parametrized (or rejects
+    ``N``) falls back to its SIF default, so callers may request a size uniformly.
+    """
     _ensure_on_path(root)
-    module = importlib.import_module(name)
-    return getattr(module, name)()
+    cls = getattr(importlib.import_module(name), name)
+    if size is not None:
+        try:
+            return cls(size)
+        except Exception:  # not scalable / invalid N → SIF default size
+            return cls()
+    return cls()
 
 
 # A small, curated default selection: constrained Hock-Schittkowski problems that
@@ -361,6 +377,7 @@ def s2mpj_problems(
     backends: tuple[str, ...] = ("numpy",),
     hessian: str = "lbfgs",
     sparse: bool = False,
+    size: int | None = None,
 ) -> list[BenchmarkProblem]:
     """Return :class:`BenchmarkProblem`s for the named S2MPJ problems.
 
@@ -369,7 +386,9 @@ def s2mpj_problems(
     namespaces (CPU NumPy/Torch); the default is NumPy only. ``hessian="exact"``
     builds problems that supply the analytic Lagrangian Hessian (else default
     L-BFGS); ``sparse=True`` returns Jacobians/Hessian as ``SparseOperator`` for
-    the sparse-direct route.
+    the sparse-direct route. ``size`` requests a target variable count for the
+    scalable problems (others keep their SIF default) — the lever for a
+    scaling-focused sweep that reaches the sparse route's intended regime.
     """
     from benchmarks.corpus import BenchmarkProblem
 
@@ -384,7 +403,7 @@ def s2mpj_problems(
         def build(xp: Namespace) -> tuple[Problem, Array]:
             import numpy as np
 
-            instance = _instantiate(root, name)
+            instance = _instantiate(root, name, size)
             problem = cls(instance, xp, sparse=sparse)
             x0 = _from_numpy(xp, np.reshape(instance.x0, (-1,)))
             return problem, x0
