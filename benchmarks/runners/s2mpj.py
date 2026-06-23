@@ -100,10 +100,23 @@ def default_configs(
             options(hessian="lbfgs", linsolve="krylov", **common),
             krylov_max_vars,
         ),
+        # L-BFGS + sparse-direct is the typical radiotherapy setup.
+        (
+            "lbfgs/sparse",
+            options(hessian="lbfgs", linsolve="sparse", **common),
+            sparse_max_vars,
+        ),
         (
             "exact/dense",
             options(hessian="exact", linsolve="dense", **common),
             dense_max_vars,
+        ),
+        # Exact Hessian + Krylov: helps attribute numerical errors to the
+        # matrix-free subspace solver rather than the Hessian approximation.
+        (
+            "exact/krylov",
+            options(hessian="exact", linsolve="krylov", **common),
+            krylov_max_vars,
         ),
         (
             "exact/sparse",
@@ -159,7 +172,11 @@ def _build_within(root: str, name: str, size: int | None, timeout: float) -> boo
 
 
 def _select_names(args: argparse.Namespace, root: str) -> tuple[str, ...] | None:
-    """Resolve the problem selection: explicit names, the whole set, or curated."""
+    """Resolve the problem selection: a file, explicit names, the whole set, or curated."""
+    if args.names_file:
+        text = Path(args.names_file).read_text()
+        lines = (line.split("#", 1)[0].strip() for line in text.splitlines())
+        return tuple(line for line in lines if line)
     if args.names:
         return tuple(n.strip() for n in args.names.split(",") if n.strip())
     if args.all:
@@ -185,6 +202,12 @@ def main(argv: list[str] | None = None) -> int:
         "--names",
         default=None,
         help="comma-separated S2MPJ problem names (else a curated default set)",
+    )
+    parser.add_argument(
+        "--names-file",
+        default=None,
+        help="file with one problem name per line (# comments allowed); takes "
+        "precedence over --names/--all — handy for a focused re-run of a subset",
     )
     parser.add_argument(
         "--all",
