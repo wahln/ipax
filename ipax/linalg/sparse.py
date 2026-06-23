@@ -66,6 +66,10 @@ class SparseDirectSolver:
         # The core emits structure; the adapter builds and factors the matrix.
         rows, cols, values, shape = K.to_coo()
         xp = array_namespace(values)
+        # Forward the operator's structural symmetry hint (the condensed/saddle
+        # blocks are symmetric by construction) so the adapter can skip its
+        # per-iteration numerical A − Aᵀ test.
+        symmetric = K.symmetry_hint()
 
         from ipax.backend.sparse import get_sparse_adapter
 
@@ -76,7 +80,9 @@ class SparseDirectSolver:
                 "install SciPy for the NumPy backend or choose another "
                 "linsolve mode"
             )
-        operator = adapter.from_coo(rows, cols, values, shape=shape)
+        operator = adapter.from_coo(
+            rows, cols, values, shape=shape, symmetric=symmetric
+        )
         # The facade is created once per solve and reused every iteration, so the
         # inner solver persists — letting the backend cache its symbolic analysis
         # across the fixed-pattern KKT factorizations of an interior-point solve.

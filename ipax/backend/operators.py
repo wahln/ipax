@@ -125,6 +125,18 @@ class LinearOperator(ABC):
         """
         raise NotImplementedError("operator does not expose an SPD preconditioner")
 
+    def symmetry_hint(self) -> bool | None:
+        """Declare ``A == Aᵀ`` when known cheaply by construction; ``None`` if not.
+
+        Optional capability mirroring :meth:`preferred_krylov_method`: an operator
+        assembled to be symmetric (the KKT condensed/saddle blocks, whose ``C``/
+        ``Cᵀ`` off-diagonals share one value array) returns ``True`` so the
+        sparse-direct route can skip the per-iteration O(nnz) ``A − Aᵀ`` numerical
+        symmetry test. ``None`` means "unknown — test numerically", preserving the
+        default behavior for generic operators.
+        """
+        return None
+
     def preferred_krylov_method(self) -> Literal["cg", "minres"] | None:
         """Return the Krylov method this operator should use, when constrained.
 

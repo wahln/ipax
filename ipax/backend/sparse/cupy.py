@@ -151,11 +151,22 @@ def _is_cudss_load_error(exc: BaseException) -> bool:
 
 
 class SparseOperator(LinearOperator):
-    """``LinearOperator`` backed by a ``cupyx.scipy.sparse`` CSR matrix."""
+    """``LinearOperator`` backed by a ``cupyx.scipy.sparse`` CSR matrix.
 
-    def __init__(self, matrix: Any, xp: Namespace) -> None:
+    Unlike the SciPy adapter the CSR form is kept eager: cuDSS consumes CSR, which
+    is also the matvec format, so it is not wasted on the direct-solve route. The
+    only per-iteration trim here is caching the symmetry verdict (and honoring the
+    assembler's structural hint) instead of recomputing ``A − Aᵀ`` every factor.
+    """
+
+    def __init__(
+        self, matrix: Any, xp: Namespace, *, symmetric: bool | None = None
+    ) -> None:
         self._matrix = matrix.tocsr()
         self._xp = xp
+        # Structural symmetry hint from the assembler (None ⇒ test numerically).
+        self._symmetric_hint = symmetric
+        self._symmetric: bool | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -166,6 +177,19 @@ class SparseOperator(LinearOperator):
     def cupy_matrix(self) -> Any:
         """The wrapped device CSR matrix (consumed by CUDA sparse solvers)."""
         return self._matrix
+
+    def is_symmetric(self) -> bool:
+        """Whether ``A == Aᵀ``: honor the assembler's hint, else test numerically.
+
+        The structural hint (set by the KKT condensed/saddle assembler) is
+        authoritative when present, sparing the per-iteration O(nnz) device-side
+        ``A − Aᵀ`` test and its host syncs.
+        """
+        if self._symmetric_hint is not None:
+            return self._symmetric_hint
+        if self._symmetric is None:
+            self._symmetric = _is_symmetric(self._matrix)
+        return self._symmetric
 
     def matvec(self, v: Array) -> Array:
         out = self._matrix @ _to_cupy(v)
@@ -349,9 +373,10 @@ class CuDSSSparseSolver:
 
     def factor(self, K: LinearOperator) -> None:
         matrix, xp = _require_csr(K)
+        assert isinstance(K, SparseOperator)  # narrowed by _require_csr
         device_id = _device_id(matrix)
         with cupy.cuda.Device(device_id):
-            symmetric = _is_symmetric(matrix)
+            symmetric = K.is_symmetric()
             if self._require_inertia and not symmetric:
                 raise ValueError("cuDSS inertia is defined only for symmetric matrices")
 
@@ -694,8 +719,13 @@ class CuPySparseAdapter:
         values: Array,
         *,
         shape: tuple[int, int],
+        symmetric: bool | None = None,
     ) -> SparseOperator:
-        """Build a :class:`SparseOperator` from Array-API COO triplets."""
+        """Build a :class:`SparseOperator` from Array-API COO triplets.
+
+        ``symmetric`` is an optional structural hint from the assembler; ``None``
+        leaves the operator to test symmetry numerically when first asked.
+        """
         from ipax.backend.namespace import array_namespace
 
         xp = array_namespace(values)
@@ -703,7 +733,7 @@ class CuPySparseAdapter:
             (_to_cupy(values), (_to_index(rows), _to_index(cols))),
             shape=shape,
         )
-        return SparseOperator(matrix, xp)
+        return SparseOperator(matrix, xp, symmetric=symmetric)
 
     def solver(self, *, require_inertia: bool = False) -> CuPySparseSolver:
         """Return the CUDA sparse-direct solver (cuDSS default, spsolve fallback)."""
