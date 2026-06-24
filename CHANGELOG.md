@@ -28,6 +28,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (operator) `linear_ineq` matrix still raises with guidance to use
   `ineq_constraints` instead.
 
+- S2MPJ scoring now uses the **dataset's own documented outcome** instead of
+  convergence alone: the loader parses each source file for the CUTEst
+  classification (`pbclass`), the SIF author's solution objective
+  (`# LO SOLTN`, present on ~72% of the corpus), and an explicit
+  `Solution (infeasible)` / `Source: an infeasible problem` marker. A case is
+  scored *correct* when it reaches the documented objective, or — for a
+  documented-infeasible problem like BURKEHAN — when it **detects infeasibility**
+  (previously flagged as a failure). The report shows the gap to the documented
+  optimum (`Δf*`) and annotates `infeasible (exp)`. The objective-free problems
+  (CUTEst feasibility / nonlinear-equation systems) can now be run via
+  `--include-objective-free` as `min 0` subject to the constraints, and one
+  configuration can be swept per process with `--config` for parallel runs.
 - S2MPJ sweep gained a size-aware run strategy for tractable full-corpus runs:
   **per-route variable caps** (dense 2000, Krylov 10000, sparse 25000) so each
   config runs only on problems that fit its route — small problems are

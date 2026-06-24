@@ -32,6 +32,9 @@ if TYPE_CHECKING:
 # known — the iterate matches it.
 _KKT_GATE = 1e-6
 _X_GATE = 1e-5
+# Tolerance for matching the dataset-documented objective (SIF ``LO SOLTN``):
+# relative + absolute, since documented values vary in precision.
+_OBJ_GATE = 1e-4
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,10 @@ class CaseResult:
     complementarity: float
     constraint_violation: float
     error_vs_optimum: float | None
+    objective: float
+    expected_objective: float | None  # dataset-documented optimum (SIF LO SOLTN)
+    expected_infeasible: bool  # dataset documents the problem as infeasible
+    pbclass: str | None  # CUTEst classification string
     solve_time: float
     linear_solver: str
     gradient_source: str
@@ -124,6 +131,10 @@ def run_case(
             complementarity=float("inf"),
             constraint_violation=float("inf"),
             error_vs_optimum=None,
+            objective=float("inf"),
+            expected_objective=None,
+            expected_infeasible=False,
+            pbclass=None,
             solve_time=0.0,
             linear_solver="",
             gradient_source="n/a",
@@ -144,11 +155,28 @@ def run_case(
     optimum = case.optimum(problem)
     error_vs_optimum = None if optimum is None else _inf_norm(xp, result.x, optimum)
 
-    correct = (
-        result.success
-        and result.kkt_error <= _KKT_GATE
-        and (error_vs_optimum is None or error_vs_optimum <= _X_GATE)
-    )
+    # Dataset-sourced expected outcome (S2MPJ problems carry these; others default).
+    expected_objective = getattr(problem, "expected_objective", None)
+    expected_infeasible = bool(getattr(problem, "expected_infeasible", False))
+    pbclass = getattr(problem, "pbclass", None)
+    objective = float(result.objective)
+
+    if expected_infeasible:
+        # The dataset documents this problem as infeasible, so *detecting*
+        # infeasibility is the correct outcome — not a failure to optimize.
+        correct = result.status is ipax.Status.INFEASIBLE
+    else:
+        objective_ok = True
+        if expected_objective is not None and math.isfinite(expected_objective):
+            objective_ok = abs(objective - expected_objective) <= _OBJ_GATE * (
+                1.0 + abs(expected_objective)
+            )
+        correct = (
+            result.success
+            and result.kkt_error <= _KKT_GATE
+            and objective_ok
+            and (error_vs_optimum is None or error_vs_optimum <= _X_GATE)
+        )
     sources = result.derivative_sources
     return CaseResult(
         problem=case.name,
@@ -165,6 +193,10 @@ def run_case(
         complementarity=result.complementarity,
         constraint_violation=result.constraint_violation,
         error_vs_optimum=error_vs_optimum,
+        objective=objective,
+        expected_objective=expected_objective,
+        expected_infeasible=expected_infeasible,
+        pbclass=pbclass,
         solve_time=result.solve_time,
         linear_solver=result.linear_solver,
         gradient_source=sources.gradient,
@@ -223,17 +255,27 @@ def format_markdown(results: list[CaseResult], environment: dict[str, object]) -
         "",
         "## Per-case detail",
         "",
+        "Status `infeasible (exp)` marks problems the dataset documents as "
+        "infeasible (detecting infeasibility is the correct outcome). `Δf*` is the "
+        "gap to the documented `LO SOLTN` objective when one is recorded.",
+        "",
         "| problem | backend | config | status | iters | kkt | infeas "
-        "| err vs x* | time (s) | solver |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Δf* | err vs x* | time (s) | solver |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for r in sorted(results, key=lambda r: (r.problem, r.backend, r.config)):
         flag = "" if r.correct else " ⚠️"
+        status = r.status + (" (exp)" if r.expected_infeasible else "")
         err = "—" if r.error_vs_optimum is None else _fmt(r.error_vs_optimum)
+        obj_gap = (
+            "—"
+            if r.expected_objective is None or not math.isfinite(r.expected_objective)
+            else _fmt(abs(r.objective - r.expected_objective))
+        )
         lines.append(
-            f"| {r.problem} | {r.backend} | `{r.config}` | {r.status}{flag} "
+            f"| {r.problem} | {r.backend} | `{r.config}` | {status}{flag} "
             f"| {r.n_iter} | {_fmt(r.kkt_error)} | {_fmt(r.constraint_violation)} "
-            f"| {err} | {r.solve_time:.3f} | {r.linear_solver or '—'} |"
+            f"| {obj_gap} | {err} | {r.solve_time:.3f} | {r.linear_solver or '—'} |"
         )
     return "\n".join(lines) + "\n"
 

@@ -286,6 +286,13 @@ def main(argv: list[str] | None = None) -> int:
         help="comma-separated config labels to run (e.g. 'exact/sparse'); default "
         "runs the whole matrix. Use it to run one configuration per process.",
     )
+    parser.add_argument(
+        "--include-objective-free",
+        action="store_true",
+        help="also run the objective-free problems (CUTEst feasibility / nonlinear "
+        "equation systems) as 'min 0' subject to the constraints, instead of "
+        "skipping them",
+    )
     args = parser.parse_args(argv)
 
     root = s2mpj_dir(args.dir)
@@ -362,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
                     hessian=mode[0],
                     sparse=mode[1],
                     size=size,
+                    feasibility=args.include_objective_free,
                 )
             }
             for mode in modes

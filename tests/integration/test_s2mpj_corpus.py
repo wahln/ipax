@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from benchmarks.harness import run_case
 from ipax import Options, Status, solve
 from ipax.problem.finitediff import gradient_fd, jacobian_fd
 from tests._helpers import array, assert_allclose
@@ -126,6 +127,59 @@ def test_exact_sparse_route_matches_exact_dense(bridge_namespace, name):
     assert dense.status is Status.OPTIMAL
     assert sparse.status is Status.OPTIMAL
     assert_allclose(xp, sparse.x, dense.x, rtol=1e-5, atol=1e-5)
+
+
+def test_documented_expected_outcome_is_attached(bridge_namespace):
+    # The loader threads the dataset's documented outcome onto the built problem.
+    xp = bridge_namespace
+    backend = xp.__name__.split(".")[-1]
+    (hs71,) = s2mpj.s2mpj_problems(("HS71",), backends=(backend,))
+    problem, _ = hs71.build(xp)
+    assert abs(problem.expected_objective - 17.0140173) <= 1e-7
+    assert problem.expected_infeasible is False
+    assert problem.pbclass and problem.pbclass.startswith("C-")
+
+    if "BURKEHAN" in s2mpj.list_s2mpj_problems():
+        (burke,) = s2mpj.s2mpj_problems(("BURKEHAN",), backends=(backend,))
+        bproblem, _ = burke.build(xp)
+        assert bproblem.expected_infeasible is True
+
+
+def test_expected_infeasible_problem_scores_correct(bridge_namespace):
+    # BURKEHAN is documented infeasible — detecting infeasibility is the correct
+    # outcome, so the harness must score it correct (not flag it as a failure).
+    xp = bridge_namespace
+    backend = xp.__name__.split(".")[-1]
+    if "BURKEHAN" not in s2mpj.list_s2mpj_problems():
+        pytest.skip("BURKEHAN not in this S2MPJ checkout")
+    (case,) = s2mpj.s2mpj_problems(("BURKEHAN",), backends=(backend,))
+    result = run_case(
+        case,
+        config="lbfgs/dense",
+        options=Options(hessian="lbfgs", linsolve="dense"),
+        xp=xp,
+        backend=backend,
+    )
+    assert result.status == "infeasible"
+    assert result.expected_infeasible is True
+    assert result.correct is True
+
+
+def test_objective_free_problem_runs_as_feasibility(bridge_namespace):
+    xp = bridge_namespace
+    backend = xp.__name__.split(".")[-1]
+    if "ARGLALE" not in s2mpj.list_s2mpj_problems():
+        pytest.skip("ARGLALE not in this S2MPJ checkout")
+    # Default: still rejected at build.
+    (skipped,) = s2mpj.s2mpj_problems(("ARGLALE",), backends=(backend,))
+    with pytest.raises(NotImplementedError, match="no objective"):
+        skipped.build(xp)
+    # With feasibility=True it builds and solves (min 0 s.t. the constraints).
+    (case,) = s2mpj.s2mpj_problems(("ARGLALE",), backends=(backend,), feasibility=True)
+    problem, x0 = case.build(xp)
+    assert float(problem.objective(x0)) == 0.0
+    result = solve(problem, x0, options=Options(hessian="lbfgs", linsolve="dense"))
+    assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE, Status.INFEASIBLE)
 
 
 def test_sized_instantiation_scales_and_falls_back(bridge_namespace):

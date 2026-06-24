@@ -10,7 +10,11 @@ import numpy as np
 import pytest
 
 import ipax.testing.backends as backends
-from benchmarks.corpus.s2mpj import _S2MPJExactProblem, _S2MPJProblem
+from benchmarks.corpus.s2mpj import (
+    _problem_metadata,
+    _S2MPJExactProblem,
+    _S2MPJProblem,
+)
 from ipax.problem.base import Problem
 from tests._helpers import array, assert_allclose
 
@@ -92,6 +96,60 @@ def _dense_hessian(problem, xp, x, y_eq, y_ineq, sigma=1.0):
         cols = [op.matvec(array(xp, e)) for e in ([1.0, 0.0], [0.0, 1.0])]
         return xp.stack(cols, axis=1)
     return op
+
+
+class _NoObjectiveInstance:
+    """Fake S2MPJ feasibility problem: constraints but no objective group."""
+
+    n = 2
+    m = 1
+    objgrps = ()  # no objective ⇒ feasibility / nonlinear-equation system
+    x0 = np.array([[0.5], [0.5]])
+    xlower = np.array([[-np.inf], [-np.inf]])
+    xupper = np.array([[np.inf], [np.inf]])
+    clower = np.array([[0.0]])
+    cupper = np.array([[0.0]])
+
+
+def _write_problem_file(tmp_path, name, body):
+    pdir = tmp_path / "python_problems"
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / f"{name}.py").write_text(body, encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_problem_metadata_parses_pbclass_soltn_and_infeasible(tmp_path):
+    root = _write_problem_file(
+        tmp_path,
+        "FAKEINF",
+        "# Source: an infeasible problem\n"
+        "#    Solution (infeasible)\n"
+        "# LO SOLTN               1.5D+01\n"
+        '    self.pbclass   = "C-CQOR2-AN-1-1"\n',
+    )
+    pbclass, expected_objective, expected_infeasible = _problem_metadata(
+        root, "FAKEINF"
+    )
+    assert pbclass == "C-CQOR2-AN-1-1"
+    assert expected_objective == 15.0  # Fortran 'D' exponent decoded
+    assert expected_infeasible is True
+
+
+def test_problem_metadata_defaults_when_absent(tmp_path):
+    root = _write_problem_file(tmp_path, "BARE", "    self.n = 3\n")
+    assert _problem_metadata(root, "BARE") == (None, None, False)
+
+
+def test_feasibility_mode_admits_objective_free_problem():
+    xp = backends.import_namespace("numpy")
+    # Without feasibility=True the objective-free problem is rejected.
+    with pytest.raises(NotImplementedError, match="no objective"):
+        _S2MPJProblem(_NoObjectiveInstance(), xp)
+    # With it, the problem minimizes a constant 0 with a zero gradient.
+    problem = _S2MPJProblem(_NoObjectiveInstance(), xp, feasibility=True)
+    x = array(xp, [0.3, 0.7])
+    assert float(problem.objective(x)) == 0.0
+    assert_allclose(xp, problem.gradient(x), array(xp, [0.0, 0.0]))
 
 
 def test_base_adapter_does_not_advertise_an_analytic_hessian():

@@ -40,6 +40,7 @@ from __future__ import annotations
 import functools
 import importlib
 import os
+import re
 import sys
 from typing import TYPE_CHECKING, Any
 
@@ -86,15 +87,34 @@ class _S2MPJProblem(Problem):
     Lagrangian Hessian, so the solver uses its default L-BFGS.
     """
 
-    def __init__(self, instance: Any, xp: Namespace, *, sparse: bool = False) -> None:
+    def __init__(
+        self,
+        instance: Any,
+        xp: Namespace,
+        *,
+        sparse: bool = False,
+        feasibility: bool = False,
+    ) -> None:
         import numpy as np
 
         self._sparse = sparse
+        # Dataset-sourced expected outcome (set by the loader from the source file):
+        # the documented ``LO SOLTN`` objective, the ``infeasible`` marker, and the
+        # CUTEst classification. Defaults here so a directly-constructed instance is
+        # still valid; the loader overwrites them.
+        self.expected_objective: float | None = None
+        self.expected_infeasible: bool = False
+        self.pbclass: str | None = None
 
-        # Reject feasibility/least-squares problems with no objective group: they
-        # are not minimization problems and cannot be benchmarked as such (S2MPJ's
-        # ``fx`` would error). ``H`` is the optional explicit quadratic objective.
-        if len(getattr(instance, "objgrps", ())) == 0 and not hasattr(instance, "H"):
+        # A problem with no objective group is a *feasibility* / nonlinear-equations
+        # system, not a minimization problem (S2MPJ's ``fx`` would error). By default
+        # we reject it; with ``feasibility=True`` we run it as ``min 0`` s.t. the
+        # constraints, turning the IPM into a feasibility finder. ``H`` is the
+        # optional explicit quadratic objective.
+        self._no_objective = len(getattr(instance, "objgrps", ())) == 0 and not hasattr(
+            instance, "H"
+        )
+        if self._no_objective and not feasibility:
             raise NotImplementedError("S2MPJ problem has no objective function")
 
         self._inst = instance
@@ -147,6 +167,8 @@ class _S2MPJProblem(Problem):
     def objective(self, x: Array) -> Scalar:
         import numpy as np
 
+        if self._no_objective:  # feasibility problem: minimize a constant 0
+            return _from_numpy(self.xp, np.asarray(0.0))
         # S2MPJ's auto-generated evaluations use Python ``float**`` and can raise
         # OverflowError on the wild trial points a line search probes (e.g.
         # LUKVLE4C's ``100*GVAR**6``). Return +inf so the solver simply rejects
@@ -162,6 +184,8 @@ class _S2MPJProblem(Problem):
     def gradient(self, x: Array) -> Array:
         import numpy as np
 
+        if self._no_objective:  # constant objective ⇒ zero gradient
+            return _from_numpy(self.xp, np.zeros((self._n,)))
         try:
             _f, g = self._inst.fgx(_to_numpy(x))
             g = np.reshape(g, (-1,))
@@ -337,6 +361,45 @@ def list_s2mpj_problems(directory: str | None = None) -> list[str]:
     return names
 
 
+@functools.lru_cache(maxsize=2048)
+def _problem_metadata(root: str, name: str) -> tuple[str | None, float | None, bool]:
+    """Parse ``(pbclass, expected_objective, expected_infeasible)`` from the source.
+
+    These come from the dataset itself, not our own judgement: ``self.pbclass`` is
+    the CUTEst classification; ``# LO SOLTN <value>`` is the SIF author's documented
+    solution objective (present on ~72% of the corpus); and an explicit
+    ``Solution (infeasible)`` / ``Source: an infeasible problem`` comment marks the
+    deliberately-infeasible problems (e.g. BURKEHAN). Missing fields → ``None`` /
+    ``False``.
+    """
+    path = os.path.join(root, "python_problems", name + ".py")
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None, None, False
+
+    pbclass = None
+    match = re.search(r'self\.pbclass\s*=\s*"([^"]+)"', text)
+    if match:
+        pbclass = match.group(1)
+
+    expected_objective: float | None = None
+    match = re.search(r"(?im)^\s*#\s*LO\s+SOLTN\s+([-+0-9.eEdD]+)", text)
+    if match:
+        try:  # SIF may use Fortran 'D' exponents
+            expected_objective = float(
+                match.group(1).replace("D", "E").replace("d", "e")
+            )
+        except ValueError:
+            expected_objective = None
+
+    infeasible = bool(
+        re.search(r"(?i)solution\s*\(\s*infeasible\s*\)", text)
+        or re.search(r"(?i)source:\s*an?\s+infeasible", text)
+    )
+    return pbclass, expected_objective, infeasible
+
+
 def _ensure_on_path(root: str) -> None:
     problems = os.path.join(root, "python_problems")
     for entry in (root, problems):
@@ -378,6 +441,7 @@ def s2mpj_problems(
     hessian: str = "lbfgs",
     sparse: bool = False,
     size: int | None = None,
+    feasibility: bool = False,
 ) -> list[BenchmarkProblem]:
     """Return :class:`BenchmarkProblem`s for the named S2MPJ problems.
 
@@ -389,6 +453,11 @@ def s2mpj_problems(
     the sparse-direct route. ``size`` requests a target variable count for the
     scalable problems (others keep their SIF default) — the lever for a
     scaling-focused sweep that reaches the sparse route's intended regime.
+    ``feasibility=True`` admits the objective-free problems (CUTEst feasibility /
+    nonlinear-equation systems), running them as ``min 0`` subject to the
+    constraints instead of rejecting them. Each built problem carries the
+    dataset's expected outcome (``expected_objective``/``expected_infeasible``/
+    ``pbclass``) for authoritative scoring.
     """
     from benchmarks.corpus import BenchmarkProblem
 
@@ -404,7 +473,13 @@ def s2mpj_problems(
             import numpy as np
 
             instance = _instantiate(root, name, size)
-            problem = cls(instance, xp, sparse=sparse)
+            problem = cls(instance, xp, sparse=sparse, feasibility=feasibility)
+            pbclass, expected_objective, expected_infeasible = _problem_metadata(
+                root, name
+            )
+            problem.pbclass = pbclass
+            problem.expected_objective = expected_objective
+            problem.expected_infeasible = expected_infeasible
             x0 = _from_numpy(xp, np.reshape(instance.x0, (-1,)))
             return problem, x0
 
