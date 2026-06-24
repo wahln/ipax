@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- Documentation: a published **S2MPJ / CUTEst benchmark** page
+  (`docs/benchmarks/s2mpj.md`) recording the latest full-corpus run — system
+  information, per-configuration metrics for the `{lbfgs, exact} × {dense, krylov,
+  sparse}` matrix, the optimization-vs-feasibility split, and the dataset-sourced
+  scoring methodology.
 - The per-iteration log table reprints its column header every
   `HEADER_REPEAT_INTERVAL` (10) rows so it stays readable on long runs, and marks
   any iterate that already satisfies every enabled acceptable-stopping criterion
