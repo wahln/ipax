@@ -280,6 +280,12 @@ def main(argv: list[str] | None = None) -> int:
         help="comma-separated problem names to skip (e.g. a problem that natively "
         "crashes a backend); combine with --resume to step past it",
     )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="comma-separated config labels to run (e.g. 'exact/sparse'); default "
+        "runs the whole matrix. Use it to run one configuration per process.",
+    )
     args = parser.parse_args(argv)
 
     root = s2mpj_dir(args.dir)
@@ -301,6 +307,11 @@ def main(argv: list[str] | None = None) -> int:
         krylov_max_vars=args.krylov_max_vars,
         sparse_max_vars=args.sparse_max_vars,
     )
+    if args.config:
+        wanted = {c.strip() for c in args.config.split(",") if c.strip()}
+        configs = [spec for spec in configs if spec[0] in wanted]
+        if not configs:
+            parser.error(f"--config {args.config!r} matched no known config labels")
     environment = capture_environment()
 
     # Each config may need a differently-built problem (exact vs L-BFGS Hessian,
@@ -313,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     json_path = out.with_suffix(".json")
     md_path = out.with_suffix(".md")
+    inflight_path = out.with_suffix(".inflight")
 
     results: list[CaseResult] = []
     if args.resume and json_path.exists():
@@ -358,55 +370,63 @@ def main(argv: list[str] | None = None) -> int:
             bare = case_name.split("/", 1)[-1]
             if (backend, bare) in done or bare in exclude:
                 continue
-            # Optional build guard: abandon a problem whose sized build is too slow
-            # (pure-Python O(n²) construction) before it stalls an unattended sweep.
-            if args.max_build_seconds > 0 and not _build_within(
-                root, bare, size, args.max_build_seconds
-            ):
-                skipped_slow_build += 1
-                continue
-            # One guarded build to gate applicability/size before running configs:
-            # objective-free problems are not minimization problems, and the size
-            # cap keeps the full sweep tractable. Genuine build errors fall through
-            # to run_case so their traceback is recorded as a row.
+            # Record the in-flight problem so a wrapper can identify (and then
+            # --exclude) a problem that natively crashes the process. The file is
+            # cleared in ``finally`` once the problem is fully handled, so it only
+            # survives a hard crash — naming exactly the culprit.
+            inflight_path.write_text(f"{backend} {bare}")
             try:
-                problem, _x0 = gate_case.build(xp)
-            except NotImplementedError:
-                skipped_no_objective += 1
-                continue
-            except Exception:
-                results.append(
-                    run_case(
-                        gate_case,
-                        config=configs[0][0],
-                        options=configs[0][1],
-                        xp=xp,
-                        backend=backend,
+                # Optional build guard: abandon a problem whose sized build is too
+                # slow (pure-Python O(n²)) before it stalls an unattended sweep.
+                if args.max_build_seconds > 0 and not _build_within(
+                    root, bare, size, args.max_build_seconds
+                ):
+                    skipped_slow_build += 1
+                    continue
+                # One guarded build to gate applicability/size before the configs:
+                # objective-free problems are not minimization problems, and the
+                # size cap keeps the full sweep tractable. Genuine build errors fall
+                # through to run_case so their traceback is recorded as a row.
+                try:
+                    problem, _x0 = gate_case.build(xp)
+                except NotImplementedError:
+                    skipped_no_objective += 1
+                    continue
+                except Exception:
+                    results.append(
+                        run_case(
+                            gate_case,
+                            config=configs[0][0],
+                            options=configs[0][1],
+                            xp=xp,
+                            backend=backend,
+                        )
                     )
-                )
+                    done.add((backend, bare))
+                    _flush()
+                    continue
+                # Run each config only when the problem fits that route's variable
+                # cap (tightened by --max-vars). A problem too large for every route
+                # is counted oversized and contributes no rows.
+                n_vars = int(problem.n_vars)
+                ran_any = False
+                for label, options, route_cap in configs:
+                    cap = _effective_cap(route_cap, args.max_vars)
+                    if cap and n_vars > cap:
+                        continue
+                    case = cases_by_mode[_problem_mode(options)][case_name]
+                    results.append(
+                        run_case(
+                            case, config=label, options=options, xp=xp, backend=backend
+                        )
+                    )
+                    ran_any = True
+                if not ran_any:
+                    skipped_too_large += 1
                 done.add((backend, bare))
                 _flush()
-                continue
-            # Run each config only when the problem fits that route's variable cap
-            # (tightened by the global --max-vars ceiling). A problem too large for
-            # every route is counted oversized and contributes no rows.
-            n_vars = int(problem.n_vars)
-            ran_any = False
-            for label, options, route_cap in configs:
-                cap = _effective_cap(route_cap, args.max_vars)
-                if cap and n_vars > cap:
-                    continue
-                case = cases_by_mode[_problem_mode(options)][case_name]
-                results.append(
-                    run_case(
-                        case, config=label, options=options, xp=xp, backend=backend
-                    )
-                )
-                ran_any = True
-            if not ran_any:
-                skipped_too_large += 1
-            done.add((backend, bare))
-            _flush()
+            finally:
+                inflight_path.unlink(missing_ok=True)
 
     _flush()
     by_status: Counter[str] = Counter(r.status for r in results)
