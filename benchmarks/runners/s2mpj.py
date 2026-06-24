@@ -267,6 +267,19 @@ def main(argv: list[str] | None = None) -> int:
         default="gradient-based",
         help="problem scaling: 'gradient-based' (default, matches solver) or 'none'",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="keep rows from an existing --out report and skip problems already in "
+        "it — so a sweep that died (e.g. a native crash in a backend) continues "
+        "instead of starting over",
+    )
+    parser.add_argument(
+        "--exclude",
+        default=None,
+        help="comma-separated problem names to skip (e.g. a problem that natively "
+        "crashes a backend); combine with --resume to step past it",
+    )
     args = parser.parse_args(argv)
 
     root = s2mpj_dir(args.dir)
@@ -296,7 +309,29 @@ def main(argv: list[str] | None = None) -> int:
     gate_mode = ("lbfgs", False)
     modes = {_problem_mode(options) for _, options, _ in configs} | {gate_mode}
 
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    json_path = out.with_suffix(".json")
+    md_path = out.with_suffix(".md")
+
     results: list[CaseResult] = []
+    if args.resume and json_path.exists():
+        prior = json.loads(json_path.read_text())
+        environment = prior.get("environment", environment)
+        results = [CaseResult(**row) for row in prior.get("results", [])]
+        print(f"resuming from {json_path}: {len(results)} rows kept")
+    # ``done`` is keyed by (backend, name) so a multi-backend resume re-runs the
+    # problem on backends it has not yet covered.
+    done = {(r.backend, r.problem.split("/", 1)[-1]) for r in results}
+    exclude = {n.strip() for n in (args.exclude or "").split(",") if n.strip()}
+
+    def _flush() -> None:
+        # Persist after every problem: an unattended sweep over this corpus can hit
+        # a native crash (e.g. a backend factorization on an overflowed model), and
+        # the report must survive it rather than losing the whole run.
+        json_path.write_text(json.dumps(to_payload(results, environment), indent=2))
+        md_path.write_text(format_markdown(results, environment), encoding="utf-8")
+
     skipped_no_objective = 0
     skipped_too_large = 0
     skipped_slow_build = 0
@@ -320,10 +355,13 @@ def main(argv: list[str] | None = None) -> int:
             for mode in modes
         }
         for case_name, gate_case in cases_by_mode[gate_mode].items():
+            bare = case_name.split("/", 1)[-1]
+            if (backend, bare) in done or bare in exclude:
+                continue
             # Optional build guard: abandon a problem whose sized build is too slow
             # (pure-Python O(n²) construction) before it stalls an unattended sweep.
             if args.max_build_seconds > 0 and not _build_within(
-                root, case_name.split("/", 1)[-1], size, args.max_build_seconds
+                root, bare, size, args.max_build_seconds
             ):
                 skipped_slow_build += 1
                 continue
@@ -346,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
                         backend=backend,
                     )
                 )
+                done.add((backend, bare))
+                _flush()
                 continue
             # Run each config only when the problem fits that route's variable cap
             # (tightened by the global --max-vars ceiling). A problem too large for
@@ -365,23 +405,17 @@ def main(argv: list[str] | None = None) -> int:
                 ran_any = True
             if not ran_any:
                 skipped_too_large += 1
+            done.add((backend, bare))
+            _flush()
 
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.with_suffix(".json").write_text(
-        json.dumps(to_payload(results, environment), indent=2)
-    )
-    out.with_suffix(".md").write_text(
-        format_markdown(results, environment), encoding="utf-8"
-    )
-
+    _flush()
     by_status: Counter[str] = Counter(r.status for r in results)
     n_correct = sum(1 for r in results if r.correct)
     print(
         f"S2MPJ sweep: {n_correct}/{len(results)} correct "
         f"(skipped {skipped_no_objective} objective-free, {skipped_too_large} oversized,"
         f" {skipped_slow_build} slow-build)"
-        f" -> {out.with_suffix('.json')}, {out.with_suffix('.md')}"
+        f" -> {json_path}, {md_path}"
     )
     for status, count in sorted(by_status.items()):
         print(f"  {status:16s} {count}")
