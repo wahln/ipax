@@ -23,6 +23,7 @@ benchmarks.
 
 from __future__ import annotations
 
+import math
 import random
 from typing import TYPE_CHECKING, Any
 
@@ -458,6 +459,254 @@ class HS43(Problem):
         return _array(self.xp, [0.0, 1.0, 2.0, -1.0])
 
 
+class HS21(Problem):
+    """HS21: bound-constrained QP with one (inactive) linear inequality.
+
+    ``min 0.01 x1² + x2² - 100`` s.t. ``10 x1 - x2 ≥ 10``, ``2 ≤ x1 ≤ 50``,
+    ``-50 ≤ x2 ≤ 50``. Optimum ``(2, 0)`` — the lower bound on ``x1`` is active
+    while the inequality stays slack — ``f* = -99.96``. Exercises an active bound
+    multiplier (``z_L``) alongside a two-sided ``linear_ineq`` block.
+    """
+
+    def __init__(self, xp: Namespace) -> None:
+        self.xp = xp
+
+    @property
+    def n_vars(self) -> int:
+        return 2
+
+    def bounds(self) -> tuple[Array, Array]:
+        return _array(self.xp, [2.0, -50.0]), _array(self.xp, [50.0, 50.0])
+
+    def objective(self, x: Array) -> Scalar:
+        return 0.01 * x[0] * x[0] + x[1] * x[1] - 100.0
+
+    def gradient(self, x: Array) -> Array:
+        return self.xp.stack((0.02 * x[0], 2.0 * x[1]))
+
+    def linear_ineq(self) -> tuple[Array, Array, Array]:
+        # 10 x1 - x2 ≥ 10  ⇒  l ≤ A x ≤ u with l = 10, u = +∞.
+        xp = self.xp
+        a = _array(xp, [[10.0, -1.0]])
+        return a, _array(xp, [10.0]), _array(xp, [float("inf")])
+
+    def lagrangian_hessian(
+        self, x: Array, y_eq: Array, y_ineq: Array, sigma: Scalar = 1.0
+    ) -> Array:
+        del y_eq, y_ineq  # objective Hessian is constant; constraint is linear
+        xp = self.xp
+        zero = xp.zeros_like(x[0])
+        return _mat(xp, ((0.02 * sigma + zero, zero), (zero, 2.0 * sigma + zero)))
+
+    def known_solution(self) -> Array:
+        return _array(self.xp, [2.0, 0.0])
+
+    def known_bound_multipliers(self) -> tuple[Array, Array]:
+        # ∇f(x*) = (0.04, 0); only the lower bound on x1 is active.
+        return _array(self.xp, [0.04, 0.0]), _array(self.xp, [0.0, 0.0])
+
+
+class HS28(Problem):
+    """HS28: convex equality-constrained QP in three variables.
+
+    ``min (x1+x2)² + (x2+x3)²`` s.t. ``x1 + 2x2 + 3x3 = 1``. Optimum
+    ``(0.5, -0.5, 0.5)``, ``f* = 0``. The objective gradient vanishes at the
+    optimum, so the equality multiplier is ``0`` — a useful degenerate-dual case.
+    """
+
+    def __init__(self, xp: Namespace) -> None:
+        self.xp = xp
+
+    @property
+    def n_vars(self) -> int:
+        return 3
+
+    def objective(self, x: Array) -> Scalar:
+        a = x[0] + x[1]
+        b = x[1] + x[2]
+        return a * a + b * b
+
+    def gradient(self, x: Array) -> Array:
+        xp = self.xp
+        a = x[0] + x[1]
+        b = x[1] + x[2]
+        return xp.stack((2.0 * a, 2.0 * a + 2.0 * b, 2.0 * b))
+
+    def linear_eq(self) -> tuple[Array, Array]:
+        xp = self.xp
+        return _array(xp, [[1.0, 2.0, 3.0]]), _array(xp, [1.0])
+
+    def lagrangian_hessian(
+        self, x: Array, y_eq: Array, y_ineq: Array, sigma: Scalar = 1.0
+    ) -> Array:
+        del x, y_eq, y_ineq  # constant ∇²f; constraint is linear
+        xp = self.xp
+        return sigma * _array(xp, [[2.0, 2.0, 0.0], [2.0, 4.0, 2.0], [0.0, 2.0, 2.0]])
+
+    def known_solution(self) -> Array:
+        return _array(self.xp, [0.5, -0.5, 0.5])
+
+    def known_multiplier(self) -> Array:
+        return _array(self.xp, [0.0])
+
+
+class HS9(Problem):
+    """HS9: equality-constrained problem with a non-unique (periodic) optimum.
+
+    ``min sin(π x1 / 12) · cos(π x2 / 16)`` s.t. ``4 x1 - 3 x2 = 0``. The
+    optimum is non-unique — every ``(12k-3, 16k-4)`` attains ``f* = -0.5`` — so
+    callers assert ``f*`` and the KKT conditions rather than a specific ``x*``.
+    Exercises a trigonometric (non-quadratic) objective with a dense Hessian.
+    """
+
+    _A = math.pi / 12.0
+    _B = math.pi / 16.0
+
+    def __init__(self, xp: Namespace) -> None:
+        self.xp = xp
+
+    @property
+    def n_vars(self) -> int:
+        return 2
+
+    def objective(self, x: Array) -> Scalar:
+        xp = self.xp
+        return xp.sin(self._A * x[0]) * xp.cos(self._B * x[1])
+
+    def gradient(self, x: Array) -> Array:
+        xp = self.xp
+        a, b = self._A, self._B
+        return xp.stack(
+            (
+                a * xp.cos(a * x[0]) * xp.cos(b * x[1]),
+                -b * xp.sin(a * x[0]) * xp.sin(b * x[1]),
+            )
+        )
+
+    def linear_eq(self) -> tuple[Array, Array]:
+        xp = self.xp
+        return _array(xp, [[4.0, -3.0]]), _array(xp, [0.0])
+
+    def lagrangian_hessian(
+        self, x: Array, y_eq: Array, y_ineq: Array, sigma: Scalar = 1.0
+    ) -> Array:
+        del y_eq, y_ineq  # constraint is linear ⇒ no constraint-Hessian term
+        xp = self.xp
+        a, b = self._A, self._B
+        s0, c0 = xp.sin(a * x[0]), xp.cos(a * x[0])
+        s1, c1 = xp.sin(b * x[1]), xp.cos(b * x[1])
+        h00 = sigma * (-a * a * s0 * c1)
+        h01 = sigma * (-a * b * c0 * s1)
+        h11 = sigma * (-b * b * s0 * c1)
+        return _mat(xp, ((h00, h01), (h01, h11)))
+
+
+class HS71(Problem):
+    """HS71: the canonical IPOPT test NLP — equality, inequality, and bounds.
+
+    ``min x1 x4 (x1+x2+x3) + x3`` s.t. ``x1 x2 x3 x4 ≥ 25``,
+    ``x1²+x2²+x3²+x4² = 40``, ``1 ≤ xi ≤ 5``. Optimum
+    ``(1, 4.743…, 3.821…, 1.379…)`` with the lower bound on ``x1`` active,
+    ``f* ≈ 17.014``. Exercises every constraint class at once with a fully
+    nonlinear objective, equality, and inequality.
+    """
+
+    def __init__(self, xp: Namespace) -> None:
+        self.xp = xp
+
+    @property
+    def n_vars(self) -> int:
+        return 4
+
+    def bounds(self) -> tuple[Array, Array]:
+        return _array(self.xp, [1.0] * 4), _array(self.xp, [5.0] * 4)
+
+    def objective(self, x: Array) -> Scalar:
+        return x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2]
+
+    def gradient(self, x: Array) -> Array:
+        xp = self.xp
+        s = x[0] + x[1] + x[2]
+        one = 1.0 + xp.zeros_like(x[0])
+        return xp.stack(
+            (
+                x[3] * (s + x[0]),
+                x[0] * x[3],
+                x[0] * x[3] + one,
+                x[0] * s,
+            )
+        )
+
+    def eq_constraints(self, x: Array) -> Array:
+        return self.xp.stack(
+            (x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3] - 40.0,)
+        )
+
+    def eq_jacobian(self, x: Array) -> Array:
+        xp = self.xp
+        return _mat(xp, ((2.0 * x[0], 2.0 * x[1], 2.0 * x[2], 2.0 * x[3]),))
+
+    def ineq_constraints(self, x: Array) -> Array:
+        # x1 x2 x3 x4 ≥ 25  ⇒  g = 25 - x1 x2 x3 x4 ≤ 0.
+        return self.xp.stack((25.0 - x[0] * x[1] * x[2] * x[3],))
+
+    def ineq_jacobian(self, x: Array) -> Array:
+        xp = self.xp
+        return _mat(
+            xp,
+            (
+                (
+                    -x[1] * x[2] * x[3],
+                    -x[0] * x[2] * x[3],
+                    -x[0] * x[1] * x[3],
+                    -x[0] * x[1] * x[2],
+                ),
+            ),
+        )
+
+    def lagrangian_hessian(
+        self, x: Array, y_eq: Array, y_ineq: Array, sigma: Scalar = 1.0
+    ) -> Array:
+        xp = self.xp
+        ye, yi = y_eq[0], y_ineq[0]
+        zero = xp.zeros_like(x[0])
+        # ∇²f (only the listed entries are nonzero).
+        f00 = 2.0 * x[3]
+        f01 = x[3]
+        f02 = x[3]
+        f03 = 2.0 * x[0] + x[1] + x[2]
+        f13 = x[0]
+        f23 = x[0]
+        # ∇²g = -∂²(x1 x2 x3 x4): off-diagonal products of the other two vars.
+        g01 = -x[2] * x[3]
+        g02 = -x[1] * x[3]
+        g03 = -x[1] * x[2]
+        g12 = -x[0] * x[3]
+        g13 = -x[0] * x[2]
+        g23 = -x[0] * x[1]
+        # ∇²c = 2·I (equality is a sphere); contributes only on the diagonal.
+        diag = 2.0 * ye + zero
+        h00 = sigma * f00 + diag
+        h01 = sigma * f01 + yi * g01
+        h02 = sigma * f02 + yi * g02
+        h03 = sigma * f03 + yi * g03
+        h12 = yi * g12
+        h13 = sigma * f13 + yi * g13
+        h23 = sigma * f23 + yi * g23
+        return _mat(
+            xp,
+            (
+                (h00, h01, h02, h03),
+                (h01, diag, h12, h13),
+                (h02, h12, diag, h23),
+                (h03, h13, h23, diag),
+            ),
+        )
+
+    def known_solution(self) -> Array:
+        return _array(self.xp, [1.0, 4.74299963, 3.82114998, 1.37940829])
+
+
 class InfeasibleEqualities(Problem):
     """Inconsistent equalities ``x = 0`` and ``x = 1`` (no feasible point)."""
 
@@ -664,8 +913,12 @@ __all__ = [
     "HS6",
     "HS7",
     "HS8",
+    "HS9",
+    "HS21",
+    "HS28",
     "HS35",
     "HS43",
+    "HS71",
     "BoundConstrainedQP",
     "EqualityConstrainedQP",
     "InfeasibleEqualities",

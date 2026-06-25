@@ -36,6 +36,27 @@ def test_filter_augment_removes_entries_dominated_by_new_pair():
     assert (0.5, 8.0) in filt.entries
 
 
+def test_switching_condition_survives_overflowing_directional_derivative():
+    # Regression (INDEF): a badly-scaled iterate yields an enormous |dphi|; the
+    # switching condition's ``(-dphi) ** s_phi`` must not raise OverflowError.
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=1.0,
+        phi0=1.0,
+        dphi=-1e308,  # would overflow float ** s_phi before the fix
+        eval_point=lambda alpha: (0.5, 0.5),
+        entries=[],
+        soc=None,
+    )
+
+    # No crash; the f-type Armijo test cannot be met for such a step, so the
+    # search exhausts α and hands off to restoration.
+    assert result.restoration
+    assert not result.accepted
+
+
 def test_line_search_reports_accepted_soc_trial():
     line_search = FilterLineSearch(LineSearchOptions())
 

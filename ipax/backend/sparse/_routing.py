@@ -131,10 +131,13 @@ class DeviceRoutingSparseAdapter:
         values: Array,
         *,
         shape: tuple[int, int],
+        symmetric: bool | None = None,
     ) -> Any:
         """Build a ``SparseOperator`` via the device-appropriate adapter."""
         self._delegate = self._resolve(values)
-        return self._delegate.from_coo(rows, cols, values, shape=shape)
+        return self._delegate.from_coo(
+            rows, cols, values, shape=shape, symmetric=symmetric
+        )
 
     def solver(self, *, require_inertia: bool = False) -> Any:
         """Return the resolved backend's sparse-direct solver."""

@@ -39,6 +39,7 @@ _MAX_ITER = 80
 _LM_INIT = 1e-8  # Levenberg–Marquardt damping seed
 _LM_GROW = 10.0
 _LM_SHRINK = 0.1
+_LM_MAX = 1e16  # ceiling on the damping before declaring no further progress
 _GRAD_TOL = 1e-10  # stationarity test for the infeasibility objective
 _SLACK_FLOOR = 1e-12
 
@@ -129,7 +130,26 @@ def restore(
             s_out = recover_slack(g)
             return x, s_out, True
 
-        dx = xp.linalg.solve(hessian + lam * identity, -grad)
+        # Damped Gauss-Newton step. A rank-deficient or extreme-scale normal
+        # matrix (e.g. the (1+x1²)² Jacobian of HS7 reaching ~1e201 at a bad
+        # iterate) can make the backend's solve raise or return a non-finite
+        # step; both are a failed LM step ⇒ grow λ and retry, exactly as a
+        # rejected step. The exception type is backend-specific (numpy
+        # ``LinAlgError``, torch ``_LinAlgError``, …) and cannot be named without
+        # importing a concrete library (invariant #1), so it is caught broadly.
+        try:
+            dx = xp.linalg.solve(hessian + lam * identity, -grad)
+            step_ok = bool(xp.all(xp.isfinite(dx)))
+        except MemoryError:  # a genuine resource failure must propagate, not retry
+            raise
+        except Exception:  # backend-specific singular-solve error (see comment)
+            step_ok = False
+        if not step_ok:
+            lam = lam * _LM_GROW
+            if lam > _LM_MAX:
+                break
+            continue
+
         x_trial = project(x + dx)
         f_trial, _, _, _ = infeasibility(x_trial)
         if f_trial < f:
@@ -137,6 +157,8 @@ def restore(
             lam = max(_LM_INIT, lam * _LM_SHRINK)
         else:
             lam = lam * _LM_GROW
+            if lam > _LM_MAX:
+                break
 
     _, c, g, _ = infeasibility(x)
     s_out = recover_slack(g)

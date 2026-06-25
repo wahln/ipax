@@ -107,6 +107,49 @@ def test_restoration_keeps_projected_bound_point_strictly_interior(namespace):
     assert bool(x_new[0] > 0.0)
 
 
+def test_restoration_survives_singular_gauss_newton_system(namespace):
+    # Regression: an extreme-scale constraint Jacobian makes the Gauss-Newton
+    # normal matrix J^T J numerically singular (cf. HS7, whose (1+x1^2)^2
+    # Jacobian reaches ~1e201 at a bad restoration iterate). The damped solve
+    # must degrade gracefully — previously numpy's solve raised
+    # ``LinAlgError: Singular matrix`` and crashed the whole solve.
+    xp = namespace
+    x = array(xp, [1.0, 1.0])
+    s = xp.zeros((0,), dtype=x.dtype)
+    # Moderate residual but a hugely ill-scaled Jacobian at this iterate.
+    jac = array(xp, [[4.0e100, -1.9e27]])
+
+    def eq_fn(z):
+        del z
+        return array(xp, [1.0])
+
+    def eq_jac_fn(z):
+        del z
+        return as_operator(jac)
+
+    x_new, _, infeasible = restore(
+        xp=xp,
+        x=x,
+        s=s,
+        m=0,
+        m_eq=1,
+        eq_fn=eq_fn,
+        eq_jac_fn=eq_jac_fn,
+        ineq_fn=_no_ineq,
+        ineq_jac_fn=_no_ineq,
+        mask_l=xp.zeros((2,), dtype=xp.bool),
+        mask_u=xp.zeros((2,), dtype=xp.bool),
+        lower_safe=xp.zeros((2,), dtype=x.dtype),
+        upper_safe=xp.zeros((2,), dtype=x.dtype),
+        tol=1e-8,
+    )
+
+    # It cannot reduce the (decoupled) violation, but it returns a finite point
+    # and reports infeasibility instead of raising.
+    assert infeasible
+    assert bool(xp.all(xp.isfinite(x_new)))
+
+
 def test_restoration_recovers_inequality_slack_without_filter_residual(namespace):
     class InactiveInequality(Problem):
         @property

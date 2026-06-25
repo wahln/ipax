@@ -177,10 +177,14 @@ Claude Code config lives in `.claude/` and is checked in:
 - **`/verify`** (`.claude/commands/verify.md`) — run `scripts/check.py` and summarize.
 - **`/tdd`** (`.claude/commands/tdd.md`) — drive a change through the mandated
   red→green→verify→regression loop, multi-backend and invariant-aware.
+- **`/release`** (`.claude/commands/release.md`) — drive the release workflow
+  (`rc/vX.Y.Z` branch → PR onto `main` → review loop → version/changelog bump → tag →
+  sync `develop`), stopping at each human/CI gate. Follows the **Releasing** section.
 
 The auditor's rubric is the static half of GPU performance work; the measured half is
-a future `benchmarks/runners/device_efficiency.py` (sync/kernel profiling on real
-hardware), deferred until GPU CI exists.
+`benchmarks/runners/device_efficiency.py` (host-sync counting + per-iteration timing
+on real hardware, kernel-launch counts best-effort via `nsys`). It is GPU-gated, so it
+is a no-op in CI until GPU CI exists; run it locally on a CUDA backend.
 
 ---
 
@@ -247,6 +251,40 @@ Minimal runnable examples live in `examples/`. Keep them short, feature-scoped,
 and runnable from the repository root with the local virtual environment. Examples
 may import a concrete backend such as NumPy at the application edge; the `ipax/`
 core must remain backend-agnostic.
+
+---
+
+## Releasing
+
+Releases follow a release-candidate PR onto `main`, then a tag. Conventions to know
+before starting:
+
+- **Version is single-sourced** in `ipax/__init__.py` (`__version__`); `pyproject.toml`
+  derives it via `[tool.hatch.version]`. Bump in **exactly that one place**.
+- **`CHANGELOG.md` follows Keep a Changelog** and is enforced by the `kacl-verify`
+  pre-commit/CI hook. Keep entries under `## [Unreleased]` as work lands.
+- **Tags are `vX.Y.Z`**; pushing a tag triggers `release.yml` (PyPI Trusted Publishing
+  + a GitHub release whose notes come from the tag annotation and the changelog).
+
+Steps:
+
+1. **Branch.** From an up-to-date `develop`, create `rc/vX.Y.Z`.
+2. **Open the PR.** Push the branch and open a PR with **base `main`, head `rc/vX.Y.Z`**.
+   **Do not bump the version yet** — review may change the contents.
+3. **Wait for CI + code review** (CI gates + Copilot/human review).
+4. **Address review.** Push fixes to `rc/vX.Y.Z`; repeat 3–4 until the PR is approved.
+   Avoid `git add -A` (it sweeps unrelated working-tree edits into the commit) — stage
+   the files you changed.
+5. **Release bump (only once approved).** Confirm `CHANGELOG.md` covers the release:
+   add `## [X.Y.Z] - YYYY-MM-DD` (move the `[Unreleased]` items into it) and update the
+   compare links at the bottom. Bump `ipax.__version__`. Run `python scripts/check.py`
+   and `pre-commit run kacl-verify --files CHANGELOG.md`. Push; let CI go green.
+6. **Merge** the PR into `main`.
+7. **Tag and sync.** Sync `main` (`git switch main && git pull --ff-only`), create the
+   annotated tag (`git tag -a vX.Y.Z main` with a short changelog-derived summary),
+   merge `main` back into `develop` (`--no-ff`), then push **both** `develop` and the
+   tag (`git push origin develop && git push origin vX.Y.Z`). The tag push runs
+   `release.yml` — confirm that workflow succeeds.
 
 ---
 

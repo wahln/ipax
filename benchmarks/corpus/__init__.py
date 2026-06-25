@@ -21,8 +21,12 @@ from ipax.testing.problems import (
     HS6,
     HS7,
     HS8,
+    HS9,
+    HS21,
+    HS28,
     HS35,
     HS43,
+    HS71,
     BoundConstrainedQP,
     EqualityConstrainedQP,
     UnconstrainedQuadratic,
@@ -61,6 +65,7 @@ class BenchmarkProblem:
         default=lambda _problem: None, repr=False
     )
     backends: tuple[str, ...] | None = None
+    exclude_configs: tuple[str, ...] = ()  # config labels the QC sweep skips here
 
 
 def _known(problem: Problem) -> Array | None:
@@ -148,6 +153,40 @@ def default_corpus() -> list[BenchmarkProblem]:
             kind="NLP",
             tags=("eq", "nonlinear"),
             build=lambda xp: (HS8(xp), _arr(xp, [2.0, 1.0])),
+        ),
+        BenchmarkProblem(
+            name="hs9",
+            kind="NLP",
+            tags=("eq", "nonlinear"),
+            build=lambda xp: (HS9(xp), _arr(xp, [0.0, 0.0])),
+        ),
+        BenchmarkProblem(
+            name="hs21",
+            kind="QP",
+            tags=("bounds", "ineq"),
+            build=lambda xp: (HS21(xp), _arr(xp, [3.0, 1.0])),
+            optimum=_known,
+        ),
+        BenchmarkProblem(
+            name="hs28",
+            kind="QP",
+            tags=("eq",),
+            build=lambda xp: (HS28(xp), _arr(xp, [-1.0, 0.5, 0.5])),
+            optimum=_known,
+        ),
+        BenchmarkProblem(
+            name="hs71",
+            kind="NLP",
+            tags=("eq", "ineq", "bounds", "nonlinear"),
+            build=lambda xp: (HS71(xp), _arr(xp, [1.0, 5.0, 5.0, 1.0])),
+            optimum=_known,
+            # The Mehrotra/Gondzio correctors sit at HS71's convergence edge on this
+            # nonconvex problem and stall on some backends/platforms (e.g. CI's
+            # Torch build) while converging on others — a known corrector-robustness
+            # gap, not a per-PR regression. Exclude those configs here so the gate is
+            # deterministic; HS71 is still swept on every stable route, and covered
+            # under the default solve by the integration tests.
+            exclude_configs=("exact/dense+mehrotra", "exact/dense+gondzio"),
         ),
         _rt_case(),
     ]

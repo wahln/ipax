@@ -25,6 +25,8 @@ nav:
       - Problem interface: concepts/problem.md
       - Linear-algebra layer: concepts/linalg.md
       - Algorithm: concepts/algorithm.md
+  - Benchmarks:
+      - S2MPJ / CUTEst: benchmarks/s2mpj.md
   - Architecture & invariants: architecture.md
   - API reference: reference.md
   - Contributing: contributing.md

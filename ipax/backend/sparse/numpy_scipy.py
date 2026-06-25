@@ -123,14 +123,44 @@ class SparseOperator(LinearOperator):
     """``LinearOperator`` backed by a ``scipy.sparse`` matrix.
 
     ``matvec``/``rmatvec`` accept and return arrays in the *original* namespace
-    ``xp`` (the matrix lives on the host as SciPy CSR), so the operator is a drop
-    in replacement for any other :class:`LinearOperator` in the IPM.
+    ``xp`` (the matrix lives on the host), so the operator is a drop-in
+    replacement for any other :class:`LinearOperator` in the IPM.
+
+    The assembled matrix is kept in its given (COO) form. The sparse-direct route
+    consumes the **CSC** form (:attr:`csc_matrix`) and never calls ``matvec``, so
+    the CSR matvec format is materialized lazily only when a matvec-family method
+    is actually used — both forms are cached, and a fresh operator is built each
+    IPM iteration, so the cache lifetime is naturally one factorization.
     """
 
-    def __init__(self, matrix: scipy.sparse.spmatrix, xp: Namespace) -> None:
-        # CSR is the natural shape for matvec; conversions are cheap and cached.
-        self._matrix = matrix.tocsr()
+    def __init__(
+        self,
+        matrix: scipy.sparse.spmatrix,
+        xp: Namespace,
+        *,
+        symmetric: bool | None = None,
+    ) -> None:
+        self._matrix = matrix
         self._xp = xp
+        # Structural symmetry hint from the assembler (None ⇒ test numerically).
+        self._symmetric_hint = symmetric
+        self._csr: scipy.sparse.csr_matrix | None = None
+        self._csc: scipy.sparse.csc_matrix | None = None
+        self._symmetric: bool | None = None
+
+    @property
+    def _csr_matrix(self) -> scipy.sparse.csr_matrix:
+        """The CSR (matvec) form, built and cached on first use."""
+        if self._csr is None:
+            self._csr = self._matrix.tocsr()
+        return self._csr
+
+    @property
+    def csc_matrix(self) -> scipy.sparse.csc_matrix:
+        """The CSC (factorization) form, built and cached on first use."""
+        if self._csc is None:
+            self._csc = self._matrix.tocsc()
+        return self._csc
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -139,38 +169,51 @@ class SparseOperator(LinearOperator):
 
     @property
     def scipy_matrix(self) -> scipy.sparse.spmatrix:
-        """The wrapped host matrix (consumed by the sparse-direct solver)."""
-        return self._matrix
+        """The wrapped host matrix in CSR (matvec) form."""
+        return self._csr_matrix
+
+    def is_symmetric(self) -> bool:
+        """Whether ``A == Aᵀ``: honor the assembler's hint, else test numerically.
+
+        The structural hint (set by the KKT condensed/saddle assembler, which
+        mirrors one value array into ``C``/``Cᵀ``) is authoritative when present,
+        so the sparse-direct route skips the O(nnz) numerical test every iteration.
+        """
+        if self._symmetric_hint is not None:
+            return self._symmetric_hint
+        if self._symmetric is None:
+            self._symmetric = _is_symmetric(self.csc_matrix)
+        return self._symmetric
 
     def matvec(self, v: Array) -> Array:
-        out = self._matrix @ _to_numpy(v)
+        out = self._csr_matrix @ _to_numpy(v)
         return to_xp_array(out, self._xp)
 
     def rmatvec(self, v: Array) -> Array:
-        out = self._matrix.T @ _to_numpy(v)
+        out = self._csr_matrix.T @ _to_numpy(v)
         return to_xp_array(out, self._xp)
 
     def matmat(self, V: Array) -> Array:
-        out = self._matrix @ _to_numpy(V)
+        out = self._csr_matrix @ _to_numpy(V)
         return to_xp_array(out, self._xp)
 
     def diagonal(self, like: Array | None = None) -> Array:
         del like
-        return to_xp_array(self._matrix.diagonal(), self._xp)
+        return to_xp_array(self._csr_matrix.diagonal(), self._xp)
 
     def row_inf_norms(self, like: Array | None = None) -> Array:
         del like
         m, n = self.shape
         if n == 0:
             return to_xp_array(np.zeros((m,), dtype=self._matrix.dtype), self._xp)
-        norms = abs(self._matrix).max(axis=1).toarray().reshape((m,))
+        norms = abs(self._csr_matrix).max(axis=1).toarray().reshape((m,))
         return to_xp_array(norms, self._xp)
 
     def to_coo(
         self, like: Array | None = None
     ) -> tuple[Array, Array, Array, tuple[int, int]]:
         del like
-        coo = self._matrix.tocoo()
+        coo = self._csr_matrix.tocoo()  # canonical (duplicates summed)
         return (
             to_xp_array(coo.row, self._xp),
             to_xp_array(coo.col, self._xp),
@@ -184,14 +227,16 @@ def _require_csc(K: LinearOperator) -> tuple[scipy.sparse.csc_matrix, Namespace]
 
     The sparse-direct route only factors operators that carry real sparse
     structure. A generic matrix-free operator has no triplets to assemble, so we
-    reject it with a clear message rather than silently densifying.
+    reject it with a clear message rather than silently densifying. The CSC form
+    is cached on the operator, so repeated calls within one factorization (router
+    → dispatched inner solver) convert at most once.
     """
     if not isinstance(K, SparseOperator):
         raise TypeError(
             "SciPy sparse solver requires a SparseOperator built from COO "
             f"triplets; got {type(K).__name__}"
         )
-    matrix = K.scipy_matrix.tocsc()
+    matrix = K.csc_matrix
     if matrix.shape[0] != matrix.shape[1]:
         raise ValueError("sparse solver requires a square operator")
     return matrix, K._xp
@@ -323,7 +368,8 @@ class FeralSparseSolver:
 
     def factor(self, K: LinearOperator) -> None:
         matrix, xp = _require_csc(K)
-        if not _is_symmetric(matrix):
+        assert isinstance(K, SparseOperator)  # narrowed by _require_csc
+        if not K.is_symmetric():
             raise ValueError("Feral sparse solver requires a symmetric operator")
 
         feral = _import_feral()
@@ -455,11 +501,12 @@ class SciPySparseSolver:
         return self._inner.describe() if self._inner is not None else "SciPy (CPU)"
 
     def factor(self, K: LinearOperator) -> None:
-        matrix, _ = _require_csc(K)
+        _require_csc(K)  # validate: SparseOperator + square (CSC cached for reuse)
+        assert isinstance(K, SparseOperator)  # narrowed by _require_csc
         # Reuse the chosen inner solver across factorizations so its symbolic
         # cache survives — the route (Feral for symmetric, SuperLU otherwise) is
         # stable across IPM iterations, so this rebuilds only on the rare flip.
-        if self._prefer_feral and not self._feral_unavailable and _is_symmetric(matrix):
+        if self._prefer_feral and not self._feral_unavailable and K.is_symmetric():
             if not isinstance(self._inner, FeralSparseSolver):
                 self._inner = FeralSparseSolver(require_inertia=self._require_inertia)
             try:
@@ -504,8 +551,13 @@ class SciPySparseAdapter:
         values: Array,
         *,
         shape: tuple[int, int],
+        symmetric: bool | None = None,
     ) -> SparseOperator:
-        """Build a :class:`SparseOperator` from Array-API COO triplets."""
+        """Build a :class:`SparseOperator` from Array-API COO triplets.
+
+        ``symmetric`` is an optional structural hint from the assembler; ``None``
+        leaves the operator to test symmetry numerically when first asked.
+        """
         from ipax.backend.namespace import array_namespace
 
         xp = array_namespace(values)
@@ -513,7 +565,7 @@ class SciPySparseAdapter:
             (_to_numpy(values), (_to_index(rows), _to_index(cols))),
             shape=shape,
         )
-        return SparseOperator(matrix, xp)
+        return SparseOperator(matrix, xp, symmetric=symmetric)
 
     def solver(self, *, require_inertia: bool = False) -> SciPySparseSolver:
         """Return the CPU sparse-direct solver (Feral default, SuperLU fallback)."""

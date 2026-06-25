@@ -225,6 +225,77 @@ def test_verbose_emits_iteration_log_to_ipax_logger(namespace, caplog):
     assert any("timing:" in rec.getMessage() for rec in records)
 
 
+def test_iteration_header_is_reprinted_periodically(namespace, caplog, monkeypatch):
+    from ipax._logging import ITERATION
+
+    # Force a header before every row so the count is deterministic regardless of
+    # how many iterations the problem needs. The driver binds the name at import,
+    # so patch it in the driver module's namespace.
+    monkeypatch.setattr("ipax.ipm.driver.HEADER_REPEAT_INTERVAL", 1)
+
+    problem = BoundConstrainedQP(namespace)
+    x0 = array(namespace, [0.25, 0.75])
+
+    with caplog.at_level(ITERATION, logger="ipax"):
+        with implemented("bound handling"):
+            solve(
+                problem,
+                x0,
+                options=Options(hessian="exact", linsolve="dense", verbose=2),
+            )
+
+    messages = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "ipax" and rec.levelno == ITERATION
+    ]
+    headers = [m for m in messages if m.lstrip().startswith("iter")]
+    rows = [m for m in messages if m.lstrip()[:1].isdigit()]
+    # With the interval at 1 every data row is preceded by its own header.
+    assert rows
+    assert len(headers) == len(rows)
+
+
+def test_iterates_meeting_acceptable_criteria_are_marked(namespace, caplog):
+    from ipax._logging import ITERATION
+
+    problem = BoundConstrainedQP(namespace)
+    x0 = array(namespace, [0.25, 0.75])
+
+    # Tolerances loose enough that the iterates satisfy them, but n_iter large
+    # enough that the acceptable rule never actually fires — so the rows are
+    # marked without changing the termination outcome.
+    acceptable = AcceptableStoppingOptions(
+        dual_inf_tol=1e6,
+        constr_viol_tol=1e6,
+        compl_inf_tol=1e6,
+        n_iter=10_000,
+    )
+
+    with caplog.at_level(ITERATION, logger="ipax"):
+        with implemented("bound handling"):
+            solve(
+                problem,
+                x0,
+                options=Options(
+                    hessian="exact",
+                    linsolve="dense",
+                    verbose=2,
+                    acceptable=acceptable,
+                ),
+            )
+
+    rows = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "ipax"
+        and rec.levelno == ITERATION
+        and rec.getMessage().lstrip()[:1].isdigit()
+    ]
+    assert rows
+    assert any(row.rstrip().endswith("*") for row in rows)
+
+
 def test_verbosity_tiers_are_emitted_at_their_levels(namespace, caplog):
     from ipax._logging import ITERATION, OPTIONS, PROBLEM, RESULT, SOLVER
 

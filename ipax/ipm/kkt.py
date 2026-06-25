@@ -281,6 +281,15 @@ class _CondensedOperator(LinearOperator):
         del like
         return _border(self.assemble())
 
+    def symmetry_hint(self) -> bool:
+        """The condensed block (and its symmetric borders) is symmetric exactly.
+
+        ``W`` is symmetric, the Σ_x/δ_w terms are diagonal, and each border places
+        ``C``/``Cᵀ`` from one shared value array, so the assembled COO is exactly
+        ``A == Aᵀ`` — the sparse-direct route can skip its numerical symmetry test.
+        """
+        return True
+
     def expected_inertia(self) -> tuple[int, int, int] | None:
         """IPOPT target inertia ``(n₊, n₋, n₀)`` of the assembled bordered system.
 
@@ -455,6 +464,11 @@ class _SaddleOperator(LinearOperator):
         """
         del like
         return _border(self.assemble())
+
+    def symmetry_hint(self) -> bool:
+        """The saddle is symmetric: ``∇c``/``∇cᵀ`` mirror one value array, the
+        ``−δ_c`` (2,2) block is diagonal, and the condensed block is symmetric."""
+        return True
 
     def expected_inertia(self) -> tuple[int, int, int] | None:
         """IPOPT target inertia of the assembled saddle, or ``None``.

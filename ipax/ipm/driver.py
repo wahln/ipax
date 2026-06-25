@@ -38,13 +38,19 @@ from collections.abc import Callable
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from ipax._logging import ITERATION, format_header, format_record, logger
-from ipax.backend.namespace import array_namespace
+from ipax._logging import (
+    HEADER_REPEAT_INTERVAL,
+    ITERATION,
+    format_header,
+    format_record,
+    logger,
+)
 from ipax.backend.operators import (
     Dense,
     Diagonal,
     LinearOperator,
     MatrixFreeJacobian,
+    VStack,
     as_operator,
 )
 from ipax.ipm.barrier import fraction_to_boundary, update_mu
@@ -71,7 +77,7 @@ from ipax.result import (
 
 if TYPE_CHECKING:
     from ipax.linalg.solver import LinearSolver
-    from ipax.options import Options
+    from ipax.options import OptimalityConditionOptions, Options
     from ipax.problem.base import Problem
     from ipax.result import IterationCallback, WarmStart
     from ipax.typing import Array, Namespace
@@ -80,71 +86,17 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 
-class _VStack(LinearOperator):
-    """Vertical stack of operators sharing the variable dimension."""
-
-    def __init__(self, ops: tuple[LinearOperator, ...]) -> None:
-        self._ops = ops
-        self._n = ops[0].shape[1]
-        self._rows = tuple(op.shape[0] for op in ops)
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        return sum(self._rows), self._n
-
-    def matvec(self, v: Array) -> Array:
-        xp = array_namespace(v)
-        return xp.concat(tuple(op.matvec(v) for op in self._ops))
-
-    def rmatvec(self, v: Array) -> Array:
-        xp = array_namespace(v)
-        result = None
-        offset = 0
-        for op, rows in zip(self._ops, self._rows, strict=True):
-            piece = op.rmatvec(v[offset : offset + rows])
-            result = piece if result is None else result + piece
-            offset += rows
-        assert result is not None
-        return xp.asarray(result)
-
-    def row_gram_diagonal(self, weights: Array) -> Array:
-        # Rows are stacked, so the weighted row energies concatenate. Propagates
-        # NotImplementedError if any block cannot supply them cheaply.
-        xp = array_namespace(weights)
-        return xp.concat(tuple(op.row_gram_diagonal(weights) for op in self._ops))
-
-    def to_coo(
-        self, like: Array | None = None
-    ) -> tuple[Array, Array, Array, tuple[int, int]]:
-        # Vertically stacked blocks ⇒ concatenate triplets with row offsets.
-        del like
-        rows_parts: list[Array] = []
-        cols_parts: list[Array] = []
-        vals_parts: list[Array] = []
-        offset = 0
-        xp = None
-        for op, n_rows in zip(self._ops, self._rows, strict=True):
-            r, c, v, _ = op.to_coo()
-            if xp is None:
-                xp = array_namespace(v)
-            rows_parts.append(r + offset)
-            cols_parts.append(c)
-            vals_parts.append(v)
-            offset += n_rows
-        assert xp is not None
-        return (
-            xp.concat(tuple(rows_parts)),
-            xp.concat(tuple(cols_parts)),
-            xp.concat(tuple(vals_parts)),
-            (offset, self._n),
-        )
-
-
 # IPOPT (Wächter & Biegler 2006) constants kept out of the loop body.
 _S_MAX = 100.0  # eq. (5): cap on the dual/complementarity scaling factors
 _KAPPA_EPSILON = 10.0  # eq. (7): barrier sub-problem tolerance factor κ_ε
 _MAX_REG_ATTEMPTS = 40
 _MAX_MU_REDUCTIONS = 64
+# A step solve that fails at a point already within this multiple of the
+# optimality tolerances is reported ACCEPTABLE rather than NUMERICAL_ERROR: near
+# a solution the condensed system is ill-conditioned, so the step can be
+# non-finite even though the iterate is essentially optimal (IPOPT
+# ``acceptable_tol`` ≈ 1e2 × ``tol``).
+_STEP_FAILURE_ACCEPT_FACTOR = 1e2
 
 
 def _norm_inf(xp: Namespace, v: Array) -> float:
@@ -157,6 +109,48 @@ def _norm1(xp: Namespace, v: Array) -> float:
     if int(v.shape[0]) == 0:
         return 0.0
     return float(xp.sum(xp.abs(v)))
+
+
+def _within_relaxed_tol(
+    optimality: OptimalityConditionOptions, record: IterationRecord
+) -> bool:
+    """Whether every enabled scaled KKT component is within the relaxed tolerance.
+
+    "Relaxed" is :data:`_STEP_FAILURE_ACCEPT_FACTOR` × the optimality tolerance
+    (IPOPT ``acceptable_tol``). Used to decide whether a stall — a failed step
+    solve, or a line search handing off to restoration — sits at an essentially
+    optimal iterate that should be accepted rather than discarded.
+    """
+    factor = _STEP_FAILURE_ACCEPT_FACTOR
+    checks = (
+        (optimality.dual_inf_tol, record.dual_infeasibility),
+        (optimality.constr_viol_tol, record.primal_infeasibility),
+        (optimality.compl_inf_tol, record.complementarity),
+    )
+    enabled = [(tol, value) for tol, value in checks if tol is not None]
+    return bool(enabled) and all(value <= factor * tol for tol, value in enabled)
+
+
+def _classify_step_failure(
+    optimality: OptimalityConditionOptions, record: IterationRecord
+) -> tuple[Status, str]:
+    """Classify a failed step solve as ACCEPTABLE (near-optimal) or an error.
+
+    Near a solution the condensed system becomes ill-conditioned and the Newton
+    step can be non-finite even when the iterate is essentially optimal (e.g. μ
+    driven well below the achieved KKT residual). Salvage such an iterate as
+    ACCEPTABLE rather than discarding a usable solution; otherwise the failure is
+    a genuine numerical error.
+    """
+    if _within_relaxed_tol(optimality, record):
+        return (
+            Status.ACCEPTABLE,
+            "acceptable: step solve failed at a point within the relaxed KKT tolerance",
+        )
+    return (
+        Status.NUMERICAL_ERROR,
+        "condensed factorization failed despite regularization",
+    )
 
 
 class IPMDriver:
@@ -269,7 +263,7 @@ class IPMDriver:
             return Dense(self._xp.zeros((0, self._n), dtype=x.dtype))
         if len(ops) == 1:
             return ops[0]
-        return _VStack(tuple(ops))
+        return VStack(tuple(ops))
 
     def _lagrangian_gradient(
         self,
@@ -529,8 +523,8 @@ class IPMDriver:
             u_minus_x = xp.where(mask_u, upper_safe - x, ones)
             return x_minus_l, u_minus_x
 
-        if logger.isEnabledFor(ITERATION):
-            logger.log(ITERATION, format_header())
+        # Count of logged rows, used to reprint the header periodically.
+        rows_logged = 0
 
         for it in range(opts.max_iter + 1):
             self._step_solve_seconds = 0.0
@@ -602,7 +596,15 @@ class IPMDriver:
             problem_time_mark = self._problem_time_total
             history.append(record)
             if logger.isEnabledFor(ITERATION):
-                logger.log(ITERATION, format_record(record))
+                if rows_logged % HEADER_REPEAT_INTERVAL == 0:
+                    logger.log(ITERATION, format_header())
+                logger.log(
+                    ITERATION,
+                    format_record(
+                        record, acceptable=acceptable.conditions_hold(record)
+                    ),
+                )
+                rows_logged += 1
 
             stop_requested = self._invoke_callback(
                 record, x, s, y_eq, y_ineq, z_lower, z_upper, m, m_eq
@@ -707,8 +709,9 @@ class IPMDriver:
                     recover_kwargs=recover_kwargs,
                 )
                 if corrected is None:
-                    status = Status.NUMERICAL_ERROR
-                    message = "condensed factorization failed despite regularization"
+                    status, message = _classify_step_failure(
+                        self._options.optimality, record
+                    )
                     break
                 mu, step, reg_applied = corrected
             else:
@@ -718,8 +721,9 @@ class IPMDriver:
                     w, sigma_x, sigma_s, ineq_jac, rhs, eq_jac, m_eq, -c, delta_c
                 )
                 if not ok:
-                    status = Status.NUMERICAL_ERROR
-                    message = "condensed factorization failed despite regularization"
+                    status, message = _classify_step_failure(
+                        self._options.optimality, record
+                    )
                     break
                 step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
 
@@ -876,6 +880,16 @@ class IPMDriver:
                     filt.augment(theta0, phi0)
 
             if restoration:
+                # A line search that stalls at an already near-optimal iterate
+                # (ill-conditioning near the solution) should accept it rather
+                # than enter restoration and risk a false "infeasible".
+                if _within_relaxed_tol(self._options.optimality, record):
+                    status = Status.ACCEPTABLE
+                    message = (
+                        "acceptable: line search stalled at a point within the "
+                        "relaxed KKT tolerance"
+                    )
+                    break
                 logger.debug("iter %d: entering feasibility restoration", it)
                 filt.augment(theta0, phi0)
                 x, s, infeasible = self._restore(

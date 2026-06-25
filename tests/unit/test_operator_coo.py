@@ -210,6 +210,37 @@ def test_saddle_lbfgs_border_solves_like_dense(namespace, tol):
     assert_allclose(namespace, sol, expected, **tol)
 
 
+def test_base_operator_symmetry_hint_is_unknown(namespace):
+    # A generic operator makes no structural symmetry claim (None = "test it").
+    assert Dense(array(namespace, [[2.0, -1.0], [0.0, 3.0]])).symmetry_hint() is None
+
+
+def test_condensed_operator_declares_symmetric(namespace):
+    # The condensed Newton block is symmetric by construction, so it tells the
+    # sparse route up front instead of forcing a per-iteration numerical test.
+    w = Dense(array(namespace, [[3.0, 1.0], [1.0, 2.0]]))
+    sigma_x = Diagonal(array(namespace, [0.5, 0.25]))
+    sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 2), dtype=float_dtype(namespace)))
+    op = build_condensed_operator(
+        w, sigma_x, sigma_s, empty_jac, RegularizationState(delta_w=1e-3)
+    )
+    assert op.symmetry_hint() is True
+
+
+def test_saddle_operator_declares_symmetric(namespace):
+    w = Dense(array(namespace, [[2.0, 0.0], [0.0, 2.0]]))
+    sigma_x = Diagonal(array(namespace, [0.0, 0.0]))
+    sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 2), dtype=float_dtype(namespace)))
+    condensed = build_condensed_operator(
+        w, sigma_x, sigma_s, empty_jac, RegularizationState()
+    )
+    eq_jac = Dense(array(namespace, [[1.0, 1.0]]))
+    saddle = build_saddle_operator(condensed, eq_jac, delta_c=1e-2)
+    assert saddle.symmetry_hint() is True
+
+
 def test_saddle_operator_to_coo_matches_matvec(namespace, tol):
     w = Dense(array(namespace, [[2.0, 0.0], [0.0, 2.0]]))
     sigma_x = Diagonal(array(namespace, [0.0, 0.0]))

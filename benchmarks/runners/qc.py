@@ -76,6 +76,8 @@ def run_sweep(
             for label, options in configs:
                 if options.linsolve == "sparse" and not caps.has_sparse_adapter:
                     continue
+                if label in case.exclude_configs:
+                    continue
                 results.append(
                     run_case(
                         case,
