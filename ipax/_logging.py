@@ -130,6 +130,11 @@ def configure_verbosity(verbose: int) -> None:
             owned = handler
         elif not isinstance(handler, logging.NullHandler):
             app_configured = True
+    if app_configured and owned is not None:
+        # The application attached its own handler after ipax created its console
+        # handler — defer to the app entirely and drop ours, else both emit.
+        logger.removeHandler(owned)
+        owned = None
     if owned is None and not app_configured:
         owned = logging.StreamHandler()
         owned.setFormatter(logging.Formatter("%(message)s"))

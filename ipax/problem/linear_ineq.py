@@ -59,8 +59,10 @@ def _lower_two_sided(
     """
     if isinstance(matrix, LinearOperator):
         raise NotImplementedError(
-            "matrix-free two-sided linear inequalities are not supported; declare "
-            "them through Problem.ineq_constraints/ineq_jacobian instead"
+            "two-sided linear inequalities require an explicit rank-2 array matrix "
+            "(the lowered rows are selected and sign-flipped by index); an "
+            "operator-valued matrix — including an explicit Dense/sparse operator — "
+            "must be declared through Problem.ineq_constraints/ineq_jacobian instead"
         )
     a = matrix
     if len(a.shape) != 2:

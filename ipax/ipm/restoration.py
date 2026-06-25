@@ -140,6 +140,8 @@ def restore(
         try:
             dx = xp.linalg.solve(hessian + lam * identity, -grad)
             step_ok = bool(xp.all(xp.isfinite(dx)))
+        except MemoryError:  # a genuine resource failure must propagate, not retry
+            raise
         except Exception:  # backend-specific singular-solve error (see comment)
             step_ok = False
         if not step_ok:

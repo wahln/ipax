@@ -220,5 +220,5 @@ def test_matrix_free_linear_ineq_is_rejected(namespace):
                 array(namespace, [1.0, 1.0]),
             )
 
-    with pytest.raises(NotImplementedError, match="matrix-free"):
+    with pytest.raises(NotImplementedError, match="ineq_constraints"):
         solve(_MatrixFreeLinearIneq(), array(namespace, [0.5, 0.5]))
