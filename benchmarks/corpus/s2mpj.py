@@ -374,7 +374,8 @@ def _problem_metadata(root: str, name: str) -> tuple[str | None, float | None, b
     """
     path = os.path.join(root, "python_problems", name + ".py")
     try:
-        text = open(path, encoding="utf-8", errors="replace").read()
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
     except OSError:
         return None, None, False
 

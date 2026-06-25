@@ -76,6 +76,27 @@ def test_app_handler_on_ipax_logger_prevents_duplicate_output():
         logger.setLevel(saved_level)
 
 
+def test_owned_handler_dropped_when_app_attaches_later():
+    # If ipax created its console handler first (verbose call) and the application
+    # later attaches its own, a subsequent configure_verbosity must drop ipax's
+    # handler and defer to the app — otherwise both emit (duplicate output).
+    saved_handlers = logger.handlers[:]
+    saved_level = logger.level
+    try:
+        logger.handlers[:] = [logging.NullHandler()]
+        configure_verbosity(2)  # ipax creates its owned handler
+        assert any(getattr(h, "_ipax_verbose_handler", False) for h in logger.handlers)
+        logger.addHandler(logging.StreamHandler())  # app attaches its own, later
+        configure_verbosity(2)  # must now defer and drop ipax's owned handler
+        tagged = [
+            h for h in logger.handlers if getattr(h, "_ipax_verbose_handler", False)
+        ]
+        assert tagged == []
+    finally:
+        logger.handlers[:] = saved_handlers
+        logger.setLevel(saved_level)
+
+
 def test_format_record_marks_acceptable_iterates():
     record = IterationRecord(3, 1.0, 1e-9, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.0, 0.0)
     plain = format_record(record)
