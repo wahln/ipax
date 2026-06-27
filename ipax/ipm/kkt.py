@@ -189,14 +189,27 @@ class _CondensedOperator(LinearOperator):
 
     def matvec(self, v: Array) -> Array:
         result = self._W.matvec(v) + self._sigma_x.matvec(v)
-        jv = self._ineq_jac.matvec(v)
-        result = result + self._ineq_jac.rmatvec(self._sigma_s.matvec(jv))
+        if self._ineq_jac.shape[0] > 0:
+            jv = self._ineq_jac.matvec(v)
+            result = result + self._ineq_jac.rmatvec(self._sigma_s.matvec(jv))
         if self._delta_w != 0.0:
             result = result + self._delta_w * v
         return result
 
     def rmatvec(self, v: Array) -> Array:
         return self.matvec(v)
+
+    def matmat(self, V: Array) -> Array:
+        result = self._W.matmat(V) + self._sigma_x.matmat(V)
+        if self._ineq_jac.shape[0] > 0:
+            jv = self._ineq_jac.matmat(V)
+            result = result + self._ineq_jac.rmatmat(self._sigma_s.matmat(jv))
+        if self._delta_w != 0.0:
+            result = result + self._delta_w * V
+        return result
+
+    def rmatmat(self, V: Array) -> Array:
+        return self.matmat(V)
 
     def diagonal(self, like: Array | None = None) -> Array:
         """Cheap diagonal for Jacobi preconditioning.
@@ -421,6 +434,17 @@ class _SaddleOperator(LinearOperator):
 
     def rmatvec(self, v: Array) -> Array:
         return self.matvec(v)
+
+    def matmat(self, V: Array) -> Array:
+        xp = array_namespace(V)
+        v_x = V[: self._n, :]
+        v_y = V[self._n :, :]
+        top = self._condensed.matmat(v_x) + self._eq_jac.rmatmat(v_y)
+        bottom = self._eq_jac.matmat(v_x) - self._delta_c * v_y
+        return xp.concat((top, bottom), axis=0)
+
+    def rmatmat(self, V: Array) -> Array:
+        return self.matmat(V)
 
     def preferred_krylov_method(self) -> Literal["minres"]:
         """The equality saddle is symmetric indefinite, so MINRES is the route."""

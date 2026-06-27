@@ -8,6 +8,33 @@ from ipax.linalg.regularize import RegularizationState
 from tests._helpers import array, assert_allclose, implemented, transpose
 
 
+class _CountingDense(Dense):
+    """Dense operator that records whether materialization is batched."""
+
+    def __init__(self, A):
+        super().__init__(A)
+        self.matvec_calls = 0
+        self.rmatvec_calls = 0
+        self.matmat_calls = 0
+        self.rmatmat_calls = 0
+
+    def matvec(self, v):
+        self.matvec_calls += 1
+        return super().matvec(v)
+
+    def rmatvec(self, v):
+        self.rmatvec_calls += 1
+        return super().rmatvec(v)
+
+    def matmat(self, V):
+        self.matmat_calls += 1
+        return super().matmat(V)
+
+    def rmatmat(self, V):
+        self.rmatmat_calls += 1
+        return super().rmatmat(V)
+
+
 def test_condensed_operator_matches_dense_formula(namespace, tol):
     W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
     sigma_x_dense = array(namespace, [[0.25, 0.0], [0.0, 0.75]])
@@ -35,6 +62,42 @@ def test_condensed_operator_matches_dense_formula(namespace, tol):
         + 1e-6 * namespace.eye(2, dtype=v.dtype)
     )
     assert_allclose(namespace, actual, namespace.matmul(expected_dense, v), **tol)
+
+
+def test_condensed_operator_matmat_batches_block_products(namespace, tol):
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    W = _CountingDense(W_dense)
+    J_dense = array(namespace, [[1.0, 2.0], [-1.0, 0.5]])
+    J = _CountingDense(J_dense)
+    V = array(namespace, [[0.25, 1.5, -0.5], [-1.0, 0.75, 2.0]])
+
+    op = build_condensed_operator(
+        W, sigma_x, sigma_s, J, RegularizationState(delta_w=1e-6)
+    )
+    actual = op.matmat(V)
+
+    expected_dense = (
+        W_dense
+        + namespace.asarray([[0.25, 0.0], [0.0, 0.75]], dtype=V.dtype)
+        + namespace.matmul(
+            transpose(namespace, J_dense),
+            namespace.matmul(
+                namespace.asarray([[2.0, 0.0], [0.0, 0.5]], dtype=V.dtype),
+                J_dense,
+            ),
+        )
+        + 1e-6 * namespace.eye(2, dtype=V.dtype)
+    )
+    expected = namespace.matmul(expected_dense, V)
+    assert_allclose(namespace, actual, expected, **tol)
+    assert W.matmat_calls == 1
+    assert J.matmat_calls == 1
+    assert J.rmatmat_calls == 1
+    assert W.matvec_calls == 0
+    assert J.matvec_calls == 0
+    assert J.rmatvec_calls == 0
 
 
 def test_condensed_operator_diagonal_matches_materialized(namespace, tol):
@@ -81,6 +144,33 @@ def test_saddle_operator_matches_dense_bordered_matrix(namespace, tol):
     expected_dense = namespace.concat((top, bottom), axis=0)
     assert_allclose(namespace, actual, namespace.matmul(expected_dense, v), **tol)
     assert op.shape == (3, 3)
+
+
+def test_saddle_operator_matmat_batches_block_products(namespace, tol):
+    N_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    J_dense = array(namespace, [[1.0, 1.0]])
+    N = _CountingDense(N_dense)
+    J = _CountingDense(J_dense)
+    op = build_saddle_operator(N, J, delta_c=1e-8)
+    V = array(
+        namespace,
+        [[0.25, 1.5, -0.5], [-1.0, 0.75, 2.0], [0.5, -0.25, 1.25]],
+    )
+
+    actual = op.matmat(V)
+
+    top = namespace.concat((N_dense, transpose(namespace, J_dense)), axis=1)
+    bottom = namespace.concat(
+        (J_dense, -1e-8 * namespace.eye(1, dtype=V.dtype)), axis=1
+    )
+    expected = namespace.matmul(namespace.concat((top, bottom), axis=0), V)
+    assert_allclose(namespace, actual, expected, **tol)
+    assert N.matmat_calls == 1
+    assert J.matmat_calls == 1
+    assert J.rmatmat_calls == 1
+    assert N.matvec_calls == 0
+    assert J.matvec_calls == 0
+    assert J.rmatvec_calls == 0
 
 
 def _empty_ineq(namespace):

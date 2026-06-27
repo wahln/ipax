@@ -48,6 +48,12 @@ class LinearOperator(ABC):
         columns = tuple(self.matvec(V[:, idx]) for idx in range(int(V.shape[1])))
         return xp.stack(columns, axis=1)
 
+    def rmatmat(self, V: Array) -> Array:
+        """Compute ``A.T @ V`` by applying ``rmatvec`` column-wise."""
+        xp = array_namespace(V)
+        columns = tuple(self.rmatvec(V[:, idx]) for idx in range(int(V.shape[1])))
+        return xp.stack(columns, axis=1)
+
     def diagonal(self, like: Array | None = None) -> Array:
         """Return the main diagonal as a rank-1 array.
 
@@ -186,6 +192,10 @@ class Dense(LinearOperator):
         xp = array_namespace(self._A, V)
         return xp.matmul(self._A, V)
 
+    def rmatmat(self, V: Array) -> Array:
+        xp = array_namespace(self._A, V)
+        return xp.matmul(xp.permute_dims(self._A, (1, 0)), V)
+
     def diagonal(self, like: Array | None = None) -> Array:
         del like
         xp = array_namespace(self._A)
@@ -246,6 +256,9 @@ class Diagonal(LinearOperator):
         xp = array_namespace(self._d, V)
         return xp.expand_dims(self._d, axis=1) * V
 
+    def rmatmat(self, V: Array) -> Array:
+        return self.matmat(V)
+
     def diagonal(self, like: Array | None = None) -> Array:
         del like
         return self._d
@@ -288,6 +301,9 @@ class Identity(LinearOperator):
         return v
 
     def matmat(self, V: Array) -> Array:
+        return V
+
+    def rmatmat(self, V: Array) -> Array:
         return V
 
     def diagonal(self, like: Array | None = None) -> Array:
@@ -351,6 +367,13 @@ class LowRank(LinearOperator):
         return xp.matmul(
             self._U,
             xp.matmul(xp.permute_dims(self._V, (1, 0)), V),
+        )
+
+    def rmatmat(self, V: Array) -> Array:
+        xp = array_namespace(self._U, self._V, V)
+        return xp.matmul(
+            self._V,
+            xp.matmul(xp.permute_dims(self._U, (1, 0)), V),
         )
 
 
@@ -417,6 +440,18 @@ class Composite(LinearOperator):
             result = term.rmatvec(result)
         return result
 
+    def matmat(self, V: Array) -> Array:
+        result = V
+        for term in reversed(self._terms):
+            result = term.matmat(result)
+        return result
+
+    def rmatmat(self, V: Array) -> Array:
+        result = V
+        for term in self._terms:
+            result = term.rmatmat(result)
+        return result
+
 
 class VStack(LinearOperator):
     """Vertical stack of operators sharing the variable (column) dimension.
@@ -451,6 +486,21 @@ class VStack(LinearOperator):
         offset = 0
         for op, rows in zip(self._ops, self._rows, strict=True):
             piece = op.rmatvec(v[offset : offset + rows])
+            result = piece if result is None else result + piece
+            offset += rows
+        assert result is not None
+        return xp.asarray(result)
+
+    def matmat(self, V: Array) -> Array:
+        xp = array_namespace(V)
+        return xp.concat(tuple(op.matmat(V) for op in self._ops), axis=0)
+
+    def rmatmat(self, V: Array) -> Array:
+        xp = array_namespace(V)
+        result = None
+        offset = 0
+        for op, rows in zip(self._ops, self._rows, strict=True):
+            piece = op.rmatmat(V[offset : offset + rows, :])
             result = piece if result is None else result + piece
             offset += rows
         assert result is not None

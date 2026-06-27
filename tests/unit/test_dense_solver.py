@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from ipax.backend.namespace import array_namespace
 from ipax.backend.operators import Dense, Diagonal
 from ipax.ipm.kkt import build_condensed_operator
 from ipax.linalg.dense import DenseSolver
@@ -50,6 +51,43 @@ def test_dense_solver_accepts_pd_condensed_block(namespace, tol):
     actual = solver.solve(array(namespace, [2.0, 3.0]))
 
     assert_allclose(namespace, actual, array(namespace, [1.0, 1.0]), **tol)
+
+
+def test_dense_solver_reuses_materialized_leading_primal_block(namespace, tol):
+    class _ExplodingPrimal:
+        shape = (2, 2)
+
+        def matmat(self, V):
+            raise AssertionError("primal block should already be materialized")
+
+    class _LeadingPrimalSaddle:
+        shape = (3, 3)
+
+        def __init__(self, matrix):
+            self._matrix = matrix
+
+        def matvec(self, v):
+            xp = array_namespace(self._matrix, v)
+            return xp.matmul(self._matrix, v)
+
+        def matmat(self, V):
+            xp = array_namespace(self._matrix, V)
+            return xp.matmul(self._matrix, V)
+
+        def primal_block(self):
+            return _ExplodingPrimal()
+
+    matrix = array(
+        namespace,
+        [[2.0, 0.25, 1.0], [0.25, 3.0, -1.0], [1.0, -1.0, -1.0]],
+    )
+    rhs = array(namespace, [1.0, 2.0, 3.0])
+    solver = DenseSolver()
+    solver.factor(_LeadingPrimalSaddle(matrix))
+
+    actual = solver.solve(rhs)
+
+    assert_allclose(namespace, namespace.matmul(matrix, actual), rhs, **tol)
 
 
 def test_dense_solver_skips_guard_for_plain_operator(namespace, tol):

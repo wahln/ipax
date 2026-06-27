@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+- Faster dense KKT solve: the condensed and saddle operators now implement native
+  batched `matmat`/`rmatmat` (and `rmatmat` is available across the
+  `LinearOperator` subclasses), so materializing the operator for the dense route
+  pushes the whole identity through each sub-block once instead of looping
+  `matvec` column-by-column — far fewer kernel launches at scale. The Cholesky
+  positive-definite guard also reuses the already-materialized matrix instead of
+  re-forming the primal block.
+
 ## [0.3.0] - 2026-06-26
 
 ### Added

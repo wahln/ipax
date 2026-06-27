@@ -64,13 +64,13 @@ class DenseSolver:
         xp = array_namespace(rhs)
         identity = xp.eye(n, dtype=rhs.dtype)
         matrix = self._operator.matmat(identity)
-        self._guard_positive_definite(matrix, xp, rhs.dtype)
+        self._guard_positive_definite(matrix, xp)
         try:
             return xp.linalg.solve(matrix, rhs)
         except Exception as exc:
             raise LinearSolveError("dense linear solve failed") from exc
 
-    def _guard_positive_definite(self, matrix: Array, xp: Any, dtype: Any) -> None:
+    def _guard_positive_definite(self, matrix: Array, xp: Any) -> None:
         """Reject a non-PD condensed block so the IPM escalates δ_w.
 
         ``xp.linalg.solve`` (LU) would silently accept an indefinite ``N`` and
@@ -88,10 +88,8 @@ class DenseSolver:
             return
         n = block.shape[0]
         # For the condensed (no-equality) operator the materialized matrix *is*
-        # ``N``; the saddle materializes ``N`` from its primal sub-block instead.
-        primal = (
-            matrix if n == matrix.shape[0] else block.matmat(xp.eye(n, dtype=dtype))
-        )
+        # ``N``; equality saddles store ``N`` in the leading primal block.
+        primal = matrix if n == matrix.shape[0] else matrix[:n, :n]
         try:
             cholesky(primal)
         except Exception as exc:
