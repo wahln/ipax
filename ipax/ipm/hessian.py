@@ -78,15 +78,30 @@ class LBFGSOperator(LinearOperator):
         return self._n, self._n
 
     def matvec(self, v: Array) -> Array:
-        if self._u is None or self._m is None:
-            return v  # B = ξI with ξ = 1 (identity seed)
-        xp = array_namespace(v)
-        u_t_v = xp.matmul(xp.permute_dims(self._u, (1, 0)), v)
-        z = xp.linalg.solve(self._m, u_t_v)
-        return self._xi * v - xp.matmul(self._u, z)
+        return self._apply(v)
 
     def rmatvec(self, v: Array) -> Array:
-        return self.matvec(v)  # B is symmetric
+        return self._apply(v)  # B is symmetric
+
+    def matmat(self, V: Array) -> Array:
+        return self._apply(V)
+
+    def rmatmat(self, V: Array) -> Array:
+        return self._apply(V)  # B is symmetric
+
+    def _apply(self, x: Array) -> Array:
+        """Apply ``B = ξI − U M⁻¹ Uᵀ`` to a vector or a batch of columns.
+
+        Shared by matvec/matmat: ``xp.linalg.solve`` takes a vector or a matrix
+        RHS, so the compact form is evaluated in one pass whether ``x`` is 1-D
+        (single application) or 2-D (batched materialization for the dense route).
+        """
+        if self._u is None or self._m is None:
+            return x  # B = ξI with ξ = 1 (identity seed)
+        xp = array_namespace(x)
+        u_t_x = xp.matmul(xp.permute_dims(self._u, (1, 0)), x)
+        z = xp.linalg.solve(self._m, u_t_x)
+        return self._xi * x - xp.matmul(self._u, z)
 
     def diagonal(self, like: Array | None = None) -> Array:
         """Diagonal of the compact Hessian ``B = ξI − U M⁻¹ Uᵀ`` (§4.3).

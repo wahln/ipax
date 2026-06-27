@@ -95,6 +95,27 @@ def test_lbfgs_compact_form_reconstructs_operator(namespace, tol):
     assert_allclose(namespace, op.matvec(v), expected, **tol)
 
 
+def test_lbfgs_matmat_uses_batched_compact_form(namespace, tol):
+    """Multi-RHS application uses one compact solve, not column-wise matvecs."""
+    op = LBFGSOperator(3, LBFGSOptions(memory=5))
+    op.update(array(namespace, [1.0, 0.5, -0.5]), array(namespace, [2.0, 1.0, 0.5]))
+    op.update(array(namespace, [0.5, -1.0, 1.0]), array(namespace, [1.0, 1.5, 0.5]))
+    V = array(namespace, [[0.5, -1.0], [-1.0, 0.25], [2.0, 1.5]])
+
+    xi, u, m = op.compact_form()
+    u_t_v = namespace.matmul(namespace.permute_dims(u, (1, 0)), V)
+    expected = xi * V - namespace.matmul(u, namespace.linalg.solve(m, u_t_v))
+
+    def _explode(_):
+        raise AssertionError("matmat should not fall back to column-wise matvec")
+
+    op.matvec = _explode
+    op.rmatvec = _explode
+
+    assert_allclose(namespace, op.matmat(V), expected, **tol)
+    assert_allclose(namespace, op.rmatmat(V), expected, **tol)
+
+
 def test_lbfgs_compact_form_unavailable_before_first_pair(namespace):
     op = LBFGSOperator(3, LBFGSOptions(memory=5))
     with pytest.raises(NotImplementedError):
