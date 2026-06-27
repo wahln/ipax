@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
+
 from ipax.backend.operators import Dense, Diagonal
+from ipax.ipm.hessian import LBFGSOperator
 from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
 from ipax.linalg.regularize import RegularizationState
+from ipax.options import LBFGSOptions
 from tests._helpers import array, assert_allclose, implemented, transpose
 
 
@@ -128,6 +132,48 @@ def test_condensed_diagonal_without_inequalities(namespace, tol):
     assert_allclose(namespace, op.diagonal(), expected, **tol)
 
 
+def _lbfgs_operator(namespace):
+    op = LBFGSOperator(3, LBFGSOptions(memory=5))
+    op.update(array(namespace, [1.0, 0.5, -0.5]), array(namespace, [2.0, 1.0, 0.5]))
+    op.update(array(namespace, [0.5, -1.0, 1.0]), array(namespace, [1.0, 1.5, 0.5]))
+    return op
+
+
+def test_condensed_dense_structured_solve_matches_materialized(namespace, tol):
+    W = _lbfgs_operator(namespace)
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype))
+    rhs = array(namespace, [1.0, -2.0, 0.5])
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+
+    dense = op.matmat(namespace.eye(3, dtype=rhs.dtype))
+    actual = op.dense_structured_solve(rhs)
+    expected = namespace.linalg.solve(dense, rhs)
+
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_condensed_dense_structured_solve_requires_diagonal_sigma_x(namespace):
+    W = _lbfgs_operator(namespace)
+    sigma_x = Dense(
+        array(
+            namespace,
+            [[0.25, 0.1, 0.0], [0.1, 0.75, 0.2], [0.0, 0.2, 1.25]],
+        )
+    )
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype))
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+
+    with pytest.raises(NotImplementedError, match="diagonal Sigma_x"):
+        op.dense_structured_solve(array(namespace, [1.0, -2.0, 0.5]))
+
+
 def test_saddle_operator_matches_dense_bordered_matrix(namespace, tol):
     n_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
     eq_jac = array(namespace, [[1.0, 1.0]])
@@ -171,6 +217,26 @@ def test_saddle_operator_matmat_batches_block_products(namespace, tol):
     assert N.matvec_calls == 0
     assert J.matvec_calls == 0
     assert J.rmatvec_calls == 0
+
+
+def test_saddle_dense_structured_solve_matches_materialized(namespace, tol):
+    W = _lbfgs_operator(namespace)
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype))
+    condensed = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, -1.0, 0.5]])), 1e-4
+    )
+    rhs = array(namespace, [1.0, -2.0, 0.5, 0.25])
+
+    dense = saddle.matmat(namespace.eye(4, dtype=rhs.dtype))
+    actual = saddle.dense_structured_solve(rhs)
+    expected = namespace.linalg.solve(dense, rhs)
+
+    assert_allclose(namespace, actual, expected, **tol)
 
 
 def _empty_ineq(namespace):

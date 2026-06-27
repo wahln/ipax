@@ -54,6 +54,19 @@ class LinearOperator(ABC):
         columns = tuple(self.rmatvec(V[:, idx]) for idx in range(int(V.shape[1])))
         return xp.stack(columns, axis=1)
 
+    def dense_structured_solve(self, rhs: Array) -> Array:
+        """Solve ``A x = rhs`` exactly by exploiting special operator structure.
+
+        Optional capability used by :class:`~ipax.linalg.dense.DenseSolver` to skip
+        the dense ``n × n`` materialization when the operator has a known
+        structured inverse (e.g. an L-BFGS diagonal-plus-low-rank condensed block
+        solved by the Woodbury identity, or the equality saddle's Schur
+        complement). Defaults to unavailable; the dense solver then falls back to
+        materializing and factoring the operator.
+        """
+        del rhs
+        raise NotImplementedError("operator does not expose a structured dense solve")
+
     def diagonal(self, like: Array | None = None) -> Array:
         """Return the main diagonal as a rank-1 array.
 

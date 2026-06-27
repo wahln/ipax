@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from ipax.backend.namespace import array_namespace
-from ipax.backend.operators import LinearOperator
+from ipax.backend.operators import Diagonal, LinearOperator
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -158,6 +158,40 @@ def _logical_assembly(op: LinearOperator) -> _Assembly:
     return _Assembly(rows, cols, values, logical_size=shape[0])
 
 
+def _woodbury_factors(
+    d: Array, u: Array, m: Array
+) -> tuple[Array, Array, Array, Array]:
+    """Precompute the reusable pieces of ``(diag(d) − U M⁻¹ Uᵀ)⁻¹``.
+
+    Returns ``(d, D⁻¹U, Uᵀ, M − Uᵀ D⁻¹ U)``. The inner ``r × r`` factor is the
+    expensive part, so callers that apply the inverse repeatedly (the L-BFGS Krylov
+    preconditioner) factor once and reuse across :func:`_woodbury_solve` applies.
+    """
+    xp = array_namespace(d, u, m)
+    inv_d_u = u / xp.expand_dims(d, axis=1)
+    u_t = xp.permute_dims(u, (1, 0))
+    inner = m - xp.matmul(u_t, inv_d_u)
+    return d, inv_d_u, u_t, inner
+
+
+def _woodbury_solve(factors: tuple[Array, Array, Array, Array], rhs: Array) -> Array:
+    """Apply ``(diag(d) − U M⁻¹ Uᵀ)⁻¹`` to ``rhs`` from :func:`_woodbury_factors`.
+
+    ``rhs`` may be a vector or a matrix (columns solved independently): one
+    diagonal inverse plus one ``r × r`` solve, never forming the ``n × n`` operator.
+    """
+    d, inv_d_u, u_t, inner = factors
+    xp = array_namespace(rhs, inv_d_u)
+    if len(rhs.shape) == 1:
+        inv_d_rhs = rhs / d
+    elif len(rhs.shape) == 2:
+        inv_d_rhs = rhs / xp.expand_dims(d, axis=1)
+    else:
+        raise ValueError("Woodbury solve requires a vector or matrix RHS")
+    z = xp.linalg.solve(inner, xp.matmul(u_t, inv_d_rhs))
+    return inv_d_rhs + xp.matmul(inv_d_u, z)
+
+
 class _CondensedOperator(LinearOperator):
     """Lazy ``W + Sigma_x + J.T @ Sigma_s @ J + delta_w * I`` operator."""
 
@@ -210,6 +244,34 @@ class _CondensedOperator(LinearOperator):
 
     def rmatmat(self, V: Array) -> Array:
         return self.matmat(V)
+
+    def dense_structured_solve(self, rhs: Array) -> Array:
+        """Exact dense solve for ``D - U M⁻¹ Uᵀ`` L-BFGS condensed blocks.
+
+        For bound-only L-BFGS systems, ``N = D - U M⁻¹ Uᵀ`` with
+        ``D = ξI + Σ_x + δ_w I``. The Woodbury identity solves ``N rhs = b``
+        through one diagonal inverse and one compact ``2m × 2m`` solve, avoiding
+        the dense ``n × n`` materialization. Inequality Gram terms are intentionally
+        excluded here so this direct path remains exact.
+        """
+        if self._ineq_jac.shape[0] > 0:
+            raise NotImplementedError(
+                "structured dense solve does not handle inequality Gram terms"
+            )
+        if not isinstance(self._sigma_x, Diagonal):
+            raise NotImplementedError(
+                "structured dense solve requires a diagonal Sigma_x block"
+            )
+        compact_form = getattr(self._W, "compact_form", None)
+        if compact_form is None:
+            raise NotImplementedError(
+                "structured dense solve requires an L-BFGS compact Hessian"
+            )
+        xi, u, m_lbfgs = compact_form()
+        d = xi + self._sigma_x.diagonal()
+        if self._delta_w != 0.0:
+            d = d + self._delta_w
+        return _woodbury_solve(_woodbury_factors(d, u, m_lbfgs), rhs)
 
     def diagonal(self, like: Array | None = None) -> Array:
         """Cheap diagonal for Jacobi preconditioning.
@@ -359,25 +421,16 @@ class _CondensedOperator(LinearOperator):
                 "L-BFGS-aware preconditioner requires an L-BFGS Hessian block"
             )
         xi, u, m_lbfgs = compact_form()
-        xp = array_namespace(u)
-
         d_tilde = xi + self._sigma_x.diagonal()
         if self._ineq_jac.shape[0] > 0:
             d_tilde = d_tilde + self._ineq_jac.gram_diagonal(self._sigma_s.diagonal())
         if self._delta_w != 0.0:
             d_tilde = d_tilde + self._delta_w
 
-        inv_dt = 1.0 / d_tilde
-        u_t = xp.permute_dims(u, (1, 0))  # (2k, n)
-        # Inner factor M − Uᵀ D̃⁻¹ U (2k×2k), nonsingular for PD N.
-        inner = m_lbfgs - xp.matmul(u_t * inv_dt, u)
-
-        def apply(r: Array) -> Array:
-            w = xp.matmul(u_t, inv_dt * r)
-            z = xp.linalg.solve(inner, w)
-            return inv_dt * (r + xp.matmul(u, z))
-
-        return apply
+        # Factor the 2k×2k inner block once (nonsingular for PD N); each apply is
+        # then one diagonal inverse plus one small solve via Sherman–Morrison–Woodbury.
+        factors = _woodbury_factors(d_tilde, u, m_lbfgs)
+        return lambda r: _woodbury_solve(factors, r)
 
 
 def build_condensed_operator(
@@ -445,6 +498,37 @@ class _SaddleOperator(LinearOperator):
 
     def rmatmat(self, V: Array) -> Array:
         return self.matmat(V)
+
+    def dense_structured_solve(self, rhs: Array) -> Array:
+        """Exact Schur-complement solve using a structured condensed inverse.
+
+        Propagates ``NotImplementedError`` from the condensed block (e.g. a
+        non-L-BFGS Hessian or an inequality Gram term), so the dense solver falls
+        back to materialization for systems without exploitable structure.
+        """
+        if len(rhs.shape) != 1:
+            raise ValueError("saddle structured dense solve requires a vector RHS")
+
+        xp = array_namespace(rhs)
+        rhs_x = rhs[: self._n]
+        rhs_y = rhs[self._n :]
+        if self._m == 0:
+            return self._condensed.dense_structured_solve(rhs_x)
+
+        identity_y = xp.eye(self._m, dtype=rhs.dtype)
+        eq_t = self._eq_jac.rmatmat(identity_y)
+        batch_rhs = xp.concat((xp.expand_dims(rhs_x, axis=1), eq_t), axis=1)
+        solved = self._condensed.dense_structured_solve(batch_rhs)
+        n_inv_rhs = solved[:, 0]
+        n_inv_eq_t = solved[:, 1:]
+
+        schur = self._eq_jac.matmat(n_inv_eq_t)
+        if self._delta_c != 0.0:
+            schur = schur + self._delta_c * identity_y
+        rhs_schur = self._eq_jac.matvec(n_inv_rhs) - rhs_y
+        dy = xp.linalg.solve(schur, rhs_schur)
+        dx = n_inv_rhs - xp.matmul(n_inv_eq_t, dy)
+        return xp.concat((dx, dy))
 
     def preferred_krylov_method(self) -> Literal["minres"]:
         """The equality saddle is symmetric indefinite, so MINRES is the route."""

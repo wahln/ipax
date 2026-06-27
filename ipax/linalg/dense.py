@@ -62,6 +62,19 @@ class DenseSolver:
             raise ValueError("right-hand side dimension does not match operator")
 
         xp = array_namespace(rhs)
+        # Optional fast path: operators with exploitable structure (an L-BFGS
+        # condensed/saddle block) solve via Woodbury without the n×n
+        # materialization; the default raises NotImplementedError, so plain
+        # operators fall through to materializing and factoring below.
+        try:
+            return self._operator.dense_structured_solve(rhs)
+        except NotImplementedError:
+            pass
+        except LinearSolveError:
+            raise
+        except Exception as exc:
+            raise LinearSolveError("dense structured solve failed") from exc
+
         identity = xp.eye(n, dtype=rhs.dtype)
         matrix = self._operator.matmat(identity)
         self._guard_positive_definite(matrix, xp)
