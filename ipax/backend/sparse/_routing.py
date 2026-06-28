@@ -132,11 +132,17 @@ class DeviceRoutingSparseAdapter:
         *,
         shape: tuple[int, int],
         symmetric: bool | None = None,
+        pattern_signature: object | None = None,
     ) -> Any:
         """Build a ``SparseOperator`` via the device-appropriate adapter."""
         self._delegate = self._resolve(values)
         return self._delegate.from_coo(
-            rows, cols, values, shape=shape, symmetric=symmetric
+            rows,
+            cols,
+            values,
+            shape=shape,
+            symmetric=symmetric,
+            pattern_signature=pattern_signature,
         )
 
     def solver(self, *, require_inertia: bool = False) -> Any:

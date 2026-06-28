@@ -20,6 +20,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   dense/saddle blocks directly instead of probing with an identity matmul; the
   materialized matrix is cached across repeated `solve()` calls after `factor()`,
   and diagonal exact-Hessian bound-only systems use a direct diagonal solve.
+- Faster sparse-direct KKT solves: explicit operators and KKT assemblers now
+  expose conservative `coo_pattern_signature()` metadata, letting sparse adapters
+  split stable structure from per-iteration values. The CuPy/cuDSS route reuses
+  symbolic analysis with `matrix_set_values` for same-pattern factors instead of
+  comparing GPU CSR index arrays, while unknown/value-dependent exact-Hessian
+  patterns still force re-analysis. Condensed and equality-saddle regularization
+  diagonals are reserved so `delta_w`/`delta_c` activation changes values rather
+  than sparsity, and the sparse facade guards cached adapters against backend or
+  device changes.
 
 ## [0.3.0] - 2026-06-26
 

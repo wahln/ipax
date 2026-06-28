@@ -118,6 +118,18 @@ class LinearOperator(ABC):
         del like
         raise NotImplementedError("operator does not expose sparse COO structure")
 
+    def coo_pattern_signature(self) -> object | None:
+        """Stable identity for the row/column pattern emitted by :meth:`to_coo`.
+
+        Sparse-direct adapters may use this to split structure from numeric
+        values without comparing device index arrays. Return ``None`` unless the
+        operator can guarantee that its COO row/column vectors are determined by
+        structural metadata rather than by current numeric values. This must be
+        conservative: a value-dependent exact Hessian that drops zero entries
+        should leave the default so the sparse solver reanalyzes.
+        """
+        return None
+
     def gram_diagonal(self, weights: Array) -> Array:
         """Return ``diag(Aᵀ diag(weights) A)`` — the weighted column energies.
 
@@ -269,6 +281,9 @@ class Dense(LinearOperator):
         values = xp.reshape(self._A, (m * n,))
         return rows, cols, values, (m, n)
 
+    def coo_pattern_signature(self) -> object:
+        return ("dense", self.shape)
+
 
 class Diagonal(LinearOperator):
     """Diagonal operator from a vector ``d``."""
@@ -323,6 +338,9 @@ class Diagonal(LinearOperator):
         n = int(self._d.shape[0])
         idx = xp.arange(n)
         return idx, idx, self._d, (n, n)
+
+    def coo_pattern_signature(self) -> object:
+        return ("diagonal", self.shape)
 
 
 class Identity(LinearOperator):
@@ -380,6 +398,9 @@ class Identity(LinearOperator):
         idx = xp.arange(self._n)
         ones = xp.ones((self._n,), dtype=like.dtype)
         return idx, idx, ones, (self._n, self._n)
+
+    def coo_pattern_signature(self) -> object:
+        return ("identity", self.shape)
 
 
 class LowRank(LinearOperator):
@@ -638,6 +659,12 @@ class VStack(LinearOperator):
             xp.concat(tuple(vals_parts)),
             (offset, self._n),
         )
+
+    def coo_pattern_signature(self) -> object | None:
+        parts = tuple(op.coo_pattern_signature() for op in self._ops)
+        if any(part is None for part in parts):
+            return None
+        return ("vstack", self.shape, parts)
 
 
 def as_operator(obj: Array | LinearOperator) -> LinearOperator:

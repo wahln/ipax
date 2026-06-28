@@ -83,6 +83,18 @@ def test_vstack_gram_diagonal_slices_row_weights(namespace, tol):
     assert_allclose(namespace, op.gram_diagonal(weights), expected, **tol)
 
 
+def test_vstack_coo_pattern_signature_composes_stable_blocks(namespace):
+    top = Dense(array(namespace, [[1.0, 2.0], [3.0, 4.0]]))
+    bottom = Diagonal(array(namespace, [5.0, 6.0]))
+    op = VStack((top, bottom))
+
+    assert op.coo_pattern_signature() == (
+        "vstack",
+        (4, 2),
+        (top.coo_pattern_signature(), bottom.coo_pattern_signature()),
+    )
+
+
 def test_identity_diagonal_uses_template_array(namespace, tol):
     like = array(namespace, [0.0, 0.0, 0.0])
     assert_allclose(

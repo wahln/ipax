@@ -139,11 +139,13 @@ class SparseOperator(LinearOperator):
         xp: Namespace,
         *,
         symmetric: bool | None = None,
+        pattern_signature: object | None = None,
     ) -> None:
         self._matrix = matrix
         self._xp = xp
         # Structural symmetry hint from the assembler (None ⇒ test numerically).
         self._symmetric_hint = symmetric
+        self._pattern_signature = pattern_signature
         self._csr: scipy.sparse.csr_matrix | None = None
         self._csc: scipy.sparse.csc_matrix | None = None
         self._symmetric: bool | None = None
@@ -184,6 +186,9 @@ class SparseOperator(LinearOperator):
         if self._symmetric is None:
             self._symmetric = _is_symmetric(self.csc_matrix)
         return self._symmetric
+
+    def coo_pattern_signature(self) -> object | None:
+        return self._pattern_signature
 
     def matvec(self, v: Array) -> Array:
         out = self._csr_matrix @ _to_numpy(v)
@@ -552,11 +557,14 @@ class SciPySparseAdapter:
         *,
         shape: tuple[int, int],
         symmetric: bool | None = None,
+        pattern_signature: object | None = None,
     ) -> SparseOperator:
         """Build a :class:`SparseOperator` from Array-API COO triplets.
 
         ``symmetric`` is an optional structural hint from the assembler; ``None``
         leaves the operator to test symmetry numerically when first asked.
+        ``pattern_signature`` is preserved for solver/adapter implementations
+        that split stable structure from per-iteration values.
         """
         from ipax.backend.namespace import array_namespace
 
@@ -565,7 +573,12 @@ class SciPySparseAdapter:
             (_to_numpy(values), (_to_index(rows), _to_index(cols))),
             shape=shape,
         )
-        return SparseOperator(matrix, xp, symmetric=symmetric)
+        return SparseOperator(
+            matrix,
+            xp,
+            symmetric=symmetric,
+            pattern_signature=pattern_signature,
+        )
 
     def solver(self, *, require_inertia: bool = False) -> SciPySparseSolver:
         """Return the CPU sparse-direct solver (Feral default, SuperLU fallback)."""

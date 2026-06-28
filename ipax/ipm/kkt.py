@@ -419,6 +419,40 @@ class _CondensedOperator(LinearOperator):
         """
         return True
 
+    def coo_pattern_signature(self) -> object | None:
+        """Stable sparse structure key, or ``None`` for value-dependent patterns."""
+        low_rank_form = getattr(self._W, "diagonal_low_rank_form", None)
+        if low_rank_form is not None:
+            try:
+                _, u, _ = low_rank_form()
+            except NotImplementedError:
+                hessian_signature: object = ("diagonal_low_rank", self._W.shape, 0)
+            else:
+                hessian_signature = (
+                    "diagonal_low_rank",
+                    self._W.shape,
+                    int(u.shape[1]),
+                )
+        else:
+            hessian_signature = self._W.coo_pattern_signature()
+            if hessian_signature is None:
+                return None
+
+        ineq_signature: object | None = None
+        if self._ineq_jac.shape[0] > 0:
+            ineq_signature = self._ineq_jac.coo_pattern_signature()
+            if ineq_signature is None:
+                return None
+
+        return (
+            "condensed",
+            self.shape,
+            hessian_signature,
+            self._sigma_x.shape,
+            self._ineq_jac.shape,
+            ineq_signature,
+        )
+
     def expected_inertia(self) -> tuple[int, int, int] | None:
         """IPOPT target inertia ``(n₊, n₋, n₀)`` of the assembled bordered system.
 
@@ -630,7 +664,7 @@ class _SaddleOperator(LinearOperator):
         rows = xp.concat((inner.rows, er + n, ec))
         cols = xp.concat((inner.cols, ec, er + n))
         values = xp.concat((inner.values, ev, ev))
-        if self._delta_c != 0.0:
+        if m > 0:
             didx = xp.arange(m) + n
             delta = xp.full((m,), -self._delta_c, dtype=values.dtype)
             rows = xp.concat((rows, didx))
@@ -654,6 +688,25 @@ class _SaddleOperator(LinearOperator):
         """The saddle is symmetric: ``∇c``/``∇cᵀ`` mirror one value array, the
         ``−δ_c`` (2,2) block is diagonal, and the condensed block is symmetric."""
         return True
+
+    def coo_pattern_signature(self) -> object | None:
+        condensed_signature = self._condensed.coo_pattern_signature()
+        if condensed_signature is None:
+            return None
+
+        eq_signature: object | None = None
+        if self._m > 0:
+            eq_signature = self._eq_jac.coo_pattern_signature()
+            if eq_signature is None:
+                return None
+
+        return (
+            "saddle",
+            self.shape,
+            condensed_signature,
+            self._eq_jac.shape,
+            eq_signature,
+        )
 
     def expected_inertia(self) -> tuple[int, int, int] | None:
         """IPOPT target inertia of the assembled saddle, or ``None``.

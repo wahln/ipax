@@ -122,6 +122,14 @@ def _is_symmetric(matrix: Any) -> bool:
     return diff_scale <= tol
 
 
+def _canonical_csr(matrix: Any) -> Any:
+    """CSR with summed duplicates and sorted column indices."""
+    csr = matrix.tocsr()
+    csr.sum_duplicates()
+    csr.sort_indices()
+    return csr
+
+
 def _device_id(matrix: Any) -> int:
     """CUDA device containing a CuPy sparse matrix's value storage."""
     device = getattr(matrix.data, "device", None)
@@ -160,12 +168,18 @@ class SparseOperator(LinearOperator):
     """
 
     def __init__(
-        self, matrix: Any, xp: Namespace, *, symmetric: bool | None = None
+        self,
+        matrix: Any,
+        xp: Namespace,
+        *,
+        symmetric: bool | None = None,
+        pattern_signature: object | None = None,
     ) -> None:
-        self._matrix = matrix.tocsr()
+        self._matrix = _canonical_csr(matrix)
         self._xp = xp
         # Structural symmetry hint from the assembler (None ⇒ test numerically).
         self._symmetric_hint = symmetric
+        self._pattern_signature = pattern_signature
         self._symmetric: bool | None = None
 
     @property
@@ -190,6 +204,9 @@ class SparseOperator(LinearOperator):
         if self._symmetric is None:
             self._symmetric = _is_symmetric(self._matrix)
         return self._symmetric
+
+    def coo_pattern_signature(self) -> object | None:
+        return self._pattern_signature
 
     def matvec(self, v: Array) -> Array:
         out = self._matrix @ _to_cupy(v)
@@ -236,7 +253,7 @@ def _require_csr(K: LinearOperator) -> tuple[Any, Namespace]:
             "CuPy sparse solver requires a SparseOperator built from COO "
             f"triplets; got {type(K).__name__}"
         )
-    matrix = K.cupy_matrix.tocsr()
+    matrix = K.cupy_matrix
     if matrix.shape[0] != matrix.shape[1]:
         raise ValueError("sparse solver requires a square operator")
     return matrix, K._xp
@@ -325,6 +342,7 @@ class CuDSSSparseSolver:
         self._col_indices: Any | None = None
         self._values: Any | None = None
         self._pattern: tuple[int, int, int, int, int, int, int] | None = None
+        self._pattern_key: object | None = None
         self._xp: Namespace | None = None
         self._dtype: Any | None = None
         self._inertia: tuple[int, int, int] | None = None
@@ -389,12 +407,18 @@ class CuDSSSparseSolver:
             matrix_type = int(cudss.MatrixType.GENERAL)
             matrix_view = int(cudss.MatrixViewType.FULL)
             if symmetric:
-                factor_matrix = cupyx.scipy.sparse.tril(matrix).tocsr()
+                factor_matrix = _canonical_csr(cupyx.scipy.sparse.tril(matrix))
                 matrix_type = int(cudss.MatrixType.SYMMETRIC)
                 matrix_view = int(cudss.MatrixViewType.LOWER)
 
             self._xp = xp
-            self._factor_csr(factor_matrix, matrix_type, matrix_view)
+            pattern_signature = K.coo_pattern_signature()
+            self._factor_csr(
+                factor_matrix,
+                matrix_type,
+                matrix_view,
+                pattern_signature=pattern_signature,
+            )
             self._inertia = (
                 self._read_inertia(int(matrix.shape[0]))
                 if self._require_inertia
@@ -493,7 +517,14 @@ class CuDSSSparseSolver:
         stream = cupy.cuda.get_current_stream()
         self._guard(self._cudss.set_stream, self._handle, int(stream.ptr))
 
-    def _factor_csr(self, matrix: Any, matrix_type: int, matrix_view: int) -> None:
+    def _factor_csr(
+        self,
+        matrix: Any,
+        matrix_type: int,
+        matrix_view: int,
+        *,
+        pattern_signature: object | None,
+    ) -> None:
         cudss = self._cudss
         if (
             cudss is None
@@ -503,43 +534,53 @@ class CuDSSSparseSolver:
         ):
             raise RuntimeError("cuDSS context was not initialized")
 
-        matrix = matrix.tocsr()
-        matrix.sum_duplicates()
-        matrix.sort_indices()
-        row_offsets = cupy.ascontiguousarray(
-            matrix.indptr.astype(cupy.int64, copy=False)
-        )
-        indices = cupy.ascontiguousarray(matrix.indices.astype(cupy.int64, copy=False))
         values = cupy.ascontiguousarray(matrix.data)
+        index_type = _index_type(cupy.dtype(cupy.int64))
         pattern = (
             int(matrix.shape[0]),
             int(matrix.shape[1]),
             int(matrix.nnz),
             matrix_type,
             matrix_view,
-            _index_type(indices.dtype),
+            index_type,
             _value_type(values.dtype),
         )
 
         self._dtype = values.dtype
+        structure_key = (
+            pattern_signature,
+            matrix_type,
+            matrix_view,
+        )
         same_pattern = (
-            pattern == self._pattern
+            pattern_signature is not None
+            and pattern == self._pattern
+            and structure_key == self._pattern_key
             and self._matrix is not None
             and self._row_offsets is not None
             and self._col_indices is not None
-            and bool(cupy.array_equal(row_offsets, self._row_offsets))
-            and bool(cupy.array_equal(indices, self._col_indices))
         )
         if same_pattern:
+            # Deliberately no ``array_equal`` on CSR indices here: on CUDA that
+            # comparison is device work plus a host sync. A non-None signature is
+            # a contract that row/column coordinates are structural; value-
+            # dependent sparse operators must return ``None`` and reanalyze.
             self._values = values
             self._guard(cudss.matrix_set_values, self._matrix, _ptr(values))
             phase = int(cudss.Phase.FACTORIZATION)
         else:
+            row_offsets = cupy.ascontiguousarray(
+                matrix.indptr.astype(cupy.int64, copy=False)
+            )
+            indices = cupy.ascontiguousarray(
+                matrix.indices.astype(cupy.int64, copy=False)
+            )
             self._destroy_matrix()
             self._row_offsets = row_offsets
             self._col_indices = indices
             self._values = values
             self._pattern = pattern
+            self._pattern_key = structure_key if pattern_signature is not None else None
             self._matrix = self._create_csr_matrix(
                 matrix,
                 row_offsets,
@@ -649,6 +690,7 @@ class CuDSSSparseSolver:
         self._col_indices = None
         self._values = None
         self._pattern = None
+        self._pattern_key = None
 
     def _destroy_temp_matrix(self, matrix: int) -> None:
         if self._cudss is not None and matrix:
@@ -720,11 +762,14 @@ class CuPySparseAdapter:
         *,
         shape: tuple[int, int],
         symmetric: bool | None = None,
+        pattern_signature: object | None = None,
     ) -> SparseOperator:
         """Build a :class:`SparseOperator` from Array-API COO triplets.
 
         ``symmetric`` is an optional structural hint from the assembler; ``None``
         leaves the operator to test symmetry numerically when first asked.
+        ``pattern_signature`` is a conservative stable-pattern key used by cuDSS
+        to reuse symbolic analysis without comparing device index arrays.
         """
         from ipax.backend.namespace import array_namespace
 
@@ -733,7 +778,12 @@ class CuPySparseAdapter:
             (_to_cupy(values), (_to_index(rows), _to_index(cols))),
             shape=shape,
         )
-        return SparseOperator(matrix, xp, symmetric=symmetric)
+        return SparseOperator(
+            matrix,
+            xp,
+            symmetric=symmetric,
+            pattern_signature=pattern_signature,
+        )
 
     def solver(self, *, require_inertia: bool = False) -> CuPySparseSolver:
         """Return the CUDA sparse-direct solver (cuDSS default, spsolve fallback)."""

@@ -33,11 +33,23 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from ipax.backend.namespace import array_namespace
+from ipax.backend.namespace import _namespace_name, array_namespace
 
 if TYPE_CHECKING:
     from ipax.backend.operators import LinearOperator
     from ipax.typing import Array
+
+
+def _dlpack_device_kind(arr: Array) -> int | None:
+    """DLPack device kind for adapter-cache guarding, or ``None``."""
+    dlpack_device = getattr(arr, "__dlpack_device__", None)
+    if dlpack_device is None:
+        return None
+    try:
+        kind, _ = dlpack_device()
+    except Exception:
+        return None
+    return int(kind)
 
 
 class SparseDirectSolver:
@@ -45,6 +57,8 @@ class SparseDirectSolver:
 
     def __init__(self, *, require_inertia: bool = False) -> None:
         self._require_inertia = require_inertia
+        self._adapter: Any = None
+        self._adapter_key: tuple[str, int | None] | None = None
         self._inner: Any = None
         # When the operator carries an L-BFGS low-rank tail, ``to_coo`` returns a
         # larger *bordered* matrix than the logical system the driver solves; we
@@ -66,6 +80,7 @@ class SparseDirectSolver:
         # The core emits structure; the adapter builds and factors the matrix.
         rows, cols, values, shape = K.to_coo()
         xp = array_namespace(values)
+        adapter_key = (_namespace_name(xp), _dlpack_device_kind(values))
         # Forward the operator's structural symmetry hint (the condensed/saddle
         # blocks are symmetric by construction) so the adapter can skip its
         # per-iteration numerical A − Aᵀ test.
@@ -73,15 +88,30 @@ class SparseDirectSolver:
 
         from ipax.backend.sparse import get_sparse_adapter
 
-        adapter: Any = get_sparse_adapter(xp)
-        if adapter is None:
+        if self._adapter is None:
+            self._adapter = get_sparse_adapter(xp)
+            if self._adapter is None:
+                raise RuntimeError(
+                    "no sparse-direct adapter is available for this backend; "
+                    "install SciPy for the NumPy backend or choose another "
+                    "linsolve mode"
+                )
+            self._adapter_key = adapter_key
+        elif adapter_key != self._adapter_key:
             raise RuntimeError(
-                "no sparse-direct adapter is available for this backend; "
-                "install SciPy for the NumPy backend or choose another "
-                "linsolve mode"
+                "SparseDirectSolver cannot reuse a cached sparse adapter across "
+                f"array backends/devices: cached {self._adapter_key}, got "
+                f"{adapter_key}"
             )
+        adapter = self._adapter
+        pattern_signature = K.coo_pattern_signature()
         operator = adapter.from_coo(
-            rows, cols, values, shape=shape, symmetric=symmetric
+            rows,
+            cols,
+            values,
+            shape=shape,
+            symmetric=symmetric,
+            pattern_signature=pattern_signature,
         )
         # The facade is created once per solve and reused every iteration, so the
         # inner solver persists — letting the backend cache its symbolic analysis

@@ -332,13 +332,26 @@ def test_cudss_solver_reuses_symbolic_analysis_without_host_pattern_copy(
     adapter = cupy_sparse_module.CuPySparseAdapter()
     rows = np.asarray([0, 1])
     cols = np.asarray([0, 1])
-    first = adapter.from_coo(rows, cols, np.asarray([1.0, 2.0]), shape=(2, 2))
-    second = adapter.from_coo(rows, cols, np.asarray([3.0, 4.0]), shape=(2, 2))
+    signature = ("stable-diagonal", 2)
+    first = adapter.from_coo(
+        rows,
+        cols,
+        np.asarray([1.0, 2.0]),
+        shape=(2, 2),
+        pattern_signature=signature,
+    )
+    second = adapter.from_coo(
+        rows,
+        cols,
+        np.asarray([3.0, 4.0]),
+        shape=(2, 2),
+        pattern_signature=signature,
+    )
     solver = adapter.solver()
     monkeypatch.setattr(
         cupy_sparse_module.cupy,
-        "asnumpy",
-        lambda value: (_ for _ in ()).throw(AssertionError(value)),
+        "array_equal",
+        lambda *args: (_ for _ in ()).throw(AssertionError(args)),
     )
 
     solver.factor(first)
@@ -349,6 +362,75 @@ def test_cudss_solver_reuses_symbolic_analysis_without_host_pattern_copy(
         int(_Phase.FACTORIZATION),
     ]
     assert fake.matrix_set_values_calls == 1
+
+
+def test_cudss_unknown_pattern_reanalyzes_without_device_comparison(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeCudss()
+    monkeypatch.setattr(cupy_sparse_module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+    monkeypatch.setattr(
+        cupy_sparse_module.cupy,
+        "array_equal",
+        lambda *args: (_ for _ in ()).throw(AssertionError(args)),
+    )
+
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    rows = np.asarray([0, 1])
+    cols = np.asarray([0, 1])
+    first = adapter.from_coo(rows, cols, np.asarray([1.0, 2.0]), shape=(2, 2))
+    second = adapter.from_coo(rows, cols, np.asarray([3.0, 4.0]), shape=(2, 2))
+    solver = adapter.solver()
+
+    solver.factor(first)
+    solver.factor(second)
+
+    assert fake.phases == [
+        int(_Phase.ANALYSIS) | int(_Phase.FACTORIZATION),
+        int(_Phase.ANALYSIS) | int(_Phase.FACTORIZATION),
+    ]
+    assert fake.matrix_set_values_calls == 0
+
+
+def test_cudss_signature_reuse_requires_matching_shape_nnz_type_metadata(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeCudss()
+    monkeypatch.setattr(cupy_sparse_module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+    monkeypatch.setattr(
+        cupy_sparse_module.cupy,
+        "array_equal",
+        lambda *args: (_ for _ in ()).throw(AssertionError(args)),
+    )
+
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    signature = ("stable", "but-metadata-changed")
+    first = adapter.from_coo(
+        np.asarray([0, 1]),
+        np.asarray([0, 1]),
+        np.asarray([1.0, 2.0]),
+        shape=(2, 2),
+        pattern_signature=signature,
+    )
+    second = adapter.from_coo(
+        np.asarray([0, 1, 1]),
+        np.asarray([0, 0, 1]),
+        np.asarray([3.0, 0.5, 4.0]),
+        shape=(2, 2),
+        pattern_signature=signature,
+    )
+    solver = adapter.solver()
+
+    solver.factor(first)
+    solver.factor(second)
+
+    assert fake.phases == [
+        int(_Phase.ANALYSIS) | int(_Phase.FACTORIZATION),
+        int(_Phase.ANALYSIS) | int(_Phase.FACTORIZATION),
+    ]
+    assert fake.matrix_set_values_calls == 0
 
 
 def test_cudss_missing_runtime_uses_spsolve_fallback(
