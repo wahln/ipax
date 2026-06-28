@@ -67,6 +67,23 @@ class LinearOperator(ABC):
         del rhs
         raise NotImplementedError("operator does not expose a structured dense solve")
 
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        """Return an explicit dense matrix when the operator already has one.
+
+        Optional capability for dense direct solves. Unlike ``matmat(I)``, this
+        lets explicit operators hand back or assemble their matrix without an
+        identity probe and the extra kernels it causes on device backends. Operators
+        without explicit dense structure leave the default unavailable. Operators
+        with no stored array (e.g. :class:`Identity`) may use ``like`` as a
+        dtype/backend template.
+
+        The result may alias the operator's backing array (e.g. :class:`Dense`
+        returns it without copying), so callers must treat it as **read-only** —
+        an in-place mutation would corrupt the operator.
+        """
+        del like
+        raise NotImplementedError("operator does not expose a dense matrix")
+
     def diagonal(self, like: Array | None = None) -> Array:
         """Return the main diagonal as a rank-1 array.
 
@@ -209,6 +226,13 @@ class Dense(LinearOperator):
         xp = array_namespace(self._A, V)
         return xp.matmul(xp.permute_dims(self._A, (1, 0)), V)
 
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        # Returns the backing array *by reference* (no copy): callers — e.g.
+        # DenseSolver, which caches it — must treat the result as read-only, as
+        # an in-place mutation would corrupt this operator.
+        del like
+        return self._A
+
     def diagonal(self, like: Array | None = None) -> Array:
         del like
         xp = array_namespace(self._A)
@@ -272,6 +296,12 @@ class Diagonal(LinearOperator):
     def rmatmat(self, V: Array) -> Array:
         return self.matmat(V)
 
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        del like
+        xp = array_namespace(self._d)
+        n = int(self._d.shape[0])
+        return xp.eye(n, dtype=self._d.dtype) * self._d
+
     def diagonal(self, like: Array | None = None) -> Array:
         del like
         return self._d
@@ -318,6 +348,12 @@ class Identity(LinearOperator):
 
     def rmatmat(self, V: Array) -> Array:
         return V
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        if like is None:
+            raise NotImplementedError("Identity dense matrix requires a template array")
+        xp = array_namespace(like)
+        return xp.eye(self._n, dtype=like.dtype)
 
     def diagonal(self, like: Array | None = None) -> Array:
         if like is None:
@@ -388,6 +424,11 @@ class LowRank(LinearOperator):
             self._V,
             xp.matmul(xp.permute_dims(self._U, (1, 0)), V),
         )
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        del like
+        xp = array_namespace(self._U, self._V)
+        return xp.matmul(self._U, xp.permute_dims(self._V, (1, 0)))
 
 
 class MatrixFreeJacobian(LinearOperator):
@@ -465,6 +506,14 @@ class Composite(LinearOperator):
             result = term.rmatmat(result)
         return result
 
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        result = self._terms[-1].dense_matrix(like)
+        for term in reversed(self._terms[:-1]):
+            left = term.dense_matrix(result)
+            xp = array_namespace(left, result)
+            result = xp.matmul(left, result)
+        return result
+
 
 class VStack(LinearOperator):
     """Vertical stack of operators sharing the variable (column) dimension.
@@ -518,6 +567,20 @@ class VStack(LinearOperator):
             offset += rows
         assert result is not None
         return xp.asarray(result)
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        xp = None
+        template = like
+        parts: list[Array] = []
+        for op in self._ops:
+            piece = op.dense_matrix(template)
+            if xp is None:
+                xp = array_namespace(piece)
+            if template is None:
+                template = piece
+            parts.append(piece)
+        assert xp is not None
+        return xp.concat(tuple(parts), axis=0)
 
     def row_gram_diagonal(self, weights: Array) -> Array:
         # Rows are stacked, so the weighted row energies concatenate. Propagates

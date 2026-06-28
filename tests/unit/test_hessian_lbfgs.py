@@ -116,6 +116,19 @@ def test_lbfgs_matmat_uses_batched_compact_form(namespace, tol):
     assert_allclose(namespace, op.rmatmat(V), expected, **tol)
 
 
+def test_lbfgs_dense_matrix_matches_batched_application(namespace, tol):
+    op = LBFGSOperator(3, LBFGSOptions(memory=5))
+    like = array(namespace, [0.0, 0.0, 0.0])
+    identity = namespace.eye(3, dtype=like.dtype)
+
+    assert_allclose(namespace, op.dense_matrix(like), identity, **tol)
+
+    op.update(array(namespace, [1.0, 0.5, -0.5]), array(namespace, [2.0, 1.0, 0.5]))
+    op.update(array(namespace, [0.5, -1.0, 1.0]), array(namespace, [1.0, 1.5, 0.5]))
+
+    assert_allclose(namespace, op.dense_matrix(), op.matmat(identity), **tol)
+
+
 def test_lbfgs_compact_form_unavailable_before_first_pair(namespace):
     op = LBFGSOperator(3, LBFGSOptions(memory=5))
     with pytest.raises(NotImplementedError):

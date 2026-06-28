@@ -55,6 +55,19 @@ def test_dense_solver_accepts_pd_condensed_block(namespace, tol):
     assert_allclose(namespace, actual, array(namespace, [1.0, 1.0]), **tol)
 
 
+def test_dense_solver_accepts_matrix_rhs(namespace, tol):
+    op = Dense(array(namespace, [[2.0, 0.0], [0.0, 4.0]]))
+    rhs = array(namespace, [[2.0, 4.0], [8.0, 12.0]])
+    solver = DenseSolver()
+    solver.factor(op)
+
+    actual = solver.solve(rhs)
+
+    assert_allclose(
+        namespace, actual, array(namespace, [[1.0, 2.0], [2.0, 3.0]]), **tol
+    )
+
+
 def test_dense_solver_prefers_structured_solve(namespace, tol):
     class _StructuredOnly:
         shape = (2, 2)
@@ -77,6 +90,71 @@ def test_dense_solver_prefers_structured_solve(namespace, tol):
 
     assert op.called
     assert_allclose(namespace, actual, array(namespace, [2.0, 4.0]), **tol)
+
+
+def test_dense_solver_prefers_dense_matrix_hook(namespace, tol):
+    class _DenseMatrixOnly(LinearOperator):
+        def __init__(self, matrix):
+            self._matrix = matrix
+            self.called = False
+
+        @property
+        def shape(self):
+            return int(self._matrix.shape[0]), int(self._matrix.shape[1])
+
+        def matvec(self, v):
+            xp = array_namespace(self._matrix, v)
+            return xp.matmul(self._matrix, v)
+
+        def matmat(self, V):
+            raise AssertionError("dense_matrix should avoid identity matmat")
+
+        def dense_matrix(self, like=None):
+            del like
+            self.called = True
+            return self._matrix
+
+    matrix = array(namespace, [[2.0, 0.0], [0.0, 4.0]])
+    op = _DenseMatrixOnly(matrix)
+    solver = DenseSolver()
+    solver.factor(op)
+
+    actual = solver.solve(array(namespace, [2.0, 8.0]))
+
+    assert op.called
+    assert_allclose(namespace, actual, array(namespace, [1.0, 2.0]), **tol)
+
+
+def test_dense_solver_caches_materialized_matrix(namespace, tol):
+    class _CountingOperator(LinearOperator):
+        def __init__(self, matrix):
+            self._matrix = matrix
+            self.matmat_calls = 0
+
+        @property
+        def shape(self):
+            return int(self._matrix.shape[0]), int(self._matrix.shape[1])
+
+        def matvec(self, v):
+            xp = array_namespace(self._matrix, v)
+            return xp.matmul(self._matrix, v)
+
+        def matmat(self, V):
+            self.matmat_calls += 1
+            xp = array_namespace(self._matrix, V)
+            return xp.matmul(self._matrix, V)
+
+    matrix = array(namespace, [[2.0, 0.0], [0.0, 4.0]])
+    op = _CountingOperator(matrix)
+    solver = DenseSolver()
+    solver.factor(op)
+
+    first = solver.solve(array(namespace, [2.0, 8.0]))
+    second = solver.solve(array(namespace, [4.0, 12.0]))
+
+    assert op.matmat_calls == 1
+    assert_allclose(namespace, first, array(namespace, [1.0, 2.0]), **tol)
+    assert_allclose(namespace, second, array(namespace, [2.0, 3.0]), **tol)
 
 
 def test_dense_solver_reuses_materialized_leading_primal_block(namespace, tol):

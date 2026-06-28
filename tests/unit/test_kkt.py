@@ -39,6 +39,12 @@ class _CountingDense(Dense):
         return super().rmatmat(V)
 
 
+class _MatmatExplodesDense(Dense):
+    def matmat(self, V):
+        del V
+        raise AssertionError("dense_matrix should avoid identity matmat")
+
+
 def test_condensed_operator_matches_dense_formula(namespace, tol):
     W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
     sigma_x_dense = array(namespace, [[0.25, 0.0], [0.0, 0.75]])
@@ -104,6 +110,42 @@ def test_condensed_operator_matmat_batches_block_products(namespace, tol):
     assert J.rmatvec_calls == 0
 
 
+def test_condensed_dense_matrix_matches_materialized(namespace, tol):
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    J = Dense(array(namespace, [[1.0, 2.0], [-1.0, 0.5]]))
+    op = build_condensed_operator(
+        Dense(W_dense), sigma_x, sigma_s, J, RegularizationState(delta_w=1e-6)
+    )
+
+    actual = op.dense_matrix()
+    expected = op.matmat(namespace.eye(2, dtype=W_dense.dtype))
+
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_condensed_dense_matrix_uses_direct_dense_hooks(namespace, tol):
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 2), dtype=W_dense.dtype))
+    op = build_condensed_operator(
+        _MatmatExplodesDense(W_dense),
+        sigma_x,
+        empty_sigma_s,
+        empty_jac,
+        RegularizationState(delta_w=1e-6),
+    )
+
+    actual = op.dense_matrix()
+    expected = W_dense + namespace.asarray(
+        [[0.250001, 0.0], [0.0, 0.750001]], dtype=W_dense.dtype
+    )
+
+    assert_allclose(namespace, actual, expected, **tol)
+
+
 def test_condensed_operator_diagonal_matches_materialized(namespace, tol):
     """The cheap Jacobi diagonal equals the materialized operator's diagonal."""
     W = Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]]))
@@ -145,6 +187,23 @@ def test_condensed_dense_structured_solve_matches_materialized(namespace, tol):
     empty_sigma_s = Diagonal(array(namespace, []))
     empty_jac = Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype))
     rhs = array(namespace, [1.0, -2.0, 0.5])
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+
+    dense = op.matmat(namespace.eye(3, dtype=rhs.dtype))
+    actual = op.dense_structured_solve(rhs)
+    expected = namespace.linalg.solve(dense, rhs)
+
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_condensed_dense_structured_solve_handles_diagonal_hessian(namespace, tol):
+    W = Diagonal(array(namespace, [2.0, 3.0, 4.0]))
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype))
+    rhs = array(namespace, [[1.0, -2.0], [0.5, 2.0], [3.0, -4.0]])
     op = build_condensed_operator(
         W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
     )
@@ -219,6 +278,24 @@ def test_saddle_operator_matmat_batches_block_products(namespace, tol):
     assert J.rmatvec_calls == 0
 
 
+def test_saddle_dense_matrix_matches_materialized(namespace, tol):
+    condensed = build_condensed_operator(
+        Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        Diagonal(array(namespace, [0.25, 0.75])),
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 2), dtype=array(namespace, [0.0]).dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, 1.0]])), delta_c=1e-4
+    )
+
+    actual = saddle.dense_matrix()
+    expected = saddle.matmat(namespace.eye(3, dtype=array(namespace, [0.0]).dtype))
+
+    assert_allclose(namespace, actual, expected, **tol)
+
+
 def test_saddle_dense_structured_solve_matches_materialized(namespace, tol):
     W = _lbfgs_operator(namespace)
     sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
@@ -231,6 +308,26 @@ def test_saddle_dense_structured_solve_matches_materialized(namespace, tol):
         condensed, Dense(array(namespace, [[1.0, -1.0, 0.5]])), 1e-4
     )
     rhs = array(namespace, [1.0, -2.0, 0.5, 0.25])
+
+    dense = saddle.matmat(namespace.eye(4, dtype=rhs.dtype))
+    actual = saddle.dense_structured_solve(rhs)
+    expected = namespace.linalg.solve(dense, rhs)
+
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_saddle_dense_structured_solve_handles_matrix_rhs(namespace, tol):
+    W = _lbfgs_operator(namespace)
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype))
+    condensed = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, -1.0, 0.5]])), 1e-4
+    )
+    rhs = array(namespace, [[1.0, -2.0], [-2.0, 0.5], [0.5, 1.5], [0.25, -0.75]])
 
     dense = saddle.matmat(namespace.eye(4, dtype=rhs.dtype))
     actual = saddle.dense_structured_solve(rhs)

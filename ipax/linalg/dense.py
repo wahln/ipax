@@ -43,6 +43,7 @@ class DenseSolver:
 
     def __init__(self) -> None:
         self._operator: LinearOperator | None = None
+        self._matrix: Array | None = None
 
     def describe(self) -> str:
         """Human-readable label for diagnostics."""
@@ -52,12 +53,15 @@ class DenseSolver:
         if K.shape[0] != K.shape[1]:
             raise ValueError("DenseSolver requires a square operator")
         self._operator = K
+        self._matrix = None
 
     def solve(self, rhs: Array) -> Array:
         if self._operator is None:
             raise RuntimeError("factor() must be called before solve()")
 
         n = self._operator.shape[0]
+        if len(rhs.shape) not in (1, 2):
+            raise ValueError("right-hand side must be a vector or matrix")
         if int(rhs.shape[0]) != n:
             raise ValueError("right-hand side dimension does not match operator")
 
@@ -66,22 +70,44 @@ class DenseSolver:
         # condensed/saddle block) solve via Woodbury without the n×n
         # materialization; the default raises NotImplementedError, so plain
         # operators fall through to materializing and factoring below.
-        try:
-            return self._operator.dense_structured_solve(rhs)
-        except NotImplementedError:
-            pass
-        except LinearSolveError:
-            raise
-        except Exception as exc:
-            raise LinearSolveError("dense structured solve failed") from exc
+        if self._matrix is None:
+            structured_solve = getattr(self._operator, "dense_structured_solve", None)
+            if structured_solve is not None:
+                try:
+                    return structured_solve(rhs)
+                except NotImplementedError:
+                    pass
+                except LinearSolveError:
+                    raise
+                except Exception as exc:
+                    raise LinearSolveError("dense structured solve failed") from exc
 
-        identity = xp.eye(n, dtype=rhs.dtype)
-        matrix = self._operator.matmat(identity)
-        self._guard_positive_definite(matrix, xp)
+            self._matrix = self._materialize_dense_matrix(rhs, xp, n)
+            self._guard_positive_definite(self._matrix, xp)
+
+        matrix = self._matrix
+        assert matrix is not None
         try:
             return xp.linalg.solve(matrix, rhs)
         except Exception as exc:
             raise LinearSolveError("dense linear solve failed") from exc
+
+    def _materialize_dense_matrix(self, rhs: Array, xp: Any, n: int) -> Array:
+        assert self._operator is not None
+        dense_matrix = getattr(self._operator, "dense_matrix", None)
+        if dense_matrix is not None:
+            try:
+                return dense_matrix(rhs)
+            except NotImplementedError:
+                pass
+            except Exception as exc:
+                raise LinearSolveError("dense matrix materialization failed") from exc
+
+        identity = xp.eye(n, dtype=rhs.dtype)
+        try:
+            return self._operator.matmat(identity)
+        except Exception as exc:
+            raise LinearSolveError("dense matrix materialization failed") from exc
 
     def _guard_positive_definite(self, matrix: Array, xp: Any) -> None:
         """Reject a non-PD condensed block so the IPM escalates δ_w.

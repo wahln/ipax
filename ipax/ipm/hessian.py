@@ -89,6 +89,24 @@ class LBFGSOperator(LinearOperator):
     def rmatmat(self, V: Array) -> Array:
         return self._apply(V)  # B is symmetric
 
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        """Materialize the compact Hessian directly from ``B = xi*I - U M^-1 U.T``."""
+        if self._u is None or self._m is None:
+            if like is None:
+                raise NotImplementedError(
+                    "L-BFGS dense matrix requires a template before the first pair"
+                )
+            xp = array_namespace(like)
+            return xp.eye(self._n, dtype=like.dtype)
+
+        xp = array_namespace(self._u)
+        identity = xp.eye(self._n, dtype=self._u.dtype)
+        correction = xp.matmul(
+            self._u,
+            xp.linalg.solve(self._m, xp.permute_dims(self._u, (1, 0))),
+        )
+        return self._xi * identity - correction
+
     def _apply(self, x: Array) -> Array:
         """Apply ``B = ξI − U M⁻¹ Uᵀ`` to a vector or a batch of columns.
 

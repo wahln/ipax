@@ -63,3 +63,14 @@ class LinearOperatorContract:
             expected = namespace.matmul(dense, V)
 
         assert_allclose(namespace, actual, expected, **tol)
+
+    def test_dense_matrix_matches_dense_when_available(self, namespace, tol):
+        with implemented(self.implementation_reason):
+            op = self.make_operator(namespace)
+            dense = self.make_dense(namespace)
+            try:
+                actual = op.dense_matrix(dense)
+            except NotImplementedError:
+                return
+
+        assert_allclose(namespace, actual, dense, **tol)

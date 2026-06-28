@@ -15,7 +15,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   positive-definite guard also reuses the already-materialized matrix instead of
   re-forming the primal block. Bound-only L-BFGS dense solves now use an exact
   Woodbury compact solve (and equality saddles use the corresponding Schur
-  complement) before falling back to full materialization.
+  complement) before falling back to full materialization. Explicit operators now
+  expose a `dense_matrix` hook, so the fallback dense route can assemble exact
+  dense/saddle blocks directly instead of probing with an identity matmul; the
+  materialized matrix is cached across repeated `solve()` calls after `factor()`,
+  and diagonal exact-Hessian bound-only systems use a direct diagonal solve.
 
 ## [0.3.0] - 2026-06-26
 

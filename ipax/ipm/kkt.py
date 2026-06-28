@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from ipax.backend.namespace import array_namespace
-from ipax.backend.operators import Diagonal, LinearOperator
+from ipax.backend.operators import Diagonal, Identity, LinearOperator
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -192,6 +192,23 @@ def _woodbury_solve(factors: tuple[Array, Array, Array, Array], rhs: Array) -> A
     return inv_d_rhs + xp.matmul(inv_d_u, z)
 
 
+def _diagonal_solve(d: Array, rhs: Array) -> Array:
+    """Apply ``diag(d)^-1`` to a vector or columns of a matrix RHS."""
+    xp = array_namespace(d, rhs)
+    if len(rhs.shape) == 1:
+        return rhs / d
+    if len(rhs.shape) == 2:
+        return rhs / xp.expand_dims(d, axis=1)
+    raise ValueError("diagonal solve requires a vector or matrix RHS")
+
+
+def _add_dense_diagonal(matrix: Array, diagonal: Array) -> Array:
+    """Return ``matrix + diag(diagonal)`` without an identity matmat probe."""
+    xp = array_namespace(matrix, diagonal)
+    n = int(diagonal.shape[0])
+    return matrix + xp.eye(n, dtype=matrix.dtype) * diagonal
+
+
 class _CondensedOperator(LinearOperator):
     """Lazy ``W + Sigma_x + J.T @ Sigma_s @ J + delta_w * I`` operator."""
 
@@ -245,6 +262,36 @@ class _CondensedOperator(LinearOperator):
     def rmatmat(self, V: Array) -> Array:
         return self.matmat(V)
 
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        """Materialize the condensed dense block from explicit operator pieces."""
+        template = like
+        if template is None:
+            try:
+                template = self._sigma_x.diagonal()
+            except NotImplementedError:
+                template = None
+
+        dense = self._W.dense_matrix(template)
+
+        if isinstance(self._sigma_x, (Diagonal, Identity)):
+            dense = _add_dense_diagonal(dense, self._sigma_x.diagonal(dense))
+        else:
+            dense = dense + self._sigma_x.dense_matrix(dense)
+
+        if self._ineq_jac.shape[0] > 0:
+            xp = array_namespace(dense)
+            jac = self._ineq_jac.dense_matrix(dense)
+            if isinstance(self._sigma_s, (Diagonal, Identity)):
+                sigma_s_jac = xp.expand_dims(self._sigma_s.diagonal(jac), axis=1) * jac
+            else:
+                sigma_s_jac = xp.matmul(self._sigma_s.dense_matrix(jac), jac)
+            dense = dense + xp.matmul(xp.permute_dims(jac, (1, 0)), sigma_s_jac)
+
+        if self._delta_w != 0.0:
+            xp = array_namespace(dense)
+            dense = dense + self._delta_w * xp.eye(self.shape[0], dtype=dense.dtype)
+        return dense
+
     def dense_structured_solve(self, rhs: Array) -> Array:
         """Exact dense solve for ``D - U M⁻¹ Uᵀ`` L-BFGS condensed blocks.
 
@@ -262,13 +309,20 @@ class _CondensedOperator(LinearOperator):
             raise NotImplementedError(
                 "structured dense solve requires a diagonal Sigma_x block"
             )
+        sigma_x = self._sigma_x.diagonal()
+        if isinstance(self._W, (Diagonal, Identity)):
+            d = self._W.diagonal(sigma_x) + sigma_x
+            if self._delta_w != 0.0:
+                d = d + self._delta_w
+            return _diagonal_solve(d, rhs)
+
         compact_form = getattr(self._W, "compact_form", None)
         if compact_form is None:
             raise NotImplementedError(
                 "structured dense solve requires an L-BFGS compact Hessian"
             )
         xi, u, m_lbfgs = compact_form()
-        d = xi + self._sigma_x.diagonal()
+        d = xi + sigma_x
         if self._delta_w != 0.0:
             d = d + self._delta_w
         return _woodbury_solve(_woodbury_factors(d, u, m_lbfgs), rhs)
@@ -499,6 +553,20 @@ class _SaddleOperator(LinearOperator):
     def rmatmat(self, V: Array) -> Array:
         return self.matmat(V)
 
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        """Materialize the bordered saddle block from explicit dense pieces."""
+        n_dense = self._condensed.dense_matrix(like)
+        if self._m == 0:
+            return n_dense
+
+        xp = array_namespace(n_dense)
+        eq = self._eq_jac.dense_matrix(n_dense)
+        top = xp.concat((n_dense, xp.permute_dims(eq, (1, 0))), axis=1)
+        bottom = xp.concat(
+            (eq, -self._delta_c * xp.eye(self._m, dtype=n_dense.dtype)), axis=1
+        )
+        return xp.concat((top, bottom), axis=0)
+
     def dense_structured_solve(self, rhs: Array) -> Array:
         """Exact Schur-complement solve using a structured condensed inverse.
 
@@ -506,29 +574,38 @@ class _SaddleOperator(LinearOperator):
         non-L-BFGS Hessian or an inequality Gram term), so the dense solver falls
         back to materialization for systems without exploitable structure.
         """
-        if len(rhs.shape) != 1:
-            raise ValueError("saddle structured dense solve requires a vector RHS")
-
         xp = array_namespace(rhs)
-        rhs_x = rhs[: self._n]
-        rhs_y = rhs[self._n :]
+        if len(rhs.shape) == 1:
+            vector_rhs = True
+            rhs_x = xp.expand_dims(rhs[: self._n], axis=1)
+            rhs_y = xp.expand_dims(rhs[self._n :], axis=1)
+        elif len(rhs.shape) == 2:
+            vector_rhs = False
+            rhs_x = rhs[: self._n, :]
+            rhs_y = rhs[self._n :, :]
+        else:
+            raise ValueError("saddle structured dense solve requires vector/matrix RHS")
+
         if self._m == 0:
-            return self._condensed.dense_structured_solve(rhs_x)
+            solution = self._condensed.dense_structured_solve(rhs_x)
+            return solution[:, 0] if vector_rhs else solution
 
         identity_y = xp.eye(self._m, dtype=rhs.dtype)
         eq_t = self._eq_jac.rmatmat(identity_y)
-        batch_rhs = xp.concat((xp.expand_dims(rhs_x, axis=1), eq_t), axis=1)
+        n_rhs = int(rhs_x.shape[1])
+        batch_rhs = xp.concat((rhs_x, eq_t), axis=1)
         solved = self._condensed.dense_structured_solve(batch_rhs)
-        n_inv_rhs = solved[:, 0]
-        n_inv_eq_t = solved[:, 1:]
+        n_inv_rhs = solved[:, :n_rhs]
+        n_inv_eq_t = solved[:, n_rhs:]
 
         schur = self._eq_jac.matmat(n_inv_eq_t)
         if self._delta_c != 0.0:
             schur = schur + self._delta_c * identity_y
-        rhs_schur = self._eq_jac.matvec(n_inv_rhs) - rhs_y
+        rhs_schur = self._eq_jac.matmat(n_inv_rhs) - rhs_y
         dy = xp.linalg.solve(schur, rhs_schur)
         dx = n_inv_rhs - xp.matmul(n_inv_eq_t, dy)
-        return xp.concat((dx, dy))
+        solution = xp.concat((dx, dy), axis=0)
+        return solution[:, 0] if vector_rhs else solution
 
     def preferred_krylov_method(self) -> Literal["minres"]:
         """The equality saddle is symmetric indefinite, so MINRES is the route."""
