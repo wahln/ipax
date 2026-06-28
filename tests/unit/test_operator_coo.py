@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from ipax.backend.operators import Dense, Diagonal, Identity
+from ipax.backend.operators import Dense, Diagonal, Identity, LinearOperator
 from ipax.ipm.hessian import LBFGSOperator
 from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
 from ipax.linalg.regularize import RegularizationState
@@ -33,6 +33,32 @@ def _identity_dense(namespace, op):
         for j in range(n)
     ]
     return namespace.stack(columns, axis=1)
+
+
+class _OffDiagonalHessian(LinearOperator):
+    """Tiny symmetric assemblable Hessian with no structural diagonal entries."""
+
+    def __init__(self, namespace) -> None:
+        self._xp = namespace
+
+    @property
+    def shape(self):
+        return 3, 3
+
+    def matvec(self, v):
+        return self._xp.stack((v[1], v[0], 0.0 * v[2]))
+
+    def rmatvec(self, v):
+        return self.matvec(v)
+
+    def to_coo(self, like=None):
+        del like
+        return (
+            self._xp.asarray([0, 1]),
+            self._xp.asarray([1, 0]),
+            array(self._xp, [1.0, 1.0]),
+            self.shape,
+        )
 
 
 def test_dense_to_coo_round_trips(namespace, tol):
@@ -80,6 +106,55 @@ def test_condensed_operator_to_coo_matches_matvec(namespace, tol):
         namespace,
         _coo_to_dense(namespace, rows, cols, values, shape),
         _identity_dense(namespace, op),
+        **tol,
+    )
+
+
+def _pairs(rows, cols):
+    return tuple((int(rows[k]), int(cols[k])) for k in range(int(rows.shape[0])))
+
+
+def test_condensed_exact_assembly_reserves_delta_w_diagonal_pattern(namespace, tol):
+    # Exact/sparse route: δ_w can activate after an initial failed factorization.
+    # The full diagonal is reserved even when the current shift has zeros, so
+    # regularization changes values rather than forcing sparse symbolic reanalysis.
+    w = _OffDiagonalHessian(namespace)
+    sigma_x = Diagonal(array(namespace, [0.0, 0.25, 0.0]))
+    sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=float_dtype(namespace)))
+    no_reg = build_condensed_operator(
+        w, sigma_x, sigma_s, empty_jac, RegularizationState()
+    )
+    with_reg = build_condensed_operator(
+        w, sigma_x, sigma_s, empty_jac, RegularizationState(delta_w=1e-2)
+    )
+
+    rows0, cols0, values0, shape0 = no_reg.to_coo()
+    rows1, cols1, values1, shape1 = with_reg.to_coo()
+
+    assert shape0 == shape1 == (3, 3)
+    assert (
+        _pairs(rows0, cols0)
+        == _pairs(rows1, cols1)
+        == (
+            (0, 1),
+            (1, 0),
+            (0, 0),
+            (1, 1),
+            (2, 2),
+        )
+    )
+    assert int(values0.shape[0]) == int(values1.shape[0]) == 5
+    assert_allclose(
+        namespace,
+        _coo_to_dense(namespace, rows0, cols0, values0, shape0),
+        _identity_dense(namespace, no_reg),
+        **tol,
+    )
+    assert_allclose(
+        namespace,
+        _coo_to_dense(namespace, rows1, cols1, values1, shape1),
+        _identity_dense(namespace, with_reg),
         **tol,
     )
 

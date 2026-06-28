@@ -384,14 +384,14 @@ class _CondensedOperator(LinearOperator):
         else:
             # Assemblable Hessian: W triplets + the Σ_x and δ_w diagonals.
             wr, wc, wv, _ = self._W.to_coo()
+            shift_diag = sigma_x_diag
+            if self._delta_w != 0.0:
+                shift_diag = shift_diag + self._delta_w
+            # Reserve the full diagonal so later δ_w activation changes values,
+            # not sparsity. Sparse solvers can then reuse symbolic analysis.
             rows = xp.concat((wr, idx))
             cols = xp.concat((wc, idx))
-            values = xp.concat((wv, sigma_x_diag))
-            if self._delta_w != 0.0:
-                delta = xp.full((n,), self._delta_w, dtype=values.dtype)
-                rows = xp.concat((rows, idx))
-                cols = xp.concat((cols, idx))
-                values = xp.concat((values, delta))
+            values = xp.concat((wv, shift_diag))
 
         if self._ineq_jac.shape[0] > 0:
             borders.append(_inequality_border(self._ineq_jac, self._sigma_s))

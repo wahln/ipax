@@ -588,6 +588,19 @@ class VStack(LinearOperator):
         xp = array_namespace(weights)
         return xp.concat(tuple(op.row_gram_diagonal(weights) for op in self._ops))
 
+    def gram_diagonal(self, weights: Array) -> Array:
+        # Row weights are stacked with the blocks; split by row range and sum each
+        # block's column-energy contribution.
+        result = None
+        offset = 0
+        for op, rows in zip(self._ops, self._rows, strict=True):
+            piece = op.gram_diagonal(weights[offset : offset + rows])
+            result = piece if result is None else result + piece
+            offset += rows
+        assert result is not None
+        xp = array_namespace(result)
+        return xp.asarray(result)
+
     def row_inf_norms(self, like: Array | None = None) -> Array:
         # Stacked rows ⇒ concatenate each block's row norms (used by scaling).
         xp = None
