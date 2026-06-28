@@ -111,18 +111,27 @@ class DeviceRoutingSparseAdapter:
 
     def __init__(self) -> None:
         self._delegate: Any = None
+        self._delegate_kind: int | None = None
 
     def _resolve(self, like: Array) -> Any:
         kind = _dlpack_device_kind(like)
+        # Reuse the delegate across iterations (the device is fixed across a
+        # solve) so its compiled COO→canonical map cache survives — recreating it
+        # every ``from_coo`` would silently disable the values-only fast path.
+        if self._delegate is not None and self._delegate_kind == kind:
+            return self._delegate
         if kind == _DLPACK_CPU:
-            return _cpu_adapter()
-        if kind == _DLPACK_CUDA:
-            return _cuda_adapter()
-        raise RuntimeError(
-            f"no sparse-direct adapter for DLPack device kind {kind}; ipax "
-            "reinterprets COO buffers onto the SciPy (CPU) and cuDSS (CUDA) "
-            "adapters, which covers host and NVIDIA CUDA arrays only"
-        )
+            delegate = _cpu_adapter()
+        elif kind == _DLPACK_CUDA:
+            delegate = _cuda_adapter()
+        else:
+            raise RuntimeError(
+                f"no sparse-direct adapter for DLPack device kind {kind}; ipax "
+                "reinterprets COO buffers onto the SciPy (CPU) and cuDSS (CUDA) "
+                "adapters, which covers host and NVIDIA CUDA arrays only"
+            )
+        self._delegate_kind = kind
+        return delegate
 
     def from_coo(
         self,

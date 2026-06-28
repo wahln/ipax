@@ -29,6 +29,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   diagonals are reserved so `delta_w`/`delta_c` activation changes values rather
   than sparsity, and the sparse facade guards cached adapters against backend or
   device changes.
+- Faster sparse assembly (values-only refactor): the SciPy and CuPy sparse
+  adapters now compile the COO→canonical-CSR/CSC transform once per fixed
+  `pattern_signature` into a gather/segment-sum map, then recompute only the value
+  array on subsequent factorizations — replacing the per-iteration
+  `coo_matrix(...).tocsc()` / `tocsr().sum_duplicates().sort_indices()` sort
+  (`O(nnz log nnz)`, never amortized by the factorization's symbolic reuse) with a
+  single `O(nnz)` scatter-add. The cuDSS symmetric route likewise caches its
+  full-CSR→lower-triangle map instead of re-running `tril(...)` plus a
+  re-canonicalization each iteration, and the device-routing adapter (Torch/JAX)
+  now persists its delegate so the cache survives across iterations. The cuDSS
+  route also uploads int32 CSR offsets/indices when the system fits a signed
+  32-bit integer (halving index bandwidth), falling back to int64 otherwise.
 
 ## [0.3.0] - 2026-06-26
 

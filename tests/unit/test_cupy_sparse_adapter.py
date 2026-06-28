@@ -39,6 +39,13 @@ def cupy_sparse_module(monkeypatch: pytest.MonkeyPatch):
     cupy.zeros = np.zeros
     cupy.empty_like = np.empty_like
     cupy.array_equal = np.array_equal
+    # Array ops used by the compiled COO→canonical-CSR fast path.
+    cupy.unique = np.unique
+    cupy.bincount = np.bincount
+    cupy.cumsum = np.cumsum
+    cupy.arange = np.arange
+    cupy.diff = np.diff
+    cupy.repeat = np.repeat
 
     class FakeRuntime:
         current_device = 0
@@ -72,9 +79,11 @@ def cupy_sparse_module(monkeypatch: pytest.MonkeyPatch):
     cupy.from_dlpack = from_dlpack
 
     cupyx = types.ModuleType("cupyx")
+    cupyx.scatter_add = lambda out, idx, vals: np.add.at(out, idx, vals)
     cupyx_scipy = types.ModuleType("cupyx.scipy")
     cupyx_sparse = types.ModuleType("cupyx.scipy.sparse")
     cupyx_sparse.coo_matrix = scipy_sparse.coo_matrix
+    cupyx_sparse.csr_matrix = scipy_sparse.csr_matrix
     cupyx_sparse.tril = scipy_sparse.tril
     cupyx_sparse_linalg = types.ModuleType("cupyx.scipy.sparse.linalg")
     cupyx_sparse_linalg.spsolve = scipy_sparse_linalg.spsolve
@@ -462,6 +471,88 @@ def test_cudss_missing_runtime_uses_spsolve_fallback(
     actual = solver.solve(np.asarray([2.0, 8.0]))
 
     np.testing.assert_allclose(actual, np.asarray([1.0, 2.0]))
+
+
+def test_from_coo_signature_fast_path_matches_slow_path(
+    cupy_sparse_module: types.ModuleType,
+) -> None:
+    # The compiled-map fast path (pattern_signature set) must build the same
+    # canonical matrix as the from-scratch COO build (signature absent).
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    rows = np.asarray([0, 0, 1, 1, 0])  # (0,0) duplicated ⇒ summed
+    cols = np.asarray([0, 1, 0, 1, 0])
+    values = np.asarray([2.0, 1.0, 1.0, 3.0, 0.5])
+
+    slow = adapter.from_coo(rows, cols, values, shape=(2, 2))
+    fast = cupy_sparse_module.CuPySparseAdapter().from_coo(
+        rows, cols, values, shape=(2, 2), pattern_signature=("p", (2, 2))
+    )
+
+    probe = np.asarray([1.0, -2.0])
+    np.testing.assert_allclose(fast.matvec(probe), slow.matvec(probe))
+
+
+def test_from_coo_signature_reuse_solves_correctly_via_cudss(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeCudss()
+    monkeypatch.setattr(cupy_sparse_module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    rows = np.asarray([0, 0, 1, 1])
+    cols = np.asarray([0, 1, 0, 1])
+    signature = ("kkt", (2, 2))
+    solver = adapter.solver()
+
+    first = adapter.from_coo(
+        rows,
+        cols,
+        np.asarray([2.0, 1.0, 1.0, 3.0]),
+        shape=(2, 2),
+        pattern_signature=signature,
+    )
+    solver.factor(first)
+    second = adapter.from_coo(
+        rows,
+        cols,
+        np.asarray([5.0, 1.0, 1.0, 4.0]),
+        shape=(2, 2),
+        pattern_signature=signature,
+    )
+    solver.factor(second)
+
+    # Symbolic analysis reused (one analysis, one values-only factor); the cached
+    # lower-triangle map serves the symmetric route without a per-iter tril.
+    assert fake.phases == [
+        int(_Phase.ANALYSIS) | int(_Phase.FACTORIZATION),
+        int(_Phase.FACTORIZATION),
+    ]
+    assert fake.matrix_set_values_calls == 1
+
+
+def test_cudss_uses_int32_indices_for_small_system(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeCudss()
+    monkeypatch.setattr(cupy_sparse_module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    operator = adapter.from_coo(
+        np.asarray([0, 1]),
+        np.asarray([0, 1]),
+        np.asarray([1.0, 1.0]),
+        shape=(2, 2),
+        pattern_signature=("diag", (2, 2)),
+    )
+    solver = adapter.solver()
+    solver.factor(operator)
+
+    # Optimization #3: the uploaded CSR offsets/indices are int32 when the system
+    # fits a signed 32-bit integer.
+    assert solver._inner._row_offsets.dtype == np.int32
+    assert solver._inner._col_indices.dtype == np.int32
 
 
 def test_cudss_solver_recreates_context_on_device_change(

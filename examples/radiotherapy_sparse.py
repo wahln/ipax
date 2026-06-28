@@ -45,9 +45,12 @@ if FORCE_NUMPY:
 
 import ipax  # noqa: E402
 
+SOLVER = "sparse"
+HESSIAN = "lbfgs"
+
 # Runnable defaults. Clinical scale (see module docstring) is ~1e7 × 1e4 @ 1e-3.
-N_VOXELS = int(os.environ.get("RT_VOXELS", 1_000_00))
-N_BEAMLETS = int(os.environ.get("RT_BEAMLETS", 10_00))
+N_VOXELS = int(os.environ.get("RT_VOXELS", 1_000_000))
+N_BEAMLETS = int(os.environ.get("RT_BEAMLETS", 1000))
 DENSITY = float(os.environ.get("RT_DENSITY", 0.001))
 
 PRECISION = np.float64
@@ -102,8 +105,8 @@ def main() -> None:
         problem,
         x0,
         options=ipax.Options(
-            hessian="lbfgs",
-            linsolve="sparse",
+            hessian=HESSIAN,
+            linsolve=SOLVER,
             mu_schedule="adaptive",
             optimality=ipax.OptimalityConditionOptions(
                 dual_inf_tol=1e-6, constr_viol_tol=1e-6, compl_inf_tol=1e-6
