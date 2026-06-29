@@ -65,6 +65,11 @@ class SparseDirectSolver:
         # pad/truncate the RHS and solution across that gap (see ``solve``).
         self._logical_size = 0
         self._assembled_size = 0
+        # Cached COO row/column structure for the current pattern signature: the
+        # KKT pattern is fixed across IPM iterations, so on a cache hit only the
+        # value vector is recomputed (``coo_values``) instead of the full triplet.
+        self._struct_signature: object | None = None
+        self._struct: tuple[Array, Array, tuple[int, int]] | None = None
 
     def describe(self) -> str:
         """Human-readable label, delegating to the dispatched backend solver."""
@@ -78,7 +83,25 @@ class SparseDirectSolver:
 
     def factor(self, K: LinearOperator) -> None:
         # The core emits structure; the adapter builds and factors the matrix.
-        rows, cols, values, shape = K.to_coo()
+        # On a fixed pattern (stable signature) reuse the cached row/column
+        # vectors and recompute only the values — the index arrays (and the
+        # low-rank border's index grids) are identical every iteration.
+        signature = K.coo_pattern_signature()
+        if (
+            signature is not None
+            and self._struct is not None
+            and self._struct_signature == signature
+        ):
+            rows, cols, shape = self._struct
+            values = K.coo_values()
+        else:
+            rows, cols, values, shape = K.to_coo()
+            if signature is not None:
+                self._struct = (rows, cols, shape)
+                self._struct_signature = signature
+            else:
+                self._struct = None
+                self._struct_signature = None
         xp = array_namespace(values)
         adapter_key = (_namespace_name(xp), _dlpack_device_kind(values))
         # Forward the operator's structural symmetry hint (the condensed/saddle

@@ -555,6 +555,61 @@ def test_cudss_uses_int32_indices_for_small_system(
     assert solver._inner._col_indices.dtype == np.int32
 
 
+def test_cudss_reuses_dense_descriptors_across_solves(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The persistent RHS/solution descriptors are created once (factor binds them
+    # for the analysis phase) and reused for every solve of the same shape — no
+    # per-solve create/destroy churn (#4).
+    fake = _FakeCudss()
+    monkeypatch.setattr(cupy_sparse_module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    operator = adapter.from_coo(
+        np.asarray([0, 1]), np.asarray([0, 1]), np.asarray([2.0, 4.0]), shape=(2, 2)
+    )
+    solver = adapter.solver()
+    solver.factor(operator)
+    dense_after_factor = len(fake.dense_matrices)
+
+    # The fake cuDSS echoes the RHS into the solution (it does not really solve),
+    # so the asserted values mirror the inputs; the point is the descriptor reuse.
+    first = solver.solve(np.asarray([2.0, 8.0]))
+    second = solver.solve(np.asarray([6.0, 4.0]))
+
+    np.testing.assert_allclose(first, np.asarray([2.0, 8.0]))
+    np.testing.assert_allclose(second, np.asarray([6.0, 4.0]))
+    # Two dense descriptors total (rhs + sol), created at factor time and reused;
+    # neither solve allocated a fresh pair.
+    assert dense_after_factor == 2
+    assert len(fake.dense_matrices) == 2
+
+
+def test_cudss_solve_result_is_independent_of_reused_buffer(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The returned array must be a copy: a later solve reuses the solution buffer
+    # in place, and must not retroactively mutate an earlier result.
+    fake = _FakeCudss()
+    monkeypatch.setattr(cupy_sparse_module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    operator = adapter.from_coo(
+        np.asarray([0, 1]), np.asarray([0, 1]), np.asarray([2.0, 4.0]), shape=(2, 2)
+    )
+    solver = adapter.solver()
+    solver.factor(operator)
+
+    first = solver.solve(np.asarray([2.0, 8.0]))
+    # The second solve overwrites the shared solution buffer in place; ``first``
+    # must keep its own values (it is a copy), not track the buffer.
+    solver.solve(np.asarray([6.0, 4.0]))
+
+    np.testing.assert_allclose(first, np.asarray([2.0, 8.0]))
+
+
 def test_cudss_solver_recreates_context_on_device_change(
     cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:

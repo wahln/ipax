@@ -41,6 +41,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   now persists its delegate so the cache survives across iterations. The cuDSS
   route also uploads int32 CSR offsets/indices when the system fits a signed
   32-bit integer (halving index bandwidth), falling back to int64 otherwise.
+- Faster sparse assembly (cached COO structure): `LinearOperator` gained an
+  optional `coo_values()` hook (the values-only counterpart of `to_coo()`), and
+  the condensed/saddle KKT blocks plus `Dense`/`Diagonal`/`Identity`/`VStack`
+  implement it. The `SparseDirectSolver` facade now caches the COO row/column
+  vectors keyed on `coo_pattern_signature` and recomputes only the values each
+  iteration, so the per-step assembly skips rebuilding the index vectors — most
+  notably the L-BFGS low-rank border's `O(n·m)` index grids — on a fixed pattern.
+- Faster cuDSS solves (descriptor reuse): the cuDSS dense RHS/solution
+  descriptors and their device buffers are now created once and reused across
+  solves and the factorization phase (rebuilt only when the system size changes),
+  replacing the per-solve `matrix_create_dn`/`matrix_destroy` churn with a buffer
+  copy.
 
 ## [0.3.0] - 2026-06-26
 

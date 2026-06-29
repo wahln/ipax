@@ -410,6 +410,59 @@ class _CondensedOperator(LinearOperator):
         del like
         return _border(self.assemble())
 
+    def _value_parts(self) -> tuple[list[Array], list[Array]]:
+        """Return ``(logical_values, border_values)`` in :meth:`to_coo` order.
+
+        The values-only counterpart of :meth:`assemble`: it recomputes just the
+        value arrays that flow into the COO triplet, skipping every index vector
+        (``arange``, the low-rank border's ``_grid_indices`` grids, the concat of
+        row/column coordinates). The solver caches the fixed structure and calls
+        this each iteration, so the per-step assembly cost drops to value work.
+        """
+        sigma_x_diag = self._sigma_x.diagonal()
+        xp = array_namespace(sigma_x_diag)
+        n = self._W.shape[0]
+        logical: list[Array] = []
+        borders: list[Array] = []
+
+        low_rank_form = getattr(self._W, "diagonal_low_rank_form", None)
+        if low_rank_form is not None:
+            try:
+                d, u, m = low_rank_form()
+            except NotImplementedError:
+                d = xp.ones((n,), dtype=sigma_x_diag.dtype)
+                u = m = None
+            logical.append(d + sigma_x_diag + self._delta_w)
+            if u is not None and m is not None and int(u.shape[1]) > 0:
+                r = int(u.shape[1])
+                n_primal = int(u.shape[0])
+                # C = Uᵀ placed as C and Cᵀ (shared value array), then E = M.
+                u_values = xp.reshape(u, (n_primal * r,))
+                borders.append(u_values)
+                borders.append(u_values)
+                borders.append(xp.reshape(m, (r * r,)))
+        else:
+            shift_diag = sigma_x_diag
+            if self._delta_w != 0.0:
+                shift_diag = shift_diag + self._delta_w
+            logical.append(self._W.coo_values())
+            logical.append(shift_diag)
+
+        if self._ineq_jac.shape[0] > 0:
+            # Inequality border: ∇g as C/Cᵀ (shared values), −Σ_s⁻¹ as the E block.
+            g_values = self._ineq_jac.coo_values()
+            borders.append(g_values)
+            borders.append(g_values)
+            borders.append(-1.0 / self._sigma_s.diagonal())
+
+        return logical, borders
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        del like
+        logical, borders = self._value_parts()
+        xp = array_namespace(logical[0])
+        return xp.concat(tuple(logical + borders))
+
     def symmetry_hint(self) -> bool:
         """The condensed block (and its symmetric borders) is symmetric exactly.
 
@@ -683,6 +736,30 @@ class _SaddleOperator(LinearOperator):
         """
         del like
         return _border(self.assemble())
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        """Values-only assembly in :meth:`to_coo` order (see condensed analogue).
+
+        Order: condensed *logical* values, the equality blocks ``∇c``/``∇cᵀ``
+        (one shared value array), the ``−δ_c`` (2,2) diagonal, then the condensed
+        block's border values — matching :meth:`assemble` followed by
+        :func:`_border` without rebuilding any index vector.
+        """
+        del like
+        value_parts = getattr(self._condensed, "_value_parts", None)
+        if value_parts is not None:
+            logical, borders = value_parts()
+        else:  # generic condensed block: no structure/value split available
+            logical, borders = [self._condensed.coo_values()], []
+        xp = array_namespace(logical[0])
+        parts = list(logical)
+        ev = self._eq_jac.coo_values()
+        parts.append(ev)
+        parts.append(ev)
+        if self._m > 0:
+            parts.append(xp.full((self._m,), -self._delta_c, dtype=logical[0].dtype))
+        parts.extend(borders)
+        return xp.concat(tuple(parts))
 
     def symmetry_hint(self) -> bool:
         """The saddle is symmetric: ``∇c``/``∇cᵀ`` mirror one value array, the

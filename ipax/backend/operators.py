@@ -118,6 +118,20 @@ class LinearOperator(ABC):
         del like
         raise NotImplementedError("operator does not expose sparse COO structure")
 
+    def coo_values(self, like: Array | None = None) -> Array:
+        """Return only the COO value vector, in :meth:`to_coo`'s exact order.
+
+        Optional fast path behind the values-only sparse refactor: in an
+        interior-point solve the COO row/column pattern is fixed (the solver
+        caches it keyed on :meth:`coo_pattern_signature`) while only the values
+        move, so an operator that can recompute its values *without* rebuilding
+        the index vectors overrides this. The default recomputes the full triplet
+        and discards the indices — always correct, but forgoes the speedup. The
+        returned order must match :meth:`to_coo` exactly (a shared contract test
+        guards the two against drift).
+        """
+        return self.to_coo(like)[2]
+
     def coo_pattern_signature(self) -> object | None:
         """Stable identity for the row/column pattern emitted by :meth:`to_coo`.
 
@@ -281,6 +295,12 @@ class Dense(LinearOperator):
         values = xp.reshape(self._A, (m * n,))
         return rows, cols, values, (m, n)
 
+    def coo_values(self, like: Array | None = None) -> Array:
+        del like
+        xp = array_namespace(self._A)
+        m, n = self.shape
+        return xp.reshape(self._A, (m * n,))
+
     def coo_pattern_signature(self) -> object:
         return ("dense", self.shape)
 
@@ -338,6 +358,10 @@ class Diagonal(LinearOperator):
         n = int(self._d.shape[0])
         idx = xp.arange(n)
         return idx, idx, self._d, (n, n)
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        del like
+        return self._d
 
     def coo_pattern_signature(self) -> object:
         return ("diagonal", self.shape)
@@ -398,6 +422,12 @@ class Identity(LinearOperator):
         idx = xp.arange(self._n)
         ones = xp.ones((self._n,), dtype=like.dtype)
         return idx, idx, ones, (self._n, self._n)
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        if like is None:
+            raise NotImplementedError("Identity COO values require a template array")
+        xp = array_namespace(like)
+        return xp.ones((self._n,), dtype=like.dtype)
 
     def coo_pattern_signature(self) -> object:
         return ("identity", self.shape)
@@ -659,6 +689,20 @@ class VStack(LinearOperator):
             xp.concat(tuple(vals_parts)),
             (offset, self._n),
         )
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        # Stacked rows ⇒ concatenate each block's values in block order, matching
+        # to_coo without recomputing the row-offset index vectors.
+        del like
+        xp = None
+        parts: list[Array] = []
+        for op in self._ops:
+            piece = op.coo_values()
+            if xp is None:
+                xp = array_namespace(piece)
+            parts.append(piece)
+        assert xp is not None
+        return xp.concat(tuple(parts))
 
     def coo_pattern_signature(self) -> object | None:
         parts = tuple(op.coo_pattern_signature() for op in self._ops)

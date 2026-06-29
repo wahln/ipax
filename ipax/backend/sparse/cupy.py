@@ -364,6 +364,14 @@ class CuDSSSparseSolver:
         # the pattern signature + (n, nnz) so a grown pattern recompiles.
         self._lower: CompiledLowerTriangle | None = None
         self._lower_key: tuple[object, int, int] | None = None
+        # Persistent dense RHS/solution descriptors and their backing device
+        # buffers, reused across solves (and the factor phase) so each solve is a
+        # buffer copy + execute instead of create/destroy of cuDSS dn matrices.
+        self._rhs_matrix: int | None = None
+        self._sol_matrix: int | None = None
+        self._b_buf: Any | None = None
+        self._x_buf: Any | None = None
+        self._dn_shape: tuple[int, int] | None = None
         self._xp: Namespace | None = None
         self._dtype: Any | None = None
         self._inertia: tuple[int, int, int] | None = None
@@ -387,6 +395,7 @@ class CuDSSSparseSolver:
 
         def release() -> None:
             self._destroy_matrix()
+            self._destroy_dense()
             if self._data is not None and self._handle is not None:
                 cudss.data_destroy(self._handle, self._data)
                 self._data = None
@@ -466,27 +475,27 @@ class CuDSSSparseSolver:
             was_vector = len(b.shape) == 1
             if was_vector:
                 b = cupy.reshape(b, (int(b.shape[0]), 1))
-            b = cupy.ascontiguousarray(b)
-            x = cupy.empty_like(b)
+            n, ncols = int(b.shape[0]), int(b.shape[1])
 
-            rhs_matrix = self._create_dense_matrix(x.shape[0], x.shape[1], b)
-            sol_matrix = self._create_dense_matrix(x.shape[0], x.shape[1], x)
-            try:
-                self._guard(
-                    cudss.execute,
-                    self._handle,
-                    int(cudss.Phase.SOLVE),
-                    self._config,
-                    self._data,
-                    self._matrix,
-                    sol_matrix,
-                    rhs_matrix,
-                )
-            finally:
-                self._destroy_temp_matrix(sol_matrix)
-                self._destroy_temp_matrix(rhs_matrix)
+            # Reuse the persistent dense descriptors/buffers, then copy this RHS
+            # into the bound buffer — no per-solve cuDSS dn create/destroy.
+            self._ensure_dense(n, ncols)
+            assert self._b_buf is not None and self._x_buf is not None
+            self._b_buf[...] = b
+            self._guard(
+                cudss.execute,
+                self._handle,
+                int(cudss.Phase.SOLVE),
+                self._config,
+                self._data,
+                self._matrix,
+                self._sol_matrix,
+                self._rhs_matrix,
+            )
 
-            result = x[:, 0] if was_vector else x
+            # Copy out of the reused solution buffer before the next solve
+            # overwrites it (the buffer outlives this call).
+            result = (self._x_buf[:, 0] if was_vector else self._x_buf).copy()
             return cast("Array", to_xp_array(result, self._xp))
 
     @property
@@ -638,24 +647,50 @@ class CuDSSSparseSolver:
             )
             phase = int(cudss.Phase.ANALYSIS) | int(cudss.Phase.FACTORIZATION)
 
+        # The analysis/factorization phases need RHS/solution descriptors bound,
+        # but their contents are unused here — point them at the persistent dense
+        # buffers (reused by solve), not a throwaway per-factor allocation.
         n = int(matrix.shape[0])
-        dummy = cupy.zeros((n, 1), dtype=values.dtype)
-        rhs_matrix = self._create_dense_matrix(n, 1, dummy)
-        sol_matrix = self._create_dense_matrix(n, 1, dummy)
-        try:
-            self._guard(
-                cudss.execute,
-                self._handle,
-                phase,
-                self._config,
-                self._data,
-                self._matrix,
-                sol_matrix,
-                rhs_matrix,
-            )
-        finally:
-            self._destroy_temp_matrix(sol_matrix)
-            self._destroy_temp_matrix(rhs_matrix)
+        self._ensure_dense(n, 1)
+        self._guard(
+            cudss.execute,
+            self._handle,
+            phase,
+            self._config,
+            self._data,
+            self._matrix,
+            self._sol_matrix,
+            self._rhs_matrix,
+        )
+
+    def _ensure_dense(self, n: int, ncols: int) -> None:
+        """Allocate (or reuse) the persistent dense RHS/solution descriptors.
+
+        cuDSS dense matrices are reused across solves and the factor phase: the
+        descriptors are bound once to fixed device buffers of shape ``(n, ncols)``
+        and only rebuilt when that shape changes (e.g. a grown L-BFGS border
+        changes the augmented system size).
+        """
+        if self._dn_shape == (n, ncols) and self._rhs_matrix is not None:
+            return
+        self._destroy_dense()
+        self._b_buf = cupy.zeros((n, ncols), dtype=self._dtype)
+        self._x_buf = cupy.zeros((n, ncols), dtype=self._dtype)
+        self._rhs_matrix = self._create_dense_matrix(n, ncols, self._b_buf)
+        self._sol_matrix = self._create_dense_matrix(n, ncols, self._x_buf)
+        self._dn_shape = (n, ncols)
+
+    def _destroy_dense(self) -> None:
+        if self._cudss is not None:
+            if self._rhs_matrix is not None:
+                self._cudss.matrix_destroy(self._rhs_matrix)
+            if self._sol_matrix is not None:
+                self._cudss.matrix_destroy(self._sol_matrix)
+        self._rhs_matrix = None
+        self._sol_matrix = None
+        self._b_buf = None
+        self._x_buf = None
+        self._dn_shape = None
 
     def _create_csr_matrix(
         self,
@@ -739,10 +774,6 @@ class CuDSSSparseSolver:
         self._values = None
         self._pattern = None
         self._pattern_key = None
-
-    def _destroy_temp_matrix(self, matrix: int) -> None:
-        if self._cudss is not None and matrix:
-            self._cudss.matrix_destroy(matrix)
 
 
 class CuPySparseSolver:
