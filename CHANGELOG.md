@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- Public sparse operators `COOOperator`, `CSROperator`, and `CSCOperator`
+  (exported from `ipax`), so a `Problem` can return a sparse Jacobian or Hessian
+  without a concrete sparse library in user code. They carry Array-API
+  index/value vectors and emit structure for the sparse-direct route
+  (`to_coo`/`coo_values`/`coo_pattern_signature`) in pure Array API, delegating
+  the matvec-family, diagonal, and Gram-diagonal algebra to the per-backend
+  adapter (invariant #4). Pattern reuse is opt-in via `pattern_key` (declare the
+  sparsity fixed across a solve to unlock symbolic-analysis and structure-cache
+  reuse). CSR/CSC are ergonomic constructors over the same core — the solver
+  factorizes the assembled KKT matrix, not the user block, so the compressed
+  format is a convenience, not a performance, choice. The SciPy and CuPy adapter
+  operators gained `gram_diagonal`/`row_gram_diagonal`/`rmatmat` so these
+  operators are first-class on the condensed-Jacobi and saddle-MINRES
+  preconditioner paths.
+
 ### Changed
 - Faster dense KKT solve: the condensed, saddle, and L-BFGS Hessian operators now
   implement native batched `matmat`/`rmatmat` (and `rmatmat` is available across the

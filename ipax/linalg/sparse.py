@@ -127,14 +127,13 @@ class SparseDirectSolver:
                 f"{adapter_key}"
             )
         adapter = self._adapter
-        pattern_signature = K.coo_pattern_signature()
         operator = adapter.from_coo(
             rows,
             cols,
             values,
             shape=shape,
             symmetric=symmetric,
-            pattern_signature=pattern_signature,
+            pattern_signature=signature,
         )
         # The facade is created once per solve and reused every iteration, so the
         # inner solver persists — letting the backend cache its symbolic analysis

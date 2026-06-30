@@ -237,9 +237,25 @@ class SparseOperator(LinearOperator):
         out = self._matrix @ _to_cupy(V)
         return cast("Array", to_xp_array(out, self._xp))
 
+    def rmatmat(self, V: Array) -> Array:
+        out = self._matrix.T @ _to_cupy(V)
+        return cast("Array", to_xp_array(out, self._xp))
+
     def diagonal(self, like: Array | None = None) -> Array:
         del like
         return cast("Array", to_xp_array(self._matrix.diagonal(), self._xp))
+
+    def gram_diagonal(self, weights: Array) -> Array:
+        # diag(Aᵀ diag(w) A)_k = Σ_i w_i A_ik² = (A∘A)ᵀ w (column energies).
+        squared = self._matrix.multiply(self._matrix)
+        out = squared.T @ _to_cupy(weights)
+        return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
+
+    def row_gram_diagonal(self, weights: Array) -> Array:
+        # diag(A diag(w) Aᵀ)_j = Σ_k w_k A_jk² = (A∘A) w (row energies).
+        squared = self._matrix.multiply(self._matrix)
+        out = squared @ _to_cupy(weights)
+        return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
 
     def row_inf_norms(self, like: Array | None = None) -> Array:
         del like

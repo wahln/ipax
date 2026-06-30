@@ -711,6 +711,227 @@ class VStack(LinearOperator):
         return ("vstack", self.shape, parts)
 
 
+class _SparseStructured(LinearOperator):
+    """Backend-agnostic sparse operator carrying Array-API COO triplets.
+
+    The public sparse operators (:class:`COOOperator`, :class:`CSROperator`,
+    :class:`CSCOperator`) all reduce to this. It honors invariant #4 exactly: it
+    stores only Array-API index/value vectors and *emits structure* through
+    :meth:`to_coo`/:meth:`coo_values`, while the actual sparse linear algebra
+    (``matvec``-family, ``diagonal``, Gram diagonals, row norms) is delegated to
+    the per-backend adapter resolved from the value array's namespace — the core
+    never builds or holds a concrete sparse matrix itself.
+
+    Pattern reuse is opt-in. By default :meth:`coo_pattern_signature` is ``None``
+    (conservative: the sparse-direct route re-analyzes every factorization). A
+    caller whose sparsity pattern is fixed across a solve — the usual case, where
+    only the numeric values move iteration to iteration — passes a stable
+    ``pattern_key`` to unlock the symbolic-analysis and structure-cache fast paths.
+    """
+
+    def __init__(
+        self,
+        rows: Array,
+        cols: Array,
+        values: Array,
+        shape: tuple[int, int],
+        *,
+        symmetric: bool | None = None,
+        pattern_key: object | None = None,
+    ) -> None:
+        if len(rows.shape) != 1 or len(cols.shape) != 1 or len(values.shape) != 1:
+            raise ValueError("COO rows, cols, and values must be rank-1 arrays")
+        if rows.shape[0] != values.shape[0] or cols.shape[0] != values.shape[0]:
+            raise ValueError("COO rows, cols, and values must have equal length")
+        if len(shape) != 2 or shape[0] < 0 or shape[1] < 0:
+            raise ValueError("shape must be a non-negative (rows, cols) pair")
+        self._rows = rows
+        self._cols = cols
+        self._values = values
+        self._shape = (int(shape[0]), int(shape[1]))
+        self._symmetric = symmetric
+        self._pattern_key = pattern_key
+        # Lazily built, cached adapter operator for the heavy linear algebra.
+        self._delegate: LinearOperator | None = None
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self._shape
+
+    def _adapter_op(self) -> LinearOperator:
+        """Resolve (and cache) the backend adapter operator for sparse algebra."""
+        if self._delegate is None:
+            from typing import Any
+
+            from ipax.backend.sparse import get_sparse_adapter
+
+            xp = array_namespace(self._values)
+            adapter: Any = get_sparse_adapter(xp)
+            if adapter is None:
+                raise NotImplementedError(
+                    "sparse matrix algebra requires a backend sparse adapter; "
+                    "install the sparse extra (e.g. ipax[sparse-cpu]) or use a "
+                    "matrix-free operator"
+                )
+            self._delegate = adapter.from_coo(
+                self._rows,
+                self._cols,
+                self._values,
+                shape=self._shape,
+                symmetric=self._symmetric,
+                pattern_signature=self.coo_pattern_signature(),
+            )
+        return self._delegate
+
+    # Structure emission — pure Array API, no adapter needed (invariant #4).
+    def to_coo(
+        self, like: Array | None = None
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        del like
+        return self._rows, self._cols, self._values, self._shape
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        del like
+        return self._values
+
+    def coo_pattern_signature(self) -> object | None:
+        if self._pattern_key is None:
+            return None
+        return ("sparse-structured", self._shape, self._symmetric, self._pattern_key)
+
+    def symmetry_hint(self) -> bool | None:
+        return self._symmetric
+
+    # Sparse linear algebra — delegated to the per-backend adapter.
+    def matvec(self, v: Array) -> Array:
+        return self._adapter_op().matvec(v)
+
+    def rmatvec(self, v: Array) -> Array:
+        return self._adapter_op().rmatvec(v)
+
+    def matmat(self, V: Array) -> Array:
+        return self._adapter_op().matmat(V)
+
+    def rmatmat(self, V: Array) -> Array:
+        return self._adapter_op().rmatmat(V)
+
+    def diagonal(self, like: Array | None = None) -> Array:
+        return self._adapter_op().diagonal(like)
+
+    def gram_diagonal(self, weights: Array) -> Array:
+        return self._adapter_op().gram_diagonal(weights)
+
+    def row_gram_diagonal(self, weights: Array) -> Array:
+        return self._adapter_op().row_gram_diagonal(weights)
+
+    def row_inf_norms(self, like: Array | None = None) -> Array:
+        return self._adapter_op().row_inf_norms(like)
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        # Densifies via the adapter (an identity probe): a convenience for the
+        # dense route, not the intended fast path for a sparse operator.
+        del like
+        xp = array_namespace(self._values)
+        n = self._shape[1]
+        return self._adapter_op().matmat(xp.eye(n, dtype=self._values.dtype))
+
+
+class COOOperator(_SparseStructured):
+    """Sparse operator from Array-API COO triplets ``(rows, cols, values)``.
+
+    The canonical way to hand the solver a sparse Jacobian or Hessian without a
+    concrete sparse library in user code: the triplets are plain Array-API
+    integer/float vectors in the caller's backend. Duplicate ``(row, col)``
+    entries are summed (matching the adapter), so block assemblies may overlap
+    freely. Pass ``symmetric=True`` for a symmetric block (e.g. a Hessian) to skip
+    the adapter's numerical symmetry test, and ``pattern_key`` to declare the
+    pattern fixed across a solve and unlock symbolic-analysis reuse.
+    """
+
+
+def _expand_indptr(xp: object, indptr: Array, nnz: int) -> Array:
+    """Compressed ``indptr`` → the major-axis index of each stored entry.
+
+    Entry ``e`` belongs to major index ``i`` where ``indptr[i] ≤ e < indptr[i+1]``;
+    ``searchsorted(..., 'right') − 1`` recovers it in one pure Array-API pass (no
+    scatter primitive, which the standard lacks).
+    """
+    arange = xp.arange(nnz)  # type: ignore[attr-defined]
+    return xp.searchsorted(indptr, arange, side="right") - 1  # type: ignore[attr-defined]
+
+
+class CSROperator(_SparseStructured):
+    """Sparse operator from CSR arrays ``(indptr, indices, data)``.
+
+    Ergonomic constructor for callers already holding a CSR matrix (the row
+    pointer has length ``shape[0] + 1``). The compressed rows are expanded to COO
+    coordinates once at construction; everything else is shared with
+    :class:`COOOperator`. CSR/CSC carry no factorization-time speed advantage over
+    COO here — the solver factorizes the *assembled* KKT matrix, not this block —
+    so choose whichever matches the data you already have.
+    """
+
+    def __init__(
+        self,
+        indptr: Array,
+        indices: Array,
+        data: Array,
+        shape: tuple[int, int],
+        *,
+        symmetric: bool | None = None,
+        pattern_key: object | None = None,
+    ) -> None:
+        if len(shape) != 2:
+            raise ValueError("shape must be a (rows, cols) pair")
+        if int(indptr.shape[0]) != int(shape[0]) + 1:
+            raise ValueError("CSR indptr must have length shape[0] + 1")
+        xp = array_namespace(data)
+        rows = _expand_indptr(xp, indptr, int(data.shape[0]))
+        super().__init__(
+            rows,
+            indices,
+            data,
+            shape,
+            symmetric=symmetric,
+            pattern_key=pattern_key,
+        )
+
+
+class CSCOperator(_SparseStructured):
+    """Sparse operator from CSC arrays ``(indptr, indices, data)``.
+
+    Ergonomic constructor for callers already holding a CSC matrix (the column
+    pointer has length ``shape[1] + 1``). The compressed columns are expanded to
+    COO coordinates once at construction; see :class:`CSROperator` on why the
+    compressed format is a convenience, not a performance, choice.
+    """
+
+    def __init__(
+        self,
+        indptr: Array,
+        indices: Array,
+        data: Array,
+        shape: tuple[int, int],
+        *,
+        symmetric: bool | None = None,
+        pattern_key: object | None = None,
+    ) -> None:
+        if len(shape) != 2:
+            raise ValueError("shape must be a (rows, cols) pair")
+        if int(indptr.shape[0]) != int(shape[1]) + 1:
+            raise ValueError("CSC indptr must have length shape[1] + 1")
+        xp = array_namespace(data)
+        cols = _expand_indptr(xp, indptr, int(data.shape[0]))
+        super().__init__(
+            indices,
+            cols,
+            data,
+            shape,
+            symmetric=symmetric,
+            pattern_key=pattern_key,
+        )
+
+
 def as_operator(obj: Array | LinearOperator) -> LinearOperator:
     """Normalize a rank-2 dense array or existing operator."""
     if isinstance(obj, LinearOperator):
@@ -723,6 +944,9 @@ def as_operator(obj: Array | LinearOperator) -> LinearOperator:
 
 
 __all__ = [
+    "COOOperator",
+    "CSCOperator",
+    "CSROperator",
     "Composite",
     "Dense",
     "Diagonal",
