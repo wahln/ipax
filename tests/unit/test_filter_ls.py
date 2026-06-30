@@ -46,6 +46,7 @@ def test_switching_condition_survives_overflowing_directional_derivative():
         theta0=1.0,
         phi0=1.0,
         dphi=-1e308,  # would overflow float ** s_phi before the fix
+        theta_max=1e10,
         eval_point=lambda alpha: (0.5, 0.5),
         entries=[],
         soc=None,
@@ -65,6 +66,7 @@ def test_line_search_reports_accepted_soc_trial():
         theta0=1.0,
         phi0=1.0,
         dphi=1.0,
+        theta_max=1e10,
         eval_point=lambda alpha: (2.0, 2.0),
         entries=[],
         soc=lambda alpha: (0.1, 2.0),
@@ -73,3 +75,44 @@ def test_line_search_reports_accepted_soc_trial():
     assert result.accepted
     assert result.used_soc
     assert not result.restoration
+
+
+def test_theta_max_guard_rejects_exploding_infeasibility():
+    # Regression (HS7, S2MPJ Task 1): an f-type step whose barrier objective φ
+    # collapses toward -∞ must NOT be accepted while the constraint violation θ
+    # explodes past the Wächter & Biegler 2006 eq. (18) guard θ_max. Before the
+    # guard, the switching + Armijo branch let such a step through and the solver
+    # diverged to a false "infeasible".
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=10.0,
+        phi0=1.0,
+        dphi=-1e6,  # switching condition holds -> f-type branch
+        theta_max=1e4,
+        eval_point=lambda alpha: (1e30, -1e30),  # huge θ, collapsing φ
+        entries=[],
+        soc=None,
+    )
+
+    assert not result.accepted
+    assert result.restoration
+
+
+def test_theta_max_guard_rejects_non_finite_theta():
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=10.0,
+        phi0=1.0,
+        dphi=-1e6,
+        theta_max=1e4,
+        eval_point=lambda alpha: (float("inf"), -1e30),
+        entries=[],
+        soc=None,
+    )
+
+    assert not result.accepted
+    assert result.restoration

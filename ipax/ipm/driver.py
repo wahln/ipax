@@ -97,6 +97,10 @@ _MAX_MU_REDUCTIONS = 64
 # non-finite even though the iterate is essentially optimal (IPOPT
 # ``acceptable_tol`` ≈ 1e2 × ``tol``).
 _STEP_FAILURE_ACCEPT_FACTOR = 1e2
+# eq. (18): the filter guard region is {θ ≥ θ_max} with θ_max = 1e4·max(1, θ(x0)).
+# Bounds how infeasible an accepted trial may be, so an f-type step whose barrier
+# objective collapses cannot be taken while the constraint violation explodes.
+_THETA_MAX_FACTOR = 1e4
 
 
 def _norm_inf(xp: Namespace, v: Array) -> float:
@@ -501,6 +505,8 @@ class IPMDriver:
 
         filt = Filter()
         line_search = FilterLineSearch(opts.line_search)
+        # eq. (18): θ_max guard, fixed from the initial constraint violation.
+        theta_max = _THETA_MAX_FACTOR * max(1.0, self._theta_l1(x, s, m, m_eq))
         breedveld = BreedveldController(opts.breedveld)
         use_breedveld = opts.globalization == "breedveld"
 
@@ -869,6 +875,7 @@ class IPMDriver:
                     theta0=theta0,
                     phi0=phi0,
                     dphi=dphi,
+                    theta_max=theta_max,
                     eval_point=eval_point,
                     entries=filt.entries,
                     soc=soc,
