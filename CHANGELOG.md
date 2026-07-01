@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- The S2MPJ / CUTEst benchmark harness now scores a second **`converged`** tier
+  alongside `correct`: a case that reaches a valid KKT point (a small scaled KKT
+  residual at a success status — which already bounds primal infeasibility)
+  counts as converged regardless of *which* optimum it found, so a solve to a
+  different local minimum on a nonconvex problem is credited as genuine
+  convergence rather than a failure. `correct` (which additionally matches the
+  dataset-documented objective) is a strict subset. Both counts appear in the
+  runner summary, the per-config table, and the report header; the per-case table
+  flags a converged-but-not-`correct` case with `≈` (and a non-converged one with
+  `⚠️`). Pure benchmark/reporting change — no solver behavior is affected.
 - Public sparse operators `COOOperator`, `CSROperator`, and `CSCOperator`
   (exported from `ipax`), so a `Problem` can return a sparse Jacobian or Hessian
   without a concrete sparse library in user code. They carry Array-API

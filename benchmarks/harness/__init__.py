@@ -29,7 +29,12 @@ if TYPE_CHECKING:
 # Accuracy gates for scoring a case "correct" (float64; relaxed from solver tol
 # to absorb backend arithmetic differences). A case is correct when it stops at
 # a success status, its scaled KKT residual is small, and — when the optimum is
-# known — the iterate matches it.
+# known — the iterate matches it. A case is the weaker "converged" (reached a
+# valid KKT point) when it stops at a success status with a small scaled KKT
+# residual, *regardless* of whether it matched the documented objective — so
+# ``correct`` implies ``converged``. The gap between the two is problems solved
+# to a different local minimum on a nonconvex objective, which the strict
+# documented-optimum gate would otherwise count as a failure.
 _KKT_GATE = 1e-6
 _X_GATE = 1e-5
 # Tolerance for matching the dataset-documented objective (SIF ``LO SOLTN``):
@@ -47,7 +52,8 @@ class CaseResult:
     config: str
     status: str
     success: bool
-    correct: bool
+    correct: bool  # matched the dataset-documented outcome (objective/infeasibility)
+    converged: bool  # reached a valid KKT point (may be a different local optimum)
     n_iter: int
     kkt_error: float
     dual_infeasibility: float
@@ -124,6 +130,7 @@ def run_case(
             status=status,
             success=False,
             correct=False,
+            converged=False,
             n_iter=0,
             kkt_error=float("inf"),
             dual_infeasibility=float("inf"),
@@ -164,16 +171,23 @@ def run_case(
     if expected_infeasible:
         # The dataset documents this problem as infeasible, so *detecting*
         # infeasibility is the correct outcome — not a failure to optimize.
+        # There is no KKT point to reach, so "converged" mirrors "correct" here.
         correct = result.status is ipax.Status.INFEASIBLE
+        converged = correct
     else:
+        # A valid KKT point: success status with a small scaled KKT residual
+        # (which already bounds primal infeasibility). This is the weaker tier
+        # that credits a solve to a *different* local optimum than the documented
+        # one — a genuine convergence, not a bug.
+        converged = result.success and result.kkt_error <= _KKT_GATE
         objective_ok = True
         if expected_objective is not None and math.isfinite(expected_objective):
             objective_ok = abs(objective - expected_objective) <= _OBJ_GATE * (
                 1.0 + abs(expected_objective)
             )
+        # ``correct`` additionally requires matching the documented optimum.
         correct = (
-            result.success
-            and result.kkt_error <= _KKT_GATE
+            converged
             and objective_ok
             and (error_vs_optimum is None or error_vs_optimum <= _X_GATE)
         )
@@ -186,6 +200,7 @@ def run_case(
         status=result.status.value,
         success=result.success,
         correct=correct,
+        converged=converged,
         n_iter=result.n_iter,
         kkt_error=result.kkt_error,
         dual_infeasibility=result.dual_infeasibility,
@@ -222,6 +237,7 @@ def format_markdown(results: list[CaseResult], environment: dict[str, object]) -
     """Render the QC sweep as a Markdown report (summary + per-case detail)."""
     total = len(results)
     n_correct = sum(1 for r in results if r.correct)
+    n_converged = sum(1 for r in results if r.converged)
     lines = [
         "# ipax quality-control benchmark",
         "",
@@ -229,12 +245,16 @@ def format_markdown(results: list[CaseResult], environment: dict[str, object]) -
         f"- python `{environment.get('python')}` on `{environment.get('platform')}`",
         f"- numpy `{environment.get('numpy')}` · scipy `{environment.get('scipy')}`"
         f" · torch `{environment.get('torch')}`",
-        f"- **correct: {n_correct}/{total}** cases",
+        f"- **correct: {n_correct}/{total}** · "
+        f"**converged (KKT): {n_converged}/{total}** cases",
         "",
         "## Success rate by configuration",
         "",
-        "| config | correct | solved | mean iters |",
-        "| --- | --- | --- | --- |",
+        "`correct` matched the documented outcome; `converged` reached a valid KKT "
+        "point (possibly a different local optimum — a superset of `correct`).",
+        "",
+        "| config | correct | converged | solved | mean iters |",
+        "| --- | --- | --- | --- | --- |",
     ]
     configs: dict[str, list[CaseResult]] = {}
     for r in results:
@@ -242,13 +262,14 @@ def format_markdown(results: list[CaseResult], environment: dict[str, object]) -
     for config, rows in configs.items():
         solved = [r for r in rows if r.success]
         correct = sum(1 for r in rows if r.correct)
+        converged = sum(1 for r in rows if r.converged)
         mean_iter = (
             sum(r.n_iter for r in solved) / len(solved) if solved else float("nan")
         )
         iters = "—" if mean_iter != mean_iter else f"{mean_iter:.1f}"
         lines.append(
-            f"| `{config}` | {correct}/{len(rows)} | {len(solved)}/{len(rows)} "
-            f"| {iters} |"
+            f"| `{config}` | {correct}/{len(rows)} | {converged}/{len(rows)} "
+            f"| {len(solved)}/{len(rows)} | {iters} |"
         )
 
     lines += [
@@ -257,14 +278,16 @@ def format_markdown(results: list[CaseResult], environment: dict[str, object]) -
         "",
         "Status `infeasible (exp)` marks problems the dataset documents as "
         "infeasible (detecting infeasibility is the correct outcome). `Δf*` is the "
-        "gap to the documented `LO SOLTN` objective when one is recorded.",
+        "gap to the documented `LO SOLTN` objective when one is recorded. A `≈` flag "
+        "marks a case that converged to a valid KKT point at a *different* objective "
+        "than the documented one; `⚠️` marks a case that did not converge.",
         "",
         "| problem | backend | config | status | iters | kkt | infeas "
         "| Δf* | err vs x* | time (s) | solver |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for r in sorted(results, key=lambda r: (r.problem, r.backend, r.config)):
-        flag = "" if r.correct else " ⚠️"
+        flag = "" if r.correct else (" ≈" if r.converged else " ⚠️")
         status = r.status + (" (exp)" if r.expected_infeasible else "")
         err = "—" if r.error_vs_optimum is None else _fmt(r.error_vs_optimum)
         obj_gap = (

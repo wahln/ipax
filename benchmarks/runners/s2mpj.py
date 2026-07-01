@@ -29,6 +29,7 @@ non-zero if any case is not "correct".
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 from collections import Counter
 from pathlib import Path
@@ -187,6 +188,17 @@ def _select_names(args: argparse.Namespace, root: str) -> tuple[str, ...] | None
     return None  # curated default in s2mpj_problems
 
 
+def _row_to_case_result(row: dict[str, object]) -> CaseResult:
+    """Rebuild a :class:`CaseResult` from a persisted JSON row, tolerating an
+    older schema on ``--resume``: back-fill ``converged`` from ``correct`` (a
+    correct row is by definition converged) and ignore unknown keys, so a sweep
+    started before the ``converged`` tier can still be resumed."""
+    fields = {f.name for f in dataclasses.fields(CaseResult)}
+    data = {k: v for k, v in row.items() if k in fields}
+    data.setdefault("converged", bool(data.get("correct", False)))
+    return CaseResult(**data)  # type: ignore[arg-type]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ipax S2MPJ accuracy sweep")
     parser.add_argument("--out", default="benchmarks/reports/s2mpj")
@@ -337,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.resume and json_path.exists():
         prior = json.loads(json_path.read_text())
         environment = prior.get("environment", environment)
-        results = [CaseResult(**row) for row in prior.get("results", [])]
+        results = [_row_to_case_result(row) for row in prior.get("results", [])]
         print(f"resuming from {json_path}: {len(results)} rows kept")
     # ``done`` is keyed by (backend, name) so a multi-backend resume re-runs the
     # problem on backends it has not yet covered.
@@ -439,8 +451,10 @@ def main(argv: list[str] | None = None) -> int:
     _flush()
     by_status: Counter[str] = Counter(r.status for r in results)
     n_correct = sum(1 for r in results if r.correct)
+    n_converged = sum(1 for r in results if r.converged)
     print(
-        f"S2MPJ sweep: {n_correct}/{len(results)} correct "
+        f"S2MPJ sweep: {n_correct}/{len(results)} correct, "
+        f"{n_converged}/{len(results)} converged (KKT) "
         f"(skipped {skipped_no_objective} objective-free, {skipped_too_large} oversized,"
         f" {skipped_slow_build} slow-build)"
         f" -> {json_path}, {md_path}"
@@ -450,9 +464,15 @@ def main(argv: list[str] | None = None) -> int:
     # Per-config coverage: each route ran a different problem count (its cap).
     per_config_total: Counter[str] = Counter(r.config for r in results)
     per_config_correct: Counter[str] = Counter(r.config for r in results if r.correct)
+    per_config_converged: Counter[str] = Counter(
+        r.config for r in results if r.converged
+    )
     for label, _options, _cap in configs:
         total = per_config_total.get(label, 0)
-        print(f"  {label:16s} {per_config_correct.get(label, 0)}/{total} correct")
+        print(
+            f"  {label:16s} {per_config_correct.get(label, 0)}/{total} correct, "
+            f"{per_config_converged.get(label, 0)}/{total} converged"
+        )
     return 0 if n_correct == len(results) else 1
 
 

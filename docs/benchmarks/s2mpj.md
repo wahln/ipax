@@ -33,6 +33,14 @@ from every problem file:
     reached a KKT point at a *different* objective than the documented best-known
     value (typically a different local minimum on a nonconvex problem).
 
+    The report therefore scores **two tiers**: `correct` (matched the documented
+    outcome) and the weaker `converged` (reached a valid KKT point — a small scaled
+    KKT residual at a success status, which already bounds primal infeasibility —
+    regardless of *which* optimum). `correct` is a subset of `converged`, so the
+    `converged` count credits genuine convergence to a different local optimum
+    rather than reading it as a failure. In the per-case table a `≈` flag marks a
+    converged-but-not-`correct` case and `⚠️` marks a non-converged one.
+
 ## Latest run
 
 ### System
