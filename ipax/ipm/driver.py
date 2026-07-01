@@ -294,17 +294,20 @@ class IPMDriver:
         y_ineq: Array,
         lbfgs: LBFGSOperator,
     ) -> LinearOperator:
-        """Lagrangian Hessian operator, by precedence (§3.2, §4.3).
+        """Lagrangian Hessian operator, by the resolved source (§3.2, §4.3).
 
-        - An analytic ``lagrangian_hessian`` is used whenever supplied, with the
-          current nonlinear equality/inequality multipliers (so ``W`` carries
-          the constraint curvature ``Σ y·∇²c`` for nonconvex problems). Linear
+        The source was decided once by ``derivatives.resolve`` (honoring
+        ``options.hessian``) and recorded in ``self._sources.hessian``:
+
+        - ``"exact"``: an analytic ``lagrangian_hessian``, with the current
+          nonlinear equality/inequality multipliers (so ``W`` carries the
+          constraint curvature ``Σ y·∇²c`` for nonconvex problems). Linear
           equalities are intentionally sliced away because their Hessian term is
           zero by contract.
-        - ``hessian="autodiff-hvp"``: exact Hessian-vector products of the
-          Lagrangian via the backend autodiff adapter (no matrix formed).
-        - ``hessian="lbfgs"`` (default): the persistent Powell-damped L-BFGS
-          approximation, whose curvature pairs the driver updates each step.
+        - ``"autodiff-hvp"``: exact Hessian-vector products of the Lagrangian via
+          the backend autodiff adapter (no matrix formed).
+        - ``"lbfgs"``: the persistent Powell-damped L-BFGS approximation, whose
+          curvature pairs the driver updates each step.
         """
         if self._has_analytic_hessian:
             hessian = self._time_problem_call(
@@ -313,9 +316,9 @@ class IPMDriver:
                 )
             )
             return as_operator(hessian)
-        if self._options.hessian == "autodiff-hvp":
+        if self._sources.hessian == "autodiff-hvp":
             return self._autodiff_hvp_operator(x, y_eq_nonlinear, y_ineq)
-        if self._options.hessian == "lbfgs":
+        if self._sources.hessian == "lbfgs":
             return lbfgs
         raise RuntimeError("no Hessian operator is available for this solve")
 
@@ -516,7 +519,9 @@ class IPMDriver:
         # top of each iteration from the just-completed step, so the Hessian
         # used this iteration reflects every accepted step so far.
         lbfgs = LBFGSOperator(n, opts.lbfgs)
-        use_lbfgs = (not self._has_analytic_hessian) and opts.hessian == "lbfgs"
+        use_lbfgs = (
+            not self._has_analytic_hessian
+        ) and self._sources.hessian == "lbfgs"
         prev_x: Array | None = None
         prev_grad: Array | None = None
         prev_ineq_jac: LinearOperator | None = None

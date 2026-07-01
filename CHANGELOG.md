@@ -69,6 +69,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   solves and the factorization phase (rebuilt only when the system size changes),
   replacing the per-solve `matrix_create_dn`/`matrix_destroy` churn with a buffer
   copy.
+- `Options.hessian` now defaults to `"auto"` (use a supplied analytic
+  `lagrangian_hessian`, else L-BFGS). The default behavior is unchanged, but the
+  explicit modes are now honored literally even when an analytic Hessian exists:
+  `"lbfgs"` always uses the limited-memory approximation and `"autodiff-hvp"`
+  always uses autodiff Hessian-vector products. Previously a supplied
+  `lagrangian_hessian` silently overrode `hessian="lbfgs"`, so the L-BFGS route
+  could not be exercised on a problem that also defined an exact Hessian.
+
+### Fixed
+- The filter line search no longer diverges (and falsely reports `infeasible`) on
+  problems where a quasi-Newton step's barrier objective collapses while the
+  constraint violation explodes. The filter is now initialized with the
+  Wächter & Biegler 2006 eq. (18) guard region `{θ ≥ θ_max}`,
+  `θ_max = 1e4·max(1, θ(x₀))`, so a trial with non-finite or wildly large `θ` is
+  rejected outright before the switching/Armijo test (surfaced by the L-BFGS route
+  on Hock-Schittkowski HS7 in the S2MPJ sweep).
 
 ## [0.3.0] - 2026-06-26
 

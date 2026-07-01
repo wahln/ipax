@@ -20,8 +20,8 @@ def test_options_are_frozen():
         opts.max_iter = 5  # type: ignore[misc]
 
 
-def test_default_hessian_is_lbfgs():
-    assert Options().hessian == "lbfgs"
+def test_default_hessian_is_auto():
+    assert Options().hessian == "auto"
 
 
 def test_default_optimality_matches_spec():

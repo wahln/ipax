@@ -24,7 +24,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Literal
 
-HessianMode = Literal["lbfgs", "exact", "autodiff-hvp", "lsr1"]
+HessianMode = Literal["auto", "lbfgs", "exact", "autodiff-hvp", "lsr1"]
 LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
 Globalization = Literal["filter", "breedveld"]
 MuSchedule = Literal["monotone", "adaptive", "breedveld"]
@@ -313,6 +313,13 @@ class Options:
     likewise accepts a :class:`CorrectionsOptions` or one of ``"none"``,
     ``"mehrotra"``, ``"gondzio"``.
 
+    ``hessian`` selects the Lagrangian Hessian source. ``"auto"`` (default) uses
+    a supplied analytic ``lagrangian_hessian`` when present, else L-BFGS. The
+    explicit modes are honored literally even when an analytic Hessian exists:
+    ``"lbfgs"`` always uses the limited-memory approximation, ``"exact"`` requires
+    the analytic operator (errors otherwise), ``"autodiff-hvp"`` uses backend
+    autodiff Hessian-vector products.
+
     Termination has four sources, checked in priority order:
 
     * ``optimality`` (:class:`OptimalityConditionOptions`) — single-iteration
@@ -332,7 +339,7 @@ class Options:
     )
     max_iter: int = 3000
     max_time: float | None = None
-    hessian: HessianMode = "lbfgs"
+    hessian: HessianMode = "auto"
     linsolve: LinSolveMode = "auto"
     globalization: Globalization = "filter"
     mu_schedule: MuSchedule = "monotone"
