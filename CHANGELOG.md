@@ -77,6 +77,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `lagrangian_hessian` silently overrode `hessian="lbfgs"`, so the L-BFGS route
   could not be exercised on a problem that also defined an exact Hessian.
 
+### Removed
+- The unimplemented `"lsr1"` value of `Options.hessian`. It was never wired to a
+  solver path — selecting it silently ran L-BFGS (or the analytic Hessian) — so
+  it is dropped rather than left as a false promise. A limited-memory SR1 update
+  remains possible future work but requires the indefinite augmented/inertia route
+  (its indefinite approximation is incompatible with the condensed route's
+  PD-by-Powell-damping design); see the note in `ipax/ipm/hessian.py`.
+
 ### Fixed
 - The filter line search no longer diverges (and falsely reports `infeasible`) on
   problems where a quasi-Newton step's barrier objective collapses while the

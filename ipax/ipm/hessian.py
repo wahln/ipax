@@ -22,7 +22,13 @@
 - **Autodiff-HVP:** exact Hessian–vector products when the backend supports
   double-backprop and the user enables it.
 - **Exact passthrough:** the operator from ``Problem.lagrangian_hessian``.
-- **L-SR1:** allows indefiniteness; pairs with the indefinite route (later).
+- **L-SR1 (future work, not exposed):** a limited-memory SR1 update would allow
+  an *indefinite* Hessian approximation (capturing negative curvature on
+  nonconvex problems), but that breaks the condensed normal-equations route's
+  "no inertia oracle required" property (which relies on a PD (1,1) block via
+  Powell damping). It would need the indefinite augmented/inertia route or a
+  trust-region globalization, so it is a deliberate scope decision — see AGENTS.md
+  Direction — and is not offered as a ``HessianMode`` until then.
 """
 
 from __future__ import annotations

@@ -24,7 +24,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Literal
 
-HessianMode = Literal["auto", "lbfgs", "exact", "autodiff-hvp", "lsr1"]
+HessianMode = Literal["auto", "lbfgs", "exact", "autodiff-hvp"]
 LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
 Globalization = Literal["filter", "breedveld"]
 MuSchedule = Literal["monotone", "adaptive", "breedveld"]

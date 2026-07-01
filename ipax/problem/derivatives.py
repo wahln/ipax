@@ -189,9 +189,8 @@ def _resolve_hessian_source(
     matrix-free modes are honored **literally**, even when the problem supplies
     an analytic ``lagrangian_hessian``: ``"lbfgs"`` always uses the limited-memory
     approximation and ``"autodiff-hvp"`` always uses autodiff HVPs. ``"auto"``
-    (default), ``"exact"``, and ``"lsr1"`` prefer a supplied analytic operator
-    (``"exact"`` requires one). With no analytic Hessian, ``"auto"`` falls back to
-    L-BFGS.
+    (default) and ``"exact"`` prefer a supplied analytic operator (``"exact"``
+    requires one). With no analytic Hessian, ``"auto"`` falls back to L-BFGS.
     """
     mode = options.hessian
     if mode == "lbfgs":
