@@ -135,6 +135,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   ray is bad). Moves RAT42LS from `numerical_error` to `optimal` on the sparse
   route. The exact-Hessian route, whose scaled steps do not overshoot, skips the
   extra gradient evaluation.
+- The solver no longer reports a **feasible iterate as `infeasible`**. Feasibility
+  restoration can stall a hair above its own (differently scaled) tolerance at a
+  point that is feasible by the driver's constraint-violation metric — a
+  degenerate optimum where constraint qualification fails (HS13), or a limit cycle
+  that keeps re-reaching feasibility (HS56) — and then declared local
+  infeasibility, which contradicts the point being feasible. The restoration
+  verdict is now believed only when the restored iterate's violation genuinely
+  exceeds the constraint-violation tolerance (by `1e3×`, far below any
+  bounded-away-from-zero infeasible stationary point); otherwise the main
+  iteration resumes from the feasible point. This clears the false `infeasible`
+  on HS13/HS56/HS72/HS102 in the S2MPJ sweep — several now converge to the true
+  optimum once the limit cycle is broken — while genuinely-infeasible problems
+  (e.g. `BURKEHAN`) are still detected.
 
 ## [0.3.0] - 2026-06-26
 

@@ -101,6 +101,15 @@ _STEP_FAILURE_ACCEPT_FACTOR = 1e2
 # Bounds how infeasible an accepted trial may be, so an f-type step whose barrier
 # objective collapses cannot be taken while the constraint violation explodes.
 _THETA_MAX_FACTOR = 1e4
+# A restoration that signals local infeasibility is only believed when the
+# returned iterate is *actually* infeasible by the driver's own θ metric — its
+# violation must exceed this multiple of the constraint-violation tolerance.
+# Restoration's raw ℓ∞ measure can stall a hair above its own (differently
+# scaled) tolerance at a point the solver considers feasible; declaring such a
+# point "locally infeasible" is a contradiction (S2MPJ Task 1: HS13/HS56/HS72).
+# The multiple is generous but far below any genuinely-infeasible stationary
+# point (whose violation is bounded away from zero, ≫ tol).
+_RESTORATION_INFEASIBLE_FACTOR = 1e3
 
 
 def _norm_inf(xp: Namespace, v: Array) -> float:
@@ -133,6 +142,30 @@ def _within_relaxed_tol(
     )
     enabled = [(tol, value) for tol, value in checks if tol is not None]
     return bool(enabled) and all(value <= factor * tol for tol, value in enabled)
+
+
+def _restoration_reports_infeasible(
+    theta_restored: float, optimality: OptimalityConditionOptions
+) -> bool:
+    """Whether a restoration "infeasible" signal should be believed.
+
+    Restoration minimizes the constraint infeasibility and reports local
+    infeasibility when it stalls with the violation above its own tolerance. That
+    verdict is only trustworthy when the returned iterate is *genuinely*
+    infeasible by the driver's own θ — its violation must exceed
+    :data:`_RESTORATION_INFEASIBLE_FACTOR` × the constraint-violation tolerance.
+    Restoration's raw ℓ∞ measure is scaled differently and can stall a hair above
+    its threshold at a point that is feasible here (a degenerate optimum where
+    constraint qualification fails, or a limit cycle that keeps re-reaching
+    feasibility); reporting such a point as infeasible would contradict the fact
+    that it is feasible (S2MPJ Task 1). A genuinely infeasible stationary point
+    has a violation bounded well away from zero, far above this threshold.
+    """
+    tol = optimality.constr_viol_tol
+    feasible_tol = _RESTORATION_INFEASIBLE_FACTOR * (
+        tol if tol is not None else optimality.kkt_tol
+    )
+    return theta_restored > feasible_tol
 
 
 def _classify_step_failure(
@@ -928,7 +961,18 @@ class IPMDriver:
                 x, s, infeasible = self._restore(
                     x, s, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
                 )
-                if infeasible:
+                # Only believe an "infeasible" verdict when the returned iterate
+                # is genuinely infeasible by the driver's own θ. Restoration's raw
+                # ℓ∞ measure can stall marginally above its (differently scaled)
+                # tolerance at a point that is feasible here — declaring it locally
+                # infeasible would be a false claim (S2MPJ Task 1). A feasible
+                # restored point means restoration stalled on *optimality*, not
+                # feasibility, so resume the main iteration from it (a genuine
+                # limit cycle then terminates at the iteration/time budget rather
+                # than as a false "infeasible").
+                if infeasible and _restoration_reports_infeasible(
+                    self._theta_l1(x, s, m, m_eq), self._options.optimality
+                ):
                     status = Status.INFEASIBLE
                     message = (
                         "locally infeasible: restoration could not reduce the "
