@@ -139,3 +139,48 @@ def test_accept_rejects_non_finite_phi():
 
     assert not result.accepted
     assert result.restoration
+
+
+def test_search_backtracks_past_non_finite_gradient_region():
+    # Regression (S2MPJ Task 2, RAT42LS): a step whose θ/φ are finite but whose
+    # gradient overflows must be rejected so the search backtracks to a damped
+    # step in the finite region, instead of accepting it and poisoning the next
+    # KKT solve. Here θ decreases (θ-type acceptable) at every α, but the gradient
+    # is only finite for α ≤ 0.3, so acceptance lands on α = 0.25.
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=1.0,
+        phi0=1.0,
+        dphi=-1.0,
+        theta_max=1e10,
+        eval_point=lambda alpha: (0.5, 0.5),  # always filter-acceptable
+        entries=[],
+        soc=None,
+        grad_finite=lambda alpha: alpha <= 0.3,
+    )
+
+    assert result.accepted
+    assert result.alpha == 0.25
+
+
+def test_search_hands_off_to_restoration_when_gradient_never_finite():
+    # If no α on the ray yields a finite gradient, the search exhausts α and
+    # hands off to restoration — the same fallback as an unacceptable θ/φ.
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=1.0,
+        phi0=1.0,
+        dphi=-1.0,
+        theta_max=1e10,
+        eval_point=lambda alpha: (0.5, 0.5),
+        entries=[],
+        soc=None,
+        grad_finite=lambda alpha: False,
+    )
+
+    assert not result.accepted
+    assert result.restoration

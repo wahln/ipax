@@ -114,6 +114,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     non-finite** (not only non-finite `θ_t`). A step that overshoots into a region
     where the objective evaluates to `-inf` would otherwise pass the Armijo test
     (`-inf` is below any finite bound) instead of backtracking to a finite iterate.
+- The L-BFGS route now recovers from a step that overshoots into a region where
+  the **objective gradient is non-finite** while `θ`/`φ` are still finite (e.g.
+  RAT42LS's logistic, whose residual stays finite while its derivative becomes
+  `inf/inf = NaN`). The filter line search evaluates only `θ`/`φ`, so it accepted
+  such a step and the next KKT solve was poisoned (`numerical_error`). A
+  `grad_finite(α)` check is now threaded into the line search on the L-BFGS route:
+  a non-finite-gradient trial is unacceptable, so the search backtracks to a
+  damped step in the finite region (handing off to restoration only if the whole
+  ray is bad). Moves RAT42LS from `numerical_error` to `optimal` on the sparse
+  route. The exact-Hessian route, whose scaled steps do not overshoot, skips the
+  extra gradient evaluation.
 
 ## [0.3.0] - 2026-06-26
 

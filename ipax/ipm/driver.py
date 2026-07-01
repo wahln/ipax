@@ -772,6 +772,21 @@ class IPMDriver:
                     self._phi(x_t, s_t, mu, m, mask_l, mask_u, lower_safe, upper_safe),
                 )
 
+            def grad_finite(
+                alpha: float,
+                x: Array = x,
+                step: NewtonStep = step,
+            ) -> bool:
+                """Whether the objective gradient at the trial point is finite.
+
+                A quasi-Newton step can overshoot into a region where θ/φ are
+                still finite but the derivatives overflow (inf/NaN) — accepting it
+                poisons the next KKT solve. Used only on the L-BFGS route, where
+                the overshoot occurs; the exact route's scaled steps do not need
+                the extra gradient evaluation.
+                """
+                return bool(xp.all(xp.isfinite(self._gradient(x + alpha * step.dx))))
+
             soc_primal: tuple[Array, Array] | None = None
 
             def is_strictly_interior(x_t: Array, s_t: Array) -> bool:
@@ -839,6 +854,11 @@ class IPMDriver:
                 s_soc = base_s + corr_s if m > 0 else s
                 if not is_strictly_interior(x_soc, s_soc):
                     return None
+                # Reject a corrected trial whose derivatives overflow (see
+                # ``grad_finite``): the SOC point has its own gradient, distinct
+                # from ``x + α d``, so the line search cannot check it for us.
+                if use_lbfgs and not bool(xp.all(xp.isfinite(self._gradient(x_soc)))):
+                    return None
 
                 soc_primal = (
                     alpha * step.dx + corr_x,
@@ -884,6 +904,7 @@ class IPMDriver:
                     eval_point=eval_point,
                     entries=filt.entries,
                     soc=soc,
+                    grad_finite=grad_finite if use_lbfgs else None,
                 )
                 alpha_p = result.alpha
                 restoration = result.restoration

@@ -112,6 +112,7 @@ class FilterLineSearch:
         eval_point: Callable[[float], tuple[float, float]],
         entries: list[tuple[float, float]],
         soc: Callable[[float], tuple[float, float] | None] | None = None,
+        grad_finite: Callable[[float], bool] | None = None,
     ) -> LineSearchResult:
         """Return the accepted ``(α, …)`` or signal restoration.
 
@@ -120,6 +121,16 @@ class FilterLineSearch:
         trial when the full step increases θ (W&B §2.3, eq. 27). ``theta_max`` is
         the W&B eq. (18) guard: trials with ``θ ≥ θ_max`` (or non-finite θ) are
         never acceptable.
+
+        ``grad_finite(α)``, when supplied, reports whether the Lagrangian
+        gradient at the trial point is finite. A step whose ``θ``/``φ`` are finite
+        can still overshoot into a region where the *derivatives* overflow to
+        inf/NaN (e.g. an exp/rational element function); the line search only
+        evaluates ``θ``/``φ``, so such a point would be accepted and then poison
+        the next KKT solve. Treating a non-finite-gradient trial as unacceptable
+        keeps backtracking to a damped step that stays in the finite region,
+        reusing the existing α-reduction (and restoration hand-off if the whole
+        ray is bad).
         """
         o = self._o
         alpha = alpha_max
@@ -136,13 +147,16 @@ class FilterLineSearch:
                     if self._accept(
                         theta_c, phi_c, theta0, phi0, dphi, alpha, theta_max, entries
                     ):
+                        # The SOC point differs from ``x + α d``; its own gradient
+                        # finiteness is checked inside ``soc`` (which returns None
+                        # to reject a non-finite-derivative corrected trial).
                         switching = self._switching(dphi, alpha, theta0)
                         return LineSearchResult(alpha, True, not switching, False, True)
             first = False
 
             if self._accept(
                 theta_t, phi_t, theta0, phi0, dphi, alpha, theta_max, entries
-            ):
+            ) and (grad_finite is None or grad_finite(alpha)):
                 switching = self._switching(dphi, alpha, theta0)
                 return LineSearchResult(alpha, True, not switching, False)
             alpha *= 0.5
