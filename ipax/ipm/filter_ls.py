@@ -169,8 +169,17 @@ class FilterLineSearch:
         # W&B eq. (18): the filter is initialized to the guard region {θ ≥ θ_max}.
         # Reject wildly infeasible (or non-finite) trials outright, before the
         # f-type switching/Armijo test — otherwise a step whose barrier objective
-        # φ collapses toward -∞ could be accepted while θ explodes.
-        if not math.isfinite(theta_t) or theta_t >= theta_max:
+        # φ collapses toward -∞ could be accepted while θ explodes. A non-finite
+        # φ_t itself must also be rejected: a trial that overshoots into a region
+        # where the objective evaluates to ±∞/NaN (e.g. an overflowing exp/rational
+        # element function) would otherwise pass the Armijo test — ``φ_t = -∞`` is
+        # trivially below any finite bound — instead of backtracking to a finite,
+        # usable iterate.
+        if (
+            not math.isfinite(theta_t)
+            or not math.isfinite(phi_t)
+            or theta_t >= theta_max
+        ):
             return False
         if not self._filter_acceptable(theta_t, phi_t, entries):
             return False

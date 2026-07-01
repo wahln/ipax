@@ -116,3 +116,26 @@ def test_theta_max_guard_rejects_non_finite_theta():
 
     assert not result.accepted
     assert result.restoration
+
+
+def test_accept_rejects_non_finite_phi():
+    # Regression (S2MPJ Task 2, BRATU1D/LUKVLE8): a step that overshoots into a
+    # region where the objective evaluates to -∞ (finite θ) must be rejected, not
+    # accepted. ``φ_t = -∞`` is trivially below the Armijo bound, so before the
+    # φ-finiteness guard the f-type branch let such a full step through instead of
+    # backtracking to a finite, usable iterate.
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=1.0,
+        phi0=1.0,
+        dphi=-1e6,  # switching condition holds -> f-type branch
+        theta_max=1e10,  # θ is fine; only φ is non-finite
+        eval_point=lambda alpha: (0.5, float("-inf")),
+        entries=[],
+        soc=None,
+    )
+
+    assert not result.accepted
+    assert result.restoration

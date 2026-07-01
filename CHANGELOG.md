@@ -102,6 +102,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   LUKVLE8, MESH, BRATU1D, RAT42LS, RAT43, INDEF); several now converge to an
   `optimal`/`acceptable` point once the failed factorization is recovered instead
   of crashing.
+- Two robustness guards for problems whose element functions overflow (exp /
+  rational terms evaluated far outside their safe range), which previously drove
+  the L-BFGS route to a `numerical_error` on the S2MPJ sweep:
+  - The L-BFGS update now drops a **non-finite curvature pair** instead of
+    appending it. A non-finite gradient difference `γ = grad L(x+) - grad L(x)`
+    would otherwise corrupt the compact form permanently (the poisoned column
+    survives the memory window, and the Powell/positive-curvature safeguards miss
+    it because the curvature `δ·γ` is then NaN).
+  - The filter line search now rejects a trial whose **barrier objective `φ_t` is
+    non-finite** (not only non-finite `θ_t`). A step that overshoots into a region
+    where the objective evaluates to `-inf` would otherwise pass the Armijo test
+    (`-inf` is below any finite bound) instead of backtracking to a finite iterate.
 
 ## [0.3.0] - 2026-06-26
 

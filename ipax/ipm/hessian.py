@@ -191,6 +191,16 @@ class LBFGSOperator(LinearOperator):
         corrupting the approximation.
         """
         xp = array_namespace(delta, gamma)
+        # A non-finite curvature pair (the Lagrangian gradient overflowed to
+        # inf/NaN at a trial iterate — e.g. an exp/rational element function
+        # evaluated far outside its safe range) would be appended and corrupt the
+        # compact form *permanently*, since the poisoned column survives in the
+        # memory window. The Powell/positive-curvature safeguards below do not
+        # catch it: ``s_y`` is then NaN and every ``<``/``<=`` comparison is
+        # False. Drop the pair so the approximation stays finite and the solver
+        # can still take a (steepest-descent-like) step to escape the region.
+        if not (bool(xp.all(xp.isfinite(delta))) and bool(xp.all(xp.isfinite(gamma)))):
+            return
         s = delta
         y = gamma
         bs = self.matvec(s)

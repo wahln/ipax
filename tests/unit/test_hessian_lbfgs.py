@@ -41,6 +41,30 @@ def test_lbfgs_update_keeps_positive_curvature(namespace):
     assert float(curvature) > 0.0
 
 
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+def test_lbfgs_update_drops_non_finite_curvature_pair(namespace, bad):
+    # Regression (S2MPJ Task 2, RAT42LS/BRATU1D): when the Lagrangian gradient
+    # overflows at a trial iterate, the curvature pair ``gamma`` is non-finite.
+    # Appending it would corrupt the compact form *permanently* (the poisoned
+    # column survives the memory window, and the Powell/positive-curvature
+    # safeguards do not catch it because ``s_y`` is NaN). The pair must be dropped
+    # so the operator stays finite and usable.
+    good_delta = array(namespace, [1.0, 0.0])
+    good_gamma = array(namespace, [2.0, 0.5])
+    bad_gamma = array(namespace, [bad, 0.5])
+    v = array(namespace, [0.5, -1.0])
+
+    with implemented("L-BFGS"):
+        op = LBFGSOperator(2, LBFGSOptions(memory=3, powell_damping=True))
+        op.update(good_delta, good_gamma)
+        before = op.matvec(v)
+        op.update(good_delta, bad_gamma)  # poisoned pair -> must be ignored
+        after = op.matvec(v)
+
+    assert bool(namespace.all(namespace.isfinite(after)))
+    assert_allclose(namespace, after, before)
+
+
 def test_lbfgs_initial_scaling_option_controls_seed_curvature(namespace):
     delta = array(namespace, [1.0, 0.0])
     gamma = array(namespace, [2.0, 0.0])
