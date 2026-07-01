@@ -252,6 +252,27 @@ class SparseOperator(LinearOperator):
         )
 
 
+def _reject_non_finite(matrix: scipy.sparse.csc_matrix) -> None:
+    """Raise :class:`LinearSolveError` if any stored value is inf/NaN.
+
+    A non-finite KKT entry means an upstream Hessian/Jacobian/Σ evaluated at a
+    bad trial iterate overflowed (e.g. a ``1/0`` in the problem's element
+    functions). The dense route already treats such a factorization as a
+    numerical failure the IPM recovers from (δ_w escalation, then step-failure
+    classification); the sparse route must behave identically rather than let a
+    backend-specific exception escape as an uncaught crash — Feral's numeric
+    factorization raises a bare ``ValueError`` here, and SuperLU would otherwise
+    factor to a non-finite solution. Checking the ``O(nnz)`` value array up front
+    is negligible beside the factorization it guards, and gives both inner
+    solvers one backend-neutral failure signal.
+    """
+    if matrix.nnz and not bool(np.isfinite(matrix.data).all()):
+        raise LinearSolveError(
+            "sparse KKT matrix has non-finite entries (inf/NaN); the upstream "
+            "derivatives overflowed at this iterate"
+        )
+
+
 def _require_csc(K: LinearOperator) -> tuple[scipy.sparse.csc_matrix, Namespace]:
     """Extract the host CSC matrix + namespace from a :class:`SparseOperator`.
 
@@ -401,6 +422,7 @@ class FeralSparseSolver:
         assert isinstance(K, SparseOperator)  # narrowed by _require_csc
         if not K.is_symmetric():
             raise ValueError("Feral sparse solver requires a symmetric operator")
+        _reject_non_finite(matrix)
 
         feral = _import_feral()
         errors = (RuntimeError, feral.FeralError)
@@ -484,6 +506,7 @@ class SuperLUSparseSolver:
     def factor(self, K: LinearOperator) -> None:
         matrix, xp = _require_csc(K)
         self._xp = xp
+        _reject_non_finite(matrix)
         try:
             self._lu = scipy.sparse.linalg.splu(matrix)
         except RuntimeError as exc:  # singular factor ⇒ numerical failure

@@ -13,7 +13,12 @@ import pytest
 # import skips the whole module when scipy is absent (and dodges E402, which
 # exempts try/except-guarded imports across ruff versions).
 try:
-    from ipax.backend.sparse.numpy_scipy import FeralSparseSolver, SciPySparseAdapter
+    from ipax.backend.sparse.numpy_scipy import (
+        FeralSparseSolver,
+        SciPySparseAdapter,
+        SuperLUSparseSolver,
+    )
+    from ipax.linalg.solver import LinearSolveError
     from ipax.testing.backends import import_namespace
     from tests._helpers import array, assert_allclose
 except ImportError:  # pragma: no cover - scipy not installed
@@ -162,6 +167,40 @@ def test_cpu_sparse_default_falls_back_to_superlu_when_feral_is_missing(monkeypa
     actual = solver.solve(array(xp, [5.0, 5.0]))
 
     assert_allclose(xp, actual, array(xp, [1.0, 2.0]))
+
+
+@pytest.mark.parametrize("bad", [np.inf, -np.inf, np.nan])
+def test_feral_solver_rejects_non_finite_matrix(monkeypatch, bad):
+    # A non-finite KKT entry (upstream derivatives overflowed) must surface as a
+    # recoverable LinearSolveError the IPM regularization loop catches — not the
+    # backend's raw ValueError, which would abort the whole solve (S2MPJ Task 2
+    # solve_error cluster). The guard runs before the Feral import, so no binding
+    # is needed to exercise it.
+    xp = _numpy_namespace()
+    monkeypatch.setitem(sys.modules, "feral", None)
+    adapter = SciPySparseAdapter()
+    rows = xp.asarray([0, 0, 1, 1])
+    cols = xp.asarray([0, 1, 0, 1])
+    values = array(xp, [2.0, bad, bad, -3.0])  # symmetric ⇒ Feral route
+    K = adapter.from_coo(rows, cols, values, shape=(2, 2), symmetric=True)
+
+    with pytest.raises(LinearSolveError, match="non-finite"):
+        FeralSparseSolver().factor(K)
+
+
+@pytest.mark.parametrize("bad", [np.inf, -np.inf, np.nan])
+def test_superlu_solver_rejects_non_finite_matrix(bad):
+    # The general (non-symmetric) fallback gets the same guard, so a non-finite
+    # matrix fails fast rather than factoring to a non-finite solution.
+    xp = _numpy_namespace()
+    adapter = SciPySparseAdapter()
+    rows = xp.asarray([0, 1, 1])
+    cols = xp.asarray([0, 0, 1])
+    values = array(xp, [2.0, bad, 3.0])  # non-symmetric ⇒ SuperLU route
+    K = adapter.from_coo(rows, cols, values, shape=(2, 2))
+
+    with pytest.raises(LinearSolveError, match="non-finite"):
+        SuperLUSparseSolver().factor(K)
 
 
 def test_feral_solver_rejects_nonsymmetric_operator_before_import(monkeypatch):

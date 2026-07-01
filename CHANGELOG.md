@@ -93,6 +93,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `θ_max = 1e4·max(1, θ(x₀))`, so a trial with non-finite or wildly large `θ` is
   rejected outright before the switching/Armijo test (surfaced by the L-BFGS route
   on Hock-Schittkowski HS7 in the S2MPJ sweep).
+- The sparse-direct route no longer aborts the whole solve with an uncaught
+  `ValueError` when an upstream Hessian/Jacobian overflows to inf/NaN at a bad
+  trial iterate. The sparse adapter now rejects a non-finite KKT matrix with a
+  `LinearSolveError`, which the IPM regularization loop already handles (δ_w
+  escalation, then a graceful step-failure classification) — matching the dense
+  route. This clears the S2MPJ sweep's `solve_error` cluster (EIGMAXA, EIGMINA,
+  LUKVLE8, MESH, BRATU1D, RAT42LS, RAT43, INDEF); several now converge to an
+  `optimal`/`acceptable` point once the failed factorization is recovered instead
+  of crashing.
 
 ## [0.3.0] - 2026-06-26
 
