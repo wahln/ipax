@@ -31,10 +31,16 @@ Preconditioning (§5.2), all matrix-free:
   CG/GMRES, or the equality saddle's SPD *block* diagonal (PD primal Jacobi block
   plus a positive approximate-Schur dual block, ``spd_preconditioner_diagonal``)
   applied to MINRES by symmetric scaling.
-- ``lbfgs`` — an L-BFGS-aware Sherman–Morrison–Woodbury inverse of the condensed
-  operator (``lbfgs_inverse_apply``), an SPD operator used directly by CG/GMRES;
-  it degrades to ``jacobi`` where no L-BFGS compact form is available (and on the
-  MINRES path, which can only apply a diagonal preconditioner).
+- ``lbfgs`` — an L-BFGS-aware Sherman–Morrison–Woodbury inverse. On the condensed
+  (equality-free) operator it is ``N⁻¹`` (``lbfgs_inverse_apply``), an SPD operator
+  used directly by CG/GMRES. On the equality **saddle** it is the block-diagonal
+  ``diag(N⁻¹, S⁻¹)`` (``lbfgs_block_preconditioner_apply``; Murphy–Golub–Wathen
+  2000) — the Woodbury ``N⁻¹`` on the (1,1) block and the reciprocal
+  approximate-Schur diagonal on the (2,2) block. Being non-diagonal it is applied
+  by **GMRES** (the default ``cg`` route switches to GMRES when this preconditioner
+  is available), since MINRES admits only a diagonal. It degrades to ``jacobi``
+  where no L-BFGS compact form is available (e.g. before the first curvature pair,
+  or an exact/matrix-free Hessian).
 All preconditioners fall back to none when no suitable structure exists.
 
 References: Hestenes & Stiefel 1952 (CG); Paige & Saunders 1975 (MINRES); Saad &
@@ -134,6 +140,17 @@ class KrylovSolver:
 
         method = self._options.method
         preferred = K.preferred_krylov_method()
+        # A non-diagonal L-BFGS block preconditioner diag(N⁻¹, S⁻¹) for the
+        # indefinite saddle can only be applied by GMRES (left preconditioning);
+        # MINRES admits a diagonal only. So on the default (``cg``) route, when the
+        # saddle offers that preconditioner and it is requested, take GMRES instead
+        # of the CG→MINRES fallback. An explicit ``minres``/``gmres`` is honored.
+        if (
+            method == "cg"
+            and self._options.preconditioner == "lbfgs"
+            and preferred == "minres"
+        ):
+            return self._gmres(K, rhs, xp, max_iter, rtol)
         if method == "gmres":
             return self._gmres(K, rhs, xp, max_iter, rtol)
         if method == "minres" or (method == "cg" and preferred == "minres"):
@@ -164,6 +181,12 @@ class KrylovSolver:
         if mode == "none":
             return lambda r: r
         if mode == "lbfgs":
+            # Prefer the saddle block preconditioner diag(N⁻¹, S⁻¹) (non-diagonal,
+            # GMRES-only); else the condensed Woodbury inverse; else Jacobi.
+            try:
+                return K.lbfgs_block_preconditioner_apply()
+            except NotImplementedError:
+                pass
             try:
                 return K.lbfgs_inverse_apply()
             except NotImplementedError:

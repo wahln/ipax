@@ -836,6 +836,49 @@ class _SaddleOperator(LinearOperator):
             dual = xp.ones((self._m,), dtype=diag_n.dtype)
         return xp.concat((diag_n, dual))
 
+    def _approximate_schur_diagonal(self, diag_n: Array) -> Array:
+        """Positive approximate-Schur dual diagonal ``δ_c + diag(∇c diag(N)⁻¹ ∇cᵀ)``.
+
+        Shared with :meth:`spd_preconditioner_diagonal`; clamped strictly positive
+        so ``1/S`` stays finite and the block preconditioner stays SPD (a zero
+        row of ``∇c`` with ``δ_c = 0`` would otherwise divide by zero).
+        """
+        xp = array_namespace(diag_n)
+        try:
+            dual = self._delta_c + self._eq_jac.row_gram_diagonal(1.0 / diag_n)
+        except NotImplementedError:
+            dual = xp.ones((self._m,), dtype=diag_n.dtype)
+        return xp.where(dual > 0.0, dual, xp.ones_like(dual))
+
+    def lbfgs_block_preconditioner_apply(self) -> Callable[[Array], Array]:
+        """Block-diagonal SPD preconditioner ``diag(N⁻¹, S⁻¹)`` for the saddle (§5.2).
+
+        Upgrades :meth:`spd_preconditioner_diagonal`'s (1,1) block from ``diag(N)``
+        to the full L-BFGS-aware Woodbury inverse ``N⁻¹`` (Murphy–Golub–Wathen
+        2000)::
+
+            ┌ N⁻¹                                 0 ┐
+            └ 0    (δ_c + diag(∇c diag(N)⁻¹ ∇cᵀ))⁻¹ ┘
+
+        ``N⁻¹`` folds the L-BFGS low-rank and ``Σ_x`` in exactly (only the
+        inequality Gram off-diagonal is approximated), so on the equality saddle it
+        clusters the spectrum far better than the diagonal Jacobi block — but it is
+        *non-diagonal*, so it is applied by GMRES (left preconditioning), not the
+        symmetric-scaling MINRES path. Raises ``NotImplementedError`` when the
+        condensed block exposes no L-BFGS compact form (exact/matrix-free Hessian).
+        """
+        n_inverse = self._condensed.lbfgs_inverse_apply()  # raises without L-BFGS
+        if self._m == 0:
+            return n_inverse
+        n = self._n
+        inv_dual = 1.0 / self._approximate_schur_diagonal(self._condensed.diagonal())
+        xp = array_namespace(inv_dual)
+
+        def apply(r: Array) -> Array:
+            return xp.concat((n_inverse(r[:n]), inv_dual * r[n:]))
+
+        return apply
+
 
 def build_saddle_operator(
     condensed_n: LinearOperator,

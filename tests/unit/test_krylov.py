@@ -208,6 +208,117 @@ def test_saddle_spd_preconditioner_diagonal_is_positive(namespace, tol):
     assert abs(float(pd[3]) - expected_dual) <= 1e-9
 
 
+def test_saddle_lbfgs_block_preconditioner_matches_blocks(namespace, tol):
+    """diag(N⁻¹, S⁻¹): the Woodbury inverse on the primal block, Schur-diagonal
+    reciprocal on the dual block."""
+    from ipax.ipm.kkt import build_saddle_operator
+
+    condensed = _condensed_no_inequalities(namespace)  # n = 6, L-BFGS, no ineqs
+    n = condensed.shape[0]
+    c_mat = array(
+        namespace,
+        [
+            [1.0, 0.0, 2.0, 0.0, -1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0, 0.0, 3.0],
+        ],
+    )
+    delta_c = 1e-8
+    saddle = build_saddle_operator(condensed, Dense(c_mat), delta_c)
+    apply = saddle.lbfgs_block_preconditioner_apply()
+
+    r = array(namespace, [0.5, -1.0, 2.0, -0.25, 1.5, -2.0, 0.7, -0.3])  # n + m = 8
+    out = apply(r)
+
+    n_inv = condensed.lbfgs_inverse_apply()
+    top = n_inv(r[:n])
+    weight = 1.0 / condensed.diagonal()
+    dual = delta_c + namespace.sum(
+        (c_mat * c_mat) * namespace.reshape(weight, (1, n)), axis=1
+    )
+    expected = namespace.concat((top, r[n:] / dual))
+    assert_allclose(namespace, out, expected, **tol)
+
+
+def test_saddle_lbfgs_block_preconditioner_requires_lbfgs_structure(namespace):
+    """A saddle whose condensed block has no L-BFGS compact form raises."""
+    from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
+    from ipax.linalg.regularize import RegularizationState
+
+    n = 3
+    dtype = array(namespace, [0.0]).dtype
+    condensed = build_condensed_operator(
+        Dense(array(namespace, [[2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 4.0]])),
+        Diagonal(array(namespace, [0.1, 0.2, 0.3])),
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, n), dtype=dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, 0.0, 1.0]])), 1e-8
+    )
+    with pytest.raises(NotImplementedError):
+        saddle.lbfgs_block_preconditioner_apply()
+
+
+def test_saddle_lbfgs_block_preconditioner_reduces_iterations(namespace):
+    """The block preconditioner diag(N⁻¹, S⁻¹), applied via GMRES, cuts iterations
+    on an ill-conditioned equality saddle vs the Jacobi/MINRES route — and solves
+    it correctly.
+    """
+    import random
+
+    from ipax.ipm.hessian import LBFGSOperator
+    from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
+    from ipax.linalg.regularize import RegularizationState
+    from ipax.options import LBFGSOptions
+
+    rng = random.Random(11)
+    n = 30
+    w = LBFGSOperator(n, LBFGSOptions(memory=6))
+    for _ in range(4):
+        delta = [rng.uniform(-1.0, 1.0) for _ in range(n)]
+        gamma = [delta[k] + rng.uniform(0.0, 0.5) + 0.5 for k in range(n)]
+        w.update(array(namespace, delta), array(namespace, gamma))
+
+    dtype = array(namespace, [0.0]).dtype
+    sigma_x = Diagonal(
+        array(namespace, [10.0 ** (3.0 * k / (n - 1)) for k in range(n)])
+    )
+    condensed = build_condensed_operator(
+        w,
+        sigma_x,
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, n), dtype=dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+    c_mat = array(
+        namespace,
+        [
+            [1.0 if k % 4 == 0 else 0.0 for k in range(n)],
+            [1.0 if k % 7 == 0 else 0.0 for k in range(n)],
+            [(-1.0) ** k * 0.5 for k in range(n)],
+        ],
+    )
+    m = 3
+    saddle = build_saddle_operator(condensed, Dense(c_mat), 1e-8)
+    x_exact = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n + m)])
+    rhs = saddle.matvec(x_exact)
+
+    jac = _solver(method="cg", rtol=1e-8, preconditioner="jacobi")  # → MINRES + Jacobi
+    jac.factor(saddle)
+    x_j = jac.solve(rhs)
+
+    blk = _solver(method="cg", rtol=1e-8, preconditioner="lbfgs")  # → GMRES + block
+    blk.factor(saddle)
+    x_b = blk.solve(rhs)
+
+    assert_allclose(namespace, x_j, x_exact, rtol=1e-5, atol=1e-5)
+    assert_allclose(namespace, x_b, x_exact, rtol=1e-5, atol=1e-5)
+    assert jac.last_method == "minres"
+    assert blk.last_method == "gmres"
+    assert blk.last_iterations < jac.last_iterations
+
+
 def test_saddle_preferred_method_skips_cg(namespace, monkeypatch, tol):
     """Saddle operators route directly to MINRES instead of probing with CG."""
     from ipax.ipm.kkt import build_saddle_operator

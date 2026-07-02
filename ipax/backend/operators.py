@@ -220,6 +220,17 @@ class LinearOperator(ABC):
         """
         raise NotImplementedError("operator has no L-BFGS-aware preconditioner")
 
+    def lbfgs_block_preconditioner_apply(self) -> Callable[[Array], Array]:
+        """Return an L-BFGS-aware block-diagonal preconditioner for a saddle.
+
+        Only the equality saddle (which wraps a condensed block with an L-BFGS
+        compact form) provides this: the block-diagonal ``diag(N⁻¹, S⁻¹)`` with the
+        Woodbury ``N⁻¹`` on the (1,1) block and an approximate-Schur diagonal on the
+        (2,2) block. Non-diagonal, so it is applied by GMRES rather than the MINRES
+        diagonal-scaling path. Optional; defaults to "not available".
+        """
+        raise NotImplementedError("operator has no L-BFGS block preconditioner")
+
     def __matmul__(self, v: Array) -> Array:
         return self.matvec(v)
 

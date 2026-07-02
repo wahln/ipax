@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- Opt-in **block-Schur preconditioner** for the matrix-free Krylov route on
+  equality saddles: `KrylovOptions(preconditioner="lbfgs")` now builds the
+  block-diagonal `diag(N⁻¹, S⁻¹)` (Murphy–Golub–Wathen) on `_SaddleOperator` —
+  the L-BFGS-aware Woodbury inverse `N⁻¹` on the (1,1) block and the reciprocal
+  approximate-Schur diagonal on the (2,2) block. Because it is non-diagonal, the
+  default `cg` route switches to **GMRES** (which left-applies it) for the saddle
+  when it is available; MINRES admits only a diagonal. It clusters the saddle
+  spectrum far better than the diagonal Jacobi block and cuts iterations on
+  ill-conditioned equality-constrained systems once L-BFGS has curvature pairs.
+  Purely opt-in: the default preconditioner remains `jacobi`, so default behavior
+  is unchanged, and it degrades to Jacobi before the first curvature pair or with
+  a non-L-BFGS Hessian.
 - The S2MPJ / CUTEst benchmark harness now scores a second **`converged`** tier
   alongside `correct`: a case that reaches a valid KKT point (a small scaled KKT
   residual at a success status — which already bounds primal infeasibility)
