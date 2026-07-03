@@ -47,6 +47,7 @@ from benchmarks.harness import (
     run_case,
     to_payload,
 )
+from ipax.options import KrylovOptions
 from ipax.testing.backends import import_namespace
 
 # Per-route variable caps. The linear-solver routes have very different size
@@ -74,6 +75,7 @@ def default_configs(
     dense_max_vars: int = _DENSE_MAX_VARS,
     krylov_max_vars: int = _KRYLOV_MAX_VARS,
     sparse_max_vars: int = _SPARSE_MAX_VARS,
+    krylov_preconditioner: str | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -83,13 +85,20 @@ def default_configs(
     config is tagged with its route's variable cap so a single full-corpus run
     stays tractable: dense problems stay small, while the sparse route reaches the
     large models it is meant for.
+
+    ``krylov_preconditioner`` overrides the matrix-free preconditioner on the two
+    Krylov configs (default: leave :class:`KrylovOptions`'s ``jacobi``) — the lever
+    for an ``auto`` vs ``jacobi`` A/B, which only affects the Krylov route.
     """
     options = ipax.Options
-    common = {
+    common: dict[str, object] = {
         "max_iter": max_iter,
         "max_time": max_time,
         "scaling": scaling,
     }
+    krylov_common = dict(common)
+    if krylov_preconditioner is not None:
+        krylov_common["krylov"] = KrylovOptions(preconditioner=krylov_preconditioner)  # type: ignore[arg-type]
     return [
         (
             "lbfgs/dense",
@@ -98,7 +107,7 @@ def default_configs(
         ),
         (
             "lbfgs/krylov",
-            options(hessian="lbfgs", linsolve="krylov", **common),
+            options(hessian="lbfgs", linsolve="krylov", **krylov_common),
             krylov_max_vars,
         ),
         # L-BFGS + sparse-direct is the typical radiotherapy setup.
@@ -116,7 +125,7 @@ def default_configs(
         # matrix-free subspace solver rather than the Hessian approximation.
         (
             "exact/krylov",
-            options(hessian="exact", linsolve="krylov", **common),
+            options(hessian="exact", linsolve="krylov", **krylov_common),
             krylov_max_vars,
         ),
         (
@@ -280,6 +289,13 @@ def main(argv: list[str] | None = None) -> int:
         help="problem scaling: 'gradient-based' (default, matches solver) or 'none'",
     )
     parser.add_argument(
+        "--preconditioner",
+        default=None,
+        choices=["none", "jacobi", "lbfgs", "auto"],
+        help="override the matrix-free Krylov preconditioner (default: jacobi). "
+        "Only affects the Krylov configs — the lever for an auto-vs-jacobi A/B.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -325,6 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         dense_max_vars=args.dense_max_vars,
         krylov_max_vars=args.krylov_max_vars,
         sparse_max_vars=args.sparse_max_vars,
+        krylov_preconditioner=args.preconditioner,
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}
