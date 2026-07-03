@@ -123,6 +123,16 @@ class _S2MPJProblem(Problem):
         m = int(getattr(instance, "m", 0))
         self._m = m
 
+        # Per-point memo of the full constraint value/Jacobian. S2MPJ bundles all
+        # constraints in one ``cx``/``cJx`` call (each ~10–16 ms of pure-Python
+        # ``eval`` + scipy-sparse assembly — ~100× the objective), and the IPM
+        # evaluates equalities and inequalities at the *same* point back-to-back, so
+        # a size-1 cache keyed on the point halves the dominant benchmark cost.
+        self._cx_key: bytes | None = None
+        self._cx_val: Any = None
+        self._cJx_key: bytes | None = None
+        self._cJx_val: Any = None
+
         # ``clower``/``cupper`` exist only when the problem has constraints.
         clower_attr = getattr(instance, "clower", None)
         cupper_attr = getattr(instance, "cupper", None)
@@ -193,19 +203,38 @@ class _S2MPJProblem(Problem):
             g = np.full((self._n,), np.inf)
         return _from_numpy(self.xp, g)
 
+    # -- shared per-point constraint value / Jacobian (memoized) -----------
+    def _cx(self, x_np: Any) -> Any:
+        """S2MPJ full constraint vector ``c(x)``, memoized on the last point."""
+        import numpy as np
+
+        key = x_np.tobytes()
+        if key != self._cx_key:
+            self._cx_key = key
+            self._cx_val = np.reshape(
+                np.asarray(self._inst.cx(x_np), dtype=float), (-1,)
+            )
+        return self._cx_val
+
+    def _cJx(self, x_np: Any) -> Any:
+        """S2MPJ constraint Jacobian ``(c, ∇c)``, memoized on the last point."""
+        key = x_np.tobytes()
+        if key != self._cJx_key:
+            self._cJx_key = key
+            self._cJx_val = self._inst.cJx(x_np)
+        return self._cJx_val
+
     # -- equalities (present only when S2MPJ has clower == cupper rows) ----
     def eq_constraints(self, x: Array) -> Array:
         if self._eq_idx.shape[0] == 0:
             raise NotImplementedError
-        import numpy as np
-
-        c = np.reshape(np.asarray(self._inst.cx(_to_numpy(x)), dtype=float), (-1,))
+        c = self._cx(_to_numpy(x))
         return _from_numpy(self.xp, c[self._eq_idx] - self._eq_rhs)
 
     def eq_jacobian(self, x: Array) -> Array | LinearOperator:
         if self._eq_idx.shape[0] == 0:
             raise NotImplementedError
-        _c, jac = self._inst.cJx(_to_numpy(x))
+        _c, jac = self._cJx(_to_numpy(x))
         if self._sparse:
             return self._sparse_op(jac.tocsr()[self._eq_idx, :])
         return _from_numpy(self.xp, jac.toarray()[self._eq_idx, :])
@@ -216,7 +245,7 @@ class _S2MPJProblem(Problem):
             raise NotImplementedError
         import numpy as np
 
-        c = np.reshape(np.asarray(self._inst.cx(_to_numpy(x)), dtype=float), (-1,))
+        c = self._cx(_to_numpy(x))
         lo = self._lo_rhs - c[self._lo_idx]
         up = c[self._up_idx] - self._up_rhs
         return _from_numpy(self.xp, np.concatenate((lo, up)))
@@ -226,7 +255,7 @@ class _S2MPJProblem(Problem):
             raise NotImplementedError
         import numpy as np
 
-        _c, jac = self._inst.cJx(_to_numpy(x))
+        _c, jac = self._cJx(_to_numpy(x))
         # Lower side ``clower − c`` contributes ``−∇c``; upper side ``c − cupper``
         # contributes ``+∇c`` (matches the constraint-value lowering above).
         if self._sparse:
