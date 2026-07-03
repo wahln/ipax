@@ -163,13 +163,13 @@ class KrylovSolver:
         )
 
         # ``preconditioner="auto"``: run with the current effective preconditioner;
-        # on a convergence failure that L-BFGS could rescue, promote and retry the
-        # same solve once, then (on success) promote for the next solve if this one
-        # was slow. In any non-auto mode this is a single ``_dispatch`` call.
+        # on a convergence failure the condensed Woodbury could rescue, promote and
+        # retry the same solve once, then (on success) promote for the next solve if
+        # this one was slow. In any non-auto mode this is a single ``_dispatch`` call.
         try:
             solution = self._dispatch(K, rhs, xp, max_iter, rtol)
         except KrylovConvergenceError:
-            if not self._auto_can_rescue(K):
+            if not self._auto_can_promote(K):
                 raise
             self._auto_promoted = True
             solution = self._dispatch(K, rhs, xp, max_iter, rtol)
@@ -201,8 +201,22 @@ class KrylovSolver:
             return self._gmres(K, rhs, xp, max_iter, rtol)
         if method == "gmres":
             return self._gmres(K, rhs, xp, max_iter, rtol)
-        if method == "minres" or (method == "cg" and preferred == "minres"):
+        if method == "minres":
+            # Explicit MINRES is honored verbatim — no fallback.
             return self._preconditioned_minres(K, rhs, xp, max_iter, rtol)
+        if method == "cg" and preferred == "minres":
+            # Default cg route on an equality saddle. MINRES is fragile on
+            # ill-conditioned indefinite saddles — it can return a garbage/non-finite
+            # step at iteration 1, which the driver answers with an unbounded (and
+            # counterproductive) δ_w escalation → numerical_error. GMRES minimizes the
+            # true residual with restarts and is markedly more robust; and the SPD
+            # *diagonal* (incl. the approximate-Schur dual block) actively hurts GMRES
+            # on these saddles, so fall back **unpreconditioned** (S2MPJ Task 7:
+            # HAGER*/DTOC*/CATENARY numerical_error → optimal).
+            try:
+                return self._preconditioned_minres(K, rhs, xp, max_iter, rtol)
+            except KrylovConvergenceError:
+                return self._gmres(K, rhs, xp, max_iter, rtol, minv=lambda r: r)
         if method != "cg":
             raise ValueError("Krylov method must be 'cg', 'minres', or 'gmres'")
 
@@ -219,42 +233,27 @@ class KrylovSolver:
         """Whether an ``"auto"`` solver is still eligible to promote at all."""
         return self._options.preconditioner == "auto" and not self._auto_promoted
 
-    def _auto_can_rescue(self, K: LinearOperator) -> bool:
-        """Whether a *failed* solve may be retried with an L-BFGS preconditioner.
+    def _auto_can_promote(self, K: LinearOperator) -> bool:
+        """Whether auto may switch Jacobi → the condensed Woodbury inverse here.
 
-        A rescue after an outright convergence failure: any L-BFGS structure —
-        even the *approximate* saddle block preconditioner — is worth trying, since
-        the alternative is a definite failure (and δ_w escalation).
+        The *only* promotion target under either trigger (failure rescue or a
+        slow-but-successful solve) is the **near-exact condensed Woodbury inverse**
+        ``N⁻¹`` (equality-free), whose preconditioning reliably helps. The
+        *approximate* saddle block preconditioner is never promoted to: its
+        approximate Schur diagonal can yield worse steps than the slow-but-stable
+        Jacobi solve and outright *diverge* a saddle Jacobi handles (S2MPJ
+        HS109/CLNLBEAM/ACOPP). The block stays reachable via explicit
+        ``preconditioner="lbfgs"``; auto leaves saddle robustness to the GMRES
+        fallback in ``_dispatch``.
         """
-        return self._auto_open() and self._lbfgs_structure_available(K)
+        return self._auto_open() and self._lbfgs_condensed_available(K)
 
     def _auto_promote_if_slow(self, K: LinearOperator, max_iter: int) -> None:
-        """Promote after a slow-but-successful solve — condensed Woodbury only.
-
-        Speculative promotion is restricted to the *near-exact* condensed Woodbury
-        inverse (equality-free ``N⁻¹``), whose preconditioning reliably helps. The
-        saddle block preconditioner uses an *approximate* Schur diagonal and on a
-        rank-deficient/ill-conditioned equality Jacobian can yield worse steps than
-        the slow-but-stable Jacobi solve (the ACOPP power-flow cluster), so it is
-        never promoted speculatively — only as a failure rescue above.
-        """
-        if not self._auto_open() or not self._lbfgs_condensed_available(K):
+        """Promote after a slow-but-successful solve (iterations over threshold)."""
+        if not self._auto_can_promote(K):
             return
         if self.last_iterations > self._options.auto_switch_ratio * max_iter:
             self._auto_promoted = True
-
-    def _lbfgs_structure_available(self, K: LinearOperator) -> bool:
-        """True when ``K`` offers an L-BFGS block/Woodbury preconditioner apply."""
-        for probe in (
-            K.lbfgs_block_preconditioner_apply,
-            K.lbfgs_inverse_apply,
-        ):
-            try:
-                probe()
-            except NotImplementedError:
-                continue
-            return True
-        return False
 
     def _lbfgs_condensed_available(self, K: LinearOperator) -> bool:
         """True when ``K`` offers the near-exact condensed Woodbury inverse ``N⁻¹``.
@@ -374,7 +373,13 @@ class KrylovSolver:
         )
 
     def _gmres(
-        self, K: LinearOperator, b: Array, xp: Namespace, max_iter: int, rtol: float
+        self,
+        K: LinearOperator,
+        b: Array,
+        xp: Namespace,
+        max_iter: int,
+        rtol: float,
+        minv: Callable[[Array], Array] | None = None,
     ) -> Array:
         """Restarted, left-preconditioned GMRES(m) (Saad & Schultz 1986).
 
@@ -384,8 +389,13 @@ class KrylovSolver:
         Convergence is decided on the *true* relative residual ``‖b − Kx‖`` at each
         restart, with the cheap Arnoldi estimate ending a cycle early. Works for
         symmetric *indefinite* systems too, so it is a robust alternative to MINRES.
+
+        ``minv`` overrides the preconditioner apply; the MINRES-failure fallback
+        passes the identity to run **unpreconditioned** GMRES (the SPD diagonal
+        hurts GMRES on ill-conditioned equality saddles — S2MPJ Task 7).
         """
-        minv = self._make_preconditioner(K, b, xp)
+        if minv is None:
+            minv = self._make_preconditioner(K, b, xp)
         restart = self._options.gmres_restart
 
         x = xp.zeros_like(b)

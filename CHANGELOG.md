@@ -124,6 +124,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   PD-by-Powell-damping design); see the note in `ipax/ipm/hessian.py`.
 
 ### Fixed
+- **Matrix-free MINRES failures on equality saddles now fall back to GMRES** instead
+  of surfacing as `numerical_error`. On the default `method="cg"` route an equality
+  saddle is solved with MINRES, which is fragile on ill-conditioned indefinite
+  saddles: it can return a garbage/non-finite step at iteration 1, which the driver
+  answers with an unbounded (and, on the iterative route, counterproductive) `δ_w`
+  escalation to `1e40` → `numerical_error` on step 1. GMRES — minimizing the true
+  residual with restarts — is markedly more robust here, and because the SPD
+  *diagonal* (incl. the approximate-Schur dual block) actively hurts GMRES on these
+  saddles, the fallback runs **unpreconditioned**. Recovers a large slice of the
+  S2MPJ optimal-control cluster on the Krylov route (HAGER*/DTOC*/CATENARY:
+  `numerical_error` → `optimal`). An explicit `method="minres"` is honored verbatim
+  (no fallback); the default `cg` route gets it automatically.
+- **`preconditioner="auto"` no longer regresses equality-constrained saddles.** The
+  failure-rescue trigger previously promoted a struggling saddle solve to the
+  *approximate* block preconditioner, whose approximate Schur diagonal can diverge a
+  solve plain Jacobi handles (S2MPJ HS109/CLNLBEAM/DISC2/EIGMAXA turned `optimal` →
+  `numerical_error` under auto). Auto now only ever promotes to the **near-exact
+  condensed Woodbury inverse** (equality-free) under *either* trigger — never the
+  saddle block — so it is `≡ jacobi` on saddles (zero regressions) while keeping the
+  equality-free acceleration. Saddle robustness is the GMRES fallback's job above;
+  the block preconditioner stays reachable via explicit `preconditioner="lbfgs"`.
 - The KKT-solve regularization loop now escalates the **dual regularization `δ_c`**
   alongside `δ_w` on a failed saddle solve. `δ_w` regularizes only the (1,1)
   primal block, so a **rank-deficient equality Jacobian** — e.g. AC optimal

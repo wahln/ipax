@@ -627,6 +627,88 @@ def test_auto_does_not_slow_promote_the_approximate_saddle_block(namespace, tol)
     assert "auto:jacobi" in solver.describe()  # but not promoted
 
 
+def test_auto_does_not_rescue_a_saddle_to_the_block(namespace):
+    """A *failed* saddle solve must NOT promote to the approximate block.
+
+    On an equality saddle the block preconditioner's approximate Schur diagonal
+    can *diverge* a solve that plain Jacobi handles (S2MPJ HS109/CLNLBEAM/ACOPP).
+    Auto only ever promotes to the near-exact condensed Woodbury inverse, which a
+    saddle does not expose — so a failed saddle solve stays Jacobi and re-raises
+    rather than switching to the block.
+    """
+    from ipax.ipm.kkt import build_saddle_operator
+
+    condensed = _condensed_no_inequalities(namespace)  # exposes the block, via lbfgs
+    c_mat = array(
+        namespace,
+        [
+            [1.0, 0.0, 2.0, 0.0, -1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0, 0.0, 3.0],
+        ],
+    )
+    saddle = build_saddle_operator(condensed, Dense(c_mat), 1e-8)
+    x_exact = array(namespace, [1.0, -1.0, 2.0, -0.5, 0.5, -2.0, 0.7, -0.3])
+    rhs = saddle.matvec(x_exact)
+
+    # max_iter=1: MINRES and the GMRES fallback both fail, so the solve raises.
+    solver = _solver(method="cg", preconditioner="auto", rtol=1e-12, max_iter=1)
+    solver.factor(saddle)
+    with pytest.raises(KrylovConvergenceError):
+        solver.solve(rhs)
+    assert "auto:jacobi" in solver.describe()  # never promoted to the block
+
+
+def _small_saddle(namespace):
+    from ipax.ipm.kkt import build_saddle_operator
+
+    saddle = build_saddle_operator(
+        Diagonal(array(namespace, [2.0, 3.0])),
+        Dense(array(namespace, [[1.0, -1.0]])),
+        1e-8,
+    )
+    x_exact = array(namespace, [0.25, -0.5, 1.5])
+    return saddle, x_exact, saddle.matvec(x_exact)
+
+
+def test_saddle_minres_failure_falls_back_to_gmres(namespace, monkeypatch, tol):
+    """When MINRES fails on an equality saddle, the default cg route falls back to
+    GMRES (unpreconditioned) instead of surfacing the failure — MINRES is fragile
+    on ill-conditioned indefinite saddles where GMRES is robust (S2MPJ Task 7).
+    """
+    saddle, x_exact, rhs = _small_saddle(namespace)
+
+    def boom(self, *args, **kwargs):
+        del self, args, kwargs
+        raise KrylovConvergenceError("forced MINRES failure")
+
+    monkeypatch.setattr(KrylovSolver, "_preconditioned_minres", boom)
+    solver = _solver(method="cg", preconditioner="jacobi", rtol=1e-10)
+    solver.factor(saddle)
+    x = solver.solve(rhs)
+
+    assert_allclose(namespace, x, x_exact, **tol)
+    assert solver.last_method == "gmres"
+
+
+def test_explicit_minres_is_not_overridden_by_the_gmres_fallback(
+    namespace, monkeypatch
+):
+    """The GMRES fallback is only for the *default* cg route; an explicit
+    ``method="minres"`` is honored — a MINRES failure propagates unchanged.
+    """
+    saddle, _x_exact, rhs = _small_saddle(namespace)
+
+    def boom(self, *args, **kwargs):
+        del self, args, kwargs
+        raise KrylovConvergenceError("forced MINRES failure")
+
+    monkeypatch.setattr(KrylovSolver, "_preconditioned_minres", boom)
+    solver = _solver(method="minres", preconditioner="jacobi")
+    solver.factor(saddle)
+    with pytest.raises(KrylovConvergenceError):
+        solver.solve(rhs)
+
+
 def test_non_convergence_raises(namespace):
     A, rhs, _ = _spd_system(namespace)
     solver = _solver(method="cg", rtol=1e-14, max_iter=1)
