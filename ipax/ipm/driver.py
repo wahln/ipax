@@ -663,6 +663,17 @@ class IPMDriver:
                 status = decision.status
                 message = decision.message
                 break
+            # IPOPT-style diverging-iterates test: an unbounded-below problem drives
+            # ‖x‖ off to infinity while the KKT residual never falls (e.g. INDEF).
+            # Report it honestly as UNBOUNDED rather than waiting for the runaway
+            # iterate to overflow into a NUMERICAL_ERROR.
+            if (
+                opts.diverging_iterates_tol is not None
+                and float(xp.max(xp.abs(x))) > opts.diverging_iterates_tol
+            ):
+                status = Status.UNBOUNDED
+                message = "iterates diverging; the problem may be unbounded below"
+                break
             if (
                 opts.max_time is not None
                 and perf_counter() - run_start >= opts.max_time

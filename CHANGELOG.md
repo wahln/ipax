@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Unbounded-problem detection.** An IPOPT-style diverging-iterates test now reports
+  `Status.UNBOUNDED` (previously in the enum but never emitted) when `‖x‖_∞` exceeds
+  the new `Options.diverging_iterates_tol` (default `1e20`, `None` disables). An
+  unbounded-below objective drove the iterate off to infinity while the KKT residual
+  never fell and only surfaced as a misleading `numerical_error` once the runaway
+  iterate overflowed to non-finite (e.g. the CUTEst INDEF problem: objective marching
+  to `-1e155`); it is now stopped early and labelled honestly (INDEF → `unbounded` at
+  iteration 27 instead of `numerical_error` at 186).
 - Opt-in **block-Schur preconditioner** for the matrix-free Krylov route on
   equality saddles: `KrylovOptions(preconditioner="lbfgs")` now builds the
   block-diagonal `diag(N⁻¹, S⁻¹)` (Murphy–Golub–Wathen) on `_SaddleOperator` —

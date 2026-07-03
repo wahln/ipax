@@ -328,12 +328,14 @@ class Options:
     the analytic operator (errors otherwise), ``"autodiff-hvp"`` uses backend
     autodiff Hessian-vector products.
 
-    Termination has four sources, checked in priority order:
+    Termination has five sources, checked in priority order:
 
     * ``optimality`` (:class:`OptimalityConditionOptions`) — single-iteration
       test reporting :attr:`Status.OPTIMAL`.
     * ``acceptable`` (:class:`AcceptableStoppingOptions`) — multi-iteration test
       reporting :attr:`Status.ACCEPTABLE` (disabled by default).
+    * ``diverging_iterates_tol`` — ‖x‖_∞ exceeding the threshold reports
+      :attr:`Status.UNBOUNDED` (``None`` disables it).
     * ``max_iter`` — iteration cap, reports :attr:`Status.MAX_ITER`.
     * ``max_time`` — wall-clock cap in seconds, reports :attr:`Status.MAX_TIME`
       (``None`` disables it).
@@ -347,6 +349,10 @@ class Options:
     )
     max_iter: int = 3000
     max_time: float | None = None
+    # IPOPT ``diverging_iterates_tol``: if ‖x‖_∞ exceeds this the iterates are
+    # declared diverging and the solve stops with :attr:`Status.UNBOUNDED` (the
+    # problem is likely unbounded below). ``None`` disables the test.
+    diverging_iterates_tol: float | None = 1e20
     hessian: HessianMode = "auto"
     linsolve: LinSolveMode = "auto"
     globalization: Globalization = "filter"
@@ -374,6 +380,9 @@ class Options:
     def __post_init__(self) -> None:
         """Validate limits and normalize shorthand option values."""
         _validate_optional_positive("max_time", self.max_time, allow_zero=False)
+        _validate_optional_positive(
+            "diverging_iterates_tol", self.diverging_iterates_tol, allow_zero=False
+        )
         if self.max_iter < 1:
             raise ValueError("max_iter must be a positive integer")
         if isinstance(self.scaling, str):
