@@ -63,7 +63,11 @@ from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
 from ipax.ipm.restoration import restore
 from ipax.ipm.step import NewtonStep, recover_eliminated
 from ipax.ipm.termination import ConditionChecker
-from ipax.linalg.regularize import RegularizationState, escalate_delta_w
+from ipax.linalg.regularize import (
+    RegularizationState,
+    escalate_delta_c,
+    escalate_delta_w,
+)
 from ipax.linalg.solver import LinearSolveError
 from ipax.problem.autodiff import get_autodiff_adapter
 from ipax.result import (
@@ -1318,12 +1322,26 @@ class IPMDriver:
         sigma_x_op = Diagonal(sigma_x)
         sigma_s_op = Diagonal(sigma_s)
         empty = xp.zeros((0,), dtype=rhs_x.dtype)
+        # δ_c is escalated alongside δ_w on a failed saddle solve: δ_w cannot
+        # repair a rank-deficient equality Jacobian (which leaves the saddle
+        # singular in the (2,2) dual block), only δ_c can (W&B 2006, §3.1). It is
+        # threaded locally, so it grows only within this failing solve.
+        current_delta_c = delta_c
+
+        def escalate() -> None:
+            nonlocal current_delta_c
+            escalate_delta_w(reg, self._options.regularization)
+            if m_eq > 0:
+                current_delta_c = escalate_delta_c(
+                    current_delta_c, self._options.regularization
+                )
+
         for _ in range(_MAX_REG_ATTEMPTS):
             condensed = build_condensed_operator(
                 w, sigma_x_op, sigma_s_op, ineq_jac, reg
             )
             if m_eq > 0:
-                operator = build_saddle_operator(condensed, eq_jac, delta_c)
+                operator = build_saddle_operator(condensed, eq_jac, current_delta_c)
                 rhs = xp.concat((rhs_x, r_y))
             else:
                 operator = condensed
@@ -1332,16 +1350,18 @@ class IPMDriver:
                 self._solver.factor(operator)
                 sol = self._solver.solve(rhs)
             except LinearSolveError:
-                escalate_delta_w(reg, self._options.regularization)
+                escalate()
                 logger.debug(
-                    "factorization failed; escalating delta_w to %.2e", reg.delta_w
+                    "factorization failed; escalating delta_w to %.2e, delta_c to %.2e",
+                    reg.delta_w,
+                    current_delta_c,
                 )
                 continue
             if not self._inertia_acceptable(operator):
                 # A symmetric-indefinite LDLᵀ can succeed with the *wrong* inertia
                 # (a non-descent step the failure path never sees); IPOPT bumps
                 # δ_w until the (1,1) block is PD (Wächter & Biegler 2006, §3.1).
-                escalate_delta_w(reg, self._options.regularization)
+                escalate()
                 logger.debug(
                     "KKT inertia mismatch; escalating delta_w to %.2e", reg.delta_w
                 )
@@ -1350,7 +1370,7 @@ class IPMDriver:
                 dx = sol[: self._n]
                 dy = sol[self._n :] if m_eq > 0 else empty
                 return dx, dy, reg.delta_w, True
-            escalate_delta_w(reg, self._options.regularization)
+            escalate()
             logger.debug("non-finite step; escalating delta_w to %.2e", reg.delta_w)
         return rhs_x, empty, reg.delta_w, False
 

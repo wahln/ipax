@@ -108,6 +108,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   PD-by-Powell-damping design); see the note in `ipax/ipm/hessian.py`.
 
 ### Fixed
+- The KKT-solve regularization loop now escalates the **dual regularization `δ_c`**
+  alongside `δ_w` on a failed saddle solve. `δ_w` regularizes only the (1,1)
+  primal block, so a **rank-deficient equality Jacobian** — e.g. AC optimal
+  power-flow's reference-bus degeneracy — left the bordered saddle singular in the
+  (2,2) dual block, and the solver escalated `δ_w` to `1e27` uselessly (into
+  numerical singularity) before reporting `numerical_error` at iteration 1. `δ_c`
+  now grows (capped by `RegularizationOptions.delta_c_max`, default `1e-1`) within
+  the failing solve and resets on the next step (Wächter & Biegler 2006, §3.1).
+  This unsticks the S2MPJ lbfgs/krylov `numerical_error` cluster (ACOPP*/ACOPR*
+  now make progress instead of dying on step 1) and fixes solves with redundant /
+  linearly-dependent equality constraints on every route.
 - The filter line search no longer diverges (and falsely reports `infeasible`) on
   problems where a quasi-Newton step's barrier objective collapses while the
   constraint violation explodes. The filter is now initialized with the

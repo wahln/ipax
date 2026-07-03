@@ -78,6 +78,7 @@ class RegularizationOptions:
     delta_w_max: float = 1e40
     delta_w_factor: float = 8.0  # escalation on Cholesky failure
     delta_c: float = 1e-8  # (2,2) block, equality regularization
+    delta_c_max: float = 1e-1  # cap on δ_c escalation (rank-deficient ∇c)
 
 
 @dataclass(frozen=True, slots=True)

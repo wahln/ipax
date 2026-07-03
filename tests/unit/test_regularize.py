@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from ipax.linalg.regularize import RegularizationState, escalate_delta_w, shrink_delta_w
+from ipax.linalg.regularize import (
+    RegularizationState,
+    escalate_delta_c,
+    escalate_delta_w,
+    shrink_delta_w,
+)
 from ipax.options import RegularizationOptions
 from tests._helpers import implemented
 
@@ -39,3 +44,16 @@ def test_shrink_delta_w_reduces_without_going_negative():
 
     assert 0.0 <= delta < 1e-4
     assert state.delta_w == delta
+
+
+def test_escalate_delta_c_multiplies_and_caps():
+    # δ_c grows by δ_w_factor from the configured value, capped at delta_c_max so
+    # the dual regularization for a rank-deficient ∇c cannot run away.
+    options = RegularizationOptions(delta_c=1e-8, delta_w_factor=8.0, delta_c_max=1e-1)
+
+    with implemented("regularization loop"):
+        first = escalate_delta_c(options.delta_c, options)
+        capped = escalate_delta_c(1e-1, options)
+
+    assert first == 8e-8
+    assert capped == options.delta_c_max  # never exceeds the cap
