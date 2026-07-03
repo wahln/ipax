@@ -29,7 +29,7 @@ LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
 Globalization = Literal["filter", "breedveld"]
 MuSchedule = Literal["monotone", "adaptive", "breedveld"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
-KrylovPreconditioner = Literal["none", "jacobi", "lbfgs"]
+KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
 ScalingMethod = Literal["none", "gradient-based"]
 CorrectionsMethod = Literal["none", "mehrotra", "gondzio"]
 
@@ -112,17 +112,24 @@ class KrylovOptions:
     max_iter: int | None = None  # default: 2 * dim + 100 at the call site
     preconditioner: KrylovPreconditioner = "jacobi"
     gmres_restart: int = 30  # GMRES(m) restart length
+    # ``"auto"`` starts with the cheap Jacobi diagonal and self-promotes to the
+    # L-BFGS Woodbury/block preconditioner the first time a solve struggles —
+    # either it fails to converge (then it retries the same solve promoted) or it
+    # burns more than this fraction of the iteration budget. Sticky thereafter.
+    auto_switch_ratio: float = 0.5
 
     def __post_init__(self) -> None:
         """Validate runtime values as well as static Literal hints."""
         if self.method not in ("cg", "minres", "gmres"):
             raise ValueError("Krylov method must be 'cg', 'minres', or 'gmres'")
-        if self.preconditioner not in ("none", "jacobi", "lbfgs"):
+        if self.preconditioner not in ("none", "jacobi", "lbfgs", "auto"):
             raise ValueError(
-                "Krylov preconditioner must be 'none', 'jacobi', or 'lbfgs'"
+                "Krylov preconditioner must be 'none', 'jacobi', 'lbfgs', or 'auto'"
             )
         if self.gmres_restart < 1:
             raise ValueError("gmres_restart must be a positive integer")
+        if not 0.0 < self.auto_switch_ratio <= 1.0:
+            raise ValueError("auto_switch_ratio must lie in (0, 1]")
 
 
 @dataclass(frozen=True, slots=True)

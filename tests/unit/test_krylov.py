@@ -517,6 +517,72 @@ def test_lbfgs_preconditioner_falls_back_without_lbfgs_structure(namespace, tol)
     assert_allclose(namespace, x, x_exact, **tol)
 
 
+def test_auto_starts_with_jacobi_and_stays_on_easy_solves(namespace, tol):
+    """``preconditioner="auto"`` begins as Jacobi and does not promote when the
+    solve is easy (converges well inside the iteration budget)."""
+    A, rhs, x_exact = _spd_system(namespace)
+    solver = _solver(method="cg", rtol=1e-12, preconditioner="auto")
+    solver.factor(Dense(A))
+    x = solver.solve(rhs)
+
+    assert_allclose(namespace, x, x_exact, **tol)
+    assert "auto:jacobi" in solver.describe()  # never promoted
+
+
+def test_auto_promotes_to_lbfgs_on_convergence_failure(namespace, tol):
+    """A jacobi solve that cannot meet the tolerance in the iteration budget
+    promotes to the L-BFGS Woodbury preconditioner and retries — succeeding."""
+    operator = _condensed_no_inequalities(namespace)  # exposes lbfgs_inverse_apply
+    x_exact = array(namespace, [1.0, -1.0, 2.0, -2.0, 0.5, -0.5])
+    rhs = operator.matvec(x_exact)
+
+    # max_iter=1 is too tight for plain Jacobi CG here, but the exact Woodbury
+    # inverse solves in a single step — so the auto retry converges.
+    solver = _solver(method="cg", rtol=1e-10, preconditioner="auto", max_iter=1)
+    solver.factor(operator)
+    x = solver.solve(rhs)
+
+    assert_allclose(namespace, x, x_exact, rtol=1e-7, atol=1e-7)
+    assert "auto:lbfgs" in solver.describe()  # promoted by the failure
+    assert solver.last_iterations == 1
+
+
+def test_auto_stays_jacobi_and_raises_without_lbfgs_structure(namespace):
+    """A plain operator has no L-BFGS compact form: a failed jacobi solve cannot
+    be rescued, so auto re-raises without promoting (no pointless retry loop)."""
+    A, rhs, _ = _spd_system(namespace)
+    solver = _solver(method="cg", rtol=1e-14, preconditioner="auto", max_iter=1)
+    solver.factor(Dense(A))
+
+    with pytest.raises(KrylovConvergenceError):
+        solver.solve(rhs)
+    assert "auto:jacobi" in solver.describe()  # no L-BFGS ⇒ never promoted
+
+
+def test_auto_promotes_after_a_slow_but_successful_solve(namespace, tol):
+    """A solve that succeeds but burns more than ``auto_switch_ratio`` of the
+    budget promotes to L-BFGS for the *next* solve (sticky across solves)."""
+    operator = _condensed_no_inequalities(namespace)
+    x_exact = array(namespace, [1.0, -1.0, 2.0, -2.0, 0.5, -0.5])
+    rhs = operator.matvec(x_exact)
+
+    # A tiny ratio: any multi-iteration Jacobi solve counts as "slow".
+    solver = _solver(
+        method="cg", rtol=1e-10, preconditioner="auto", auto_switch_ratio=1e-6
+    )
+    solver.factor(operator)
+
+    first = solver.solve(rhs)  # Jacobi, several iterations → triggers promotion
+    assert_allclose(namespace, first, x_exact, rtol=1e-7, atol=1e-7)
+    assert first is not None
+    assert solver.last_iterations > 1
+    assert "auto:lbfgs" in solver.describe()
+
+    second = solver.solve(rhs)  # now the exact Woodbury inverse: one step
+    assert_allclose(namespace, second, x_exact, rtol=1e-7, atol=1e-7)
+    assert solver.last_iterations == 1
+
+
 def test_non_convergence_raises(namespace):
     A, rhs, _ = _spd_system(namespace)
     solver = _solver(method="cg", rtol=1e-14, max_iter=1)

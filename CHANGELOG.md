@@ -19,6 +19,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   Purely opt-in: the default preconditioner remains `jacobi`, so default behavior
   is unchanged, and it degrades to Jacobi before the first curvature pair or with
   a non-L-BFGS Hessian.
+- Adaptive **`KrylovOptions(preconditioner="auto")`** mode that self-tunes between
+  the two preconditioners: it starts on the cheap Jacobi diagonal and promotes to
+  the L-BFGS Woodbury/block preconditioner the first time a solve struggles — a
+  convergence failure the Woodbury inverse could rescue triggers an immediate
+  promoted retry of the same solve, and a merely slow success (more than the new
+  `auto_switch_ratio` fraction, default `0.5`, of the iteration budget) promotes
+  for the next solve. The promotion is sticky for the life of the solver instance
+  (one IPM run), and only fires when the operator actually exposes an L-BFGS
+  compact form — so ill-conditioned systems get the stronger preconditioner while
+  well-conditioned ones never pay the per-iteration Woodbury cost. The default
+  remains `jacobi`; `auto` is opt-in.
 - The S2MPJ / CUTEst benchmark harness now scores a second **`converged`** tier
   alongside `correct`: a case that reaches a valid KKT point (a small scaled KKT
   residual at a success status — which already bounds primal infeasibility)

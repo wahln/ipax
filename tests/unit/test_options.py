@@ -114,7 +114,7 @@ def test_krylov_options_reject_unsupported_methods(method):
         KrylovOptions(method=method)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("preconditioner", ["none", "jacobi", "lbfgs"])
+@pytest.mark.parametrize("preconditioner", ["none", "jacobi", "lbfgs", "auto"])
 def test_krylov_options_accept_supported_preconditioners(preconditioner):
     opts = KrylovOptions(preconditioner=preconditioner)  # type: ignore[arg-type]
     assert opts.preconditioner == preconditioner
@@ -129,3 +129,13 @@ def test_krylov_options_reject_unsupported_preconditioners(preconditioner):
 def test_krylov_options_reject_nonpositive_gmres_restart():
     with pytest.raises(ValueError, match="gmres_restart"):
         KrylovOptions(gmres_restart=0)
+
+
+@pytest.mark.parametrize("ratio", [0.0, -0.5, 1.5])
+def test_krylov_options_reject_out_of_range_auto_switch_ratio(ratio):
+    with pytest.raises(ValueError, match="auto_switch_ratio"):
+        KrylovOptions(auto_switch_ratio=ratio)
+
+
+def test_krylov_options_accept_auto_switch_ratio_in_range():
+    assert KrylovOptions(auto_switch_ratio=0.25).auto_switch_ratio == 0.25

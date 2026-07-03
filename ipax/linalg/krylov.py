@@ -41,6 +41,12 @@ Preconditioning (§5.2), all matrix-free:
   is available), since MINRES admits only a diagonal. It degrades to ``jacobi``
   where no L-BFGS compact form is available (e.g. before the first curvature pair,
   or an exact/matrix-free Hessian).
+- ``auto`` — start with cheap ``jacobi`` and self-promote to ``lbfgs`` the first
+  time a solve struggles: a convergence failure the Woodbury inverse could rescue
+  triggers an immediate promoted retry, and a merely slow success (more than
+  ``auto_switch_ratio`` of the iteration budget) promotes for the next solve. The
+  flag is sticky for the life of the solver, so the extra Woodbury cost is paid
+  only on ill-conditioned systems while well-conditioned ones stay on Jacobi.
 All preconditioners fall back to none when no suitable structure exists.
 
 References: Hestenes & Stiefel 1952 (CG); Paige & Saunders 1975 (MINRES); Saad &
@@ -111,10 +117,28 @@ class KrylovSolver:
         self.last_iterations: int = 0
         self.last_residual: float = 0.0
         self.last_method: str = ""
+        # ``preconditioner="auto"``: sticky flag, set once a solve struggles, that
+        # promotes the effective preconditioner from Jacobi to L-BFGS (§5.2).
+        self._auto_promoted: bool = False
 
     def describe(self) -> str:
         """Human-readable label for diagnostics, incl. method/preconditioner."""
-        return f"krylov ({self._options.method}, pc={self._options.preconditioner})"
+        pc: str = self._options.preconditioner
+        if pc == "auto":
+            pc = f"auto:{self._effective_preconditioner()}"
+        return f"krylov ({self._options.method}, pc={pc})"
+
+    def _effective_preconditioner(self) -> str:
+        """Resolve the preconditioner actually in force this solve.
+
+        In ``"auto"`` mode this is Jacobi until a solve struggles, then L-BFGS
+        (sticky for the life of this solver instance / IPM run); otherwise it is
+        the configured mode verbatim.
+        """
+        mode = self._options.preconditioner
+        if mode == "auto":
+            return "lbfgs" if self._auto_promoted else "jacobi"
+        return mode
 
     def factor(self, K: LinearOperator) -> None:
         """Store the operator. Krylov methods need no factorization."""
@@ -138,16 +162,40 @@ class KrylovSolver:
             else 2 * dim + 100
         )
 
+        # ``preconditioner="auto"``: run with the current effective preconditioner;
+        # on a convergence failure that L-BFGS could rescue, promote and retry the
+        # same solve once, then (on success) promote for the next solve if this one
+        # was slow. In any non-auto mode this is a single ``_dispatch`` call.
+        try:
+            solution = self._dispatch(K, rhs, xp, max_iter, rtol)
+        except KrylovConvergenceError:
+            if not self._auto_can_promote(K):
+                raise
+            self._auto_promoted = True
+            solution = self._dispatch(K, rhs, xp, max_iter, rtol)
+        else:
+            self._auto_promote_if_slow(K, max_iter)
+        return solution
+
+    def _dispatch(
+        self,
+        K: LinearOperator,
+        rhs: Array,
+        xp: Namespace,
+        max_iter: int,
+        rtol: float,
+    ) -> Array:
+        """Route to CG / MINRES / GMRES per method, preferred route, and pc."""
         method = self._options.method
         preferred = K.preferred_krylov_method()
         # A non-diagonal L-BFGS block preconditioner diag(N⁻¹, S⁻¹) for the
         # indefinite saddle can only be applied by GMRES (left preconditioning);
         # MINRES admits a diagonal only. So on the default (``cg``) route, when the
-        # saddle offers that preconditioner and it is requested, take GMRES instead
+        # saddle offers that preconditioner and it is in force, take GMRES instead
         # of the CG→MINRES fallback. An explicit ``minres``/``gmres`` is honored.
         if (
             method == "cg"
-            and self._options.preconditioner == "lbfgs"
+            and self._effective_preconditioner() == "lbfgs"
             and preferred == "minres"
         ):
             return self._gmres(K, rhs, xp, max_iter, rtol)
@@ -165,6 +213,41 @@ class KrylovSolver:
         except _IndefiniteOperatorError:
             return self._preconditioned_minres(K, rhs, xp, max_iter, rtol)
 
+    # -- auto preconditioner promotion (§5.2) -----------------------------
+
+    def _auto_can_promote(self, K: LinearOperator) -> bool:
+        """Whether an ``"auto"`` solver may still switch Jacobi → L-BFGS here.
+
+        Only when in auto mode, not already promoted, and the operator actually
+        exposes an L-BFGS compact form — otherwise promotion is a no-op that would
+        just repeat the same (failing) Jacobi solve.
+        """
+        return (
+            self._options.preconditioner == "auto"
+            and not self._auto_promoted
+            and self._lbfgs_structure_available(K)
+        )
+
+    def _auto_promote_if_slow(self, K: LinearOperator, max_iter: int) -> None:
+        """Promote after a successful-but-slow solve (iterations over threshold)."""
+        if not self._auto_can_promote(K):
+            return
+        if self.last_iterations > self._options.auto_switch_ratio * max_iter:
+            self._auto_promoted = True
+
+    def _lbfgs_structure_available(self, K: LinearOperator) -> bool:
+        """True when ``K`` offers an L-BFGS block/Woodbury preconditioner apply."""
+        for probe in (
+            K.lbfgs_block_preconditioner_apply,
+            K.lbfgs_inverse_apply,
+        ):
+            try:
+                probe()
+            except NotImplementedError:
+                continue
+            return True
+        return False
+
     # -- preconditioning --------------------------------------------------
 
     def _make_preconditioner(
@@ -177,7 +260,7 @@ class KrylovSolver:
         uses a strictly positive (SPD) diagonal — the saddle's SPD block diagonal
         when offered, else the operator's own diagonal.
         """
-        mode = self._options.preconditioner
+        mode = self._effective_preconditioner()
         if mode == "none":
             return lambda r: r
         if mode == "lbfgs":
@@ -370,7 +453,7 @@ class KrylovSolver:
         *diagonal* SPD ``D`` — so the non-diagonal ``lbfgs`` inverse is not
         representable here and degrades to the same SPD diagonal as ``jacobi``.
         """
-        mode = self._options.preconditioner
+        mode = self._effective_preconditioner()
         if mode == "none":
             return None
         if mode not in ("jacobi", "lbfgs"):

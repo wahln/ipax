@@ -45,6 +45,14 @@ user-overridable via `Options.linsolve`. Adding a solver never touches
     below ~1e4 variables), so default usage is unaffected; the residual gap is for
     large, matrix-free, equality-constrained models.
 
+    To get the block preconditioner *only where it pays off*, use
+    `KrylovOptions(preconditioner="auto")`: it runs the cheap Jacobi diagonal
+    until a solve struggles — a convergence failure triggers an immediate promoted
+    retry, and a slow success (over `auto_switch_ratio` of the iteration budget)
+    promotes for subsequent solves — then stays on the L-BFGS block/Woodbury
+    preconditioner for the rest of that solve. Well-conditioned systems never pay
+    the extra Woodbury cost.
+
 ## Sparsity as an adapter concern
 
 The standard has no sparse type. The core emits structure as Array-API
