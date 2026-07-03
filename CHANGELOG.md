@@ -21,15 +21,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   a non-L-BFGS Hessian.
 - Adaptive **`KrylovOptions(preconditioner="auto")`** mode that self-tunes between
   the two preconditioners: it starts on the cheap Jacobi diagonal and promotes to
-  the L-BFGS Woodbury/block preconditioner the first time a solve struggles — a
-  convergence failure the Woodbury inverse could rescue triggers an immediate
-  promoted retry of the same solve, and a merely slow success (more than the new
+  the L-BFGS preconditioner the first time a solve struggles. Two triggers, with
+  deliberately asymmetric aggressiveness so promotion never regresses a solve:
+  a **convergence failure** is rescued by retrying the same solve with *any*
+  available L-BFGS structure (the alternative is a definite failure and δ_w
+  escalation), whereas a merely **slow success** (more than the new
   `auto_switch_ratio` fraction, default `0.5`, of the iteration budget) promotes
-  for the next solve. The promotion is sticky for the life of the solver instance
-  (one IPM run), and only fires when the operator actually exposes an L-BFGS
-  compact form — so ill-conditioned systems get the stronger preconditioner while
-  well-conditioned ones never pay the per-iteration Woodbury cost. The default
-  remains `jacobi`; `auto` is opt-in.
+  only to the *near-exact condensed Woodbury inverse* `N⁻¹`. The approximate
+  saddle block preconditioner is never promoted speculatively — on a
+  rank-deficient equality Jacobian its approximate Schur diagonal can yield worse
+  steps than the slow-but-stable Jacobi solve (observed on the ACOPP power-flow
+  cluster). Promotion is sticky for the life of the solver instance (one IPM run),
+  so ill-conditioned systems get the stronger preconditioner while well-conditioned
+  ones never pay the per-iteration Woodbury cost. The default remains `jacobi`;
+  `auto` is opt-in.
 - The S2MPJ / CUTEst benchmark harness now scores a second **`converged`** tier
   alongside `correct`: a case that reaches a valid KKT point (a small scaled KKT
   residual at a success status — which already bounds primal infeasibility)

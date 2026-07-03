@@ -169,7 +169,7 @@ class KrylovSolver:
         try:
             solution = self._dispatch(K, rhs, xp, max_iter, rtol)
         except KrylovConvergenceError:
-            if not self._auto_can_promote(K):
+            if not self._auto_can_rescue(K):
                 raise
             self._auto_promoted = True
             solution = self._dispatch(K, rhs, xp, max_iter, rtol)
@@ -215,22 +215,30 @@ class KrylovSolver:
 
     # -- auto preconditioner promotion (§5.2) -----------------------------
 
-    def _auto_can_promote(self, K: LinearOperator) -> bool:
-        """Whether an ``"auto"`` solver may still switch Jacobi → L-BFGS here.
+    def _auto_open(self) -> bool:
+        """Whether an ``"auto"`` solver is still eligible to promote at all."""
+        return self._options.preconditioner == "auto" and not self._auto_promoted
 
-        Only when in auto mode, not already promoted, and the operator actually
-        exposes an L-BFGS compact form — otherwise promotion is a no-op that would
-        just repeat the same (failing) Jacobi solve.
+    def _auto_can_rescue(self, K: LinearOperator) -> bool:
+        """Whether a *failed* solve may be retried with an L-BFGS preconditioner.
+
+        A rescue after an outright convergence failure: any L-BFGS structure —
+        even the *approximate* saddle block preconditioner — is worth trying, since
+        the alternative is a definite failure (and δ_w escalation).
         """
-        return (
-            self._options.preconditioner == "auto"
-            and not self._auto_promoted
-            and self._lbfgs_structure_available(K)
-        )
+        return self._auto_open() and self._lbfgs_structure_available(K)
 
     def _auto_promote_if_slow(self, K: LinearOperator, max_iter: int) -> None:
-        """Promote after a successful-but-slow solve (iterations over threshold)."""
-        if not self._auto_can_promote(K):
+        """Promote after a slow-but-successful solve — condensed Woodbury only.
+
+        Speculative promotion is restricted to the *near-exact* condensed Woodbury
+        inverse (equality-free ``N⁻¹``), whose preconditioning reliably helps. The
+        saddle block preconditioner uses an *approximate* Schur diagonal and on a
+        rank-deficient/ill-conditioned equality Jacobian can yield worse steps than
+        the slow-but-stable Jacobi solve (the ACOPP power-flow cluster), so it is
+        never promoted speculatively — only as a failure rescue above.
+        """
+        if not self._auto_open() or not self._lbfgs_condensed_available(K):
             return
         if self.last_iterations > self._options.auto_switch_ratio * max_iter:
             self._auto_promoted = True
@@ -247,6 +255,18 @@ class KrylovSolver:
                 continue
             return True
         return False
+
+    def _lbfgs_condensed_available(self, K: LinearOperator) -> bool:
+        """True when ``K`` offers the near-exact condensed Woodbury inverse ``N⁻¹``.
+
+        This is the equality-free condensed operator only; the equality saddle
+        exposes the block preconditioner instead, not this near-exact inverse.
+        """
+        try:
+            K.lbfgs_inverse_apply()
+        except NotImplementedError:
+            return False
+        return True
 
     # -- preconditioning --------------------------------------------------
 

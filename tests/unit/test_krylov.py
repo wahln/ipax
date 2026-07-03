@@ -583,6 +583,50 @@ def test_auto_promotes_after_a_slow_but_successful_solve(namespace, tol):
     assert solver.last_iterations == 1
 
 
+def test_auto_does_not_slow_promote_the_approximate_saddle_block(namespace, tol):
+    """A slow-but-successful *saddle* solve must NOT speculatively promote.
+
+    The saddle block preconditioner ``diag(N⁻¹, S⁻¹)`` uses an *approximate* Schur
+    diagonal, so on a rank-deficient/ill-conditioned saddle it can yield worse
+    steps than the slow-but-stable Jacobi/MINRES solve (observed on the ACOPP
+    power-flow cluster). Speculative slow-promotion is therefore restricted to the
+    near-exact condensed Woodbury inverse; a saddle stays on Jacobi unless a solve
+    outright fails.
+    """
+    from ipax.ipm.kkt import build_saddle_operator
+
+    d = array(
+        namespace,
+        [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0],
+    )
+    c_mat = array(
+        namespace,
+        [
+            [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        ],
+    )
+    saddle = build_saddle_operator(Diagonal(d), Dense(c_mat), 1e-8)
+    x_exact = array(
+        namespace,
+        [1.0, -1.0, 2.0, -2.0, 0.5, -0.5, 1.5, -1.5, 0.25, -0.25, 3.0, -3.0],
+    )
+    rhs = saddle.matvec(x_exact)
+
+    # A tiny ratio would promote any multi-iteration solve — but this saddle
+    # exposes only the approximate block preconditioner, not the condensed
+    # Woodbury, so slow-promotion must decline it.
+    solver = _solver(
+        method="cg", rtol=1e-10, preconditioner="auto", auto_switch_ratio=1e-6
+    )
+    solver.factor(saddle)
+    x = solver.solve(rhs)
+
+    assert_allclose(namespace, x, x_exact, rtol=1e-6, atol=1e-6)
+    assert solver.last_iterations > 1  # genuinely slow
+    assert "auto:jacobi" in solver.describe()  # but not promoted
+
+
 def test_non_convergence_raises(namespace):
     A, rhs, _ = _spd_system(namespace)
     solver = _solver(method="cg", rtol=1e-14, max_iter=1)
