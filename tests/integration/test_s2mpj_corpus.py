@@ -129,6 +129,28 @@ def test_exact_sparse_route_matches_exact_dense(bridge_namespace, name):
     assert_allclose(xp, sparse.x, dense.x, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("name", ("BT1", "DISC2"))
+def test_nonconvex_equality_exact_sparse_converges(bridge_namespace, name):
+    # Regression: well-conditioned nonconvex *equality*-constrained problems on the
+    # exact/sparse (inertia) route. Escalating δ_c in lockstep with δ_w on an
+    # inertia-mismatch failure changes the very inertia the check tests against, so
+    # δ_w ran away and the solve diverged (BT1 optimal→max_time). δ_c must escalate
+    # only on a factorization failure, not an inertia mismatch. These reach the
+    # optimum cleanly when the gating is correct.
+    xp = bridge_namespace
+    if name not in s2mpj.list_s2mpj_problems():
+        pytest.skip(f"{name} not in this S2MPJ checkout")
+    backend = xp.__name__.split(".")[-1]
+    (case,) = s2mpj.s2mpj_problems(
+        (name,), backends=(backend,), hessian="exact", sparse=True
+    )
+    problem, x0 = case.build(xp)
+    result = solve(problem, x0, options=Options(hessian="exact", linsolve="sparse"))
+
+    assert result.status is Status.OPTIMAL, f"{name}: {result.status}"
+    assert result.kkt_error <= 1e-6
+
+
 def test_documented_expected_outcome_is_attached(bridge_namespace):
     # The loader threads the dataset's documented outcome onto the built problem.
     xp = bridge_namespace

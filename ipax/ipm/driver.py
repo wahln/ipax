@@ -1343,10 +1343,17 @@ class IPMDriver:
         # threaded locally, so it grows only within this failing solve.
         current_delta_c = delta_c
 
-        def escalate() -> None:
+        def escalate(*, dual: bool) -> None:
             nonlocal current_delta_c
             escalate_delta_w(reg, self._options.regularization)
-            if m_eq > 0:
+            # Escalate δ_c ONLY when the factorization itself failed — a singular
+            # KKT matrix, the rank-deficient ∇c case δ_c repairs (W&B 2006, §3.1).
+            # An *inertia mismatch* or a non-finite step is a (1,1)-block problem
+            # δ_w owns: perturbing the (2,2) block there is not only useless but,
+            # on the inertia route, changes the very inertia the check tests against
+            # — over-regularizing well-conditioned equality problems (BT1/DISC2 on
+            # exact/sparse) into a δ_w runaway and divergence.
+            if dual and m_eq > 0:
                 current_delta_c = escalate_delta_c(
                     current_delta_c, self._options.regularization
                 )
@@ -1365,7 +1372,7 @@ class IPMDriver:
                 self._solver.factor(operator)
                 sol = self._solver.solve(rhs)
             except LinearSolveError:
-                escalate()
+                escalate(dual=True)
                 logger.debug(
                     "factorization failed; escalating delta_w to %.2e, delta_c to %.2e",
                     reg.delta_w,
@@ -1376,7 +1383,7 @@ class IPMDriver:
                 # A symmetric-indefinite LDLᵀ can succeed with the *wrong* inertia
                 # (a non-descent step the failure path never sees); IPOPT bumps
                 # δ_w until the (1,1) block is PD (Wächter & Biegler 2006, §3.1).
-                escalate()
+                escalate(dual=False)
                 logger.debug(
                     "KKT inertia mismatch; escalating delta_w to %.2e", reg.delta_w
                 )
@@ -1385,7 +1392,7 @@ class IPMDriver:
                 dx = sol[: self._n]
                 dy = sol[self._n :] if m_eq > 0 else empty
                 return dx, dy, reg.delta_w, True
-            escalate()
+            escalate(dual=False)
             logger.debug("non-finite step; escalating delta_w to %.2e", reg.delta_w)
         return rhs_x, empty, reg.delta_w, False
 
