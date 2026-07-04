@@ -81,6 +81,10 @@ class SparseDirectSolver:
         )
         return f"sparse [{detail}]"
 
+    def set_outer_residual(self, residual: float) -> None:
+        """No-op: a direct factorization has no inner tolerance to adapt."""
+        del residual
+
     def factor(self, K: LinearOperator) -> None:
         # The core emits structure; the adapter builds and factors the matrix.
         # On a fixed pattern (stable signature) reuse the cached row/column

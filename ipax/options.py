@@ -106,12 +106,27 @@ class KrylovOptions:
     """Matrix-free solver tolerances (§5.2)."""
 
     method: KrylovMethod = "cg"
-    # Tight by default so the matrix-free Newton step is accurate enough for the
-    # IPM to reach the scaled-KKT tolerance (§4.5); relax for large problems.
+    # When ``adaptive_tol`` is on this is the *floor* of the inexact-Newton forcing
+    # sequence (the tightest inner tolerance, reached near convergence); when off it
+    # is the fixed inner relative tolerance for every solve.
     rtol: float = 1e-10
     max_iter: int | None = None  # default: 2 * dim + 100 at the call site
     preconditioner: KrylovPreconditioner = "jacobi"
     gmres_restart: int = 30  # GMRES(m) restart length
+    # Inexact-Newton forcing sequence (Eisenstat–Walker 1996): the inner solve need
+    # only be as accurate as the *current* outer KKT residual demands, so early
+    # iterations solve loosely (fast, and robust on ill-conditioned initial systems
+    # a tight 1e-10 cannot reach) and tighten toward ``rtol`` as the IPM converges.
+    # ``inner_rtol = clip(adaptive_eta · ‖outer KKT residual‖, rtol, adaptive_rtol_max)``.
+    # Set ``adaptive_tol=False`` to force the fixed ``rtol`` on every solve.
+    adaptive_tol: bool = True
+    adaptive_eta: float = 0.1  # forcing factor: inner tol ≈ η · outer residual
+    # Loosest inner tolerance (cap). Calibrated to the default outer scaled-KKT tol
+    # (1e-8): the inner solve is never looser than the accuracy the IPM targets, so
+    # early steps stay accurate enough to keep the iterate feasible (a looser cap
+    # drives step-sensitive IPM problems into infeasibility) while still relaxing the
+    # unreachable 1e-10 that stalls ill-conditioned initial systems.
+    adaptive_rtol_max: float = 1e-8
     # ``"auto"`` starts with the cheap Jacobi diagonal and self-promotes to the
     # L-BFGS Woodbury/block preconditioner the first time a solve struggles —
     # either it fails to converge (then it retries the same solve promoted) or it
@@ -130,6 +145,12 @@ class KrylovOptions:
             raise ValueError("gmres_restart must be a positive integer")
         if not 0.0 < self.auto_switch_ratio <= 1.0:
             raise ValueError("auto_switch_ratio must lie in (0, 1]")
+        if self.adaptive_eta <= 0.0:
+            raise ValueError("adaptive_eta must be positive")
+        # Equal floor/cap is allowed (adaptive collapses to the fixed rtol); the cap
+        # must not be below the floor or above 1.
+        if not self.rtol <= self.adaptive_rtol_max <= 1.0:
+            raise ValueError("adaptive_rtol_max must lie in [rtol, 1]")
 
 
 @dataclass(frozen=True, slots=True)

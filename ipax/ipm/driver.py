@@ -619,6 +619,10 @@ class IPMDriver:
             }
             residuals = self.kkt_error(mu=0.0, **err_kwargs)
             e0 = residuals.error
+            # Feed the current outer KKT residual to the linear solver so an
+            # iterative route can drive an inexact-Newton forcing sequence (loose
+            # early, tight near convergence); direct solvers ignore it.
+            self._solver.set_outer_residual(e0)
             theta = self._theta(
                 x, g, s, c, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
             )

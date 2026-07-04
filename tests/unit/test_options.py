@@ -139,3 +139,20 @@ def test_krylov_options_reject_out_of_range_auto_switch_ratio(ratio):
 
 def test_krylov_options_accept_auto_switch_ratio_in_range():
     assert KrylovOptions(auto_switch_ratio=0.25).auto_switch_ratio == 0.25
+
+
+def test_krylov_options_reject_nonpositive_adaptive_eta():
+    with pytest.raises(ValueError, match="adaptive_eta"):
+        KrylovOptions(adaptive_eta=0.0)
+
+
+@pytest.mark.parametrize("cap", [1e-12, 2.0])  # <= rtol floor, and > 1
+def test_krylov_options_reject_out_of_range_adaptive_rtol_max(cap):
+    with pytest.raises(ValueError, match="adaptive_rtol_max"):
+        KrylovOptions(rtol=1e-10, adaptive_rtol_max=cap)
+
+
+def test_krylov_options_adaptive_defaults_on():
+    opts = KrylovOptions()
+    assert opts.adaptive_tol is True
+    assert 0.0 < opts.adaptive_eta and opts.rtol < opts.adaptive_rtol_max <= 1.0

@@ -49,6 +49,10 @@ class DenseSolver:
         """Human-readable label for diagnostics."""
         return "dense"
 
+    def set_outer_residual(self, residual: float) -> None:
+        """No-op: a direct factorization has no inner tolerance to adapt."""
+        del residual
+
     def factor(self, K: LinearOperator) -> None:
         if K.shape[0] != K.shape[1]:
             raise ValueError("DenseSolver requires a square operator")

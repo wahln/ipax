@@ -709,6 +709,69 @@ def test_explicit_minres_is_not_overridden_by_the_gmres_fallback(
         solver.solve(rhs)
 
 
+def test_effective_rtol_uses_fixed_rtol_without_a_residual_hint(namespace):
+    """Before any hint (e.g. a standalone solve, no driver) the fixed rtol holds."""
+    solver = _solver(rtol=1e-10, adaptive_tol=True)
+    assert solver._effective_rtol() == 1e-10
+
+
+def test_effective_rtol_is_fixed_when_adaptive_disabled(namespace):
+    solver = _solver(rtol=1e-9, adaptive_tol=False)
+    solver.set_outer_residual(1e3)
+    assert solver._effective_rtol() == 1e-9
+
+
+def test_effective_rtol_forcing_sequence(namespace):
+    """clip(η·‖r‖, rtol, cap): loose (capped) when far, η·‖r‖ mid-range, rtol floor."""
+    solver = _solver(
+        rtol=1e-10, adaptive_tol=True, adaptive_eta=0.1, adaptive_rtol_max=1e-2
+    )
+
+    solver.set_outer_residual(1e3)  # far from optimal → capped loose
+    assert solver._effective_rtol() == 1e-2
+
+    solver.set_outer_residual(1e-3)  # mid-range → η·‖r‖
+    assert abs(solver._effective_rtol() - 1e-4) <= 1e-18
+
+    solver.set_outer_residual(1e-12)  # near optimal → floored at rtol
+    assert solver._effective_rtol() == 1e-10
+
+
+def test_set_outer_residual_ignores_non_finite_and_nonpositive(namespace):
+    solver = _solver(rtol=1e-10, adaptive_tol=True, adaptive_rtol_max=1e-2)
+    solver.set_outer_residual(1e-3)  # a valid hint → η·‖r‖ = 1e-4 (within [floor, cap])
+    for bad in (float("nan"), float("inf"), 0.0, -1.0):
+        solver.set_outer_residual(bad)  # ignored → keeps the last valid hint
+        assert abs(solver._effective_rtol() - 1e-4) <= 1e-18
+
+
+def test_adaptive_residual_hint_loosens_the_solve(namespace):
+    """A large outer-residual hint loosens the inner tolerance, cutting iterations
+    vs the tight fixed rtol on the same ill-conditioned diagonal system."""
+    d = array(namespace, [10.0**k for k in range(8)])  # wide spectrum
+    operator = Diagonal(d)
+    x_exact = array(namespace, [1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0])
+    rhs = operator.matvec(x_exact)
+
+    tight = _solver(method="cg", preconditioner="none", adaptive_tol=False, rtol=1e-12)
+    tight.factor(operator)
+    tight.solve(rhs)
+
+    loose = _solver(
+        method="cg",
+        preconditioner="none",
+        adaptive_tol=True,
+        rtol=1e-12,
+        adaptive_eta=0.1,
+        adaptive_rtol_max=1e-1,
+    )
+    loose.set_outer_residual(1e6)  # far from optimal → loose inner solve
+    loose.factor(operator)
+    loose.solve(rhs)
+
+    assert loose.last_iterations < tight.last_iterations
+
+
 def test_non_convergence_raises(namespace):
     A, rhs, _ = _spd_system(namespace)
     solver = _solver(method="cg", rtol=1e-14, max_iter=1)

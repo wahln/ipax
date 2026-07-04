@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Adaptive Krylov tolerance (inexact Newton).** The matrix-free solver now drives
+  an Eisenstat–Walker forcing sequence by default: the inner solve is only as tight
+  as the current outer KKT residual demands —
+  `inner_rtol = clip(adaptive_eta · ‖KKT residual‖, rtol, adaptive_rtol_max)` — so
+  early iterations solve loosely (fast, and *robust*: an ill-conditioned initial KKT
+  system that the fixed `rtol=1e-10` could never reach — the inner CG/MINRES/GMRES
+  just fails and triggers a δ_w runaway → `numerical_error` — now yields a usable
+  step) and tighten toward `rtol` as the IPM converges. New `KrylovOptions`:
+  `adaptive_tol` (default `True`), `adaptive_eta` (`0.1`), `adaptive_rtol_max`
+  (`1e-8`, calibrated to the outer tol — a looser cap drives step-sensitive IPM
+  problems into infeasibility). Set `adaptive_tol=False` to force the fixed `rtol`.
+  The `LinearSolver` protocol gained a `set_outer_residual` hint (no-op for the
+  direct solvers). On the S2MPJ Krylov route this both *solves* problems that
+  previously errored (e.g. MRIBASIS: `numerical_error` → `optimal`) and *speeds up*
+  ones that timed out chasing 1e-10 (NET1/LAUNCH/CLNLBEAM: `max_time` → `optimal`).
 - **Unbounded-problem detection.** An IPOPT-style diverging-iterates test now reports
   `Status.UNBOUNDED` (previously in the enum but never emitted) when `‖x‖_∞` exceeds
   the new `Options.diverging_iterates_tol` (default `1e20`, `None` disables). An

@@ -56,6 +56,7 @@ saddle systems); Byrd, Nocedal & Schnabel 1994 (compact L-BFGS).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -120,6 +121,34 @@ class KrylovSolver:
         # ``preconditioner="auto"``: sticky flag, set once a solve struggles, that
         # promotes the effective preconditioner from Jacobi to L-BFGS (§5.2).
         self._auto_promoted: bool = False
+        # Inexact-Newton forcing: the most recent outer KKT residual hinted by the
+        # driver, or ``None`` before the first hint (then the fixed ``rtol`` is used).
+        self._outer_residual: float | None = None
+
+    def set_outer_residual(self, residual: float) -> None:
+        """Record the current outer KKT residual for the adaptive inner tolerance.
+
+        Non-finite or non-positive hints are ignored (the fixed ``rtol`` then
+        applies) so a degenerate residual can never loosen the solve.
+        """
+        if math.isfinite(residual) and residual > 0.0:
+            self._outer_residual = residual
+
+    def _effective_rtol(self) -> float:
+        """Inner relative tolerance for this solve — fixed, or the forcing term.
+
+        With ``adaptive_tol`` (and a residual hint) this is the Eisenstat–Walker
+        forcing term ``clip(η · ‖r_outer‖, rtol, adaptive_rtol_max)``: loose while
+        the IPM is far from optimal (so an ill-conditioned early system a tight
+        ``rtol`` cannot reach still yields a usable inexact-Newton step) and
+        tightening to ``rtol`` as the outer residual falls. Otherwise the fixed
+        ``rtol``.
+        """
+        opts = self._options
+        if not opts.adaptive_tol or self._outer_residual is None:
+            return opts.rtol
+        target = opts.adaptive_eta * self._outer_residual
+        return min(opts.adaptive_rtol_max, max(opts.rtol, target))
 
     def describe(self) -> str:
         """Human-readable label for diagnostics, incl. method/preconditioner."""
@@ -155,7 +184,7 @@ class KrylovSolver:
             raise ValueError("right-hand side dimension does not match operator")
 
         xp = array_namespace(rhs)
-        rtol = self._options.rtol
+        rtol = self._effective_rtol()
         max_iter = (
             self._options.max_iter
             if self._options.max_iter is not None
