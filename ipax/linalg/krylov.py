@@ -478,9 +478,18 @@ class KrylovSolver:
                 g.append(-s * g[j])
                 g[j] = c * g[j]
 
-                if h_next > 0.0:
+                if h_next > 0.0 and math.isfinite(h_next):
                     v.append(w / h_next)
-                if abs(g[j + 1]) <= precond_tol or h_next == 0.0:
+                # End the cycle on convergence, an Arnoldi (happy) breakdown
+                # ``h_next == 0``, or a non-finite operator image (NaN/Inf from a bad
+                # iterate) — continuing would index a basis vector never appended.
+                # A non-finite residual leaves the outer true-residual check below to
+                # raise ``KrylovConvergenceError`` so the driver escalates δ_w.
+                if (
+                    not math.isfinite(h_next)
+                    or h_next == 0.0
+                    or abs(g[j + 1]) <= precond_tol
+                ):
                     break
 
             # Back-substitution on the upper-triangular rotated Hessenberg.

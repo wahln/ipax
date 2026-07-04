@@ -389,6 +389,20 @@ def test_gmres_converges_with_small_restart(namespace, tol):
     assert_allclose(namespace, x, x_exact, rtol=1e-6, atol=1e-6)
 
 
+def test_gmres_non_finite_operator_raises_convergence_error(namespace):
+    """A NaN in the operator (a bad iterate feeding the saddle GMRES fallback) must
+    not crash the Arnoldi with an IndexError from the breakdown path — it raises
+    KrylovConvergenceError so the driver escalates δ_w instead of the solve crashing.
+    """
+    nan = float("nan")
+    A = array(namespace, [[nan, 1.0], [1.0, 2.0]])
+    rhs = array(namespace, [1.0, 1.0])
+    solver = _solver(method="gmres", rtol=1e-10, max_iter=10)
+    solver.factor(Dense(A))
+    with pytest.raises(KrylovConvergenceError):
+        solver.solve(rhs)
+
+
 def test_gmres_non_convergence_raises(namespace):
     A, rhs, _ = _spd_system(namespace)
     solver = _solver(method="gmres", rtol=1e-14, max_iter=1, gmres_restart=1)
