@@ -178,12 +178,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   the failing solve and resets on the next step (Wächter & Biegler 2006, §3.1).
   This unsticks the S2MPJ lbfgs/krylov `numerical_error` cluster (ACOPP*/ACOPR*
   now make progress instead of dying on step 1) and fixes solves with redundant /
-  linearly-dependent equality constraints on every route. `δ_c` escalates **only on
-  a factorization failure** (a singular KKT matrix — the rank-deficient case it
-  repairs), never on an *inertia mismatch* or non-finite step: those are (1,1)-block
-  problems `δ_w` owns, and perturbing the (2,2) block there changes the very inertia
-  the check tests against, over-regularizing well-conditioned equality problems
-  (e.g. BT1/DISC2 on exact/sparse) into a `δ_w` runaway and divergence.
+  linearly-dependent equality constraints on every route. `δ_c` escalation is a
+  **last resort**, gated on `δ_w` first growing past `delta_c_trigger` (default
+  `1e4`): a rank-deficient `∇c` leaves `δ_w` running to its ceiling uselessly (only
+  `δ_c` repairs the (2,2) block), whereas an ordinary indefinite (1,1) block is
+  fixed by a *small* `δ_w`. Escalating `δ_c` while `δ_w` is still small perturbs the
+  (2,2) block needlessly and — on the inertia route — changes the very inertia the
+  check tests against, which diverged well-conditioned equality problems (e.g.
+  BT1/DISC2/FLETCHER on the exact routes). The trigger keeps `δ_c` away from them
+  while still activating for the genuinely rank-deficient case.
 - The filter line search no longer diverges (and falsely reports `infeasible`) on
   problems where a quasi-Newton step's barrier objective collapses while the
   constraint violation explodes. The filter is now initialized with the

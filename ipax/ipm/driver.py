@@ -1343,20 +1343,21 @@ class IPMDriver:
         # threaded locally, so it grows only within this failing solve.
         current_delta_c = delta_c
 
-        def escalate(*, dual: bool) -> None:
+        reg_opts = self._options.regularization
+
+        def escalate() -> None:
             nonlocal current_delta_c
-            escalate_delta_w(reg, self._options.regularization)
-            # Escalate δ_c ONLY when the factorization itself failed — a singular
-            # KKT matrix, the rank-deficient ∇c case δ_c repairs (W&B 2006, §3.1).
-            # An *inertia mismatch* or a non-finite step is a (1,1)-block problem
-            # δ_w owns: perturbing the (2,2) block there is not only useless but,
-            # on the inertia route, changes the very inertia the check tests against
-            # — over-regularizing well-conditioned equality problems (BT1/DISC2 on
-            # exact/sparse) into a δ_w runaway and divergence.
-            if dual and m_eq > 0:
-                current_delta_c = escalate_delta_c(
-                    current_delta_c, self._options.regularization
-                )
+            escalate_delta_w(reg, reg_opts)
+            # δ_c is a *last resort* for a singular DUAL block (rank-deficient ∇c):
+            # escalate it only once δ_w has grown past `delta_c_trigger` without
+            # resolving the failure. A rank-deficient ∇c leaves δ_w running to its
+            # ceiling uselessly (only δ_c repairs the (2,2) block); an ordinary
+            # indefinite (1,1) block is fixed by a *small* δ_w. Escalating δ_c while
+            # δ_w is still small perturbs the (2,2) block needlessly and — on the
+            # inertia route — changes the very inertia the check tests against,
+            # diverging well-conditioned equality problems (BT1/DISC2 exact/sparse).
+            if m_eq > 0 and reg.delta_w >= reg_opts.delta_c_trigger:
+                current_delta_c = escalate_delta_c(current_delta_c, reg_opts)
 
         for _ in range(_MAX_REG_ATTEMPTS):
             condensed = build_condensed_operator(
@@ -1372,7 +1373,7 @@ class IPMDriver:
                 self._solver.factor(operator)
                 sol = self._solver.solve(rhs)
             except LinearSolveError:
-                escalate(dual=True)
+                escalate()
                 logger.debug(
                     "factorization failed; escalating delta_w to %.2e, delta_c to %.2e",
                     reg.delta_w,
@@ -1383,7 +1384,7 @@ class IPMDriver:
                 # A symmetric-indefinite LDLᵀ can succeed with the *wrong* inertia
                 # (a non-descent step the failure path never sees); IPOPT bumps
                 # δ_w until the (1,1) block is PD (Wächter & Biegler 2006, §3.1).
-                escalate(dual=False)
+                escalate()
                 logger.debug(
                     "KKT inertia mismatch; escalating delta_w to %.2e", reg.delta_w
                 )
@@ -1392,7 +1393,7 @@ class IPMDriver:
                 dx = sol[: self._n]
                 dy = sol[self._n :] if m_eq > 0 else empty
                 return dx, dy, reg.delta_w, True
-            escalate(dual=False)
+            escalate()
             logger.debug("non-finite step; escalating delta_w to %.2e", reg.delta_w)
         return rhs_x, empty, reg.delta_w, False
 

@@ -132,11 +132,11 @@ def test_exact_sparse_route_matches_exact_dense(bridge_namespace, name):
 @pytest.mark.parametrize("name", ("BT1", "DISC2"))
 def test_nonconvex_equality_exact_sparse_converges(bridge_namespace, name):
     # Regression: well-conditioned nonconvex *equality*-constrained problems on the
-    # exact/sparse (inertia) route. Escalating δ_c in lockstep with δ_w on an
-    # inertia-mismatch failure changes the very inertia the check tests against, so
-    # δ_w ran away and the solve diverged (BT1 optimal→max_time). δ_c must escalate
-    # only on a factorization failure, not an inertia mismatch. These reach the
-    # optimum cleanly when the gating is correct.
+    # exact/sparse (inertia) route. Escalating δ_c in lockstep with δ_w on a small-δ_w
+    # failure changes the very inertia the check tests against, so δ_w ran away and
+    # the solve diverged (BT1 optimal→max_time). δ_c must stay a last resort, gated
+    # on δ_w first growing past `delta_c_trigger`. These reach the optimum cleanly
+    # when the gating is correct.
     xp = bridge_namespace
     if name not in s2mpj.list_s2mpj_problems():
         pytest.skip(f"{name} not in this S2MPJ checkout")

@@ -79,6 +79,14 @@ class RegularizationOptions:
     delta_w_factor: float = 8.0  # escalation on Cholesky failure
     delta_c: float = 1e-8  # (2,2) block, equality regularization
     delta_c_max: float = 1e-1  # cap on δ_c escalation (rank-deficient ∇c)
+    # δ_c escalation is a *last resort* for a singular DUAL block (rank-deficient
+    # ∇c): it starts only once δ_w escalation has grown past this without resolving
+    # the KKT failure. A rank-deficient ∇c leaves δ_w running to `delta_w_max`
+    # uselessly (it cannot repair the (2,2) block); an ordinary indefinite (1,1)
+    # block is fixed by a *small* δ_w, so gating here keeps δ_c away from
+    # well-conditioned equality problems, where escalating it early perturbs the
+    # (2,2) block, corrupts the KKT inertia, and diverges the solve.
+    delta_c_trigger: float = 1e4
 
 
 @dataclass(frozen=True, slots=True)
