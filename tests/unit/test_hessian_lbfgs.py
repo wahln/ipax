@@ -41,6 +41,15 @@ def test_lbfgs_update_keeps_positive_curvature(namespace):
     assert float(curvature) > 0.0
 
 
+def test_lbfgs_rmatvec_matches_matvec(namespace, tol):
+    # B is symmetric, so the adjoint apply is the same compact-form apply.
+    v = array(namespace, [0.5, -1.0])
+    with implemented("L-BFGS"):
+        op = LBFGSOperator(2, LBFGSOptions(memory=3))
+        op.update(array(namespace, [1.0, 0.0]), array(namespace, [2.0, 0.5]))
+        assert_allclose(namespace, op.rmatvec(v), op.matvec(v), **tol)
+
+
 @pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
 def test_lbfgs_update_drops_non_finite_curvature_pair(namespace, bad):
     # Regression (S2MPJ Task 2, RAT42LS/BRATU1D): when the Lagrangian gradient

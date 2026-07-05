@@ -374,7 +374,9 @@ class Options:
     * ``optimality`` (:class:`OptimalityConditionOptions`) — single-iteration
       test reporting :attr:`Status.OPTIMAL`.
     * ``acceptable`` (:class:`AcceptableStoppingOptions`) — multi-iteration test
-      reporting :attr:`Status.ACCEPTABLE` (disabled by default).
+      reporting :attr:`Status.ACCEPTABLE`; enabled by default (IPOPT convention:
+      tolerances of ``1e-6`` held for 15 consecutive iterations). Set all its
+      tolerances to ``None`` to disable.
     * ``diverging_iterates_tol`` — ‖x‖_∞ exceeding the threshold reports
       :attr:`Status.UNBOUNDED` (``None`` disables it).
     * ``max_iter`` — iteration cap, reports :attr:`Status.MAX_ITER`.

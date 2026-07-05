@@ -573,6 +573,22 @@ def test_auto_stays_jacobi_and_raises_without_lbfgs_structure(namespace):
     assert "auto:jacobi" in solver.describe()  # no L-BFGS ⇒ never promoted
 
 
+def test_auto_stays_jacobi_when_fast_despite_lbfgs_structure(namespace, tol):
+    """A fast Jacobi solve must not promote even when the L-BFGS Woodbury
+    inverse *is* available: promotion is reserved for solves that struggle."""
+    operator = _condensed_no_inequalities(namespace)
+    x_exact = array(namespace, [1.0, -1.0, 2.0, -2.0, 0.5, -0.5])
+    rhs = operator.matvec(x_exact)
+
+    # Generous budget: the handful of CG iterations stays far below the ratio.
+    solver = _solver(method="cg", rtol=1e-10, preconditioner="auto", max_iter=10_000)
+    solver.factor(operator)
+    x = solver.solve(rhs)
+
+    assert_allclose(namespace, x, x_exact, rtol=1e-7, atol=1e-7)
+    assert "auto:jacobi" in solver.describe()  # available, but never needed
+
+
 def test_auto_promotes_after_a_slow_but_successful_solve(namespace, tol):
     """A solve that succeeds but burns more than ``auto_switch_ratio`` of the
     budget promotes to L-BFGS for the *next* solve (sticky across solves)."""

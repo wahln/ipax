@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-05
+
 ### Added
 - **Adaptive Krylov tolerance (inexact Newton).** The matrix-free solver now drives
   an Eisenstat–Walker forcing sequence by default: the inner solve is only as tight
@@ -281,6 +283,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   ray is bad). Moves RAT42LS from `numerical_error` to `optimal` on the sparse
   route. The exact-Hessian route, whose scaled steps do not overshoot, skips the
   extra gradient evaluation.
+- The GMRES fallback no longer crashes with a raw `ZeroDivisionError` on a
+  **singular KKT system** (QC gate: HS9 with `hessian="exact", linsolve="krylov"`
+  from the standard start, where the exact Lagrangian Hessian is identically zero
+  so the first condensed (1,1) block is the zero operator). When the operator
+  image of a basis vector vanishes after orthogonalization, the rotated
+  Hessenberg diagonal is exactly zero; the back-substitution now takes the
+  minimal-norm choice for that rank-deficient column and lets the true-residual
+  check raise the controlled `KrylovConvergenceError`, so the driver escalates
+  δ_w and recovers (HS9: OPTIMAL in 5 iterations). The Jacobi preconditioner
+  build also skips its `1/diag(N)` divide-by-zero warning for a non-positive
+  primal diagonal it was going to discard anyway.
 - The solver no longer reports a **feasible iterate as `infeasible`**. Feasibility
   restoration can stall a hair above its own (differently scaled) tolerance at a
   point that is feasible by the driver's constraint-violation metric — a
@@ -503,7 +516,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/wahln/ipax/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/wahln/ipax/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/wahln/ipax/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/wahln/ipax/compare/v0.1.0...v0.1.1

@@ -210,6 +210,20 @@ def test_scaled_problem_applies_factors(namespace):
     )
 
 
+def test_row_scaled_pattern_signature_propagation(namespace):
+    from ipax.backend.operators import Diagonal
+    from ipax.problem.scaling import _RowScaled
+
+    d = array(namespace, [2.0, 0.5])
+    # A structured inner Jacobian keeps a (distinct) stable signature ...
+    structured = _RowScaled(Diagonal(array(namespace, [1.0, 3.0])), d)
+    assert structured.coo_pattern_signature() is not None
+
+    # ... while a matrix-free one propagates "no reuse" (None).
+    mf = MatrixFreeJacobian((2, 2), matvec=lambda v: v)
+    assert _RowScaled(mf, d).coo_pattern_signature() is None
+
+
 def test_scaling_options_validation():
     with pytest.raises(ValueError, match="scaling method"):
         ScalingOptions(method="bogus")  # type: ignore[arg-type]
