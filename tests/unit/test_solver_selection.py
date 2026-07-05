@@ -8,7 +8,7 @@ from ipax.backend.namespace import Capabilities
 from ipax.linalg.dense import DenseSolver
 from ipax.linalg.krylov import KrylovSolver
 from ipax.linalg.solver import select_solver
-from ipax.options import Options
+from ipax.options import DenseOptions, Options
 from tests._helpers import implemented
 
 
@@ -66,6 +66,21 @@ def test_select_solver_prefers_sparse_when_requested_and_available():
         )
 
     assert solver.__class__.__name__.lower().startswith("sparse")
+
+
+@pytest.mark.parametrize("mode", ["dense", "auto"])
+def test_select_solver_threads_dense_options_through(mode):
+    solver = select_solver(
+        n_vars=100,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(
+            linsolve=mode,
+            dense=DenseOptions(kkt_route="augmented"),  # type: ignore[arg-type]
+        ),
+    )
+    assert isinstance(solver, DenseSolver)
+    assert solver._options.kkt_route == "augmented"
 
 
 def test_select_solver_rejects_unavailable_sparse_backend():

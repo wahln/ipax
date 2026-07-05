@@ -30,6 +30,7 @@ Globalization = Literal["filter", "breedveld"]
 MuSchedule = Literal["monotone", "adaptive", "breedveld"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
+DenseKKTRoute = Literal["condensed", "augmented"]
 ScalingMethod = Literal["none", "gradient-based"]
 CorrectionsMethod = Literal["none", "mehrotra", "gondzio"]
 
@@ -163,6 +164,34 @@ class KrylovOptions:
         # must not be below the floor or above 1.
         if not self.rtol <= self.adaptive_rtol_max <= 1.0:
             raise ValueError("adaptive_rtol_max must lie in [rtol, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class DenseOptions:
+    """Dense-route KKT materialization: condensed vs. augmented.
+
+    ``"condensed"`` (default) forms the normal-equations block ``N`` by
+    condensing the inequality Gram term ``∇gᵀ Σ_s ∇g`` into an explicit
+    matmul, then Cholesky-probes it for positive definiteness
+    (``ipax.linalg.dense``). ``"augmented"`` instead keeps ``∇g``/``−Σ_s⁻¹``
+    as an explicit symmetric border — the dense analogue of the sparse-direct
+    indefinite-augmented route (Friedlander & Orban 2012) — and factors it
+    with a pivoted Bunch-Kaufman LDLᵀ where a backend adapter is available
+    (NumPy/SciPy, Torch), falling back to a symmetric eigendecomposition
+    (``xp.linalg.eigh``) otherwise. Either way it exposes real inertia, so
+    the IPOPT inertia-guided δ_w correction (Wächter & Biegler 2006 §3.1)
+    engages for the dense route too — closing a gap the plain Cholesky
+    pass/fail check cannot. Falls back to ``"condensed"`` behavior
+    automatically whenever the operator can't expose the unformed bordered
+    matrix (e.g. an L-BFGS Hessian, already PD by Powell damping — there is
+    nothing to gain there).
+    """
+
+    kkt_route: DenseKKTRoute = "condensed"
+
+    def __post_init__(self) -> None:
+        if self.kkt_route not in ("condensed", "augmented"):
+            raise ValueError("dense kkt_route must be 'condensed' or 'augmented'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,6 +436,7 @@ class Options:
     breedveld: BreedveldOptions = field(default_factory=BreedveldOptions)
     lbfgs: LBFGSOptions = field(default_factory=LBFGSOptions)
     krylov: KrylovOptions = field(default_factory=KrylovOptions)
+    dense: DenseOptions = field(default_factory=DenseOptions)
     scaling: ScalingOptions | ScalingMethod = field(default_factory=ScalingOptions)
     corrections: CorrectionsOptions | CorrectionsMethod = field(
         default_factory=CorrectionsOptions
@@ -442,6 +472,8 @@ __all__ = [
     "BreedveldOptions",
     "CorrectionsMethod",
     "CorrectionsOptions",
+    "DenseKKTRoute",
+    "DenseOptions",
     "Globalization",
     "HessianMode",
     "KrylovMethod",

@@ -76,7 +76,7 @@ def select_solver(
     if mode == "dense":
         if not has_dense_solve():
             raise RuntimeError("dense linear solving requires xp.linalg.solve")
-        return DenseSolver()
+        return DenseSolver(options.dense)
 
     if mode == "krylov":
         return KrylovSolver(options.krylov)
@@ -93,7 +93,7 @@ def select_solver(
         and has_dense_solve()
         and (not has_equalities or "cholesky" in capabilities.linalg_functions)
     ):
-        return DenseSolver()
+        return DenseSolver(options.dense)
 
     return KrylovSolver(options.krylov)
 

@@ -209,6 +209,25 @@ def _add_dense_diagonal(matrix: Array, diagonal: Array) -> Array:
     return matrix + xp.eye(n, dtype=matrix.dtype) * diagonal
 
 
+def _dense_or_matmat_probe(op: LinearOperator, n_cols: int, like: Array) -> Array:
+    """Materialize ``op`` to dense, falling back to a ``matmat`` identity probe.
+
+    Some Jacobian operators expose no ``dense_matrix`` hook (e.g.
+    ``ipax.problem.scaling._RowScaled``, which a scaled problem's inequality
+    Jacobian is by default) but always support ``matmat``. The augmented
+    route needs the *explicit* border matrix (unlike the condensed route,
+    which can fall back to reconstructing the whole condensed block via an
+    outer matmat probe — see ``DenseSolver._materialize_dense_matrix``), so
+    this probes at the individual-block level instead.
+    """
+    try:
+        return op.dense_matrix(like)
+    except NotImplementedError:
+        xp = array_namespace(like)
+        identity = xp.eye(n_cols, dtype=like.dtype)
+        return op.matmat(identity)
+
+
 class _CondensedOperator(LinearOperator):
     """Lazy ``W + Sigma_x + J.T @ Sigma_s @ J + delta_w * I`` operator."""
 
@@ -262,8 +281,13 @@ class _CondensedOperator(LinearOperator):
     def rmatmat(self, V: Array) -> Array:
         return self.matmat(V)
 
-    def dense_matrix(self, like: Array | None = None) -> Array:
-        """Materialize the condensed dense block from explicit operator pieces."""
+    def logical_dense_block(self, like: Array | None = None) -> Array:
+        """Dense ``W + Sigma_x + delta_w I`` block — no inequality term.
+
+        Shared by :meth:`dense_matrix` (condensed route: folds the inequality
+        Gram term ``∇gᵀ Σ_s ∇g`` into this via a matmul) and
+        :meth:`augmented_dense_matrix` (augmented route: borders it instead).
+        """
         template = like
         if template is None:
             try:
@@ -278,6 +302,15 @@ class _CondensedOperator(LinearOperator):
         else:
             dense = dense + self._sigma_x.dense_matrix(dense)
 
+        if self._delta_w != 0.0:
+            xp = array_namespace(dense)
+            dense = dense + self._delta_w * xp.eye(self.shape[0], dtype=dense.dtype)
+        return dense
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        """Materialize the condensed dense block from explicit operator pieces."""
+        dense = self.logical_dense_block(like)
+
         if self._ineq_jac.shape[0] > 0:
             xp = array_namespace(dense)
             jac = self._ineq_jac.dense_matrix(dense)
@@ -287,10 +320,58 @@ class _CondensedOperator(LinearOperator):
                 sigma_s_jac = xp.matmul(self._sigma_s.dense_matrix(jac), jac)
             dense = dense + xp.matmul(xp.permute_dims(jac, (1, 0)), sigma_s_jac)
 
-        if self._delta_w != 0.0:
-            xp = array_namespace(dense)
-            dense = dense + self._delta_w * xp.eye(self.shape[0], dtype=dense.dtype)
         return dense
+
+    def inequality_border_dense(
+        self, like: Array | None = None
+    ) -> tuple[Array, Array] | None:
+        """Dense ``(∇g, −Σ_s⁻¹ diagonal)`` for the augmented route, or ``None``.
+
+        Shared with :meth:`_SaddleOperator.augmented_dense_matrix`, which
+        places this border *after* the equality-dual block (the auxiliary
+        border rows carry a zero RHS and are discarded post-solve, mirroring
+        ``SparseDirectSolver``'s pad/truncate for the same reason).
+        """
+        if self._ineq_jac.shape[0] == 0:
+            return None
+        neg_inv_sigma_s = -1.0 / self._sigma_s.diagonal()
+        template = like if like is not None else neg_inv_sigma_s
+        jac = _dense_or_matmat_probe(self._ineq_jac, self.shape[0], template)
+        return jac, neg_inv_sigma_s
+
+    def augmented_dense_matrix(self, like: Array | None = None) -> Array:
+        """Dense bordered KKT block for the augmented route (§5.1).
+
+        Keeps ``∇g``/``−Σ_s⁻¹`` as an explicit symmetric border instead of
+        condensing the inequality Gram term ``∇gᵀ Σ_s ∇g`` via a matmul — the
+        dense analogue of the sparse-direct augmented route
+        (:func:`_inequality_border`/:meth:`assemble`). Friedlander & Orban
+        (2012); mirrors the indefinite-augmented KKT system IPOPT-style
+        sparse-direct solvers factor directly (Wächter & Biegler 2006 §3.1).
+
+        Raises ``NotImplementedError`` for a diagonal-plus-low-rank (L-BFGS)
+        Hessian: it is already positive definite by Powell damping (see
+        :meth:`primal_block`), so there is nothing to gain from the augmented
+        route there — ``DenseSolver`` falls back to :meth:`dense_matrix`.
+        """
+        if getattr(self._W, "diagonal_low_rank_form", None) is not None:
+            raise NotImplementedError(
+                "augmented dense route requires an assemblable (non-low-rank) Hessian"
+            )
+        primal = self.logical_dense_block(like)
+        border = self.inequality_border_dense(primal)
+        if border is None:
+            return primal
+
+        jac, neg_inv_sigma_s = border
+        xp = array_namespace(primal)
+        m_ineq = jac.shape[0]
+        e_block = xp.eye(m_ineq, dtype=primal.dtype) * xp.expand_dims(
+            neg_inv_sigma_s, axis=1
+        )
+        top = xp.concat((primal, xp.permute_dims(jac, (1, 0))), axis=1)
+        bottom = xp.concat((jac, e_block), axis=1)
+        return xp.concat((top, bottom), axis=0)
 
     def dense_structured_solve(self, rhs: Array) -> Array:
         """Exact dense solve for ``D - U M⁻¹ Uᵀ`` L-BFGS condensed blocks.
@@ -652,6 +733,57 @@ class _SaddleOperator(LinearOperator):
         bottom = xp.concat(
             (eq, -self._delta_c * xp.eye(self._m, dtype=n_dense.dtype)), axis=1
         )
+        return xp.concat((top, bottom), axis=0)
+
+    def augmented_dense_matrix(self, like: Array | None = None) -> Array:
+        """Dense bordered saddle for the augmented route (§5.1).
+
+        Both equalities and inequalities stay explicit borders — never
+        condensed into a Schur complement. Layout
+        ``[Δx (n) | Δy (m) | inequality border]``: the inequality border
+        stays at the tail (zero RHS, discarded post-solve) so the leading
+        ``n + m`` block matches the logical ``[Δx | Δy]`` slice the driver
+        reads (:attr:`shape`), exactly like :meth:`to_coo`'s bordering.
+
+        Propagates ``NotImplementedError`` when the condensed block does not
+        expose :meth:`_CondensedOperator.logical_dense_block` (e.g. a plain
+        operator, or an L-BFGS Hessian — already PD by Powell damping).
+        """
+        logical_fn = getattr(self._condensed, "logical_dense_block", None)
+        if logical_fn is None:
+            raise NotImplementedError(
+                "augmented dense route requires a condensed block that "
+                "exposes logical_dense_block"
+            )
+        primal = logical_fn(like)
+        xp = array_namespace(primal)
+        m = self._m
+
+        if m == 0:
+            core = primal
+        else:
+            eq = _dense_or_matmat_probe(self._eq_jac, self._n, primal)
+            top = xp.concat((primal, xp.permute_dims(eq, (1, 0))), axis=1)
+            bottom = xp.concat(
+                (eq, -self._delta_c * xp.eye(m, dtype=primal.dtype)), axis=1
+            )
+            core = xp.concat((top, bottom), axis=0)
+
+        border_fn = getattr(self._condensed, "inequality_border_dense", None)
+        border = border_fn(primal) if border_fn is not None else None
+        if border is None:
+            return core
+
+        jac, neg_inv_sigma_s = border
+        m_ineq = jac.shape[0]
+        # The inequality border only couples to the primal block [0, n): pad
+        # its connection with zero columns/rows over the dual block [n, n+m).
+        conn = xp.concat((jac, xp.zeros((m_ineq, m), dtype=primal.dtype)), axis=1)
+        e_block = xp.eye(m_ineq, dtype=primal.dtype) * xp.expand_dims(
+            neg_inv_sigma_s, axis=1
+        )
+        top = xp.concat((core, xp.permute_dims(conn, (1, 0))), axis=1)
+        bottom = xp.concat((conn, e_block), axis=1)
         return xp.concat((top, bottom), axis=0)
 
     def dense_structured_solve(self, rhs: Array) -> Array:
