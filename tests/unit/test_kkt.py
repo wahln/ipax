@@ -413,3 +413,257 @@ def test_saddle_expected_inertia_none_propagates(namespace):
         condensed, Dense(array(namespace, [[1.0, 1.0]])), 1e-8
     )
     assert saddle.expected_inertia() is None
+
+
+# --- solve-kernel helpers (module-private, tested directly) -----------------
+
+
+def test_diagonal_solve_vector_and_bad_rank(namespace, tol):
+    from ipax.ipm.kkt import _diagonal_solve
+
+    d = array(namespace, [2.0, 4.0])
+    actual = _diagonal_solve(d, array(namespace, [1.0, 2.0]))
+    assert_allclose(namespace, actual, array(namespace, [0.5, 0.5]), **tol)
+    with pytest.raises(ValueError, match="vector or matrix"):
+        _diagonal_solve(d, namespace.zeros((2, 1, 1), dtype=d.dtype))
+
+
+def test_woodbury_solve_rejects_bad_rank(namespace):
+    from ipax.ipm.kkt import _woodbury_factors, _woodbury_solve
+
+    d = array(namespace, [2.0, 2.0])
+    u = array(namespace, [[1.0], [0.5]])
+    m = array(namespace, [[3.0]])
+    factors = _woodbury_factors(d, u, m)
+    with pytest.raises(ValueError, match="vector or matrix"):
+        _woodbury_solve(factors, namespace.zeros((2, 1, 1), dtype=d.dtype))
+
+
+# --- batched transposes (symmetric blocks: A.T @ V == A @ V) ----------------
+
+
+def test_condensed_and_saddle_rmatmat_match_matmat(namespace, tol):
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    jac = Dense(array(namespace, [[1.0, 2.0], [-1.0, 0.5]]))
+    condensed = build_condensed_operator(
+        Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        Diagonal(array(namespace, [0.25, 0.75])),
+        sigma_s,
+        jac,
+        RegularizationState(delta_w=1e-6),
+    )
+    V = array(namespace, [[1.0, 2.0], [3.0, 4.0]])
+    assert_allclose(namespace, condensed.rmatmat(V), condensed.matmat(V), **tol)
+
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, 1.0]])), 1e-8
+    )
+    Vs = array(namespace, [[1.0, 2.0], [3.0, 4.0], [0.5, -1.0]])
+    assert_allclose(namespace, saddle.rmatmat(Vs), saddle.matmat(Vs), **tol)
+
+
+# --- dense materialization of non-diagonal Sigma blocks ---------------------
+
+
+def test_condensed_dense_matrix_general_sigma_blocks(namespace, tol):
+    # Sigma_x carries no cheap diagonal and Sigma_s is a full matrix, so the
+    # materialization must take the general dense_matrix branches (and derive
+    # its dtype template from W instead of Sigma_x's diagonal).
+    class _NoDiagonalDense(Dense):
+        def diagonal(self, like=None):
+            raise NotImplementedError("no cheap diagonal")
+
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x_dense = array(namespace, [[0.25, 0.1], [0.1, 0.75]])
+    sigma_s_dense = array(namespace, [[2.0, 0.25], [0.25, 0.5]])
+    J_dense = array(namespace, [[1.0, 2.0], [-1.0, 0.5]])
+    op = build_condensed_operator(
+        Dense(W_dense),
+        _NoDiagonalDense(sigma_x_dense),
+        Dense(sigma_s_dense),
+        Dense(J_dense),
+        RegularizationState(delta_w=1e-6),
+    )
+
+    expected = (
+        W_dense
+        + sigma_x_dense
+        + namespace.matmul(
+            transpose(namespace, J_dense),
+            namespace.matmul(sigma_s_dense, J_dense),
+        )
+        + 1e-6 * namespace.eye(2, dtype=W_dense.dtype)
+    )
+    assert_allclose(namespace, op.dense_matrix(), expected, **tol)
+
+
+# --- diagonal-Hessian structured solve ---------------------------------------
+
+
+def test_condensed_diagonal_hessian_structured_solve(namespace, tol):
+    # W, Sigma_x diagonal and no inequalities: N = diag(W + Sigma_x + delta_w),
+    # solved directly without materialization (incl. the delta_w shift).
+    empty_sigma_s, empty_jac = _empty_ineq(namespace)
+    op = build_condensed_operator(
+        Diagonal(array(namespace, [1.0, 3.0])),
+        Diagonal(array(namespace, [0.5, 1.0])),
+        empty_sigma_s,
+        empty_jac,
+        RegularizationState(delta_w=0.5),
+    )
+    actual = op.dense_structured_solve(array(namespace, [2.0, 4.5]))
+    assert_allclose(namespace, actual, array(namespace, [1.0, 1.0]), **tol)
+
+    # Unregularized: N = diag(W + Sigma_x) with no delta_w shift.
+    unregularized = build_condensed_operator(
+        Diagonal(array(namespace, [1.0, 3.0])),
+        Diagonal(array(namespace, [0.5, 1.0])),
+        *_empty_ineq(namespace),
+        RegularizationState(delta_w=0.0),
+    )
+    actual = unregularized.dense_structured_solve(array(namespace, [3.0, 8.0]))
+    assert_allclose(namespace, actual, array(namespace, [2.0, 2.0]), **tol)
+
+
+# --- saddle with an empty equality block (m == 0) ----------------------------
+
+
+def _diagonal_condensed(namespace, *, delta_w=0.5):
+    empty_sigma_s, empty_jac = _empty_ineq(namespace)
+    return build_condensed_operator(
+        Diagonal(array(namespace, [1.0, 3.0])),
+        Diagonal(array(namespace, [0.5, 1.0])),
+        empty_sigma_s,
+        empty_jac,
+        RegularizationState(delta_w=delta_w),
+    )
+
+
+def _empty_eq(namespace):
+    dtype = array(namespace, [0.0]).dtype
+    return Dense(namespace.zeros((0, 2), dtype=dtype))
+
+
+def test_saddle_empty_equality_block_delegates_to_condensed(namespace, tol):
+    condensed = _diagonal_condensed(namespace)
+    saddle = build_saddle_operator(condensed, _empty_eq(namespace), 1e-8)
+
+    assert_allclose(namespace, saddle.dense_matrix(), condensed.dense_matrix(), **tol)
+    rhs = array(namespace, [2.0, 4.5])
+    assert_allclose(
+        namespace,
+        saddle.dense_structured_solve(rhs),
+        condensed.dense_structured_solve(rhs),
+        **tol,
+    )
+    # COO assembly must skip the (2,2) block entirely, and the pattern
+    # signature must not consult the (absent) equality Jacobian.
+    _rows, _cols, values, shape = saddle.to_coo()
+    assert shape == (2, 2)
+    assert_allclose(namespace, saddle.coo_values(), values, **tol)
+    assert saddle.coo_pattern_signature() is not None
+
+
+def test_saddle_structured_solve_rejects_bad_rank(namespace):
+    saddle = build_saddle_operator(
+        _diagonal_condensed(namespace),
+        Dense(array(namespace, [[1.0, 1.0]])),
+        1e-8,
+    )
+    rhs3 = namespace.zeros((3, 1, 1), dtype=array(namespace, [0.0]).dtype)
+    with pytest.raises(ValueError, match="vector/matrix"):
+        saddle.dense_structured_solve(rhs3)
+
+
+def test_saddle_structured_solve_without_dual_regularization(namespace, tol):
+    # delta_c = 0: the Schur complement carries no shift.
+    saddle = build_saddle_operator(
+        _diagonal_condensed(namespace),
+        Dense(array(namespace, [[1.0, 1.0]])),
+        0.0,
+    )
+    rhs = array(namespace, [1.0, -2.0, 0.5])
+    dense = saddle.matmat(namespace.eye(3, dtype=rhs.dtype))
+    assert_allclose(
+        namespace,
+        saddle.dense_structured_solve(rhs),
+        namespace.linalg.solve(dense, rhs),
+        **tol,
+    )
+
+
+# --- values-only assembly over a generic condensed block ---------------------
+
+
+def test_saddle_coo_values_generic_condensed_block(namespace, tol):
+    # A condensed block without the structure/value split (here a plain
+    # Diagonal) must still produce values in to_coo order.
+    saddle = build_saddle_operator(
+        Diagonal(array(namespace, [2.0, 3.0])),
+        Dense(array(namespace, [[1.0, 4.0]])),
+        0.25,
+    )
+    assert_allclose(namespace, saddle.coo_values(), saddle.to_coo()[2], **tol)
+
+
+# --- pattern-signature propagation -------------------------------------------
+
+
+def test_pattern_signature_none_propagates_from_unstructured_blocks(namespace):
+    from ipax.backend.operators import MatrixFreeJacobian
+
+    # Condensed: a matrix-free inequality Jacobian has no signature.
+    sigma_s = Diagonal(array(namespace, [2.0]))
+    mf_ineq = MatrixFreeJacobian((1, 2), matvec=lambda v: v[:1])
+    condensed = build_condensed_operator(
+        Diagonal(array(namespace, [1.0, 2.0])),
+        Diagonal(array(namespace, [0.5, 0.5])),
+        sigma_s,
+        mf_ineq,
+        RegularizationState(),
+    )
+    assert condensed.coo_pattern_signature() is None
+
+    # Saddle: an unstructured condensed block propagates None ...
+    mf_condensed = MatrixFreeJacobian((2, 2), matvec=lambda v: v)
+    eq = Dense(array(namespace, [[1.0, 1.0]]))
+    assert build_saddle_operator(mf_condensed, eq, 0.0).coo_pattern_signature() is None
+
+    # ... and so does a matrix-free equality Jacobian.
+    mf_eq = MatrixFreeJacobian((1, 2), matvec=lambda v: v[:1])
+    structured = Diagonal(array(namespace, [1.0, 2.0]))
+    assert build_saddle_operator(structured, mf_eq, 0.0).coo_pattern_signature() is None
+
+
+# --- SPD preconditioner fallbacks --------------------------------------------
+
+
+def test_saddle_approximate_schur_falls_back_to_identity_dual(namespace, tol):
+    # A matrix-free equality Jacobian exposes no cheap row-Gram diagonal, so the
+    # approximate-Schur dual block degrades to the SPD identity.
+    from ipax.backend.operators import MatrixFreeJacobian
+
+    condensed = _diagonal_condensed(namespace)
+    mf_eq = MatrixFreeJacobian((1, 2), matvec=lambda v: v[:1])
+    saddle = build_saddle_operator(condensed, mf_eq, 0.1)
+    dual = saddle._approximate_schur_diagonal(condensed.diagonal())
+    assert_allclose(namespace, dual, array(namespace, [1.0]), **tol)
+
+
+def test_saddle_block_preconditioner_without_equalities(namespace, tol):
+    # m == 0: the block preconditioner reduces to the condensed Woodbury inverse.
+    W = LBFGSOperator(2, LBFGSOptions(memory=3))
+    W.update(array(namespace, [1.0, 0.0]), array(namespace, [2.0, 0.5]))
+    dtype = array(namespace, [0.0]).dtype
+    condensed = build_condensed_operator(
+        W,
+        Diagonal(array(namespace, [0.5, 0.5])),
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 2), dtype=dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+    saddle = build_saddle_operator(condensed, _empty_eq(namespace), 0.0)
+
+    apply = saddle.lbfgs_block_preconditioner_apply()
+    r = array(namespace, [1.0, -2.0])
+    assert_allclose(namespace, apply(r), condensed.lbfgs_inverse_apply()(r), **tol)

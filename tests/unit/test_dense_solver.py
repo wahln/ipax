@@ -259,3 +259,69 @@ def test_dense_solver_skips_guard_for_plain_operator(namespace, tol):
     actual = solver.solve(array(namespace, [2.0, 3.0]))
 
     assert_allclose(namespace, actual, array(namespace, [3.0, 2.0]), **tol)
+
+
+def test_dense_solver_rejects_bad_rhs_rank(namespace):
+    solver = DenseSolver()
+    solver.factor(Dense(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
+    rhs3 = namespace.zeros((2, 1, 1), dtype=array(namespace, [0.0]).dtype)
+    with pytest.raises(ValueError, match="vector or matrix"):
+        solver.solve(rhs3)
+
+
+def test_dense_solver_wraps_structured_solve_failure(namespace):
+    # A structured solve crashing on unexpected numerics must surface as the
+    # controlled LinearSolveError (so the IPM escalates delta_w), not the raw
+    # backend exception.
+    class _StructuredBoom(Dense):
+        def dense_structured_solve(self, rhs):
+            raise RuntimeError("backend blew up")
+
+    solver = DenseSolver()
+    solver.factor(_StructuredBoom(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
+    with pytest.raises(LinearSolveError, match="structured solve failed"):
+        solver.solve(array(namespace, [1.0, 2.0]))
+
+
+def test_dense_solver_passes_structured_linear_solve_error_through(namespace):
+    # An already-classified LinearSolveError is re-raised as-is (no re-wrapping).
+    class _StructuredFails(Dense):
+        def dense_structured_solve(self, rhs):
+            raise LinearSolveError("already classified")
+
+    solver = DenseSolver()
+    solver.factor(_StructuredFails(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
+    with pytest.raises(LinearSolveError, match="already classified"):
+        solver.solve(array(namespace, [1.0, 2.0]))
+
+
+def test_dense_solver_wraps_dense_matrix_failure(namespace):
+    class _DenseMatrixBoom(Dense):
+        def dense_matrix(self, like=None):
+            raise RuntimeError("assembly blew up")
+
+    solver = DenseSolver()
+    solver.factor(_DenseMatrixBoom(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
+    with pytest.raises(LinearSolveError, match="materialization failed"):
+        solver.solve(array(namespace, [1.0, 2.0]))
+
+
+def test_dense_solver_wraps_matmat_probe_failure(namespace):
+    # A duck-typed operator without the optional structured-solve/dense-matrix
+    # hooks: the solver skips both and probes matmat, whose failure must also
+    # be classified as a LinearSolveError.
+    class _MatmatBoom:
+        @property
+        def shape(self):
+            return (2, 2)
+
+        def matvec(self, v):
+            return v
+
+        def matmat(self, V):
+            raise RuntimeError("probe blew up")
+
+    solver = DenseSolver()
+    solver.factor(_MatmatBoom())
+    with pytest.raises(LinearSolveError, match="materialization failed"):
+        solver.solve(array(namespace, [1.0, 2.0]))

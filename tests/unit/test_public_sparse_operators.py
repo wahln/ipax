@@ -122,6 +122,38 @@ def test_coo_rejects_mismatched_lengths(namespace):
         COOOperator(rows, cols, values, (2, 2))
 
 
+def test_coo_rejects_non_rank1_triplets(namespace):
+    rows = namespace.asarray([[0], [1]])
+    cols = namespace.asarray([0, 1])
+    values = array(namespace, [1.0, 2.0])
+    with pytest.raises(ValueError, match="rank-1"):
+        COOOperator(rows, cols, values, (2, 2))
+
+
+def test_coo_rejects_bad_shape(namespace):
+    rows = namespace.asarray([0, 1])
+    cols = namespace.asarray([0, 1])
+    values = array(namespace, [1.0, 2.0])
+    with pytest.raises(ValueError, match="pair"):
+        COOOperator(rows, cols, values, (2, -1))
+
+
+def test_csr_rejects_non_pair_shape(namespace):
+    indptr = namespace.asarray([0, 3, 5])
+    indices = namespace.asarray([0, 1, 2, 1, 2])
+    data = array(namespace, [2.0, -1.0, 0.5, 3.0, 4.0])
+    with pytest.raises(ValueError, match="pair"):
+        CSROperator(indptr, indices, data, (2,))
+
+
+def test_csc_rejects_non_pair_shape(namespace):
+    indptr = namespace.asarray([0, 1, 3, 5])
+    indices = namespace.asarray([0, 0, 1, 0, 1])
+    data = array(namespace, [2.0, -1.0, 3.0, 0.5, 4.0])
+    with pytest.raises(ValueError, match="pair"):
+        CSCOperator(indptr, indices, data, (2,))
+
+
 def test_csr_rejects_wrong_indptr_length(namespace):
     indptr = namespace.asarray([0, 3])  # length 2, needs shape[0] + 1 = 3
     indices = namespace.asarray([0, 1, 2, 1, 2])
@@ -173,3 +205,14 @@ def test_rmatmat_matches_dense(namespace, tol):
     V = array(namespace, [[1.0, 0.0], [0.0, 1.0]])
     expected = namespace.matmul(transpose(namespace, dense), V)
     assert_allclose(namespace, op.rmatmat(V), expected, **tol)
+
+
+def test_diagonal_matches_dense(namespace, tol):
+    _require_adapter(namespace)
+    op = COOOperator(
+        namespace.asarray([0, 0, 1]),
+        namespace.asarray([0, 1, 1]),
+        array(namespace, [2.0, -1.0, 3.0]),
+        (2, 2),
+    )
+    assert_allclose(namespace, op.diagonal(), array(namespace, [2.0, 3.0]), **tol)
