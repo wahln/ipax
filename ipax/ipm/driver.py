@@ -1337,26 +1337,39 @@ class IPMDriver:
         sigma_x_op = Diagonal(sigma_x)
         sigma_s_op = Diagonal(sigma_s)
         empty = xp.zeros((0,), dtype=rhs_x.dtype)
-        # δ_c is escalated alongside δ_w on a failed saddle solve: δ_w cannot
-        # repair a rank-deficient equality Jacobian (which leaves the saddle
-        # singular in the (2,2) dual block), only δ_c can (W&B 2006, §3.1). It is
-        # threaded locally, so it grows only within this failing solve.
+        # δ_c is escalated on a failed saddle solve only as a *last resort*: δ_w
+        # cannot repair a rank-deficient equality Jacobian (which leaves the
+        # saddle singular in the (2,2) dual block), only δ_c can (W&B 2006,
+        # §3.1). It is threaded locally, so it grows only within this failing
+        # solve.
         current_delta_c = delta_c
 
         reg_opts = self._options.regularization
+        # Two-phase ladder. Phase 1 escalates δ_w alone: an indefinite (1,1)
+        # block — including one carrying exploded-multiplier curvature ~1e8–1e9
+        # (HS61) — is repaired by δ_w by itself, and any δ_c mixed into that
+        # repair distorts the dual step exactly when it must correct the
+        # multipliers (HS61 cycled forever on a (2.3e9, 2.6e-3) step where the
+        # (2.3e9, 1e-8) step recovered). Only once δ_w has grown past
+        # `delta_c_trigger` without success is the failure attributed to the
+        # dual block: phase 2 then *resets δ_w to the floor* — a huge δ_w left
+        # in place would poison the very solve δ_c is meant to rescue — and
+        # escalates both from small values.
+        in_dual_phase = False
 
         def escalate() -> None:
-            nonlocal current_delta_c
+            nonlocal current_delta_c, in_dual_phase
+            if (
+                m_eq > 0
+                and not in_dual_phase
+                and reg.delta_w >= reg_opts.delta_c_trigger
+            ):
+                in_dual_phase = True
+                reg.delta_w = 0.0  # restart the δ_w ladder at its floor
+                current_delta_c = escalate_delta_c(current_delta_c, reg_opts)
+                return
             escalate_delta_w(reg, reg_opts)
-            # δ_c is a *last resort* for a singular DUAL block (rank-deficient ∇c):
-            # escalate it only once δ_w has grown past `delta_c_trigger` without
-            # resolving the failure. A rank-deficient ∇c leaves δ_w running to its
-            # ceiling uselessly (only δ_c repairs the (2,2) block); an ordinary
-            # indefinite (1,1) block is fixed by a *small* δ_w. Escalating δ_c while
-            # δ_w is still small perturbs the (2,2) block needlessly and — on the
-            # inertia route — changes the very inertia the check tests against,
-            # diverging well-conditioned equality problems (BT1/DISC2 exact/sparse).
-            if m_eq > 0 and reg.delta_w >= reg_opts.delta_c_trigger:
+            if in_dual_phase:
                 current_delta_c = escalate_delta_c(current_delta_c, reg_opts)
 
         for _ in range(_MAX_REG_ATTEMPTS):

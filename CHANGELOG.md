@@ -147,6 +147,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   PD-by-Powell-damping design); see the note in `ipax/ipm/hessian.py`.
 
 ### Fixed
+- **δ_c escalation no longer contaminates a pure-δ_w repair** (regression in the
+  rank-deficient-∇c fix, caught by the v6 S2MPJ sweep: HS61 went from optimal at
+  kkt 1e-14 in 12 iterations to cycling at kkt ~1e3 until `max_time`). Exploded
+  equality multipliers can leave ~1e8–1e9 negative curvature in the primal block;
+  that is repaired by δ_w *alone* (HS61: δ_w = 2.3e9), and the resulting dual step
+  is exactly what heals the multipliers. With `delta_c_trigger = 1e4`, δ_c grew
+  alongside δ_w during that climb, so the eventually-successful factorization
+  carried a meaningful δ_c whose relaxed dual step never repaired the multipliers.
+  The regularization ladder is now **two-phase**: phase 1 escalates δ_w alone
+  (`delta_c_trigger` default raised 1e4 → 1e10, above any legitimate primal
+  repair); only when that ladder is exhausted is the failure attributed to a
+  singular dual block, and phase 2 then *resets δ_w to its floor* and escalates
+  (small δ_w, growing δ_c) together — a huge leftover δ_w would poison the very
+  solve δ_c is meant to rescue. The rank-deficient motivations are preserved and
+  improved: ACOPP14 now reaches OPTIMAL in ~15 iterations on the exact routes
+  (the phase-2 steps carry a small δ_w instead of ≥1e4), and BT1/DISC2 stay
+  optimal. Regression test: HS61 (gated) alongside the existing BT1/DISC2 case.
 - **Matrix-free MINRES failures on equality saddles now fall back to GMRES** instead
   of surfacing as `numerical_error`. On the default `method="cg"` route an equality
   saddle is solved with MINRES, which is fragile on ill-conditioned indefinite

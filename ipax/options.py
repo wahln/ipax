@@ -81,12 +81,16 @@ class RegularizationOptions:
     delta_c_max: float = 1e-1  # cap on δ_c escalation (rank-deficient ∇c)
     # δ_c escalation is a *last resort* for a singular DUAL block (rank-deficient
     # ∇c): it starts only once δ_w escalation has grown past this without resolving
-    # the KKT failure. A rank-deficient ∇c leaves δ_w running to `delta_w_max`
-    # uselessly (it cannot repair the (2,2) block); an ordinary indefinite (1,1)
-    # block is fixed by a *small* δ_w, so gating here keeps δ_c away from
-    # well-conditioned equality problems, where escalating it early perturbs the
-    # (2,2) block, corrupts the KKT inertia, and diverges the solve.
-    delta_c_trigger: float = 1e4
+    # the KKT failure — at which point δ_w is *reset to its floor* and the search
+    # continues with (small δ_w, growing δ_c). A rank-deficient ∇c leaves δ_w
+    # running to `delta_w_max` uselessly (it cannot repair the (2,2) block); an
+    # ordinary indefinite (1,1) block is fixed by δ_w alone, so the trigger must
+    # sit above any δ_w a genuine primal repair can need. Exploded multipliers can
+    # legitimately demand δ_w ~ 1e8–1e9 (S2MPJ HS61: the primal block carries
+    # −3.2e8 curvature, cured by δ_w = 2.3e9 alone; a lower trigger let δ_c
+    # contaminate that repair and the distorted dual step cycled forever), hence
+    # the generous default.
+    delta_c_trigger: float = 1e10
 
 
 @dataclass(frozen=True, slots=True)

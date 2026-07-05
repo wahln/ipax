@@ -151,6 +151,33 @@ def test_nonconvex_equality_exact_sparse_converges(bridge_namespace, name):
     assert result.kkt_error <= 1e-6
 
 
+@pytest.mark.parametrize("name", ("HS61",))
+def test_exploded_multiplier_curvature_recovers_via_pure_delta_w(
+    bridge_namespace, name
+):
+    # Regression (v6 sweep): HS61's first full step explodes the equality
+    # multipliers, leaving ~ -3.2e8 curvature in the primal block, which a pure
+    # delta_w ladder repairs at delta_w ~ 2.3e9 and whose resulting dual step
+    # heals the multipliers (optimal in ~12 iterations). A delta_c_trigger below
+    # that scale let delta_c contaminate the repair: the (huge delta_w,
+    # meaningful delta_c) step distorts exactly the dual correction it needs,
+    # and the solve cycles at kkt ~ 1e3 forever. delta_c must stay a
+    # last resort that begins only after the pure-delta_w ladder is exhausted
+    # (and then restarts delta_w from the floor).
+    xp = bridge_namespace
+    if name not in s2mpj.list_s2mpj_problems():
+        pytest.skip(f"{name} not in this S2MPJ checkout")
+    backend = xp.__name__.split(".")[-1]
+    (case,) = s2mpj.s2mpj_problems((name,), backends=(backend,), hessian="exact")
+    problem, x0 = case.build(xp)
+    result = solve(problem, x0, options=Options(hessian="exact", linsolve="dense"))
+
+    assert result.status is Status.OPTIMAL, f"{name}: {result.status}"
+    assert result.kkt_error <= 1e-6
+    assert abs(float(result.objective) - (-143.6461)) <= 1e-3
+    assert result.n_iter <= 50
+
+
 def test_documented_expected_outcome_is_attached(bridge_namespace):
     # The loader threads the dataset's documented outcome onto the built problem.
     xp = bridge_namespace
