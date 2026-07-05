@@ -138,6 +138,8 @@ def test_acceptable_objective_change_handles_a_stuck_dual_infeasibility():
         AcceptableStoppingOptions(
             f_rel_change_tol=1e-4,
             constr_viol_tol=1e-6,
+            dual_inf_tol=None,  # the stuck component must be opted out
+            compl_inf_tol=None,
             n_iter=2,
         )
     )
@@ -153,7 +155,12 @@ def test_acceptable_objective_change_handles_a_stuck_dual_infeasibility():
 
 
 def test_disabled_acceptable_checker_never_fires():
-    checker = ConditionChecker.for_acceptable(AcceptableStoppingOptions())
+    # Setting every tolerance to None opts out of the (default-on) mechanism.
+    checker = ConditionChecker.for_acceptable(
+        AcceptableStoppingOptions(
+            dual_inf_tol=None, constr_viol_tol=None, compl_inf_tol=None, n_iter=1
+        )
+    )
 
     assert checker.observe(_record(0, 1.0)) is None
     assert checker.observe(_record(1, 1.0)) is None

@@ -84,6 +84,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   preconditioner paths.
 
 ### Changed
+- **Acceptable-level termination is now enabled by default** (IPOPT convention:
+  `acceptable_tol = 1e-6` — 1e2 × the optimality tolerance — held for
+  `acceptable_iter = 15` consecutive iterations). The mechanism existed
+  (`AcceptableStoppingOptions`, `Status.ACCEPTABLE`) but every tolerance defaulted
+  to `None`, so a solve whose achievable KKT floor sits between 1e-8 and 1e-6 —
+  degenerate optima, ill-conditioned least squares — ground thousands of
+  iterations into `max_iter`/`max_time` at an essentially optimal point (v6 S2MPJ
+  sweep: PALMER1A spent 300 s at kkt 4.2e-8; it now stops ACCEPTABLE at the same
+  point in 1.2 s). New defaults: `dual_inf_tol = constr_viol_tol = compl_inf_tol
+  = 1e-6`, `n_iter = 15`; set all three to `None` to restore the old
+  grind-to-the-cap behavior.
 - Faster dense KKT solve: the condensed, saddle, and L-BFGS Hessian operators now
   implement native batched `matmat`/`rmatmat` (and `rmatmat` is available across the
   `LinearOperator` subclasses), so materializing the operator for the dense route

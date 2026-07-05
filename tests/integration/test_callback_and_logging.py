@@ -88,7 +88,14 @@ def test_acceptable_stopping_is_integrated_with_the_driver(namespace):
             options=Options(
                 hessian="exact",
                 linsolve="dense",
-                acceptable=AcceptableStoppingOptions(dual_inf_tol=1e6, n_iter=1),
+                # One ultra-loose enabled condition, the (default-on) others
+                # opted out: the gate must fire on the very first iterate.
+                acceptable=AcceptableStoppingOptions(
+                    dual_inf_tol=1e6,
+                    constr_viol_tol=None,
+                    compl_inf_tol=None,
+                    n_iter=1,
+                ),
             ),
         )
 

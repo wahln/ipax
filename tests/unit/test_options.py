@@ -82,11 +82,26 @@ def test_optimality_requires_at_least_one_condition():
         )
 
 
-def test_acceptable_stopping_is_disabled_by_default():
+def test_acceptable_stopping_defaults_to_the_ipopt_convention():
+    # IPOPT enables acceptable-level termination by default (acceptable_tol =
+    # 1e-6 = 1e2 x the optimality tol, acceptable_iter = 15). A disabled-by-
+    # default gate lets a solve whose achievable KKT floor sits between 1e-8
+    # and 1e-6 grind thousands of iterations into max_time at an essentially
+    # optimal point (S2MPJ v6: PALMER1A, 2431 iterations at kkt 4.2e-8).
     acceptable = Options().acceptable
 
     assert acceptable.f_tol is None
     assert acceptable.f_rel_change_tol is None
+    assert acceptable.dual_inf_tol == 1e-6
+    assert acceptable.constr_viol_tol == 1e-6
+    assert acceptable.compl_inf_tol == 1e-6
+    assert acceptable.n_iter == 15
+
+
+def test_acceptable_stopping_can_be_disabled():
+    acceptable = AcceptableStoppingOptions(
+        dual_inf_tol=None, constr_viol_tol=None, compl_inf_tol=None
+    )
     assert acceptable.dual_inf_tol is None
     assert acceptable.constr_viol_tol is None
     assert acceptable.compl_inf_tol is None

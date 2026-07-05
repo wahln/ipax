@@ -36,6 +36,37 @@ def test_unconstrained_quadratic_hits_closed_form(namespace, tol):
     )
 
 
+def test_unreachable_optimality_stops_acceptable_not_max_iter(namespace):
+    # The default acceptable gate (IPOPT convention: 1e2 x tol for 15
+    # consecutive iterations) must stop a solve that cannot reach the optimality
+    # conditions, instead of grinding to max_iter/max_time at an essentially
+    # optimal point (S2MPJ v6: PALMER1A, NELSONLS, LOADBAL). Optimality is made
+    # deterministically unreachable via f_tol: the optimum objective is
+    # ~-0.68, so |f| <= 1e-12 never holds, while the KKT residuals settle far
+    # below the acceptable 1e-6 within a few iterations.
+    Q = array(namespace, [[4.0, 1.0], [1.0, 3.0]])
+    b = array(namespace, [1.0, 2.0])
+    problem = UnconstrainedQuadratic(Q, b, namespace)
+    x0 = array(namespace, [0.0, 0.0])
+    from ipax.options import OptimalityConditionOptions
+
+    options = Options(
+        hessian="exact",
+        linsolve="dense",
+        optimality=OptimalityConditionOptions(f_tol=1e-12),
+    )
+
+    result = solve(problem, x0, options=options)
+
+    assert result.status is Status.ACCEPTABLE
+    assert result.success
+    assert result.kkt_error <= 1e-6
+    # the floor is reached in a handful of iterations; 15 consecutive holds
+    # later the gate fires - far below the 3000-iteration cap.
+    assert result.n_iter <= 60
+    assert_allclose(namespace, result.x, problem.known_solution(), rtol=1e-6, atol=1e-6)
+
+
 def test_bound_constrained_qp_finds_known_active_bounds(namespace):
     problem = BoundConstrainedQP(namespace)
     x0 = array(namespace, [0.25, 0.75])

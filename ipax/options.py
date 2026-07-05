@@ -317,9 +317,15 @@ class AcceptableStoppingOptions:
     ``n_iter`` *consecutive* iterations before the solve stops. "Acceptable"
     means *what the caller is willing to accept* — e.g. stopping once the
     objective and primal feasibility have settled even though a
-    dual-infeasibility-dominated residual will not reduce further. Every
-    tolerance is ``None`` (disabled) by default, so the whole mechanism is off
-    unless explicitly configured.
+    dual-infeasibility-dominated residual will not reduce further.
+
+    The defaults follow the IPOPT convention (``acceptable_tol = 1e-6`` — 1e2 ×
+    the optimality tolerance — held for ``acceptable_iter = 15`` iterations): a
+    problem whose achievable KKT floor sits between the acceptable and optimal
+    tolerances (degenerate optimum, ill-conditioned least squares) then stops as
+    :attr:`Status.ACCEPTABLE` after 15 stagnant iterations instead of grinding
+    to ``max_iter``/``max_time`` at an essentially optimal point. Set every
+    tolerance to ``None`` to disable the mechanism entirely.
 
     The fields match :class:`OptimalityConditionOptions` (``f_tol``,
     ``f_rel_change_tol``, ``dual_inf_tol``, ``constr_viol_tol``,
@@ -328,9 +334,11 @@ class AcceptableStoppingOptions:
 
     f_tol: float | None = None
     f_rel_change_tol: float | None = None
-    dual_inf_tol: float | None = None
-    constr_viol_tol: float | None = None
-    compl_inf_tol: float | None = None
+    # IPOPT ``acceptable_tol``: 1e2 × the 1e-8 optimality default, consistent
+    # with the driver's step-failure salvage factor.
+    dual_inf_tol: float | None = 1e-6
+    constr_viol_tol: float | None = 1e-6
+    compl_inf_tol: float | None = 1e-6
     n_iter: int = 15
 
     def __post_init__(self) -> None:
