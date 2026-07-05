@@ -44,6 +44,7 @@ import scipy.sparse
 import scipy.sparse.linalg
 
 from ipax.backend.operators import LinearOperator
+from ipax.backend.sparse._canonical import CompiledCompressed, compile_compressed
 from ipax.backend.sparse._routing import to_xp_array
 from ipax.linalg.solver import LinearSolveError
 
@@ -72,6 +73,11 @@ def _to_numpy(arr: Array) -> np.ndarray:
 def _to_index(arr: Array) -> np.ndarray:
     """Host integer-index vector for COO assembly."""
     return _to_numpy(arr).astype(np.int64, copy=False)
+
+
+def _scatter_add(out: np.ndarray, idx: np.ndarray, vals: np.ndarray) -> None:
+    """Unbuffered scatter-add (sums duplicate targets) for the canonical map."""
+    np.add.at(out, idx, vals)
 
 
 def _import_feral() -> Any:
@@ -139,13 +145,18 @@ class SparseOperator(LinearOperator):
         xp: Namespace,
         *,
         symmetric: bool | None = None,
+        pattern_signature: object | None = None,
+        csc: scipy.sparse.csc_matrix | None = None,
     ) -> None:
-        self._matrix = matrix
+        self._matrix = matrix if csc is None else csc
         self._xp = xp
         # Structural symmetry hint from the assembler (None ⇒ test numerically).
         self._symmetric_hint = symmetric
+        self._pattern_signature = pattern_signature
         self._csr: scipy.sparse.csr_matrix | None = None
-        self._csc: scipy.sparse.csc_matrix | None = None
+        # A pre-canonicalized CSC from the compiled COO map (values-only refactor
+        # fast path) is the factorization form directly — no per-iteration tocsc.
+        self._csc: scipy.sparse.csc_matrix | None = csc
         self._symmetric: bool | None = None
 
     @property
@@ -185,6 +196,9 @@ class SparseOperator(LinearOperator):
             self._symmetric = _is_symmetric(self.csc_matrix)
         return self._symmetric
 
+    def coo_pattern_signature(self) -> object | None:
+        return self._pattern_signature
+
     def matvec(self, v: Array) -> Array:
         out = self._csr_matrix @ _to_numpy(v)
         return to_xp_array(out, self._xp)
@@ -197,9 +211,25 @@ class SparseOperator(LinearOperator):
         out = self._csr_matrix @ _to_numpy(V)
         return to_xp_array(out, self._xp)
 
+    def rmatmat(self, V: Array) -> Array:
+        out = self._csr_matrix.T @ _to_numpy(V)
+        return to_xp_array(out, self._xp)
+
     def diagonal(self, like: Array | None = None) -> Array:
         del like
         return to_xp_array(self._csr_matrix.diagonal(), self._xp)
+
+    def gram_diagonal(self, weights: Array) -> Array:
+        # diag(Aᵀ diag(w) A)_k = Σ_i w_i A_ik² = (A∘A)ᵀ w (column energies).
+        squared = self._csr_matrix.multiply(self._csr_matrix)
+        out = squared.T @ _to_numpy(weights)
+        return to_xp_array(np.asarray(out).reshape(-1), self._xp)
+
+    def row_gram_diagonal(self, weights: Array) -> Array:
+        # diag(A diag(w) Aᵀ)_j = Σ_k w_k A_jk² = (A∘A) w (row energies).
+        squared = self._csr_matrix.multiply(self._csr_matrix)
+        out = squared @ _to_numpy(weights)
+        return to_xp_array(np.asarray(out).reshape(-1), self._xp)
 
     def row_inf_norms(self, like: Array | None = None) -> Array:
         del like
@@ -219,6 +249,27 @@ class SparseOperator(LinearOperator):
             to_xp_array(coo.col, self._xp),
             to_xp_array(coo.data, self._xp),
             self.shape,
+        )
+
+
+def _reject_non_finite(matrix: scipy.sparse.csc_matrix) -> None:
+    """Raise :class:`LinearSolveError` if any stored value is inf/NaN.
+
+    A non-finite KKT entry means an upstream Hessian/Jacobian/Σ evaluated at a
+    bad trial iterate overflowed (e.g. a ``1/0`` in the problem's element
+    functions). The dense route already treats such a factorization as a
+    numerical failure the IPM recovers from (δ_w escalation, then step-failure
+    classification); the sparse route must behave identically rather than let a
+    backend-specific exception escape as an uncaught crash — Feral's numeric
+    factorization raises a bare ``ValueError`` here, and SuperLU would otherwise
+    factor to a non-finite solution. Checking the ``O(nnz)`` value array up front
+    is negligible beside the factorization it guards, and gives both inner
+    solvers one backend-neutral failure signal.
+    """
+    if matrix.nnz and not bool(np.isfinite(matrix.data).all()):
+        raise LinearSolveError(
+            "sparse KKT matrix has non-finite entries (inf/NaN); the upstream "
+            "derivatives overflowed at this iterate"
         )
 
 
@@ -371,6 +422,7 @@ class FeralSparseSolver:
         assert isinstance(K, SparseOperator)  # narrowed by _require_csc
         if not K.is_symmetric():
             raise ValueError("Feral sparse solver requires a symmetric operator")
+        _reject_non_finite(matrix)
 
         feral = _import_feral()
         errors = (RuntimeError, feral.FeralError)
@@ -454,6 +506,7 @@ class SuperLUSparseSolver:
     def factor(self, K: LinearOperator) -> None:
         matrix, xp = _require_csc(K)
         self._xp = xp
+        _reject_non_finite(matrix)
         try:
             self._lu = scipy.sparse.linalg.splu(matrix)
         except RuntimeError as exc:  # singular factor ⇒ numerical failure
@@ -542,7 +595,19 @@ class SciPySparseSolver:
 
 
 class SciPySparseAdapter:
-    """Factory pairing COO assembly with the SciPy sparse-direct solver."""
+    """Factory pairing COO assembly with the SciPy sparse-direct solver.
+
+    The adapter persists across an interior-point solve (the facade caches one
+    instance), so it memoizes the COO→canonical-CSC map for the most recent
+    ``pattern_signature``. On a fixed KKT pattern this turns the per-iteration
+    ``coo_matrix(...).tocsc()`` sort into a single scatter-add (see
+    :mod:`ipax.backend.sparse._canonical`).
+    """
+
+    def __init__(self) -> None:
+        self._signature: object | None = None
+        self._compiled: CompiledCompressed | None = None
+        self._meta: tuple[tuple[int, int], int] | None = None
 
     def from_coo(
         self,
@@ -552,20 +617,82 @@ class SciPySparseAdapter:
         *,
         shape: tuple[int, int],
         symmetric: bool | None = None,
+        pattern_signature: object | None = None,
     ) -> SparseOperator:
         """Build a :class:`SparseOperator` from Array-API COO triplets.
 
         ``symmetric`` is an optional structural hint from the assembler; ``None``
         leaves the operator to test symmetry numerically when first asked.
+        ``pattern_signature`` keys the compiled-map cache: a stable signature
+        (the KKT block's fixed pattern) reuses the canonical CSC structure and
+        recomputes only the value array; ``None`` (value-dependent patterns)
+        always rebuilds from scratch.
         """
         from ipax.backend.namespace import array_namespace
 
         xp = array_namespace(values)
-        matrix = scipy.sparse.coo_matrix(
-            (_to_numpy(values), (_to_index(rows), _to_index(cols))),
-            shape=shape,
+        np_rows = _to_index(rows)
+        np_cols = _to_index(cols)
+        np_values = _to_numpy(values)
+        n_triplets = int(np_values.shape[0])
+
+        if pattern_signature is not None:
+            csc = self._canonical_csc(
+                np_rows, np_cols, np_values, shape, pattern_signature, n_triplets
+            )
+            return SparseOperator(
+                csc,
+                xp,
+                symmetric=symmetric,
+                pattern_signature=pattern_signature,
+                csc=csc,
+            )
+
+        matrix = scipy.sparse.coo_matrix((np_values, (np_rows, np_cols)), shape=shape)
+        return SparseOperator(
+            matrix,
+            xp,
+            symmetric=symmetric,
+            pattern_signature=pattern_signature,
         )
-        return SparseOperator(matrix, xp, symmetric=symmetric)
+
+    def _canonical_csc(
+        self,
+        rows: np.ndarray,
+        cols: np.ndarray,
+        values: np.ndarray,
+        shape: tuple[int, int],
+        signature: object,
+        n_triplets: int,
+    ) -> scipy.sparse.csc_matrix:
+        """Canonical CSC via the cached compiled map, recompiling on a new pattern.
+
+        The cache is keyed on ``(signature, shape, n_triplets)``: a caller that
+        reuses a signature key for a structurally different system (a grown
+        L-BFGS border) recompiles rather than misapplying the stale map.
+        """
+        meta = (shape, n_triplets)
+        if self._compiled is None or self._signature != signature or self._meta != meta:
+            # major=col, minor=row ⇒ canonical CSC structure directly.
+            self._compiled = compile_compressed(
+                np,
+                _scatter_add,
+                major=cols,
+                minor=rows,
+                n_major=shape[1],
+                n_minor=shape[0],
+            )
+            self._signature = signature
+            self._meta = meta
+        compiled = self._compiled
+        data = compiled.data(values)
+        csc = scipy.sparse.csc_matrix(
+            (data, compiled.indices, compiled.indptr), shape=shape
+        )
+        # The compiled structure is sorted and duplicate-free by construction, so
+        # SuperLU/Feral can consume it without a defensive re-canonicalization.
+        csc.has_canonical_format = True
+        return csc
 
     def solver(self, *, require_inertia: bool = False) -> SciPySparseSolver:
         """Return the CPU sparse-direct solver (Feral default, SuperLU fallback)."""

@@ -5,8 +5,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from ipax.ipm.driver import (
+    _RESTORATION_INFEASIBLE_FACTOR,
     _STEP_FAILURE_ACCEPT_FACTOR,
     _classify_step_failure,
+    _restoration_reports_infeasible,
     _within_relaxed_tol,
 )
 from ipax.options import OptimalityConditionOptions
@@ -71,6 +73,32 @@ def test_within_relaxed_tol_gates_both_salvage_paths():
     # Feasibility matters too: a near-zero dual residual but a violated
     # constraint (large primal infeasibility) is not near-optimal.
     assert not _within_relaxed_tol(_OPT, _record(1e-10, 5.0, 1e-10))
+
+
+def test_restoration_verdict_ignores_a_feasible_restored_point():
+    # S2MPJ Task 1: restoration can stall a hair above its own tolerance at a
+    # point that is feasible by the driver's θ (a degenerate optimum where CQ
+    # fails, or a limit cycle that keeps re-reaching feasibility). Such a point
+    # must NOT be believed infeasible — declaring a feasible point "infeasible"
+    # is a contradiction. A genuinely infeasible stationary point (θ bounded away
+    # from zero) still is.
+    tol = _OPT.constr_viol_tol
+    feasible_tol = _RESTORATION_INFEASIBLE_FACTOR * tol
+    assert not _restoration_reports_infeasible(tol, _OPT)  # at the raw tolerance
+    assert not _restoration_reports_infeasible(feasible_tol, _OPT)  # at the boundary
+    assert not _restoration_reports_infeasible(1e-6, _OPT)  # HS72-scale violation
+    assert _restoration_reports_infeasible(feasible_tol * 1.0001, _OPT)  # just over
+    assert _restoration_reports_infeasible(1e-2, _OPT)  # genuinely infeasible
+
+
+def test_restoration_verdict_falls_back_to_kkt_tol_without_constr_viol_tol():
+    # With the constraint-violation condition disabled, the feasibility band is
+    # keyed off the representative kkt_tol instead of raising.
+    opt = OptimalityConditionOptions(constr_viol_tol=None)
+    assert opt.constr_viol_tol is None
+    feasible_tol = _RESTORATION_INFEASIBLE_FACTOR * opt.kkt_tol
+    assert not _restoration_reports_infeasible(feasible_tol, opt)
+    assert _restoration_reports_infeasible(feasible_tol * 10.0, opt)
 
 
 def test_no_enabled_kkt_conditions_do_not_salvage():

@@ -48,6 +48,42 @@ class LinearOperator(ABC):
         columns = tuple(self.matvec(V[:, idx]) for idx in range(int(V.shape[1])))
         return xp.stack(columns, axis=1)
 
+    def rmatmat(self, V: Array) -> Array:
+        """Compute ``A.T @ V`` by applying ``rmatvec`` column-wise."""
+        xp = array_namespace(V)
+        columns = tuple(self.rmatvec(V[:, idx]) for idx in range(int(V.shape[1])))
+        return xp.stack(columns, axis=1)
+
+    def dense_structured_solve(self, rhs: Array) -> Array:
+        """Solve ``A x = rhs`` exactly by exploiting special operator structure.
+
+        Optional capability used by :class:`~ipax.linalg.dense.DenseSolver` to skip
+        the dense ``n × n`` materialization when the operator has a known
+        structured inverse (e.g. an L-BFGS diagonal-plus-low-rank condensed block
+        solved by the Woodbury identity, or the equality saddle's Schur
+        complement). Defaults to unavailable; the dense solver then falls back to
+        materializing and factoring the operator.
+        """
+        del rhs
+        raise NotImplementedError("operator does not expose a structured dense solve")
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        """Return an explicit dense matrix when the operator already has one.
+
+        Optional capability for dense direct solves. Unlike ``matmat(I)``, this
+        lets explicit operators hand back or assemble their matrix without an
+        identity probe and the extra kernels it causes on device backends. Operators
+        without explicit dense structure leave the default unavailable. Operators
+        with no stored array (e.g. :class:`Identity`) may use ``like`` as a
+        dtype/backend template.
+
+        The result may alias the operator's backing array (e.g. :class:`Dense`
+        returns it without copying), so callers must treat it as **read-only** —
+        an in-place mutation would corrupt the operator.
+        """
+        del like
+        raise NotImplementedError("operator does not expose a dense matrix")
+
     def diagonal(self, like: Array | None = None) -> Array:
         """Return the main diagonal as a rank-1 array.
 
@@ -81,6 +117,32 @@ class LinearOperator(ABC):
         """
         del like
         raise NotImplementedError("operator does not expose sparse COO structure")
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        """Return only the COO value vector, in :meth:`to_coo`'s exact order.
+
+        Optional fast path behind the values-only sparse refactor: in an
+        interior-point solve the COO row/column pattern is fixed (the solver
+        caches it keyed on :meth:`coo_pattern_signature`) while only the values
+        move, so an operator that can recompute its values *without* rebuilding
+        the index vectors overrides this. The default recomputes the full triplet
+        and discards the indices — always correct, but forgoes the speedup. The
+        returned order must match :meth:`to_coo` exactly (a shared contract test
+        guards the two against drift).
+        """
+        return self.to_coo(like)[2]
+
+    def coo_pattern_signature(self) -> object | None:
+        """Stable identity for the row/column pattern emitted by :meth:`to_coo`.
+
+        Sparse-direct adapters may use this to split structure from numeric
+        values without comparing device index arrays. Return ``None`` unless the
+        operator can guarantee that its COO row/column vectors are determined by
+        structural metadata rather than by current numeric values. This must be
+        conservative: a value-dependent exact Hessian that drops zero entries
+        should leave the default so the sparse solver reanalyzes.
+        """
+        return None
 
     def gram_diagonal(self, weights: Array) -> Array:
         """Return ``diag(Aᵀ diag(weights) A)`` — the weighted column energies.
@@ -158,6 +220,17 @@ class LinearOperator(ABC):
         """
         raise NotImplementedError("operator has no L-BFGS-aware preconditioner")
 
+    def lbfgs_block_preconditioner_apply(self) -> Callable[[Array], Array]:
+        """Return an L-BFGS-aware block-diagonal preconditioner for a saddle.
+
+        Only the equality saddle (which wraps a condensed block with an L-BFGS
+        compact form) provides this: the block-diagonal ``diag(N⁻¹, S⁻¹)`` with the
+        Woodbury ``N⁻¹`` on the (1,1) block and an approximate-Schur diagonal on the
+        (2,2) block. Non-diagonal, so it is applied by GMRES rather than the MINRES
+        diagonal-scaling path. Optional; defaults to "not available".
+        """
+        raise NotImplementedError("operator has no L-BFGS block preconditioner")
+
     def __matmul__(self, v: Array) -> Array:
         return self.matvec(v)
 
@@ -185,6 +258,17 @@ class Dense(LinearOperator):
     def matmat(self, V: Array) -> Array:
         xp = array_namespace(self._A, V)
         return xp.matmul(self._A, V)
+
+    def rmatmat(self, V: Array) -> Array:
+        xp = array_namespace(self._A, V)
+        return xp.matmul(xp.permute_dims(self._A, (1, 0)), V)
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        # Returns the backing array *by reference* (no copy): callers — e.g.
+        # DenseSolver, which caches it — must treat the result as read-only, as
+        # an in-place mutation would corrupt this operator.
+        del like
+        return self._A
 
     def diagonal(self, like: Array | None = None) -> Array:
         del like
@@ -222,6 +306,15 @@ class Dense(LinearOperator):
         values = xp.reshape(self._A, (m * n,))
         return rows, cols, values, (m, n)
 
+    def coo_values(self, like: Array | None = None) -> Array:
+        del like
+        xp = array_namespace(self._A)
+        m, n = self.shape
+        return xp.reshape(self._A, (m * n,))
+
+    def coo_pattern_signature(self) -> object:
+        return ("dense", self.shape)
+
 
 class Diagonal(LinearOperator):
     """Diagonal operator from a vector ``d``."""
@@ -246,6 +339,15 @@ class Diagonal(LinearOperator):
         xp = array_namespace(self._d, V)
         return xp.expand_dims(self._d, axis=1) * V
 
+    def rmatmat(self, V: Array) -> Array:
+        return self.matmat(V)
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        del like
+        xp = array_namespace(self._d)
+        n = int(self._d.shape[0])
+        return xp.eye(n, dtype=self._d.dtype) * self._d
+
     def diagonal(self, like: Array | None = None) -> Array:
         del like
         return self._d
@@ -268,6 +370,13 @@ class Diagonal(LinearOperator):
         idx = xp.arange(n)
         return idx, idx, self._d, (n, n)
 
+    def coo_values(self, like: Array | None = None) -> Array:
+        del like
+        return self._d
+
+    def coo_pattern_signature(self) -> object:
+        return ("diagonal", self.shape)
+
 
 class Identity(LinearOperator):
     """Identity operator ``I_n``."""
@@ -289,6 +398,15 @@ class Identity(LinearOperator):
 
     def matmat(self, V: Array) -> Array:
         return V
+
+    def rmatmat(self, V: Array) -> Array:
+        return V
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        if like is None:
+            raise NotImplementedError("Identity dense matrix requires a template array")
+        xp = array_namespace(like)
+        return xp.eye(self._n, dtype=like.dtype)
 
     def diagonal(self, like: Array | None = None) -> Array:
         if like is None:
@@ -315,6 +433,15 @@ class Identity(LinearOperator):
         idx = xp.arange(self._n)
         ones = xp.ones((self._n,), dtype=like.dtype)
         return idx, idx, ones, (self._n, self._n)
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        if like is None:
+            raise NotImplementedError("Identity COO values require a template array")
+        xp = array_namespace(like)
+        return xp.ones((self._n,), dtype=like.dtype)
+
+    def coo_pattern_signature(self) -> object:
+        return ("identity", self.shape)
 
 
 class LowRank(LinearOperator):
@@ -352,6 +479,18 @@ class LowRank(LinearOperator):
             self._U,
             xp.matmul(xp.permute_dims(self._V, (1, 0)), V),
         )
+
+    def rmatmat(self, V: Array) -> Array:
+        xp = array_namespace(self._U, self._V, V)
+        return xp.matmul(
+            self._V,
+            xp.matmul(xp.permute_dims(self._U, (1, 0)), V),
+        )
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        del like
+        xp = array_namespace(self._U, self._V)
+        return xp.matmul(self._U, xp.permute_dims(self._V, (1, 0)))
 
 
 class MatrixFreeJacobian(LinearOperator):
@@ -417,6 +556,26 @@ class Composite(LinearOperator):
             result = term.rmatvec(result)
         return result
 
+    def matmat(self, V: Array) -> Array:
+        result = V
+        for term in reversed(self._terms):
+            result = term.matmat(result)
+        return result
+
+    def rmatmat(self, V: Array) -> Array:
+        result = V
+        for term in self._terms:
+            result = term.rmatmat(result)
+        return result
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        result = self._terms[-1].dense_matrix(like)
+        for term in reversed(self._terms[:-1]):
+            left = term.dense_matrix(result)
+            xp = array_namespace(left, result)
+            result = xp.matmul(left, result)
+        return result
+
 
 class VStack(LinearOperator):
     """Vertical stack of operators sharing the variable (column) dimension.
@@ -456,11 +615,53 @@ class VStack(LinearOperator):
         assert result is not None
         return xp.asarray(result)
 
+    def matmat(self, V: Array) -> Array:
+        xp = array_namespace(V)
+        return xp.concat(tuple(op.matmat(V) for op in self._ops), axis=0)
+
+    def rmatmat(self, V: Array) -> Array:
+        xp = array_namespace(V)
+        result = None
+        offset = 0
+        for op, rows in zip(self._ops, self._rows, strict=True):
+            piece = op.rmatmat(V[offset : offset + rows, :])
+            result = piece if result is None else result + piece
+            offset += rows
+        assert result is not None
+        return xp.asarray(result)
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        xp = None
+        template = like
+        parts: list[Array] = []
+        for op in self._ops:
+            piece = op.dense_matrix(template)
+            if xp is None:
+                xp = array_namespace(piece)
+            if template is None:
+                template = piece
+            parts.append(piece)
+        assert xp is not None
+        return xp.concat(tuple(parts), axis=0)
+
     def row_gram_diagonal(self, weights: Array) -> Array:
         # Rows are stacked, so the weighted row energies concatenate. Propagates
         # NotImplementedError if any block cannot supply them cheaply.
         xp = array_namespace(weights)
         return xp.concat(tuple(op.row_gram_diagonal(weights) for op in self._ops))
+
+    def gram_diagonal(self, weights: Array) -> Array:
+        # Row weights are stacked with the blocks; split by row range and sum each
+        # block's column-energy contribution.
+        result = None
+        offset = 0
+        for op, rows in zip(self._ops, self._rows, strict=True):
+            piece = op.gram_diagonal(weights[offset : offset + rows])
+            result = piece if result is None else result + piece
+            offset += rows
+        assert result is not None
+        xp = array_namespace(result)
+        return xp.asarray(result)
 
     def row_inf_norms(self, like: Array | None = None) -> Array:
         # Stacked rows ⇒ concatenate each block's row norms (used by scaling).
@@ -500,6 +701,247 @@ class VStack(LinearOperator):
             (offset, self._n),
         )
 
+    def coo_values(self, like: Array | None = None) -> Array:
+        # Stacked rows ⇒ concatenate each block's values in block order, matching
+        # to_coo without recomputing the row-offset index vectors.
+        del like
+        xp = None
+        parts: list[Array] = []
+        for op in self._ops:
+            piece = op.coo_values()
+            if xp is None:
+                xp = array_namespace(piece)
+            parts.append(piece)
+        assert xp is not None
+        return xp.concat(tuple(parts))
+
+    def coo_pattern_signature(self) -> object | None:
+        parts = tuple(op.coo_pattern_signature() for op in self._ops)
+        if any(part is None for part in parts):
+            return None
+        return ("vstack", self.shape, parts)
+
+
+class _SparseStructured(LinearOperator):
+    """Backend-agnostic sparse operator carrying Array-API COO triplets.
+
+    The public sparse operators (:class:`COOOperator`, :class:`CSROperator`,
+    :class:`CSCOperator`) all reduce to this. It honors invariant #4 exactly: it
+    stores only Array-API index/value vectors and *emits structure* through
+    :meth:`to_coo`/:meth:`coo_values`, while the actual sparse linear algebra
+    (``matvec``-family, ``diagonal``, Gram diagonals, row norms) is delegated to
+    the per-backend adapter resolved from the value array's namespace — the core
+    never builds or holds a concrete sparse matrix itself.
+
+    Pattern reuse is opt-in. By default :meth:`coo_pattern_signature` is ``None``
+    (conservative: the sparse-direct route re-analyzes every factorization). A
+    caller whose sparsity pattern is fixed across a solve — the usual case, where
+    only the numeric values move iteration to iteration — passes a stable
+    ``pattern_key`` to unlock the symbolic-analysis and structure-cache fast paths.
+    """
+
+    def __init__(
+        self,
+        rows: Array,
+        cols: Array,
+        values: Array,
+        shape: tuple[int, int],
+        *,
+        symmetric: bool | None = None,
+        pattern_key: object | None = None,
+    ) -> None:
+        if len(rows.shape) != 1 or len(cols.shape) != 1 or len(values.shape) != 1:
+            raise ValueError("COO rows, cols, and values must be rank-1 arrays")
+        if rows.shape[0] != values.shape[0] or cols.shape[0] != values.shape[0]:
+            raise ValueError("COO rows, cols, and values must have equal length")
+        if len(shape) != 2 or shape[0] < 0 or shape[1] < 0:
+            raise ValueError("shape must be a non-negative (rows, cols) pair")
+        self._rows = rows
+        self._cols = cols
+        self._values = values
+        self._shape = (int(shape[0]), int(shape[1]))
+        self._symmetric = symmetric
+        self._pattern_key = pattern_key
+        # Lazily built, cached adapter operator for the heavy linear algebra.
+        self._delegate: LinearOperator | None = None
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self._shape
+
+    def _adapter_op(self) -> LinearOperator:
+        """Resolve (and cache) the backend adapter operator for sparse algebra."""
+        if self._delegate is None:
+            from typing import Any
+
+            from ipax.backend.sparse import get_sparse_adapter
+
+            xp = array_namespace(self._values)
+            adapter: Any = get_sparse_adapter(xp)
+            if adapter is None:
+                raise NotImplementedError(
+                    "sparse matrix algebra requires a backend sparse adapter; "
+                    "install the sparse extra (e.g. ipax[sparse-cpu]) or use a "
+                    "matrix-free operator"
+                )
+            self._delegate = adapter.from_coo(
+                self._rows,
+                self._cols,
+                self._values,
+                shape=self._shape,
+                symmetric=self._symmetric,
+                pattern_signature=self.coo_pattern_signature(),
+            )
+        return self._delegate
+
+    # Structure emission — pure Array API, no adapter needed (invariant #4).
+    def to_coo(
+        self, like: Array | None = None
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        del like
+        return self._rows, self._cols, self._values, self._shape
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        del like
+        return self._values
+
+    def coo_pattern_signature(self) -> object | None:
+        if self._pattern_key is None:
+            return None
+        return ("sparse-structured", self._shape, self._symmetric, self._pattern_key)
+
+    def symmetry_hint(self) -> bool | None:
+        return self._symmetric
+
+    # Sparse linear algebra — delegated to the per-backend adapter.
+    def matvec(self, v: Array) -> Array:
+        return self._adapter_op().matvec(v)
+
+    def rmatvec(self, v: Array) -> Array:
+        return self._adapter_op().rmatvec(v)
+
+    def matmat(self, V: Array) -> Array:
+        return self._adapter_op().matmat(V)
+
+    def rmatmat(self, V: Array) -> Array:
+        return self._adapter_op().rmatmat(V)
+
+    def diagonal(self, like: Array | None = None) -> Array:
+        return self._adapter_op().diagonal(like)
+
+    def gram_diagonal(self, weights: Array) -> Array:
+        return self._adapter_op().gram_diagonal(weights)
+
+    def row_gram_diagonal(self, weights: Array) -> Array:
+        return self._adapter_op().row_gram_diagonal(weights)
+
+    def row_inf_norms(self, like: Array | None = None) -> Array:
+        return self._adapter_op().row_inf_norms(like)
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        # Densifies via the adapter (an identity probe): a convenience for the
+        # dense route, not the intended fast path for a sparse operator.
+        del like
+        xp = array_namespace(self._values)
+        n = self._shape[1]
+        return self._adapter_op().matmat(xp.eye(n, dtype=self._values.dtype))
+
+
+class COOOperator(_SparseStructured):
+    """Sparse operator from Array-API COO triplets ``(rows, cols, values)``.
+
+    The canonical way to hand the solver a sparse Jacobian or Hessian without a
+    concrete sparse library in user code: the triplets are plain Array-API
+    integer/float vectors in the caller's backend. Duplicate ``(row, col)``
+    entries are summed (matching the adapter), so block assemblies may overlap
+    freely. Pass ``symmetric=True`` for a symmetric block (e.g. a Hessian) to skip
+    the adapter's numerical symmetry test, and ``pattern_key`` to declare the
+    pattern fixed across a solve and unlock symbolic-analysis reuse.
+    """
+
+
+def _expand_indptr(xp: object, indptr: Array, nnz: int) -> Array:
+    """Compressed ``indptr`` → the major-axis index of each stored entry.
+
+    Entry ``e`` belongs to major index ``i`` where ``indptr[i] ≤ e < indptr[i+1]``;
+    ``searchsorted(..., 'right') − 1`` recovers it in one pure Array-API pass (no
+    scatter primitive, which the standard lacks).
+    """
+    arange = xp.arange(nnz)  # type: ignore[attr-defined]
+    return xp.searchsorted(indptr, arange, side="right") - 1  # type: ignore[attr-defined]
+
+
+class CSROperator(_SparseStructured):
+    """Sparse operator from CSR arrays ``(indptr, indices, data)``.
+
+    Ergonomic constructor for callers already holding a CSR matrix (the row
+    pointer has length ``shape[0] + 1``). The compressed rows are expanded to COO
+    coordinates once at construction; everything else is shared with
+    :class:`COOOperator`. CSR/CSC carry no factorization-time speed advantage over
+    COO here — the solver factorizes the *assembled* KKT matrix, not this block —
+    so choose whichever matches the data you already have.
+    """
+
+    def __init__(
+        self,
+        indptr: Array,
+        indices: Array,
+        data: Array,
+        shape: tuple[int, int],
+        *,
+        symmetric: bool | None = None,
+        pattern_key: object | None = None,
+    ) -> None:
+        if len(shape) != 2:
+            raise ValueError("shape must be a (rows, cols) pair")
+        if int(indptr.shape[0]) != int(shape[0]) + 1:
+            raise ValueError("CSR indptr must have length shape[0] + 1")
+        xp = array_namespace(data)
+        rows = _expand_indptr(xp, indptr, int(data.shape[0]))
+        super().__init__(
+            rows,
+            indices,
+            data,
+            shape,
+            symmetric=symmetric,
+            pattern_key=pattern_key,
+        )
+
+
+class CSCOperator(_SparseStructured):
+    """Sparse operator from CSC arrays ``(indptr, indices, data)``.
+
+    Ergonomic constructor for callers already holding a CSC matrix (the column
+    pointer has length ``shape[1] + 1``). The compressed columns are expanded to
+    COO coordinates once at construction; see :class:`CSROperator` on why the
+    compressed format is a convenience, not a performance, choice.
+    """
+
+    def __init__(
+        self,
+        indptr: Array,
+        indices: Array,
+        data: Array,
+        shape: tuple[int, int],
+        *,
+        symmetric: bool | None = None,
+        pattern_key: object | None = None,
+    ) -> None:
+        if len(shape) != 2:
+            raise ValueError("shape must be a (rows, cols) pair")
+        if int(indptr.shape[0]) != int(shape[1]) + 1:
+            raise ValueError("CSC indptr must have length shape[1] + 1")
+        xp = array_namespace(data)
+        cols = _expand_indptr(xp, indptr, int(data.shape[0]))
+        super().__init__(
+            indices,
+            cols,
+            data,
+            shape,
+            symmetric=symmetric,
+            pattern_key=pattern_key,
+        )
+
 
 def as_operator(obj: Array | LinearOperator) -> LinearOperator:
     """Normalize a rank-2 dense array or existing operator."""
@@ -513,6 +955,9 @@ def as_operator(obj: Array | LinearOperator) -> LinearOperator:
 
 
 __all__ = [
+    "COOOperator",
+    "CSCOperator",
+    "CSROperator",
     "Composite",
     "Dense",
     "Diagonal",

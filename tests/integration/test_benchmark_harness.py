@@ -44,6 +44,7 @@ def test_run_case_scores_a_known_optimum(namespace):
         backend="test",
     )
     assert result.correct
+    assert result.converged  # correct is a subset of converged
     assert result.success
     assert result.error is None
     assert result.error_vs_optimum is not None and result.error_vs_optimum <= 1e-6
@@ -79,7 +80,44 @@ def test_run_case_records_failures_without_raising(namespace):
         backend="test",
     )
     assert not result.correct
+    assert not result.converged  # a failed solve reached no KKT point
     assert result.error is not None  # captured, not raised
+
+
+def test_run_case_converged_but_not_correct_when_objective_differs(namespace):
+    # A solve that reaches a valid KKT point but a *different* objective than the
+    # dataset-documented one is `converged` but not `correct` — the tier that
+    # credits convergence to a different local optimum on a nonconvex problem.
+    from benchmarks.corpus import BenchmarkProblem
+
+    class _QP(ipax.Problem):
+        expected_objective = -12345.0  # deliberately wrong "documented" optimum
+
+        @property
+        def n_vars(self) -> int:
+            return 2
+
+        def objective(self, x):
+            return namespace.sum(x * x)
+
+        def gradient(self, x):
+            return 2.0 * x
+
+    case = BenchmarkProblem(
+        name="wrong_opt",
+        kind="NLP",
+        tags=(),
+        build=lambda xp: (_QP(), namespace.asarray([1.0, 1.0])),
+    )
+    result = run_case(
+        case,
+        config="lbfgs/dense",
+        options=ipax.Options(hessian="lbfgs", linsolve="dense"),
+        xp=namespace,
+        backend="test",
+    )
+    assert result.converged  # reached a KKT point (x -> 0, kkt small)
+    assert not result.correct  # but the objective misses the documented value
 
 
 def test_report_round_trips_json_and_markdown(namespace):
@@ -97,3 +135,4 @@ def test_report_round_trips_json_and_markdown(namespace):
     markdown = format_markdown(results, env)
     assert "# ipax quality-control benchmark" in markdown
     assert "bound_qp" in markdown
+    assert "converged" in markdown  # the KKT-convergence tier is reported

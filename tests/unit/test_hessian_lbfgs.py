@@ -41,6 +41,39 @@ def test_lbfgs_update_keeps_positive_curvature(namespace):
     assert float(curvature) > 0.0
 
 
+def test_lbfgs_rmatvec_matches_matvec(namespace, tol):
+    # B is symmetric, so the adjoint apply is the same compact-form apply.
+    v = array(namespace, [0.5, -1.0])
+    with implemented("L-BFGS"):
+        op = LBFGSOperator(2, LBFGSOptions(memory=3))
+        op.update(array(namespace, [1.0, 0.0]), array(namespace, [2.0, 0.5]))
+        assert_allclose(namespace, op.rmatvec(v), op.matvec(v), **tol)
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+def test_lbfgs_update_drops_non_finite_curvature_pair(namespace, bad):
+    # Regression (S2MPJ Task 2, RAT42LS/BRATU1D): when the Lagrangian gradient
+    # overflows at a trial iterate, the curvature pair ``gamma`` is non-finite.
+    # Appending it would corrupt the compact form *permanently* (the poisoned
+    # column survives the memory window, and the Powell/positive-curvature
+    # safeguards do not catch it because ``s_y`` is NaN). The pair must be dropped
+    # so the operator stays finite and usable.
+    good_delta = array(namespace, [1.0, 0.0])
+    good_gamma = array(namespace, [2.0, 0.5])
+    bad_gamma = array(namespace, [bad, 0.5])
+    v = array(namespace, [0.5, -1.0])
+
+    with implemented("L-BFGS"):
+        op = LBFGSOperator(2, LBFGSOptions(memory=3, powell_damping=True))
+        op.update(good_delta, good_gamma)
+        before = op.matvec(v)
+        op.update(good_delta, bad_gamma)  # poisoned pair -> must be ignored
+        after = op.matvec(v)
+
+    assert bool(namespace.all(namespace.isfinite(after)))
+    assert_allclose(namespace, after, before)
+
+
 def test_lbfgs_initial_scaling_option_controls_seed_curvature(namespace):
     delta = array(namespace, [1.0, 0.0])
     gamma = array(namespace, [2.0, 0.0])
@@ -93,6 +126,40 @@ def test_lbfgs_compact_form_reconstructs_operator(namespace, tol):
     u_t_v = namespace.matmul(namespace.permute_dims(u, (1, 0)), v)
     expected = xi * v - namespace.matmul(u, namespace.linalg.solve(m, u_t_v))
     assert_allclose(namespace, op.matvec(v), expected, **tol)
+
+
+def test_lbfgs_matmat_uses_batched_compact_form(namespace, tol):
+    """Multi-RHS application uses one compact solve, not column-wise matvecs."""
+    op = LBFGSOperator(3, LBFGSOptions(memory=5))
+    op.update(array(namespace, [1.0, 0.5, -0.5]), array(namespace, [2.0, 1.0, 0.5]))
+    op.update(array(namespace, [0.5, -1.0, 1.0]), array(namespace, [1.0, 1.5, 0.5]))
+    V = array(namespace, [[0.5, -1.0], [-1.0, 0.25], [2.0, 1.5]])
+
+    xi, u, m = op.compact_form()
+    u_t_v = namespace.matmul(namespace.permute_dims(u, (1, 0)), V)
+    expected = xi * V - namespace.matmul(u, namespace.linalg.solve(m, u_t_v))
+
+    def _explode(_):
+        raise AssertionError("matmat should not fall back to column-wise matvec")
+
+    op.matvec = _explode
+    op.rmatvec = _explode
+
+    assert_allclose(namespace, op.matmat(V), expected, **tol)
+    assert_allclose(namespace, op.rmatmat(V), expected, **tol)
+
+
+def test_lbfgs_dense_matrix_matches_batched_application(namespace, tol):
+    op = LBFGSOperator(3, LBFGSOptions(memory=5))
+    like = array(namespace, [0.0, 0.0, 0.0])
+    identity = namespace.eye(3, dtype=like.dtype)
+
+    assert_allclose(namespace, op.dense_matrix(like), identity, **tol)
+
+    op.update(array(namespace, [1.0, 0.5, -0.5]), array(namespace, [2.0, 1.0, 0.5]))
+    op.update(array(namespace, [0.5, -1.0, 1.0]), array(namespace, [1.0, 1.5, 0.5]))
+
+    assert_allclose(namespace, op.dense_matrix(), op.matmat(identity), **tol)
 
 
 def test_lbfgs_compact_form_unavailable_before_first_pair(namespace):

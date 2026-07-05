@@ -97,6 +97,12 @@ class _RowScaled(LinearOperator):
         xp = array_namespace(values)
         return rows, cols, values * xp.take(self._d, rows), shape
 
+    def coo_pattern_signature(self) -> object | None:
+        signature = self._jac.coo_pattern_signature()
+        if signature is None:
+            return None
+        return ("row_scaled", self.shape, signature)
+
 
 @dataclass(frozen=True, slots=True)
 class ProblemScaling:

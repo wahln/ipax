@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from ipax.backend.namespace import array_namespace
-from ipax.backend.operators import LinearOperator
+from ipax.backend.operators import Diagonal, Identity, LinearOperator
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -158,6 +158,57 @@ def _logical_assembly(op: LinearOperator) -> _Assembly:
     return _Assembly(rows, cols, values, logical_size=shape[0])
 
 
+def _woodbury_factors(
+    d: Array, u: Array, m: Array
+) -> tuple[Array, Array, Array, Array]:
+    """Precompute the reusable pieces of ``(diag(d) − U M⁻¹ Uᵀ)⁻¹``.
+
+    Returns ``(d, D⁻¹U, Uᵀ, M − Uᵀ D⁻¹ U)``. The inner ``r × r`` factor is the
+    expensive part, so callers that apply the inverse repeatedly (the L-BFGS Krylov
+    preconditioner) factor once and reuse across :func:`_woodbury_solve` applies.
+    """
+    xp = array_namespace(d, u, m)
+    inv_d_u = u / xp.expand_dims(d, axis=1)
+    u_t = xp.permute_dims(u, (1, 0))
+    inner = m - xp.matmul(u_t, inv_d_u)
+    return d, inv_d_u, u_t, inner
+
+
+def _woodbury_solve(factors: tuple[Array, Array, Array, Array], rhs: Array) -> Array:
+    """Apply ``(diag(d) − U M⁻¹ Uᵀ)⁻¹`` to ``rhs`` from :func:`_woodbury_factors`.
+
+    ``rhs`` may be a vector or a matrix (columns solved independently): one
+    diagonal inverse plus one ``r × r`` solve, never forming the ``n × n`` operator.
+    """
+    d, inv_d_u, u_t, inner = factors
+    xp = array_namespace(rhs, inv_d_u)
+    if len(rhs.shape) == 1:
+        inv_d_rhs = rhs / d
+    elif len(rhs.shape) == 2:
+        inv_d_rhs = rhs / xp.expand_dims(d, axis=1)
+    else:
+        raise ValueError("Woodbury solve requires a vector or matrix RHS")
+    z = xp.linalg.solve(inner, xp.matmul(u_t, inv_d_rhs))
+    return inv_d_rhs + xp.matmul(inv_d_u, z)
+
+
+def _diagonal_solve(d: Array, rhs: Array) -> Array:
+    """Apply ``diag(d)^-1`` to a vector or columns of a matrix RHS."""
+    xp = array_namespace(d, rhs)
+    if len(rhs.shape) == 1:
+        return rhs / d
+    if len(rhs.shape) == 2:
+        return rhs / xp.expand_dims(d, axis=1)
+    raise ValueError("diagonal solve requires a vector or matrix RHS")
+
+
+def _add_dense_diagonal(matrix: Array, diagonal: Array) -> Array:
+    """Return ``matrix + diag(diagonal)`` without an identity matmat probe."""
+    xp = array_namespace(matrix, diagonal)
+    n = int(diagonal.shape[0])
+    return matrix + xp.eye(n, dtype=matrix.dtype) * diagonal
+
+
 class _CondensedOperator(LinearOperator):
     """Lazy ``W + Sigma_x + J.T @ Sigma_s @ J + delta_w * I`` operator."""
 
@@ -189,14 +240,92 @@ class _CondensedOperator(LinearOperator):
 
     def matvec(self, v: Array) -> Array:
         result = self._W.matvec(v) + self._sigma_x.matvec(v)
-        jv = self._ineq_jac.matvec(v)
-        result = result + self._ineq_jac.rmatvec(self._sigma_s.matvec(jv))
+        if self._ineq_jac.shape[0] > 0:
+            jv = self._ineq_jac.matvec(v)
+            result = result + self._ineq_jac.rmatvec(self._sigma_s.matvec(jv))
         if self._delta_w != 0.0:
             result = result + self._delta_w * v
         return result
 
     def rmatvec(self, v: Array) -> Array:
         return self.matvec(v)
+
+    def matmat(self, V: Array) -> Array:
+        result = self._W.matmat(V) + self._sigma_x.matmat(V)
+        if self._ineq_jac.shape[0] > 0:
+            jv = self._ineq_jac.matmat(V)
+            result = result + self._ineq_jac.rmatmat(self._sigma_s.matmat(jv))
+        if self._delta_w != 0.0:
+            result = result + self._delta_w * V
+        return result
+
+    def rmatmat(self, V: Array) -> Array:
+        return self.matmat(V)
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        """Materialize the condensed dense block from explicit operator pieces."""
+        template = like
+        if template is None:
+            try:
+                template = self._sigma_x.diagonal()
+            except NotImplementedError:
+                template = None
+
+        dense = self._W.dense_matrix(template)
+
+        if isinstance(self._sigma_x, (Diagonal, Identity)):
+            dense = _add_dense_diagonal(dense, self._sigma_x.diagonal(dense))
+        else:
+            dense = dense + self._sigma_x.dense_matrix(dense)
+
+        if self._ineq_jac.shape[0] > 0:
+            xp = array_namespace(dense)
+            jac = self._ineq_jac.dense_matrix(dense)
+            if isinstance(self._sigma_s, (Diagonal, Identity)):
+                sigma_s_jac = xp.expand_dims(self._sigma_s.diagonal(jac), axis=1) * jac
+            else:
+                sigma_s_jac = xp.matmul(self._sigma_s.dense_matrix(jac), jac)
+            dense = dense + xp.matmul(xp.permute_dims(jac, (1, 0)), sigma_s_jac)
+
+        if self._delta_w != 0.0:
+            xp = array_namespace(dense)
+            dense = dense + self._delta_w * xp.eye(self.shape[0], dtype=dense.dtype)
+        return dense
+
+    def dense_structured_solve(self, rhs: Array) -> Array:
+        """Exact dense solve for ``D - U M⁻¹ Uᵀ`` L-BFGS condensed blocks.
+
+        For bound-only L-BFGS systems, ``N = D - U M⁻¹ Uᵀ`` with
+        ``D = ξI + Σ_x + δ_w I``. The Woodbury identity solves ``N rhs = b``
+        through one diagonal inverse and one compact ``2m × 2m`` solve, avoiding
+        the dense ``n × n`` materialization. Inequality Gram terms are intentionally
+        excluded here so this direct path remains exact.
+        """
+        if self._ineq_jac.shape[0] > 0:
+            raise NotImplementedError(
+                "structured dense solve does not handle inequality Gram terms"
+            )
+        if not isinstance(self._sigma_x, Diagonal):
+            raise NotImplementedError(
+                "structured dense solve requires a diagonal Sigma_x block"
+            )
+        sigma_x = self._sigma_x.diagonal()
+        if isinstance(self._W, (Diagonal, Identity)):
+            d = self._W.diagonal(sigma_x) + sigma_x
+            if self._delta_w != 0.0:
+                d = d + self._delta_w
+            return _diagonal_solve(d, rhs)
+
+        compact_form = getattr(self._W, "compact_form", None)
+        if compact_form is None:
+            raise NotImplementedError(
+                "structured dense solve requires an L-BFGS compact Hessian"
+            )
+        xi, u, m_lbfgs = compact_form()
+        d = xi + sigma_x
+        if self._delta_w != 0.0:
+            d = d + self._delta_w
+        return _woodbury_solve(_woodbury_factors(d, u, m_lbfgs), rhs)
 
     def diagonal(self, like: Array | None = None) -> Array:
         """Cheap diagonal for Jacobi preconditioning.
@@ -255,14 +384,14 @@ class _CondensedOperator(LinearOperator):
         else:
             # Assemblable Hessian: W triplets + the Σ_x and δ_w diagonals.
             wr, wc, wv, _ = self._W.to_coo()
+            shift_diag = sigma_x_diag
+            if self._delta_w != 0.0:
+                shift_diag = shift_diag + self._delta_w
+            # Reserve the full diagonal so later δ_w activation changes values,
+            # not sparsity. Sparse solvers can then reuse symbolic analysis.
             rows = xp.concat((wr, idx))
             cols = xp.concat((wc, idx))
-            values = xp.concat((wv, sigma_x_diag))
-            if self._delta_w != 0.0:
-                delta = xp.full((n,), self._delta_w, dtype=values.dtype)
-                rows = xp.concat((rows, idx))
-                cols = xp.concat((cols, idx))
-                values = xp.concat((values, delta))
+            values = xp.concat((wv, shift_diag))
 
         if self._ineq_jac.shape[0] > 0:
             borders.append(_inequality_border(self._ineq_jac, self._sigma_s))
@@ -281,6 +410,59 @@ class _CondensedOperator(LinearOperator):
         del like
         return _border(self.assemble())
 
+    def _value_parts(self) -> tuple[list[Array], list[Array]]:
+        """Return ``(logical_values, border_values)`` in :meth:`to_coo` order.
+
+        The values-only counterpart of :meth:`assemble`: it recomputes just the
+        value arrays that flow into the COO triplet, skipping every index vector
+        (``arange``, the low-rank border's ``_grid_indices`` grids, the concat of
+        row/column coordinates). The solver caches the fixed structure and calls
+        this each iteration, so the per-step assembly cost drops to value work.
+        """
+        sigma_x_diag = self._sigma_x.diagonal()
+        xp = array_namespace(sigma_x_diag)
+        n = self._W.shape[0]
+        logical: list[Array] = []
+        borders: list[Array] = []
+
+        low_rank_form = getattr(self._W, "diagonal_low_rank_form", None)
+        if low_rank_form is not None:
+            try:
+                d, u, m = low_rank_form()
+            except NotImplementedError:
+                d = xp.ones((n,), dtype=sigma_x_diag.dtype)
+                u = m = None
+            logical.append(d + sigma_x_diag + self._delta_w)
+            if u is not None and m is not None and int(u.shape[1]) > 0:
+                r = int(u.shape[1])
+                n_primal = int(u.shape[0])
+                # C = Uᵀ placed as C and Cᵀ (shared value array), then E = M.
+                u_values = xp.reshape(u, (n_primal * r,))
+                borders.append(u_values)
+                borders.append(u_values)
+                borders.append(xp.reshape(m, (r * r,)))
+        else:
+            shift_diag = sigma_x_diag
+            if self._delta_w != 0.0:
+                shift_diag = shift_diag + self._delta_w
+            logical.append(self._W.coo_values())
+            logical.append(shift_diag)
+
+        if self._ineq_jac.shape[0] > 0:
+            # Inequality border: ∇g as C/Cᵀ (shared values), −Σ_s⁻¹ as the E block.
+            g_values = self._ineq_jac.coo_values()
+            borders.append(g_values)
+            borders.append(g_values)
+            borders.append(-1.0 / self._sigma_s.diagonal())
+
+        return logical, borders
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        del like
+        logical, borders = self._value_parts()
+        xp = array_namespace(logical[0])
+        return xp.concat(tuple(logical + borders))
+
     def symmetry_hint(self) -> bool:
         """The condensed block (and its symmetric borders) is symmetric exactly.
 
@@ -289,6 +471,40 @@ class _CondensedOperator(LinearOperator):
         ``A == Aᵀ`` — the sparse-direct route can skip its numerical symmetry test.
         """
         return True
+
+    def coo_pattern_signature(self) -> object | None:
+        """Stable sparse structure key, or ``None`` for value-dependent patterns."""
+        low_rank_form = getattr(self._W, "diagonal_low_rank_form", None)
+        if low_rank_form is not None:
+            try:
+                _, u, _ = low_rank_form()
+            except NotImplementedError:
+                hessian_signature: object = ("diagonal_low_rank", self._W.shape, 0)
+            else:
+                hessian_signature = (
+                    "diagonal_low_rank",
+                    self._W.shape,
+                    int(u.shape[1]),
+                )
+        else:
+            hessian_signature = self._W.coo_pattern_signature()
+            if hessian_signature is None:
+                return None
+
+        ineq_signature: object | None = None
+        if self._ineq_jac.shape[0] > 0:
+            ineq_signature = self._ineq_jac.coo_pattern_signature()
+            if ineq_signature is None:
+                return None
+
+        return (
+            "condensed",
+            self.shape,
+            hessian_signature,
+            self._sigma_x.shape,
+            self._ineq_jac.shape,
+            ineq_signature,
+        )
 
     def expected_inertia(self) -> tuple[int, int, int] | None:
         """IPOPT target inertia ``(n₊, n₋, n₀)`` of the assembled bordered system.
@@ -346,25 +562,16 @@ class _CondensedOperator(LinearOperator):
                 "L-BFGS-aware preconditioner requires an L-BFGS Hessian block"
             )
         xi, u, m_lbfgs = compact_form()
-        xp = array_namespace(u)
-
         d_tilde = xi + self._sigma_x.diagonal()
         if self._ineq_jac.shape[0] > 0:
             d_tilde = d_tilde + self._ineq_jac.gram_diagonal(self._sigma_s.diagonal())
         if self._delta_w != 0.0:
             d_tilde = d_tilde + self._delta_w
 
-        inv_dt = 1.0 / d_tilde
-        u_t = xp.permute_dims(u, (1, 0))  # (2k, n)
-        # Inner factor M − Uᵀ D̃⁻¹ U (2k×2k), nonsingular for PD N.
-        inner = m_lbfgs - xp.matmul(u_t * inv_dt, u)
-
-        def apply(r: Array) -> Array:
-            w = xp.matmul(u_t, inv_dt * r)
-            z = xp.linalg.solve(inner, w)
-            return inv_dt * (r + xp.matmul(u, z))
-
-        return apply
+        # Factor the 2k×2k inner block once (nonsingular for PD N); each apply is
+        # then one diagonal inverse plus one small solve via Sherman–Morrison–Woodbury.
+        factors = _woodbury_factors(d_tilde, u, m_lbfgs)
+        return lambda r: _woodbury_solve(factors, r)
 
 
 def build_condensed_operator(
@@ -422,6 +629,71 @@ class _SaddleOperator(LinearOperator):
     def rmatvec(self, v: Array) -> Array:
         return self.matvec(v)
 
+    def matmat(self, V: Array) -> Array:
+        xp = array_namespace(V)
+        v_x = V[: self._n, :]
+        v_y = V[self._n :, :]
+        top = self._condensed.matmat(v_x) + self._eq_jac.rmatmat(v_y)
+        bottom = self._eq_jac.matmat(v_x) - self._delta_c * v_y
+        return xp.concat((top, bottom), axis=0)
+
+    def rmatmat(self, V: Array) -> Array:
+        return self.matmat(V)
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        """Materialize the bordered saddle block from explicit dense pieces."""
+        n_dense = self._condensed.dense_matrix(like)
+        if self._m == 0:
+            return n_dense
+
+        xp = array_namespace(n_dense)
+        eq = self._eq_jac.dense_matrix(n_dense)
+        top = xp.concat((n_dense, xp.permute_dims(eq, (1, 0))), axis=1)
+        bottom = xp.concat(
+            (eq, -self._delta_c * xp.eye(self._m, dtype=n_dense.dtype)), axis=1
+        )
+        return xp.concat((top, bottom), axis=0)
+
+    def dense_structured_solve(self, rhs: Array) -> Array:
+        """Exact Schur-complement solve using a structured condensed inverse.
+
+        Propagates ``NotImplementedError`` from the condensed block (e.g. a
+        non-L-BFGS Hessian or an inequality Gram term), so the dense solver falls
+        back to materialization for systems without exploitable structure.
+        """
+        xp = array_namespace(rhs)
+        if len(rhs.shape) == 1:
+            vector_rhs = True
+            rhs_x = xp.expand_dims(rhs[: self._n], axis=1)
+            rhs_y = xp.expand_dims(rhs[self._n :], axis=1)
+        elif len(rhs.shape) == 2:
+            vector_rhs = False
+            rhs_x = rhs[: self._n, :]
+            rhs_y = rhs[self._n :, :]
+        else:
+            raise ValueError("saddle structured dense solve requires vector/matrix RHS")
+
+        if self._m == 0:
+            solution = self._condensed.dense_structured_solve(rhs_x)
+            return solution[:, 0] if vector_rhs else solution
+
+        identity_y = xp.eye(self._m, dtype=rhs.dtype)
+        eq_t = self._eq_jac.rmatmat(identity_y)
+        n_rhs = int(rhs_x.shape[1])
+        batch_rhs = xp.concat((rhs_x, eq_t), axis=1)
+        solved = self._condensed.dense_structured_solve(batch_rhs)
+        n_inv_rhs = solved[:, :n_rhs]
+        n_inv_eq_t = solved[:, n_rhs:]
+
+        schur = self._eq_jac.matmat(n_inv_eq_t)
+        if self._delta_c != 0.0:
+            schur = schur + self._delta_c * identity_y
+        rhs_schur = self._eq_jac.matmat(n_inv_rhs) - rhs_y
+        dy = xp.linalg.solve(schur, rhs_schur)
+        dx = n_inv_rhs - xp.matmul(n_inv_eq_t, dy)
+        solution = xp.concat((dx, dy), axis=0)
+        return solution[:, 0] if vector_rhs else solution
+
     def preferred_krylov_method(self) -> Literal["minres"]:
         """The equality saddle is symmetric indefinite, so MINRES is the route."""
         return "minres"
@@ -445,7 +717,7 @@ class _SaddleOperator(LinearOperator):
         rows = xp.concat((inner.rows, er + n, ec))
         cols = xp.concat((inner.cols, ec, er + n))
         values = xp.concat((inner.values, ev, ev))
-        if self._delta_c != 0.0:
+        if m > 0:
             didx = xp.arange(m) + n
             delta = xp.full((m,), -self._delta_c, dtype=values.dtype)
             rows = xp.concat((rows, didx))
@@ -465,10 +737,53 @@ class _SaddleOperator(LinearOperator):
         del like
         return _border(self.assemble())
 
+    def coo_values(self, like: Array | None = None) -> Array:
+        """Values-only assembly in :meth:`to_coo` order (see condensed analogue).
+
+        Order: condensed *logical* values, the equality blocks ``∇c``/``∇cᵀ``
+        (one shared value array), the ``−δ_c`` (2,2) diagonal, then the condensed
+        block's border values — matching :meth:`assemble` followed by
+        :func:`_border` without rebuilding any index vector.
+        """
+        del like
+        value_parts = getattr(self._condensed, "_value_parts", None)
+        if value_parts is not None:
+            logical, borders = value_parts()
+        else:  # generic condensed block: no structure/value split available
+            logical, borders = [self._condensed.coo_values()], []
+        xp = array_namespace(logical[0])
+        parts = list(logical)
+        ev = self._eq_jac.coo_values()
+        parts.append(ev)
+        parts.append(ev)
+        if self._m > 0:
+            parts.append(xp.full((self._m,), -self._delta_c, dtype=logical[0].dtype))
+        parts.extend(borders)
+        return xp.concat(tuple(parts))
+
     def symmetry_hint(self) -> bool:
         """The saddle is symmetric: ``∇c``/``∇cᵀ`` mirror one value array, the
         ``−δ_c`` (2,2) block is diagonal, and the condensed block is symmetric."""
         return True
+
+    def coo_pattern_signature(self) -> object | None:
+        condensed_signature = self._condensed.coo_pattern_signature()
+        if condensed_signature is None:
+            return None
+
+        eq_signature: object | None = None
+        if self._m > 0:
+            eq_signature = self._eq_jac.coo_pattern_signature()
+            if eq_signature is None:
+                return None
+
+        return (
+            "saddle",
+            self.shape,
+            condensed_signature,
+            self._eq_jac.shape,
+            eq_signature,
+        )
 
     def expected_inertia(self) -> tuple[int, int, int] | None:
         """IPOPT target inertia of the assembled saddle, or ``None``.
@@ -513,13 +828,61 @@ class _SaddleOperator(LinearOperator):
         diag_n = self._condensed.diagonal()
         xp = array_namespace(diag_n)
         try:
-            schur = self._eq_jac.row_gram_diagonal(1.0 / diag_n)
+            # A zero ``diag(N)`` entry (e.g. an identically-zero exact Hessian at
+            # the start point with ``δ_w = 0``) makes the whole diagonal unusable —
+            # the solver's positivity check discards it — but ``1/0`` would emit
+            # divide-by-zero warnings; substitute 1 to keep the build quiet.
+            safe_n = xp.where(diag_n == 0.0, xp.ones_like(diag_n), diag_n)
+            schur = self._eq_jac.row_gram_diagonal(1.0 / safe_n)
             dual = self._delta_c + schur
         except NotImplementedError:
             # Primal-only preconditioning: SPD identity on the (strictly positive)
             # dual block keeps the whole preconditioner SPD.
             dual = xp.ones((self._m,), dtype=diag_n.dtype)
         return xp.concat((diag_n, dual))
+
+    def _approximate_schur_diagonal(self, diag_n: Array) -> Array:
+        """Positive approximate-Schur dual diagonal ``δ_c + diag(∇c diag(N)⁻¹ ∇cᵀ)``.
+
+        Shared with :meth:`spd_preconditioner_diagonal`; clamped strictly positive
+        so ``1/S`` stays finite and the block preconditioner stays SPD (a zero
+        row of ``∇c`` with ``δ_c = 0`` would otherwise divide by zero).
+        """
+        xp = array_namespace(diag_n)
+        try:
+            dual = self._delta_c + self._eq_jac.row_gram_diagonal(1.0 / diag_n)
+        except NotImplementedError:
+            dual = xp.ones((self._m,), dtype=diag_n.dtype)
+        return xp.where(dual > 0.0, dual, xp.ones_like(dual))
+
+    def lbfgs_block_preconditioner_apply(self) -> Callable[[Array], Array]:
+        """Block-diagonal SPD preconditioner ``diag(N⁻¹, S⁻¹)`` for the saddle (§5.2).
+
+        Upgrades :meth:`spd_preconditioner_diagonal`'s (1,1) block from ``diag(N)``
+        to the full L-BFGS-aware Woodbury inverse ``N⁻¹`` (Murphy–Golub–Wathen
+        2000)::
+
+            ┌ N⁻¹                                 0 ┐
+            └ 0    (δ_c + diag(∇c diag(N)⁻¹ ∇cᵀ))⁻¹ ┘
+
+        ``N⁻¹`` folds the L-BFGS low-rank and ``Σ_x`` in exactly (only the
+        inequality Gram off-diagonal is approximated), so on the equality saddle it
+        clusters the spectrum far better than the diagonal Jacobi block — but it is
+        *non-diagonal*, so it is applied by GMRES (left preconditioning), not the
+        symmetric-scaling MINRES path. Raises ``NotImplementedError`` when the
+        condensed block exposes no L-BFGS compact form (exact/matrix-free Hessian).
+        """
+        n_inverse = self._condensed.lbfgs_inverse_apply()  # raises without L-BFGS
+        if self._m == 0:
+            return n_inverse
+        n = self._n
+        inv_dual = 1.0 / self._approximate_schur_diagonal(self._condensed.diagonal())
+        xp = array_namespace(inv_dual)
+
+        def apply(r: Array) -> Array:
+            return xp.concat((n_inverse(r[:n]), inv_dual * r[n:]))
+
+        return apply
 
 
 def build_saddle_operator(

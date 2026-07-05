@@ -14,6 +14,13 @@ model is evaluated on the host. This is for accuracy / cross-backend consistency
 benchmarking; it forces a host sync per evaluation, so it is *not* for GPU
 performance work (use the synthetic RT generator / TROTS surrogate there).
 
+S2MPJ's generic ``evalgrsum`` evaluation loop is interpretive (per-element
+``eval()`` dispatch, ``lil_matrix`` row assembly) and dominates sweep wall-time,
+so the bridge routes ``fx/fgx/cx/cJx`` through the **precompiled evaluator** in
+:mod:`benchmarks.corpus._s2mpj_fast` whenever it verifies against the original
+methods at build time (else it falls back to the originals — see that module's
+docstring for the mechanism and measured speedups).
+
 S2MPJ has no license file, so its files are **not vendored**. Point
 ``IPAX_S2MPJ_DIR`` (or the ``directory`` argument) at a local checkout; the loader
 returns ``[]`` when it is absent, mirroring the other external corpora.
@@ -123,6 +130,23 @@ class _S2MPJProblem(Problem):
         m = int(getattr(instance, "m", 0))
         self._m = m
 
+        # Precompiled evaluator, verified against the original methods at build
+        # time (None → keep the originals). Cached on the shared instance, so the
+        # per-config rebuilds of the same problem verify once.
+        from benchmarks.corpus._s2mpj_fast import fast_evaluator
+
+        self._fast = fast_evaluator(instance)
+
+        # Per-point memo of the full constraint value/Jacobian. S2MPJ bundles all
+        # constraints in one ``cx``/``cJx`` call (each ~10–16 ms of pure-Python
+        # ``eval`` + scipy-sparse assembly — ~100× the objective), and the IPM
+        # evaluates equalities and inequalities at the *same* point back-to-back, so
+        # a size-1 cache keyed on the point halves the dominant benchmark cost.
+        self._cx_key: bytes | None = None
+        self._cx_val: Any = None
+        self._cJx_key: bytes | None = None
+        self._cJx_val: Any = None
+
         # ``clower``/``cupper`` exist only when the problem has constraints.
         clower_attr = getattr(instance, "clower", None)
         cupper_attr = getattr(instance, "cupper", None)
@@ -164,6 +188,19 @@ class _S2MPJProblem(Problem):
     def bounds(self) -> tuple[Array | None, Array | None]:
         return self._lower, self._upper
 
+    # -- evaluation dispatch: verified fast evaluator, else the original -----
+    def _eval_fx(self, x_np: Any) -> Any:
+        return (self._fast or self._inst).fx(x_np)
+
+    def _eval_fgx(self, x_np: Any) -> Any:
+        return (self._fast or self._inst).fgx(x_np)
+
+    def _eval_cx(self, x_np: Any) -> Any:
+        return (self._fast or self._inst).cx(x_np)
+
+    def _eval_cJx(self, x_np: Any) -> Any:
+        return (self._fast or self._inst).cJx(x_np)
+
     def objective(self, x: Array) -> Scalar:
         import numpy as np
 
@@ -176,7 +213,7 @@ class _S2MPJProblem(Problem):
         # Python float) so the value keeps the backend dtype — a Python float
         # re-cast via ``xp.asarray`` would silently drop to float32 on Torch.
         try:
-            val = np.asarray(self._inst.fx(_to_numpy(x)))
+            val = np.asarray(self._eval_fx(_to_numpy(x)))
         except (OverflowError, FloatingPointError):
             val = np.asarray(np.inf)
         return _from_numpy(self.xp, val)
@@ -187,25 +224,51 @@ class _S2MPJProblem(Problem):
         if self._no_objective:  # constant objective ⇒ zero gradient
             return _from_numpy(self.xp, np.zeros((self._n,)))
         try:
-            _f, g = self._inst.fgx(_to_numpy(x))
+            _f, g = self._eval_fgx(_to_numpy(x))
             g = np.reshape(g, (-1,))
         except (OverflowError, FloatingPointError):
             g = np.full((self._n,), np.inf)
         return _from_numpy(self.xp, g)
 
+    # -- shared per-point constraint value / Jacobian (memoized) -----------
+    def _cx(self, x_np: Any) -> Any:
+        """S2MPJ full constraint vector ``c(x)``, memoized on the last point."""
+        import numpy as np
+
+        key = x_np.tobytes()
+        if key != self._cx_key:
+            self._cx_key = key
+            self._cx_val = np.reshape(
+                np.asarray(self._eval_cx(x_np), dtype=float), (-1,)
+            )
+        return self._cx_val
+
+    def _cJx(self, x_np: Any) -> Any:
+        """S2MPJ constraint Jacobian ``(c, ∇c)``, memoized on the last point."""
+        import numpy as np
+
+        key = x_np.tobytes()
+        if key != self._cJx_key:
+            self._cJx_key = key
+            self._cJx_val = self._eval_cJx(x_np)
+            # cJx returns c(x) alongside the Jacobian; seed the value memo so the
+            # driver's same-point eq/ineq *value* requests skip a full cx call.
+            c, _jac = self._cJx_val
+            self._cx_key = key
+            self._cx_val = np.reshape(np.asarray(c, dtype=float), (-1,))
+        return self._cJx_val
+
     # -- equalities (present only when S2MPJ has clower == cupper rows) ----
     def eq_constraints(self, x: Array) -> Array:
         if self._eq_idx.shape[0] == 0:
             raise NotImplementedError
-        import numpy as np
-
-        c = np.reshape(np.asarray(self._inst.cx(_to_numpy(x)), dtype=float), (-1,))
+        c = self._cx(_to_numpy(x))
         return _from_numpy(self.xp, c[self._eq_idx] - self._eq_rhs)
 
     def eq_jacobian(self, x: Array) -> Array | LinearOperator:
         if self._eq_idx.shape[0] == 0:
             raise NotImplementedError
-        _c, jac = self._inst.cJx(_to_numpy(x))
+        _c, jac = self._cJx(_to_numpy(x))
         if self._sparse:
             return self._sparse_op(jac.tocsr()[self._eq_idx, :])
         return _from_numpy(self.xp, jac.toarray()[self._eq_idx, :])
@@ -216,7 +279,7 @@ class _S2MPJProblem(Problem):
             raise NotImplementedError
         import numpy as np
 
-        c = np.reshape(np.asarray(self._inst.cx(_to_numpy(x)), dtype=float), (-1,))
+        c = self._cx(_to_numpy(x))
         lo = self._lo_rhs - c[self._lo_idx]
         up = c[self._up_idx] - self._up_rhs
         return _from_numpy(self.xp, np.concatenate((lo, up)))
@@ -226,7 +289,7 @@ class _S2MPJProblem(Problem):
             raise NotImplementedError
         import numpy as np
 
-        _c, jac = self._inst.cJx(_to_numpy(x))
+        _c, jac = self._cJx(_to_numpy(x))
         # Lower side ``clower − c`` contributes ``−∇c``; upper side ``c − cupper``
         # contributes ``+∇c`` (matches the constraint-value lowering above).
         if self._sparse:
@@ -279,18 +342,26 @@ class _S2MPJProblem(Problem):
     ) -> Any:
         """Assemble ``σ∇²f + Σ y·∇²c`` as a host ``scipy.sparse`` matrix.
 
-        ``LgHxy`` returns ``∇²f + Σ Y_i ∇²c_i`` (no objective scaling); the
-        ``σ ≠ 1`` correction adds ``(σ−1)∇²f`` via a constraint-free call, so the
-        result is correct under gradient-based scaling, where the driver passes
-        ``σ = s_f`` through the scaling wrapper.
+        ``LgHxy`` returns ``∇²f + Σ Y_i ∇²c_i`` (no objective scaling). For the
+        common ``σ > 0`` case (gradient-based scaling passes ``σ = s_f`` through
+        the scaling wrapper) the identity ``σ∇²f + Σ Y∇²c = σ·(∇²f + Σ(Y/σ)∇²c)``
+        folds the objective scaling into the multipliers, so one ``LgHxy`` call
+        suffices — ``LgHxy`` costs a full interpretive Hessian assembly, so the
+        old two-call ``(σ−1)∇²f`` correction doubled the exact-Hessian bridge
+        cost. ``σ ≤ 0`` keeps the general two-call form.
         """
         import numpy as np
 
         s = float(sigma)
         xcol = np.reshape(_to_numpy(x), (-1, 1))
         Y = self._s2mpj_multipliers(y_eq, y_ineq)
-        _lval, _grad, hess = self._inst.LgHxy(xcol, np.reshape(Y, (-1, 1)))
-        if s != 1.0:
+        if s == 1.0:
+            _lval, _grad, hess = self._inst.LgHxy(xcol, np.reshape(Y, (-1, 1)))
+        elif s > 0.0:
+            _lval, _grad, hess = self._inst.LgHxy(xcol, np.reshape(Y / s, (-1, 1)))
+            hess = s * hess
+        else:
+            _lval, _grad, hess = self._inst.LgHxy(xcol, np.reshape(Y, (-1, 1)))
             _l0, _g0, hess_f = self._inst.LgHxy(xcol, np.zeros((self._m, 1)))
             hess = hess + (s - 1.0) * hess_f
         return hess

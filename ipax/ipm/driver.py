@@ -63,7 +63,11 @@ from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
 from ipax.ipm.restoration import restore
 from ipax.ipm.step import NewtonStep, recover_eliminated
 from ipax.ipm.termination import ConditionChecker
-from ipax.linalg.regularize import RegularizationState, escalate_delta_w
+from ipax.linalg.regularize import (
+    RegularizationState,
+    escalate_delta_c,
+    escalate_delta_w,
+)
 from ipax.linalg.solver import LinearSolveError
 from ipax.problem.autodiff import get_autodiff_adapter
 from ipax.result import (
@@ -97,6 +101,19 @@ _MAX_MU_REDUCTIONS = 64
 # non-finite even though the iterate is essentially optimal (IPOPT
 # ``acceptable_tol`` ≈ 1e2 × ``tol``).
 _STEP_FAILURE_ACCEPT_FACTOR = 1e2
+# eq. (18): the filter guard region is {θ ≥ θ_max} with θ_max = 1e4·max(1, θ(x0)).
+# Bounds how infeasible an accepted trial may be, so an f-type step whose barrier
+# objective collapses cannot be taken while the constraint violation explodes.
+_THETA_MAX_FACTOR = 1e4
+# A restoration that signals local infeasibility is only believed when the
+# returned iterate is *actually* infeasible by the driver's own θ metric — its
+# violation must exceed this multiple of the constraint-violation tolerance.
+# Restoration's raw ℓ∞ measure can stall a hair above its own (differently
+# scaled) tolerance at a point the solver considers feasible; declaring such a
+# point "locally infeasible" is a contradiction (S2MPJ Task 1: HS13/HS56/HS72).
+# The multiple is generous but far below any genuinely-infeasible stationary
+# point (whose violation is bounded away from zero, ≫ tol).
+_RESTORATION_INFEASIBLE_FACTOR = 1e3
 
 
 def _norm_inf(xp: Namespace, v: Array) -> float:
@@ -129,6 +146,30 @@ def _within_relaxed_tol(
     )
     enabled = [(tol, value) for tol, value in checks if tol is not None]
     return bool(enabled) and all(value <= factor * tol for tol, value in enabled)
+
+
+def _restoration_reports_infeasible(
+    theta_restored: float, optimality: OptimalityConditionOptions
+) -> bool:
+    """Whether a restoration "infeasible" signal should be believed.
+
+    Restoration minimizes the constraint infeasibility and reports local
+    infeasibility when it stalls with the violation above its own tolerance. That
+    verdict is only trustworthy when the returned iterate is *genuinely*
+    infeasible by the driver's own θ — its violation must exceed
+    :data:`_RESTORATION_INFEASIBLE_FACTOR` × the constraint-violation tolerance.
+    Restoration's raw ℓ∞ measure is scaled differently and can stall a hair above
+    its threshold at a point that is feasible here (a degenerate optimum where
+    constraint qualification fails, or a limit cycle that keeps re-reaching
+    feasibility); reporting such a point as infeasible would contradict the fact
+    that it is feasible (S2MPJ Task 1). A genuinely infeasible stationary point
+    has a violation bounded well away from zero, far above this threshold.
+    """
+    tol = optimality.constr_viol_tol
+    feasible_tol = _RESTORATION_INFEASIBLE_FACTOR * (
+        tol if tol is not None else optimality.kkt_tol
+    )
+    return theta_restored > feasible_tol
 
 
 def _classify_step_failure(
@@ -290,17 +331,20 @@ class IPMDriver:
         y_ineq: Array,
         lbfgs: LBFGSOperator,
     ) -> LinearOperator:
-        """Lagrangian Hessian operator, by precedence (§3.2, §4.3).
+        """Lagrangian Hessian operator, by the resolved source (§3.2, §4.3).
 
-        - An analytic ``lagrangian_hessian`` is used whenever supplied, with the
-          current nonlinear equality/inequality multipliers (so ``W`` carries
-          the constraint curvature ``Σ y·∇²c`` for nonconvex problems). Linear
+        The source was decided once by ``derivatives.resolve`` (honoring
+        ``options.hessian``) and recorded in ``self._sources.hessian``:
+
+        - ``"exact"``: an analytic ``lagrangian_hessian``, with the current
+          nonlinear equality/inequality multipliers (so ``W`` carries the
+          constraint curvature ``Σ y·∇²c`` for nonconvex problems). Linear
           equalities are intentionally sliced away because their Hessian term is
           zero by contract.
-        - ``hessian="autodiff-hvp"``: exact Hessian-vector products of the
-          Lagrangian via the backend autodiff adapter (no matrix formed).
-        - ``hessian="lbfgs"`` (default): the persistent Powell-damped L-BFGS
-          approximation, whose curvature pairs the driver updates each step.
+        - ``"autodiff-hvp"``: exact Hessian-vector products of the Lagrangian via
+          the backend autodiff adapter (no matrix formed).
+        - ``"lbfgs"``: the persistent Powell-damped L-BFGS approximation, whose
+          curvature pairs the driver updates each step.
         """
         if self._has_analytic_hessian:
             hessian = self._time_problem_call(
@@ -309,9 +353,9 @@ class IPMDriver:
                 )
             )
             return as_operator(hessian)
-        if self._options.hessian == "autodiff-hvp":
+        if self._sources.hessian == "autodiff-hvp":
             return self._autodiff_hvp_operator(x, y_eq_nonlinear, y_ineq)
-        if self._options.hessian == "lbfgs":
+        if self._sources.hessian == "lbfgs":
             return lbfgs
         raise RuntimeError("no Hessian operator is available for this solve")
 
@@ -501,6 +545,8 @@ class IPMDriver:
 
         filt = Filter()
         line_search = FilterLineSearch(opts.line_search)
+        # eq. (18): θ_max guard, fixed from the initial constraint violation.
+        theta_max = _THETA_MAX_FACTOR * max(1.0, self._theta_l1(x, s, m, m_eq))
         breedveld = BreedveldController(opts.breedveld)
         use_breedveld = opts.globalization == "breedveld"
 
@@ -510,7 +556,9 @@ class IPMDriver:
         # top of each iteration from the just-completed step, so the Hessian
         # used this iteration reflects every accepted step so far.
         lbfgs = LBFGSOperator(n, opts.lbfgs)
-        use_lbfgs = (not self._has_analytic_hessian) and opts.hessian == "lbfgs"
+        use_lbfgs = (
+            not self._has_analytic_hessian
+        ) and self._sources.hessian == "lbfgs"
         prev_x: Array | None = None
         prev_grad: Array | None = None
         prev_ineq_jac: LinearOperator | None = None
@@ -571,6 +619,10 @@ class IPMDriver:
             }
             residuals = self.kkt_error(mu=0.0, **err_kwargs)
             e0 = residuals.error
+            # Feed the current outer KKT residual to the linear solver so an
+            # iterative route can drive an inexact-Newton forcing sequence (loose
+            # early, tight near convergence); direct solvers ignore it.
+            self._solver.set_outer_residual(e0)
             theta = self._theta(
                 x, g, s, c, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
             )
@@ -614,6 +666,17 @@ class IPMDriver:
             if decision is not None:
                 status = decision.status
                 message = decision.message
+                break
+            # IPOPT-style diverging-iterates test: an unbounded-below problem drives
+            # ‖x‖ off to infinity while the KKT residual never falls (e.g. INDEF).
+            # Report it honestly as UNBOUNDED rather than waiting for the runaway
+            # iterate to overflow into a NUMERICAL_ERROR.
+            if (
+                opts.diverging_iterates_tol is not None
+                and float(xp.max(xp.abs(x))) > opts.diverging_iterates_tol
+            ):
+                status = Status.UNBOUNDED
+                message = "iterates diverging; the problem may be unbounded below"
                 break
             if (
                 opts.max_time is not None
@@ -761,6 +824,21 @@ class IPMDriver:
                     self._phi(x_t, s_t, mu, m, mask_l, mask_u, lower_safe, upper_safe),
                 )
 
+            def grad_finite(
+                alpha: float,
+                x: Array = x,
+                step: NewtonStep = step,
+            ) -> bool:
+                """Whether the objective gradient at the trial point is finite.
+
+                A quasi-Newton step can overshoot into a region where θ/φ are
+                still finite but the derivatives overflow (inf/NaN) — accepting it
+                poisons the next KKT solve. Used only on the L-BFGS route, where
+                the overshoot occurs; the exact route's scaled steps do not need
+                the extra gradient evaluation.
+                """
+                return bool(xp.all(xp.isfinite(self._gradient(x + alpha * step.dx))))
+
             soc_primal: tuple[Array, Array] | None = None
 
             def is_strictly_interior(x_t: Array, s_t: Array) -> bool:
@@ -828,6 +906,11 @@ class IPMDriver:
                 s_soc = base_s + corr_s if m > 0 else s
                 if not is_strictly_interior(x_soc, s_soc):
                     return None
+                # Reject a corrected trial whose derivatives overflow (see
+                # ``grad_finite``): the SOC point has its own gradient, distinct
+                # from ``x + α d``, so the line search cannot check it for us.
+                if use_lbfgs and not bool(xp.all(xp.isfinite(self._gradient(x_soc)))):
+                    return None
 
                 soc_primal = (
                     alpha * step.dx + corr_x,
@@ -869,9 +952,11 @@ class IPMDriver:
                     theta0=theta0,
                     phi0=phi0,
                     dphi=dphi,
+                    theta_max=theta_max,
                     eval_point=eval_point,
                     entries=filt.entries,
                     soc=soc,
+                    grad_finite=grad_finite if use_lbfgs else None,
                 )
                 alpha_p = result.alpha
                 restoration = result.restoration
@@ -895,7 +980,18 @@ class IPMDriver:
                 x, s, infeasible = self._restore(
                     x, s, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
                 )
-                if infeasible:
+                # Only believe an "infeasible" verdict when the returned iterate
+                # is genuinely infeasible by the driver's own θ. Restoration's raw
+                # ℓ∞ measure can stall marginally above its (differently scaled)
+                # tolerance at a point that is feasible here — declaring it locally
+                # infeasible would be a false claim (S2MPJ Task 1). A feasible
+                # restored point means restoration stalled on *optimality*, not
+                # feasibility, so resume the main iteration from it (a genuine
+                # limit cycle then terminates at the iteration/time budget rather
+                # than as a false "infeasible").
+                if infeasible and _restoration_reports_infeasible(
+                    self._theta_l1(x, s, m, m_eq), self._options.optimality
+                ):
                     status = Status.INFEASIBLE
                     message = (
                         "locally infeasible: restoration could not reduce the "
@@ -1241,12 +1337,47 @@ class IPMDriver:
         sigma_x_op = Diagonal(sigma_x)
         sigma_s_op = Diagonal(sigma_s)
         empty = xp.zeros((0,), dtype=rhs_x.dtype)
+        # δ_c is escalated on a failed saddle solve only as a *last resort*: δ_w
+        # cannot repair a rank-deficient equality Jacobian (which leaves the
+        # saddle singular in the (2,2) dual block), only δ_c can (W&B 2006,
+        # §3.1). It is threaded locally, so it grows only within this failing
+        # solve.
+        current_delta_c = delta_c
+
+        reg_opts = self._options.regularization
+        # Two-phase ladder. Phase 1 escalates δ_w alone: an indefinite (1,1)
+        # block — including one carrying exploded-multiplier curvature ~1e8–1e9
+        # (HS61) — is repaired by δ_w by itself, and any δ_c mixed into that
+        # repair distorts the dual step exactly when it must correct the
+        # multipliers (HS61 cycled forever on a (2.3e9, 2.6e-3) step where the
+        # (2.3e9, 1e-8) step recovered). Only once δ_w has grown past
+        # `delta_c_trigger` without success is the failure attributed to the
+        # dual block: phase 2 then *resets δ_w to the floor* — a huge δ_w left
+        # in place would poison the very solve δ_c is meant to rescue — and
+        # escalates both from small values.
+        in_dual_phase = False
+
+        def escalate() -> None:
+            nonlocal current_delta_c, in_dual_phase
+            if (
+                m_eq > 0
+                and not in_dual_phase
+                and reg.delta_w >= reg_opts.delta_c_trigger
+            ):
+                in_dual_phase = True
+                reg.delta_w = 0.0  # restart the δ_w ladder at its floor
+                current_delta_c = escalate_delta_c(current_delta_c, reg_opts)
+                return
+            escalate_delta_w(reg, reg_opts)
+            if in_dual_phase:
+                current_delta_c = escalate_delta_c(current_delta_c, reg_opts)
+
         for _ in range(_MAX_REG_ATTEMPTS):
             condensed = build_condensed_operator(
                 w, sigma_x_op, sigma_s_op, ineq_jac, reg
             )
             if m_eq > 0:
-                operator = build_saddle_operator(condensed, eq_jac, delta_c)
+                operator = build_saddle_operator(condensed, eq_jac, current_delta_c)
                 rhs = xp.concat((rhs_x, r_y))
             else:
                 operator = condensed
@@ -1255,16 +1386,18 @@ class IPMDriver:
                 self._solver.factor(operator)
                 sol = self._solver.solve(rhs)
             except LinearSolveError:
-                escalate_delta_w(reg, self._options.regularization)
+                escalate()
                 logger.debug(
-                    "factorization failed; escalating delta_w to %.2e", reg.delta_w
+                    "factorization failed; escalating delta_w to %.2e, delta_c to %.2e",
+                    reg.delta_w,
+                    current_delta_c,
                 )
                 continue
             if not self._inertia_acceptable(operator):
                 # A symmetric-indefinite LDLᵀ can succeed with the *wrong* inertia
                 # (a non-descent step the failure path never sees); IPOPT bumps
                 # δ_w until the (1,1) block is PD (Wächter & Biegler 2006, §3.1).
-                escalate_delta_w(reg, self._options.regularization)
+                escalate()
                 logger.debug(
                     "KKT inertia mismatch; escalating delta_w to %.2e", reg.delta_w
                 )
@@ -1273,7 +1406,7 @@ class IPMDriver:
                 dx = sol[: self._n]
                 dy = sol[self._n :] if m_eq > 0 else empty
                 return dx, dy, reg.delta_w, True
-            escalate_delta_w(reg, self._options.regularization)
+            escalate()
             logger.debug("non-finite step; escalating delta_w to %.2e", reg.delta_w)
         return rhs_x, empty, reg.delta_w, False
 

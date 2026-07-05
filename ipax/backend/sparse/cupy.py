@@ -35,10 +35,18 @@ from typing import TYPE_CHECKING, Any, cast
 
 # Allowed import boundary (invariants #1, #4): backend/sparse/ adapters only.
 import cupy
+import cupyx
 import cupyx.scipy.sparse
 import cupyx.scipy.sparse.linalg
 
 from ipax.backend.operators import LinearOperator
+from ipax.backend.sparse._canonical import (
+    CompiledCompressed,
+    CompiledLowerTriangle,
+    compile_compressed,
+    compile_lower_triangle,
+    index_dtype,
+)
 from ipax.backend.sparse._routing import to_xp_array
 from ipax.linalg.solver import LinearSolveError
 
@@ -75,6 +83,11 @@ def _to_cupy(arr: Array) -> Any:
 def _to_index(arr: Array) -> Any:
     """Device integer-index vector for COO/CSR assembly."""
     return _to_cupy(arr).astype(cupy.int64, copy=False)
+
+
+def _scatter_add(out: Any, idx: Any, vals: Any) -> None:
+    """Device unbuffered scatter-add (sums duplicate targets) for canonical maps."""
+    cupyx.scatter_add(out, idx, vals)
 
 
 def _to_float(value: Any) -> float:
@@ -122,6 +135,14 @@ def _is_symmetric(matrix: Any) -> bool:
     return diff_scale <= tol
 
 
+def _canonical_csr(matrix: Any) -> Any:
+    """CSR with summed duplicates and sorted column indices."""
+    csr = matrix.tocsr()
+    csr.sum_duplicates()
+    csr.sort_indices()
+    return csr
+
+
 def _device_id(matrix: Any) -> int:
     """CUDA device containing a CuPy sparse matrix's value storage."""
     device = getattr(matrix.data, "device", None)
@@ -160,12 +181,22 @@ class SparseOperator(LinearOperator):
     """
 
     def __init__(
-        self, matrix: Any, xp: Namespace, *, symmetric: bool | None = None
+        self,
+        matrix: Any,
+        xp: Namespace,
+        *,
+        symmetric: bool | None = None,
+        pattern_signature: object | None = None,
+        canonical: bool = False,
     ) -> None:
-        self._matrix = matrix.tocsr()
+        # ``canonical=True`` marks ``matrix`` as an already-canonical CSR from the
+        # compiled COO map (values-only refactor fast path), so the per-iteration
+        # ``tocsr().sum_duplicates().sort_indices()`` is skipped.
+        self._matrix = matrix if canonical else _canonical_csr(matrix)
         self._xp = xp
         # Structural symmetry hint from the assembler (None ⇒ test numerically).
         self._symmetric_hint = symmetric
+        self._pattern_signature = pattern_signature
         self._symmetric: bool | None = None
 
     @property
@@ -191,6 +222,9 @@ class SparseOperator(LinearOperator):
             self._symmetric = _is_symmetric(self._matrix)
         return self._symmetric
 
+    def coo_pattern_signature(self) -> object | None:
+        return self._pattern_signature
+
     def matvec(self, v: Array) -> Array:
         out = self._matrix @ _to_cupy(v)
         return cast("Array", to_xp_array(out, self._xp))
@@ -203,9 +237,25 @@ class SparseOperator(LinearOperator):
         out = self._matrix @ _to_cupy(V)
         return cast("Array", to_xp_array(out, self._xp))
 
+    def rmatmat(self, V: Array) -> Array:
+        out = self._matrix.T @ _to_cupy(V)
+        return cast("Array", to_xp_array(out, self._xp))
+
     def diagonal(self, like: Array | None = None) -> Array:
         del like
         return cast("Array", to_xp_array(self._matrix.diagonal(), self._xp))
+
+    def gram_diagonal(self, weights: Array) -> Array:
+        # diag(Aᵀ diag(w) A)_k = Σ_i w_i A_ik² = (A∘A)ᵀ w (column energies).
+        squared = self._matrix.multiply(self._matrix)
+        out = squared.T @ _to_cupy(weights)
+        return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
+
+    def row_gram_diagonal(self, weights: Array) -> Array:
+        # diag(A diag(w) Aᵀ)_j = Σ_k w_k A_jk² = (A∘A) w (row energies).
+        squared = self._matrix.multiply(self._matrix)
+        out = squared @ _to_cupy(weights)
+        return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
 
     def row_inf_norms(self, like: Array | None = None) -> Array:
         del like
@@ -236,7 +286,7 @@ def _require_csr(K: LinearOperator) -> tuple[Any, Namespace]:
             "CuPy sparse solver requires a SparseOperator built from COO "
             f"triplets; got {type(K).__name__}"
         )
-    matrix = K.cupy_matrix.tocsr()
+    matrix = K.cupy_matrix
     if matrix.shape[0] != matrix.shape[1]:
         raise ValueError("sparse solver requires a square operator")
     return matrix, K._xp
@@ -325,6 +375,19 @@ class CuDSSSparseSolver:
         self._col_indices: Any | None = None
         self._values: Any | None = None
         self._pattern: tuple[int, int, int, int, int, int, int] | None = None
+        self._pattern_key: object | None = None
+        # Cached full-CSR → lower-triangle map for the symmetric route, keyed on
+        # the pattern signature + (n, nnz) so a grown pattern recompiles.
+        self._lower: CompiledLowerTriangle | None = None
+        self._lower_key: tuple[object, int, int] | None = None
+        # Persistent dense RHS/solution descriptors and their backing device
+        # buffers, reused across solves (and the factor phase) so each solve is a
+        # buffer copy + execute instead of create/destroy of cuDSS dn matrices.
+        self._rhs_matrix: int | None = None
+        self._sol_matrix: int | None = None
+        self._b_buf: Any | None = None
+        self._x_buf: Any | None = None
+        self._dn_shape: tuple[int, int] | None = None
         self._xp: Namespace | None = None
         self._dtype: Any | None = None
         self._inertia: tuple[int, int, int] | None = None
@@ -348,6 +411,7 @@ class CuDSSSparseSolver:
 
         def release() -> None:
             self._destroy_matrix()
+            self._destroy_dense()
             if self._data is not None and self._handle is not None:
                 cudss.data_destroy(self._handle, self._data)
                 self._data = None
@@ -385,16 +449,22 @@ class CuDSSSparseSolver:
             cudss = self._cudss
             assert cudss is not None
 
+            pattern_signature = K.coo_pattern_signature()
             factor_matrix = matrix
             matrix_type = int(cudss.MatrixType.GENERAL)
             matrix_view = int(cudss.MatrixViewType.FULL)
             if symmetric:
-                factor_matrix = cupyx.scipy.sparse.tril(matrix).tocsr()
+                factor_matrix = self._lower_triangle_csr(matrix, pattern_signature)
                 matrix_type = int(cudss.MatrixType.SYMMETRIC)
                 matrix_view = int(cudss.MatrixViewType.LOWER)
 
             self._xp = xp
-            self._factor_csr(factor_matrix, matrix_type, matrix_view)
+            self._factor_csr(
+                factor_matrix,
+                matrix_type,
+                matrix_view,
+                pattern_signature=pattern_signature,
+            )
             self._inertia = (
                 self._read_inertia(int(matrix.shape[0]))
                 if self._require_inertia
@@ -421,27 +491,27 @@ class CuDSSSparseSolver:
             was_vector = len(b.shape) == 1
             if was_vector:
                 b = cupy.reshape(b, (int(b.shape[0]), 1))
-            b = cupy.ascontiguousarray(b)
-            x = cupy.empty_like(b)
+            n, ncols = int(b.shape[0]), int(b.shape[1])
 
-            rhs_matrix = self._create_dense_matrix(x.shape[0], x.shape[1], b)
-            sol_matrix = self._create_dense_matrix(x.shape[0], x.shape[1], x)
-            try:
-                self._guard(
-                    cudss.execute,
-                    self._handle,
-                    int(cudss.Phase.SOLVE),
-                    self._config,
-                    self._data,
-                    self._matrix,
-                    sol_matrix,
-                    rhs_matrix,
-                )
-            finally:
-                self._destroy_temp_matrix(sol_matrix)
-                self._destroy_temp_matrix(rhs_matrix)
+            # Reuse the persistent dense descriptors/buffers, then copy this RHS
+            # into the bound buffer — no per-solve cuDSS dn create/destroy.
+            self._ensure_dense(n, ncols)
+            assert self._b_buf is not None and self._x_buf is not None
+            self._b_buf[...] = b
+            self._guard(
+                cudss.execute,
+                self._handle,
+                int(cudss.Phase.SOLVE),
+                self._config,
+                self._data,
+                self._matrix,
+                self._sol_matrix,
+                self._rhs_matrix,
+            )
 
-            result = x[:, 0] if was_vector else x
+            # Copy out of the reused solution buffer before the next solve
+            # overwrites it (the buffer outlives this call).
+            result = (self._x_buf[:, 0] if was_vector else self._x_buf).copy()
             return cast("Array", to_xp_array(result, self._xp))
 
     @property
@@ -493,7 +563,35 @@ class CuDSSSparseSolver:
         stream = cupy.cuda.get_current_stream()
         self._guard(self._cudss.set_stream, self._handle, int(stream.ptr))
 
-    def _factor_csr(self, matrix: Any, matrix_type: int, matrix_view: int) -> None:
+    def _lower_triangle_csr(self, matrix: Any, signature: object | None) -> Any:
+        """Lower triangle of a canonical symmetric CSR for the cuDSS LDLᵀ route.
+
+        On a stable ``signature`` the lower-triangle structure is fixed, so the
+        per-iteration ``tril(...)`` + re-canonicalization collapses to one cached
+        boolean gather of the full canonical CSR data. ``None`` (value-dependent
+        pattern) falls back to the from-scratch ``tril`` build.
+        """
+        n = int(matrix.shape[0])
+        if signature is None:
+            return _canonical_csr(cupyx.scipy.sparse.tril(matrix))
+        key = (signature, n, int(matrix.nnz))
+        if self._lower is None or self._lower_key != key:
+            self._lower = compile_lower_triangle(cupy, matrix.indptr, matrix.indices, n)
+            self._lower_key = key
+        lower = self._lower
+        data = lower.data(matrix.data)
+        return cupyx.scipy.sparse.csr_matrix(
+            (data, lower.indices, lower.indptr), shape=(n, n)
+        )
+
+    def _factor_csr(
+        self,
+        matrix: Any,
+        matrix_type: int,
+        matrix_view: int,
+        *,
+        pattern_signature: object | None,
+    ) -> None:
         cudss = self._cudss
         if (
             cudss is None
@@ -503,43 +601,58 @@ class CuDSSSparseSolver:
         ):
             raise RuntimeError("cuDSS context was not initialized")
 
-        matrix = matrix.tocsr()
-        matrix.sum_duplicates()
-        matrix.sort_indices()
-        row_offsets = cupy.ascontiguousarray(
-            matrix.indptr.astype(cupy.int64, copy=False)
-        )
-        indices = cupy.ascontiguousarray(matrix.indices.astype(cupy.int64, copy=False))
         values = cupy.ascontiguousarray(matrix.data)
+        # Optimization #3: int32 indices halve index bandwidth and speed up cuDSS
+        # analysis/solve whenever the dimensions and nnz fit a signed 32-bit int.
+        idx_dtype = index_dtype(
+            cupy, int(matrix.shape[0]), int(matrix.shape[1]), int(matrix.nnz)
+        )
+        index_type = _index_type(cupy.dtype(idx_dtype))
         pattern = (
             int(matrix.shape[0]),
             int(matrix.shape[1]),
             int(matrix.nnz),
             matrix_type,
             matrix_view,
-            _index_type(indices.dtype),
+            index_type,
             _value_type(values.dtype),
         )
 
         self._dtype = values.dtype
+        structure_key = (
+            pattern_signature,
+            matrix_type,
+            matrix_view,
+        )
         same_pattern = (
-            pattern == self._pattern
+            pattern_signature is not None
+            and pattern == self._pattern
+            and structure_key == self._pattern_key
             and self._matrix is not None
             and self._row_offsets is not None
             and self._col_indices is not None
-            and bool(cupy.array_equal(row_offsets, self._row_offsets))
-            and bool(cupy.array_equal(indices, self._col_indices))
         )
         if same_pattern:
+            # Deliberately no ``array_equal`` on CSR indices here: on CUDA that
+            # comparison is device work plus a host sync. A non-None signature is
+            # a contract that row/column coordinates are structural; value-
+            # dependent sparse operators must return ``None`` and reanalyze.
             self._values = values
             self._guard(cudss.matrix_set_values, self._matrix, _ptr(values))
             phase = int(cudss.Phase.FACTORIZATION)
         else:
+            row_offsets = cupy.ascontiguousarray(
+                matrix.indptr.astype(idx_dtype, copy=False)
+            )
+            indices = cupy.ascontiguousarray(
+                matrix.indices.astype(idx_dtype, copy=False)
+            )
             self._destroy_matrix()
             self._row_offsets = row_offsets
             self._col_indices = indices
             self._values = values
             self._pattern = pattern
+            self._pattern_key = structure_key if pattern_signature is not None else None
             self._matrix = self._create_csr_matrix(
                 matrix,
                 row_offsets,
@@ -550,24 +663,50 @@ class CuDSSSparseSolver:
             )
             phase = int(cudss.Phase.ANALYSIS) | int(cudss.Phase.FACTORIZATION)
 
+        # The analysis/factorization phases need RHS/solution descriptors bound,
+        # but their contents are unused here — point them at the persistent dense
+        # buffers (reused by solve), not a throwaway per-factor allocation.
         n = int(matrix.shape[0])
-        dummy = cupy.zeros((n, 1), dtype=values.dtype)
-        rhs_matrix = self._create_dense_matrix(n, 1, dummy)
-        sol_matrix = self._create_dense_matrix(n, 1, dummy)
-        try:
-            self._guard(
-                cudss.execute,
-                self._handle,
-                phase,
-                self._config,
-                self._data,
-                self._matrix,
-                sol_matrix,
-                rhs_matrix,
-            )
-        finally:
-            self._destroy_temp_matrix(sol_matrix)
-            self._destroy_temp_matrix(rhs_matrix)
+        self._ensure_dense(n, 1)
+        self._guard(
+            cudss.execute,
+            self._handle,
+            phase,
+            self._config,
+            self._data,
+            self._matrix,
+            self._sol_matrix,
+            self._rhs_matrix,
+        )
+
+    def _ensure_dense(self, n: int, ncols: int) -> None:
+        """Allocate (or reuse) the persistent dense RHS/solution descriptors.
+
+        cuDSS dense matrices are reused across solves and the factor phase: the
+        descriptors are bound once to fixed device buffers of shape ``(n, ncols)``
+        and only rebuilt when that shape changes (e.g. a grown L-BFGS border
+        changes the augmented system size).
+        """
+        if self._dn_shape == (n, ncols) and self._rhs_matrix is not None:
+            return
+        self._destroy_dense()
+        self._b_buf = cupy.zeros((n, ncols), dtype=self._dtype)
+        self._x_buf = cupy.zeros((n, ncols), dtype=self._dtype)
+        self._rhs_matrix = self._create_dense_matrix(n, ncols, self._b_buf)
+        self._sol_matrix = self._create_dense_matrix(n, ncols, self._x_buf)
+        self._dn_shape = (n, ncols)
+
+    def _destroy_dense(self) -> None:
+        if self._cudss is not None:
+            if self._rhs_matrix is not None:
+                self._cudss.matrix_destroy(self._rhs_matrix)
+            if self._sol_matrix is not None:
+                self._cudss.matrix_destroy(self._sol_matrix)
+        self._rhs_matrix = None
+        self._sol_matrix = None
+        self._b_buf = None
+        self._x_buf = None
+        self._dn_shape = None
 
     def _create_csr_matrix(
         self,
@@ -581,8 +720,9 @@ class CuDSSSparseSolver:
         cudss = self._cudss
         if cudss is None:
             raise RuntimeError("cuDSS context was not initialized")
-        # cuDSS shares one index type for row offsets and column indices; our
-        # COO assembly keeps both as int64 (see ``_factor_csr``).
+        # cuDSS shares one index type for row offsets and column indices; both
+        # carry the same dtype chosen in ``_factor_csr`` (int32 when the system
+        # fits a signed 32-bit int, else int64).
         return cast(
             int,
             self._guard(
@@ -649,10 +789,7 @@ class CuDSSSparseSolver:
         self._col_indices = None
         self._values = None
         self._pattern = None
-
-    def _destroy_temp_matrix(self, matrix: int) -> None:
-        if self._cudss is not None and matrix:
-            self._cudss.matrix_destroy(matrix)
+        self._pattern_key = None
 
 
 class CuPySparseSolver:
@@ -710,7 +847,19 @@ class CuPySparseSolver:
 
 
 class CuPySparseAdapter:
-    """Factory pairing CuPy COO assembly with CUDA sparse-direct solvers."""
+    """Factory pairing CuPy COO assembly with CUDA sparse-direct solvers.
+
+    The adapter persists across an interior-point solve (the facade caches one
+    instance), so it memoizes the COO→canonical-CSR map for the most recent
+    ``pattern_signature``. On a fixed KKT pattern this replaces the per-iteration
+    device ``tocsr().sum_duplicates().sort_indices()`` with a single scatter-add
+    (see :mod:`ipax.backend.sparse._canonical`).
+    """
+
+    def __init__(self) -> None:
+        self._signature: object | None = None
+        self._compiled: CompiledCompressed | None = None
+        self._meta: tuple[tuple[int, int], int] | None = None
 
     def from_coo(
         self,
@@ -720,20 +869,83 @@ class CuPySparseAdapter:
         *,
         shape: tuple[int, int],
         symmetric: bool | None = None,
+        pattern_signature: object | None = None,
     ) -> SparseOperator:
         """Build a :class:`SparseOperator` from Array-API COO triplets.
 
         ``symmetric`` is an optional structural hint from the assembler; ``None``
         leaves the operator to test symmetry numerically when first asked.
+        ``pattern_signature`` keys the compiled-map cache (a stable signature
+        reuses the canonical CSR structure and recomputes only values) and is
+        also used by cuDSS to reuse its symbolic analysis without comparing
+        device index arrays.
         """
         from ipax.backend.namespace import array_namespace
 
         xp = array_namespace(values)
+        cp_values = _to_cupy(values)
+
+        if pattern_signature is not None:
+            csr = self._canonical_csr(
+                _to_index(rows),
+                _to_index(cols),
+                cp_values,
+                shape,
+                pattern_signature,
+                int(cp_values.shape[0]),
+            )
+            return SparseOperator(
+                csr,
+                xp,
+                symmetric=symmetric,
+                pattern_signature=pattern_signature,
+                canonical=True,
+            )
+
         matrix = cupyx.scipy.sparse.coo_matrix(
-            (_to_cupy(values), (_to_index(rows), _to_index(cols))),
+            (cp_values, (_to_index(rows), _to_index(cols))),
             shape=shape,
         )
-        return SparseOperator(matrix, xp, symmetric=symmetric)
+        return SparseOperator(
+            matrix,
+            xp,
+            symmetric=symmetric,
+            pattern_signature=pattern_signature,
+        )
+
+    def _canonical_csr(
+        self,
+        rows: Any,
+        cols: Any,
+        values: Any,
+        shape: tuple[int, int],
+        signature: object,
+        n_triplets: int,
+    ) -> Any:
+        """Canonical CSR via the cached compiled map, recompiling on a new pattern.
+
+        Keyed on ``(signature, shape, n_triplets)`` so a reused signature with a
+        structurally different system (a grown L-BFGS border) recompiles rather
+        than misapplying the stale map.
+        """
+        meta = (shape, n_triplets)
+        if self._compiled is None or self._signature != signature or self._meta != meta:
+            # major=row, minor=col ⇒ canonical CSR structure directly.
+            self._compiled = compile_compressed(
+                cupy,
+                _scatter_add,
+                major=rows,
+                minor=cols,
+                n_major=shape[0],
+                n_minor=shape[1],
+            )
+            self._signature = signature
+            self._meta = meta
+        compiled = self._compiled
+        data = compiled.data(values)
+        return cupyx.scipy.sparse.csr_matrix(
+            (data, compiled.indices, compiled.indptr), shape=shape
+        )
 
     def solver(self, *, require_inertia: bool = False) -> CuPySparseSolver:
         """Return the CUDA sparse-direct solver (cuDSS default, spsolve fallback)."""

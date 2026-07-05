@@ -73,6 +73,20 @@ def test_solver_before_from_coo_errors():
         DeviceRoutingSparseAdapter().solver()
 
 
+def test_routing_reuses_delegate_across_calls_on_same_device():
+    # The delegate adapter must persist across iterations so its compiled
+    # COO→canonical map cache (values-only refactor fast path) survives; a fresh
+    # delegate every call would silently disable that reuse for Torch/JAX.
+    adapter = DeviceRoutingSparseAdapter()
+    rows = np.asarray([0, 1])
+    cols = np.asarray([0, 1])
+    adapter.from_coo(rows, cols, np.asarray([1.0, 2.0]), shape=(2, 2))
+    first_delegate = adapter._delegate
+    adapter.from_coo(rows, cols, np.asarray([3.0, 4.0]), shape=(2, 2))
+
+    assert adapter._delegate is first_delegate
+
+
 def test_to_xp_array_round_trips_into_namespace(namespace):
     # ``to_xp_array`` is what returns SciPy/CuPy results to the caller's
     # namespace; for any backend with a sparse adapter it must yield an array of

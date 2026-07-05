@@ -21,6 +21,11 @@ returns.
 
 from __future__ import annotations
 
+from ipax.backend.operators import (
+    COOOperator,
+    CSCOperator,
+    CSROperator,
+)
 from ipax.options import (
     AcceptableStoppingOptions,
     CorrectionsOptions,
@@ -44,6 +49,9 @@ from ipax.solve import solve
 
 __all__ = [
     "AcceptableStoppingOptions",
+    "COOOperator",
+    "CSCOperator",
+    "CSROperator",
     "CorrectionsOptions",
     "DerivativeSources",
     "FunctionProblem",
@@ -63,4 +71,4 @@ __all__ = [
     "solve",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

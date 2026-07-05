@@ -47,6 +47,16 @@ class LinearSolver(Protocol):
         """Return ``x`` such that ``K x = rhs`` to the configured tolerance."""
         ...
 
+    def set_outer_residual(self, residual: float) -> None:
+        """Hint the current outer KKT residual for an adaptive inner tolerance.
+
+        Iterative solvers use it to drive an inexact-Newton forcing sequence
+        (solve loosely while the IPM is far from optimal, tighten as it converges);
+        direct solvers ignore it. Optional — the driver calls it once per iteration
+        and a solver may no-op.
+        """
+        ...
+
 
 def select_solver(
     *,

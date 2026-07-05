@@ -46,6 +46,7 @@ def test_switching_condition_survives_overflowing_directional_derivative():
         theta0=1.0,
         phi0=1.0,
         dphi=-1e308,  # would overflow float ** s_phi before the fix
+        theta_max=1e10,
         eval_point=lambda alpha: (0.5, 0.5),
         entries=[],
         soc=None,
@@ -65,6 +66,7 @@ def test_line_search_reports_accepted_soc_trial():
         theta0=1.0,
         phi0=1.0,
         dphi=1.0,
+        theta_max=1e10,
         eval_point=lambda alpha: (2.0, 2.0),
         entries=[],
         soc=lambda alpha: (0.1, 2.0),
@@ -73,3 +75,112 @@ def test_line_search_reports_accepted_soc_trial():
     assert result.accepted
     assert result.used_soc
     assert not result.restoration
+
+
+def test_theta_max_guard_rejects_exploding_infeasibility():
+    # Regression (HS7, S2MPJ Task 1): an f-type step whose barrier objective φ
+    # collapses toward -∞ must NOT be accepted while the constraint violation θ
+    # explodes past the Wächter & Biegler 2006 eq. (18) guard θ_max. Before the
+    # guard, the switching + Armijo branch let such a step through and the solver
+    # diverged to a false "infeasible".
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=10.0,
+        phi0=1.0,
+        dphi=-1e6,  # switching condition holds -> f-type branch
+        theta_max=1e4,
+        eval_point=lambda alpha: (1e30, -1e30),  # huge θ, collapsing φ
+        entries=[],
+        soc=None,
+    )
+
+    assert not result.accepted
+    assert result.restoration
+
+
+def test_theta_max_guard_rejects_non_finite_theta():
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=10.0,
+        phi0=1.0,
+        dphi=-1e6,
+        theta_max=1e4,
+        eval_point=lambda alpha: (float("inf"), -1e30),
+        entries=[],
+        soc=None,
+    )
+
+    assert not result.accepted
+    assert result.restoration
+
+
+def test_accept_rejects_non_finite_phi():
+    # Regression (S2MPJ Task 2, BRATU1D/LUKVLE8): a step that overshoots into a
+    # region where the objective evaluates to -∞ (finite θ) must be rejected, not
+    # accepted. ``φ_t = -∞`` is trivially below the Armijo bound, so before the
+    # φ-finiteness guard the f-type branch let such a full step through instead of
+    # backtracking to a finite, usable iterate.
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=1.0,
+        phi0=1.0,
+        dphi=-1e6,  # switching condition holds -> f-type branch
+        theta_max=1e10,  # θ is fine; only φ is non-finite
+        eval_point=lambda alpha: (0.5, float("-inf")),
+        entries=[],
+        soc=None,
+    )
+
+    assert not result.accepted
+    assert result.restoration
+
+
+def test_search_backtracks_past_non_finite_gradient_region():
+    # Regression (S2MPJ Task 2, RAT42LS): a step whose θ/φ are finite but whose
+    # gradient overflows must be rejected so the search backtracks to a damped
+    # step in the finite region, instead of accepting it and poisoning the next
+    # KKT solve. Here θ decreases (θ-type acceptable) at every α, but the gradient
+    # is only finite for α ≤ 0.3, so acceptance lands on α = 0.25.
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=1.0,
+        phi0=1.0,
+        dphi=-1.0,
+        theta_max=1e10,
+        eval_point=lambda alpha: (0.5, 0.5),  # always filter-acceptable
+        entries=[],
+        soc=None,
+        grad_finite=lambda alpha: alpha <= 0.3,
+    )
+
+    assert result.accepted
+    assert result.alpha == 0.25
+
+
+def test_search_hands_off_to_restoration_when_gradient_never_finite():
+    # If no α on the ray yields a finite gradient, the search exhausts α and
+    # hands off to restoration — the same fallback as an unacceptable θ/φ.
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=1.0,
+        phi0=1.0,
+        dphi=-1.0,
+        theta_max=1e10,
+        eval_point=lambda alpha: (0.5, 0.5),
+        entries=[],
+        soc=None,
+        grad_finite=lambda alpha: False,
+    )
+
+    assert not result.accepted
+    assert result.restoration

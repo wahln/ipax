@@ -20,8 +20,8 @@ def test_options_are_frozen():
         opts.max_iter = 5  # type: ignore[misc]
 
 
-def test_default_hessian_is_lbfgs():
-    assert Options().hessian == "lbfgs"
+def test_default_hessian_is_auto():
+    assert Options().hessian == "auto"
 
 
 def test_default_optimality_matches_spec():
@@ -82,11 +82,26 @@ def test_optimality_requires_at_least_one_condition():
         )
 
 
-def test_acceptable_stopping_is_disabled_by_default():
+def test_acceptable_stopping_defaults_to_the_ipopt_convention():
+    # IPOPT enables acceptable-level termination by default (acceptable_tol =
+    # 1e-6 = 1e2 x the optimality tol, acceptable_iter = 15). A disabled-by-
+    # default gate lets a solve whose achievable KKT floor sits between 1e-8
+    # and 1e-6 grind thousands of iterations into max_time at an essentially
+    # optimal point (S2MPJ v6: PALMER1A, 2431 iterations at kkt 4.2e-8).
     acceptable = Options().acceptable
 
     assert acceptable.f_tol is None
     assert acceptable.f_rel_change_tol is None
+    assert acceptable.dual_inf_tol == 1e-6
+    assert acceptable.constr_viol_tol == 1e-6
+    assert acceptable.compl_inf_tol == 1e-6
+    assert acceptable.n_iter == 15
+
+
+def test_acceptable_stopping_can_be_disabled():
+    acceptable = AcceptableStoppingOptions(
+        dual_inf_tol=None, constr_viol_tol=None, compl_inf_tol=None
+    )
     assert acceptable.dual_inf_tol is None
     assert acceptable.constr_viol_tol is None
     assert acceptable.compl_inf_tol is None
@@ -114,7 +129,7 @@ def test_krylov_options_reject_unsupported_methods(method):
         KrylovOptions(method=method)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("preconditioner", ["none", "jacobi", "lbfgs"])
+@pytest.mark.parametrize("preconditioner", ["none", "jacobi", "lbfgs", "auto"])
 def test_krylov_options_accept_supported_preconditioners(preconditioner):
     opts = KrylovOptions(preconditioner=preconditioner)  # type: ignore[arg-type]
     assert opts.preconditioner == preconditioner
@@ -129,3 +144,30 @@ def test_krylov_options_reject_unsupported_preconditioners(preconditioner):
 def test_krylov_options_reject_nonpositive_gmres_restart():
     with pytest.raises(ValueError, match="gmres_restart"):
         KrylovOptions(gmres_restart=0)
+
+
+@pytest.mark.parametrize("ratio", [0.0, -0.5, 1.5])
+def test_krylov_options_reject_out_of_range_auto_switch_ratio(ratio):
+    with pytest.raises(ValueError, match="auto_switch_ratio"):
+        KrylovOptions(auto_switch_ratio=ratio)
+
+
+def test_krylov_options_accept_auto_switch_ratio_in_range():
+    assert KrylovOptions(auto_switch_ratio=0.25).auto_switch_ratio == 0.25
+
+
+def test_krylov_options_reject_nonpositive_adaptive_eta():
+    with pytest.raises(ValueError, match="adaptive_eta"):
+        KrylovOptions(adaptive_eta=0.0)
+
+
+@pytest.mark.parametrize("cap", [1e-12, 2.0])  # <= rtol floor, and > 1
+def test_krylov_options_reject_out_of_range_adaptive_rtol_max(cap):
+    with pytest.raises(ValueError, match="adaptive_rtol_max"):
+        KrylovOptions(rtol=1e-10, adaptive_rtol_max=cap)
+
+
+def test_krylov_options_adaptive_defaults_on():
+    opts = KrylovOptions()
+    assert opts.adaptive_tol is True
+    assert 0.0 < opts.adaptive_eta and opts.rtol < opts.adaptive_rtol_max <= 1.0

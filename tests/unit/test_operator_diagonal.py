@@ -16,6 +16,7 @@ from ipax.backend.operators import (
     Identity,
     LowRank,
     MatrixFreeJacobian,
+    VStack,
 )
 from tests._helpers import array, assert_allclose, transpose
 
@@ -66,6 +67,32 @@ def test_dense_row_gram_diagonal_matches_formula(namespace, tol):
 def test_identity_gram_diagonal_returns_weights(namespace, tol):
     w = array(namespace, [0.5, 1.0, 2.0])
     assert_allclose(namespace, Identity(3).gram_diagonal(w), w, **tol)
+
+
+def test_vstack_gram_diagonal_slices_row_weights(namespace, tol):
+    top = Dense(array(namespace, [[1.0, 2.0, 0.0], [-1.0, 0.5, 3.0]]))
+    bottom = Dense(array(namespace, [[0.0, -2.0, 1.0]]))
+    op = VStack((top, bottom))
+    weights = array(namespace, [2.0, 0.5, 3.0])
+    dense = op.dense_matrix()
+
+    weighted = namespace.expand_dims(weights, axis=1) * dense
+    gram = namespace.matmul(transpose(namespace, dense), weighted)
+    expected = namespace.linalg.diagonal(gram)
+
+    assert_allclose(namespace, op.gram_diagonal(weights), expected, **tol)
+
+
+def test_vstack_coo_pattern_signature_composes_stable_blocks(namespace):
+    top = Dense(array(namespace, [[1.0, 2.0], [3.0, 4.0]]))
+    bottom = Diagonal(array(namespace, [5.0, 6.0]))
+    op = VStack((top, bottom))
+
+    assert op.coo_pattern_signature() == (
+        "vstack",
+        (4, 2),
+        (top.coo_pattern_signature(), bottom.coo_pattern_signature()),
+    )
 
 
 def test_identity_diagonal_uses_template_array(namespace, tol):

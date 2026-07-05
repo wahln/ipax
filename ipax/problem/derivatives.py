@@ -183,21 +183,33 @@ def _resolve_hessian_source(
     adapter: object | None,
     options: Options,
 ) -> tuple[bool, str]:
-    """Return ``(has_analytic, label)`` for the Lagrangian Hessian (§3.2)."""
-    if _provides(problem, "lagrangian_hessian"):
-        return True, "exact"
-    if options.hessian == "autodiff-hvp":
+    """Return ``(has_analytic, label)`` for the Lagrangian Hessian (§3.2).
+
+    Precedence depends on ``options.hessian``. The explicit quasi-Newton /
+    matrix-free modes are honored **literally**, even when the problem supplies
+    an analytic ``lagrangian_hessian``: ``"lbfgs"`` always uses the limited-memory
+    approximation and ``"autodiff-hvp"`` always uses autodiff HVPs. ``"auto"``
+    (default) and ``"exact"`` prefer a supplied analytic operator (``"exact"``
+    requires one). With no analytic Hessian, ``"auto"`` falls back to L-BFGS.
+    """
+    mode = options.hessian
+    if mode == "lbfgs":
+        # Honor the explicit request even if an analytic Hessian is available.
+        return False, "lbfgs"
+    if mode == "autodiff-hvp":
         if adapter is None:
             raise RuntimeError(
                 "hessian='autodiff-hvp' requires an autodiff-capable backend "
                 "(PyTorch or JAX); none is available for this namespace"
             )
         return False, "autodiff-hvp"
-    if options.hessian == "exact":
+    if _provides(problem, "lagrangian_hessian"):
+        return True, "exact"
+    if mode == "exact":
         raise RuntimeError(
-            "hessian='exact' requires problem.lagrangian_hessian; omit the "
-            "option to use L-BFGS or choose hessian='autodiff-hvp' on an "
-            "autodiff-capable backend"
+            "hessian='exact' requires problem.lagrangian_hessian; use "
+            "hessian='auto' (or omit it) to fall back to L-BFGS, or "
+            "hessian='autodiff-hvp' on an autodiff-capable backend"
         )
     return False, "lbfgs"
 

@@ -27,16 +27,31 @@ user-overridable via `Options.linsolve`. Adding a solver never touches
 !!! warning "Known limitation: matrix-free Krylov on equality saddles"
 
     On **equality-constrained** problems the matrix-free `KrylovSolver` borders
-    the condensed system into an indefinite saddle and solves it with MINRES. Its
-    only preconditioner there is a diagonal (Jacobi) one, which is too weak for
-    *ill-conditioned* saddles: MINRES (and GMRES) can stall, and the solve is
-    reported as `numerical_error`. This affects a number of equality-heavy CUTEst
-    problems (optimal-control / network models) when `linsolve="krylov"` is
-    forced. Those same problems solve through the **dense** route, which is the
-    automatic choice below ~1e4 variables — so default usage is unaffected; the
-    gap is for large, matrix-free, equality-constrained models. A stronger saddle
-    preconditioner (constraint / block-Schur) is tracked future work; until then,
-    prefer `linsolve="dense"` or the sparse-direct route for such problems.
+    the condensed system into an indefinite saddle and, by default (Jacobi
+    preconditioner), solves it with MINRES. A diagonal preconditioner is too weak
+    for *ill-conditioned* saddles: MINRES can stall and the solve is reported as
+    `numerical_error`. This affects a number of equality-heavy CUTEst problems
+    (optimal-control / network models) when `linsolve="krylov"` is forced.
+
+    An opt-in **block-Schur preconditioner** is now available for the L-BFGS route:
+    `KrylovOptions(preconditioner="lbfgs")` builds the block-diagonal
+    `diag(N⁻¹, S⁻¹)` (Murphy–Golub–Wathen), applying the L-BFGS-aware Woodbury
+    inverse on the (1,1) block, and switches the saddle solve to GMRES (which can
+    left-apply the non-diagonal preconditioner). It measurably helps saddles whose
+    bottleneck is the *linear solve* once L-BFGS has warmed up, but does not help
+    the first-iteration cold-start failures (before any curvature pair, the L-BFGS
+    Hessian is `ξI` and the step direction — not the solve — is the issue). The
+    same problems still solve through the **dense** route (the automatic choice
+    below ~1e4 variables), so default usage is unaffected; the residual gap is for
+    large, matrix-free, equality-constrained models.
+
+    To get the block preconditioner *only where it pays off*, use
+    `KrylovOptions(preconditioner="auto")`: it runs the cheap Jacobi diagonal
+    until a solve struggles — a convergence failure triggers an immediate promoted
+    retry, and a slow success (over `auto_switch_ratio` of the iteration budget)
+    promotes for subsequent solves — then stays on the L-BFGS block/Woodbury
+    preconditioner for the rest of that solve. Well-conditioned systems never pay
+    the extra Woodbury cost.
 
 ## Sparsity as an adapter concern
 

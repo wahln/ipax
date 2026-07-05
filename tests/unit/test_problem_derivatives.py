@@ -105,3 +105,40 @@ def test_exact_hessian_requires_analytic_operator(namespace):
 
     with pytest.raises(RuntimeError, match="hessian='exact'"):
         resolve(ObjectiveOnlyProblem(), namespace, Options(hessian="exact"))
+
+
+class _QuadraticWithHessian(Problem):
+    """An objective that supplies an analytic Lagrangian Hessian."""
+
+    def __init__(self, xp) -> None:
+        self.xp = xp
+
+    @property
+    def n_vars(self) -> int:
+        return 2
+
+    def objective(self, x):
+        return self.xp.sum(x * x)
+
+    def gradient(self, x):
+        return 2.0 * x
+
+    def lagrangian_hessian(self, x, y_eq, y_ineq, sigma=1.0):
+        return 2.0 * sigma * self.xp.eye(2, dtype=x.dtype)
+
+
+def test_auto_hessian_prefers_supplied_analytic_operator(namespace):
+    # The default (``hessian="auto"``) uses a supplied analytic Hessian.
+    resolved = resolve(_QuadraticWithHessian(namespace), namespace, Options())
+    assert resolved.has_analytic_hessian is True
+    assert resolved.sources.hessian == "exact"
+
+
+def test_explicit_lbfgs_overrides_supplied_analytic_hessian(namespace):
+    # Regression: ``hessian="lbfgs"`` must run L-BFGS even when the problem
+    # supplies an analytic Lagrangian Hessian (previously silently ignored).
+    resolved = resolve(
+        _QuadraticWithHessian(namespace), namespace, Options(hessian="lbfgs")
+    )
+    assert resolved.has_analytic_hessian is False
+    assert resolved.sources.hessian == "lbfgs"

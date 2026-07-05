@@ -24,12 +24,12 @@ import math
 from dataclasses import dataclass, field
 from typing import Literal
 
-HessianMode = Literal["lbfgs", "exact", "autodiff-hvp", "lsr1"]
+HessianMode = Literal["auto", "lbfgs", "exact", "autodiff-hvp"]
 LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
 Globalization = Literal["filter", "breedveld"]
 MuSchedule = Literal["monotone", "adaptive", "breedveld"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
-KrylovPreconditioner = Literal["none", "jacobi", "lbfgs"]
+KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
 ScalingMethod = Literal["none", "gradient-based"]
 CorrectionsMethod = Literal["none", "mehrotra", "gondzio"]
 
@@ -78,6 +78,19 @@ class RegularizationOptions:
     delta_w_max: float = 1e40
     delta_w_factor: float = 8.0  # escalation on Cholesky failure
     delta_c: float = 1e-8  # (2,2) block, equality regularization
+    delta_c_max: float = 1e-1  # cap on δ_c escalation (rank-deficient ∇c)
+    # δ_c escalation is a *last resort* for a singular DUAL block (rank-deficient
+    # ∇c): it starts only once δ_w escalation has grown past this without resolving
+    # the KKT failure — at which point δ_w is *reset to its floor* and the search
+    # continues with (small δ_w, growing δ_c). A rank-deficient ∇c leaves δ_w
+    # running to `delta_w_max` uselessly (it cannot repair the (2,2) block); an
+    # ordinary indefinite (1,1) block is fixed by δ_w alone, so the trigger must
+    # sit above any δ_w a genuine primal repair can need. Exploded multipliers can
+    # legitimately demand δ_w ~ 1e8–1e9 (S2MPJ HS61: the primal block carries
+    # −3.2e8 curvature, cured by δ_w = 2.3e9 alone; a lower trigger let δ_c
+    # contaminate that repair and the distorted dual step cycled forever), hence
+    # the generous default.
+    delta_c_trigger: float = 1e10
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,23 +118,51 @@ class KrylovOptions:
     """Matrix-free solver tolerances (§5.2)."""
 
     method: KrylovMethod = "cg"
-    # Tight by default so the matrix-free Newton step is accurate enough for the
-    # IPM to reach the scaled-KKT tolerance (§4.5); relax for large problems.
+    # When ``adaptive_tol`` is on this is the *floor* of the inexact-Newton forcing
+    # sequence (the tightest inner tolerance, reached near convergence); when off it
+    # is the fixed inner relative tolerance for every solve.
     rtol: float = 1e-10
     max_iter: int | None = None  # default: 2 * dim + 100 at the call site
     preconditioner: KrylovPreconditioner = "jacobi"
     gmres_restart: int = 30  # GMRES(m) restart length
+    # Inexact-Newton forcing sequence (Eisenstat–Walker 1996): the inner solve need
+    # only be as accurate as the *current* outer KKT residual demands, so early
+    # iterations solve loosely (fast, and robust on ill-conditioned initial systems
+    # a tight 1e-10 cannot reach) and tighten toward ``rtol`` as the IPM converges.
+    # ``inner_rtol = clip(adaptive_eta · ‖outer KKT residual‖, rtol, adaptive_rtol_max)``.
+    # Set ``adaptive_tol=False`` to force the fixed ``rtol`` on every solve.
+    adaptive_tol: bool = True
+    adaptive_eta: float = 0.1  # forcing factor: inner tol ≈ η · outer residual
+    # Loosest inner tolerance (cap). Calibrated to the default outer scaled-KKT tol
+    # (1e-8): the inner solve is never looser than the accuracy the IPM targets, so
+    # early steps stay accurate enough to keep the iterate feasible (a looser cap
+    # drives step-sensitive IPM problems into infeasibility) while still relaxing the
+    # unreachable 1e-10 that stalls ill-conditioned initial systems.
+    adaptive_rtol_max: float = 1e-8
+    # ``"auto"`` starts with the cheap Jacobi diagonal and self-promotes to the
+    # L-BFGS Woodbury/block preconditioner the first time a solve struggles —
+    # either it fails to converge (then it retries the same solve promoted) or it
+    # burns more than this fraction of the iteration budget. Sticky thereafter.
+    auto_switch_ratio: float = 0.5
 
     def __post_init__(self) -> None:
         """Validate runtime values as well as static Literal hints."""
         if self.method not in ("cg", "minres", "gmres"):
             raise ValueError("Krylov method must be 'cg', 'minres', or 'gmres'")
-        if self.preconditioner not in ("none", "jacobi", "lbfgs"):
+        if self.preconditioner not in ("none", "jacobi", "lbfgs", "auto"):
             raise ValueError(
-                "Krylov preconditioner must be 'none', 'jacobi', or 'lbfgs'"
+                "Krylov preconditioner must be 'none', 'jacobi', 'lbfgs', or 'auto'"
             )
         if self.gmres_restart < 1:
             raise ValueError("gmres_restart must be a positive integer")
+        if not 0.0 < self.auto_switch_ratio <= 1.0:
+            raise ValueError("auto_switch_ratio must lie in (0, 1]")
+        if self.adaptive_eta <= 0.0:
+            raise ValueError("adaptive_eta must be positive")
+        # Equal floor/cap is allowed (adaptive collapses to the fixed rtol); the cap
+        # must not be below the floor or above 1.
+        if not self.rtol <= self.adaptive_rtol_max <= 1.0:
+            raise ValueError("adaptive_rtol_max must lie in [rtol, 1]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,9 +317,15 @@ class AcceptableStoppingOptions:
     ``n_iter`` *consecutive* iterations before the solve stops. "Acceptable"
     means *what the caller is willing to accept* — e.g. stopping once the
     objective and primal feasibility have settled even though a
-    dual-infeasibility-dominated residual will not reduce further. Every
-    tolerance is ``None`` (disabled) by default, so the whole mechanism is off
-    unless explicitly configured.
+    dual-infeasibility-dominated residual will not reduce further.
+
+    The defaults follow the IPOPT convention (``acceptable_tol = 1e-6`` — 1e2 ×
+    the optimality tolerance — held for ``acceptable_iter = 15`` iterations): a
+    problem whose achievable KKT floor sits between the acceptable and optimal
+    tolerances (degenerate optimum, ill-conditioned least squares) then stops as
+    :attr:`Status.ACCEPTABLE` after 15 stagnant iterations instead of grinding
+    to ``max_iter``/``max_time`` at an essentially optimal point. Set every
+    tolerance to ``None`` to disable the mechanism entirely.
 
     The fields match :class:`OptimalityConditionOptions` (``f_tol``,
     ``f_rel_change_tol``, ``dual_inf_tol``, ``constr_viol_tol``,
@@ -287,9 +334,11 @@ class AcceptableStoppingOptions:
 
     f_tol: float | None = None
     f_rel_change_tol: float | None = None
-    dual_inf_tol: float | None = None
-    constr_viol_tol: float | None = None
-    compl_inf_tol: float | None = None
+    # IPOPT ``acceptable_tol``: 1e2 × the 1e-8 optimality default, consistent
+    # with the driver's step-failure salvage factor.
+    dual_inf_tol: float | None = 1e-6
+    constr_viol_tol: float | None = 1e-6
+    compl_inf_tol: float | None = 1e-6
     n_iter: int = 15
 
     def __post_init__(self) -> None:
@@ -313,12 +362,23 @@ class Options:
     likewise accepts a :class:`CorrectionsOptions` or one of ``"none"``,
     ``"mehrotra"``, ``"gondzio"``.
 
-    Termination has four sources, checked in priority order:
+    ``hessian`` selects the Lagrangian Hessian source. ``"auto"`` (default) uses
+    a supplied analytic ``lagrangian_hessian`` when present, else L-BFGS. The
+    explicit modes are honored literally even when an analytic Hessian exists:
+    ``"lbfgs"`` always uses the limited-memory approximation, ``"exact"`` requires
+    the analytic operator (errors otherwise), ``"autodiff-hvp"`` uses backend
+    autodiff Hessian-vector products.
+
+    Termination has five sources, checked in priority order:
 
     * ``optimality`` (:class:`OptimalityConditionOptions`) — single-iteration
       test reporting :attr:`Status.OPTIMAL`.
     * ``acceptable`` (:class:`AcceptableStoppingOptions`) — multi-iteration test
-      reporting :attr:`Status.ACCEPTABLE` (disabled by default).
+      reporting :attr:`Status.ACCEPTABLE`; enabled by default (IPOPT convention:
+      tolerances of ``1e-6`` held for 15 consecutive iterations). Set all its
+      tolerances to ``None`` to disable.
+    * ``diverging_iterates_tol`` — ‖x‖_∞ exceeding the threshold reports
+      :attr:`Status.UNBOUNDED` (``None`` disables it).
     * ``max_iter`` — iteration cap, reports :attr:`Status.MAX_ITER`.
     * ``max_time`` — wall-clock cap in seconds, reports :attr:`Status.MAX_TIME`
       (``None`` disables it).
@@ -332,7 +392,11 @@ class Options:
     )
     max_iter: int = 3000
     max_time: float | None = None
-    hessian: HessianMode = "lbfgs"
+    # IPOPT ``diverging_iterates_tol``: if ‖x‖_∞ exceeds this the iterates are
+    # declared diverging and the solve stops with :attr:`Status.UNBOUNDED` (the
+    # problem is likely unbounded below). ``None`` disables the test.
+    diverging_iterates_tol: float | None = 1e20
+    hessian: HessianMode = "auto"
     linsolve: LinSolveMode = "auto"
     globalization: Globalization = "filter"
     mu_schedule: MuSchedule = "monotone"
@@ -359,6 +423,9 @@ class Options:
     def __post_init__(self) -> None:
         """Validate limits and normalize shorthand option values."""
         _validate_optional_positive("max_time", self.max_time, allow_zero=False)
+        _validate_optional_positive(
+            "diverging_iterates_tol", self.diverging_iterates_tol, allow_zero=False
+        )
         if self.max_iter < 1:
             raise ValueError("max_iter must be a positive integer")
         if isinstance(self.scaling, str):

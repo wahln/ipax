@@ -48,6 +48,22 @@ def escalate_delta_w(
     return delta_w
 
 
+def escalate_delta_c(delta_c: float, options: RegularizationOptions) -> float:
+    """Bump the dual (2,2) regularization ``δ_c`` after a failed saddle solve.
+
+    Escalated alongside ``δ_w`` when the KKT solve keeps failing: ``δ_w``
+    regularizes the (1,1) primal block, but a **rank-deficient equality Jacobian**
+    (e.g. AC power-flow's reference-bus degeneracy) leaves the bordered saddle
+    singular in the (2,2) **dual** block, which only ``δ_c`` can repair (Wächter &
+    Biegler 2006, §3.1). Pure function of the current value: the caller threads it
+    through one ``_solve_step`` retry loop, so it grows only within a failing
+    solve and resets to ``options.delta_c`` on the next step.
+    """
+    seed = options.delta_c if options.delta_c > 0.0 else options.delta_w_init
+    nxt = seed if delta_c <= 0.0 else delta_c * options.delta_w_factor
+    return min(nxt, options.delta_c_max)
+
+
 def shrink_delta_w(
     state: RegularizationState,
     options: RegularizationOptions,
@@ -65,4 +81,9 @@ def shrink_delta_w(
     return delta_w
 
 
-__all__ = ["RegularizationState", "escalate_delta_w", "shrink_delta_w"]
+__all__ = [
+    "RegularizationState",
+    "escalate_delta_c",
+    "escalate_delta_w",
+    "shrink_delta_w",
+]

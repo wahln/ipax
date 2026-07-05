@@ -22,7 +22,13 @@
 - **Autodiff-HVP:** exact Hessian–vector products when the backend supports
   double-backprop and the user enables it.
 - **Exact passthrough:** the operator from ``Problem.lagrangian_hessian``.
-- **L-SR1:** allows indefiniteness; pairs with the indefinite route (later).
+- **L-SR1 (future work, not exposed):** a limited-memory SR1 update would allow
+  an *indefinite* Hessian approximation (capturing negative curvature on
+  nonconvex problems), but that breaks the condensed normal-equations route's
+  "no inertia oracle required" property (which relies on a PD (1,1) block via
+  Powell damping). It would need the indefinite augmented/inertia route or a
+  trust-region globalization, so it is a deliberate scope decision — see AGENTS.md
+  Direction — and is not offered as a ``HessianMode`` until then.
 """
 
 from __future__ import annotations
@@ -78,15 +84,48 @@ class LBFGSOperator(LinearOperator):
         return self._n, self._n
 
     def matvec(self, v: Array) -> Array:
-        if self._u is None or self._m is None:
-            return v  # B = ξI with ξ = 1 (identity seed)
-        xp = array_namespace(v)
-        u_t_v = xp.matmul(xp.permute_dims(self._u, (1, 0)), v)
-        z = xp.linalg.solve(self._m, u_t_v)
-        return self._xi * v - xp.matmul(self._u, z)
+        return self._apply(v)
 
     def rmatvec(self, v: Array) -> Array:
-        return self.matvec(v)  # B is symmetric
+        return self._apply(v)  # B is symmetric
+
+    def matmat(self, V: Array) -> Array:
+        return self._apply(V)
+
+    def rmatmat(self, V: Array) -> Array:
+        return self._apply(V)  # B is symmetric
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        """Materialize the compact Hessian directly from ``B = xi*I - U M^-1 U.T``."""
+        if self._u is None or self._m is None:
+            if like is None:
+                raise NotImplementedError(
+                    "L-BFGS dense matrix requires a template before the first pair"
+                )
+            xp = array_namespace(like)
+            return xp.eye(self._n, dtype=like.dtype)
+
+        xp = array_namespace(self._u)
+        identity = xp.eye(self._n, dtype=self._u.dtype)
+        correction = xp.matmul(
+            self._u,
+            xp.linalg.solve(self._m, xp.permute_dims(self._u, (1, 0))),
+        )
+        return self._xi * identity - correction
+
+    def _apply(self, x: Array) -> Array:
+        """Apply ``B = ξI − U M⁻¹ Uᵀ`` to a vector or a batch of columns.
+
+        Shared by matvec/matmat: ``xp.linalg.solve`` takes a vector or a matrix
+        RHS, so the compact form is evaluated in one pass whether ``x`` is 1-D
+        (single application) or 2-D (batched materialization for the dense route).
+        """
+        if self._u is None or self._m is None:
+            return x  # B = ξI with ξ = 1 (identity seed)
+        xp = array_namespace(x)
+        u_t_x = xp.matmul(xp.permute_dims(self._u, (1, 0)), x)
+        z = xp.linalg.solve(self._m, u_t_x)
+        return self._xi * x - xp.matmul(self._u, z)
 
     def diagonal(self, like: Array | None = None) -> Array:
         """Diagonal of the compact Hessian ``B = ξI − U M⁻¹ Uᵀ`` (§4.3).
@@ -152,6 +191,16 @@ class LBFGSOperator(LinearOperator):
         corrupting the approximation.
         """
         xp = array_namespace(delta, gamma)
+        # A non-finite curvature pair (the Lagrangian gradient overflowed to
+        # inf/NaN at a trial iterate — e.g. an exp/rational element function
+        # evaluated far outside its safe range) would be appended and corrupt the
+        # compact form *permanently*, since the poisoned column survives in the
+        # memory window. The Powell/positive-curvature safeguards below do not
+        # catch it: ``s_y`` is then NaN and every ``<``/``<=`` comparison is
+        # False. Drop the pair so the approximation stays finite and the solver
+        # can still take a (steepest-descent-like) step to escape the region.
+        if not (bool(xp.all(xp.isfinite(delta))) and bool(xp.all(xp.isfinite(gamma)))):
+            return
         s = delta
         y = gamma
         bs = self.matvec(s)
