@@ -499,7 +499,18 @@ class KrylovSolver:
                 acc = g[i]
                 for jj in range(i + 1, k):
                     acc -= r_cols[jj][i] * y[jj]
-                y[i] = acc / r_cols[i][i]
+                diag = r_cols[i][i]
+                # The rotated diagonal is √(h[i]² + h_next²), so it vanishes only
+                # when K·vᵢ vanished after orthogonalization (a singular operator,
+                # e.g. an identically-zero exact Hessian at the start point) — the
+                # projected least-squares column is rank-deficient. Take the
+                # minimal-norm choice yᵢ = 0 and let the outer true-residual check
+                # decide, raising KrylovConvergenceError so the driver escalates
+                # δ_w instead of crashing on a raw ZeroDivisionError.
+                if diag == 0.0 or not math.isfinite(diag):
+                    y[i] = 0.0
+                    continue
+                y[i] = acc / diag
             for i in range(k):
                 x = x + y[i] * v[i]
 

@@ -828,7 +828,12 @@ class _SaddleOperator(LinearOperator):
         diag_n = self._condensed.diagonal()
         xp = array_namespace(diag_n)
         try:
-            schur = self._eq_jac.row_gram_diagonal(1.0 / diag_n)
+            # A zero ``diag(N)`` entry (e.g. an identically-zero exact Hessian at
+            # the start point with ``δ_w = 0``) makes the whole diagonal unusable —
+            # the solver's positivity check discards it — but ``1/0`` would emit
+            # divide-by-zero warnings; substitute 1 to keep the build quiet.
+            safe_n = xp.where(diag_n == 0.0, xp.ones_like(diag_n), diag_n)
+            schur = self._eq_jac.row_gram_diagonal(1.0 / safe_n)
             dual = self._delta_c + schur
         except NotImplementedError:
             # Primal-only preconditioning: SPD identity on the (strictly positive)
