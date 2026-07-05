@@ -186,6 +186,30 @@ def test_exact_hessian_maps_multipliers_with_correct_signs(
     assert_allclose(xp, hess, expected, rtol=1e-12, atol=1e-12)
 
 
+def test_exact_hessian_sigma_folds_into_one_lghxy_call():
+    # σ∇²f + Σ Y∇²c = σ·(∇²f + Σ(Y/σ)∇²c): the σ ≠ 1 correction must not cost a
+    # second LgHxy call — each call is a full interpretive Hessian assembly, so
+    # the old two-call form doubled the exact-Hessian bridge cost.
+    xp = backends.import_namespace("numpy")
+
+    class _Counting(_QuadInstance):
+        calls = 0
+
+        def LgHxy(self, x, y):
+            _Counting.calls += 1
+            return super().LgHxy(x, y)
+
+    problem = _S2MPJExactProblem(_Counting(0.0, 0.0), xp)
+    _Counting.calls = 0  # discard any build-time verification calls
+    hess = _dense_hessian(problem, xp, [1.0, 1.0], [2.0], [], sigma=0.25)
+
+    assert _Counting.calls == 1
+    expected = xp.asarray(
+        [[0.25 * _QuadInstance.a + 2.0, 0.0], [0.0, 0.25 * _QuadInstance.b]]
+    )
+    assert_allclose(xp, hess, expected, rtol=1e-12, atol=1e-12)
+
+
 @pytest.mark.parametrize("sparse", [False, True])
 def test_exact_hessian_scales_only_the_objective_term_by_sigma(sparse):
     # Under gradient-based scaling the driver passes σ = s_f ≠ 1; only ∇²f scales,

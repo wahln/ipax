@@ -248,6 +248,80 @@ def test_sized_instantiation_scales_and_falls_back(bridge_namespace):
     assert fixed_problem.n_vars == 4  # not size-parametrized: fell back to default
 
 
+@pytest.mark.parametrize("name", ("HS71", "ACOPP14", "BATCH", "AVGASA"))
+def test_fast_evaluator_matches_original_s2mpj_methods(name):
+    # The precompiled evaluator must agree with s2mpjlib's interpretive loop on
+    # real corpus problems (values, gradients, Jacobians) at the start point and
+    # perturbed points — beyond the build-time verification the bridge does.
+    import numpy as np
+    import scipy.sparse as sp
+
+    from benchmarks.corpus._s2mpj_fast import fast_evaluator
+    from benchmarks.corpus.s2mpj import _instantiate
+
+    if name not in s2mpj.list_s2mpj_problems():
+        pytest.skip(f"{name} not in this S2MPJ checkout")
+    inst = _instantiate(_ROOT, name)
+    fast = fast_evaluator(inst)
+    assert fast is not None, f"{name}: fast evaluator fell back unexpectedly"
+
+    rng = np.random.default_rng(3)
+    x0 = np.reshape(np.asarray(inst.x0, dtype=float), (-1,))
+    for trial in range(3):
+        x = x0 + (0.1 * rng.standard_normal(x0.shape[0]) if trial else 0.0)
+        f_ref, g_ref = inst.fgx(x)
+        f_new, g_new = fast.fgx(x)
+        assert f_new == pytest.approx(f_ref, rel=1e-10, abs=1e-12)
+        np.testing.assert_allclose(
+            np.ravel(g_new), np.ravel(g_ref), rtol=1e-9, atol=1e-11
+        )
+        c_ref, J_ref = inst.cJx(x)
+        c_new, J_new = fast.cJx(x)
+        np.testing.assert_allclose(
+            np.ravel(c_new), np.ravel(c_ref), rtol=1e-9, atol=1e-11
+        )
+        diff = sp.csr_matrix(J_ref) - sp.csr_matrix(J_new)
+        if diff.nnz:
+            assert float(np.max(np.abs(diff.data))) <= 1e-9 * max(
+                1.0, float(np.max(np.abs(sp.csr_matrix(J_ref).data)))
+            )
+
+
+def test_parallel_runner_produces_the_full_report(tmp_path):
+    # --jobs fans problems out over worker processes; the report must contain
+    # every (problem, config) row exactly as a serial run would produce.
+    from benchmarks.runners.s2mpj import main
+
+    out = tmp_path / "sweep"
+    rc = main(
+        [
+            "--names",
+            "HS21,HS35,HS71,HS28",
+            "--jobs",
+            "2",
+            "--out",
+            str(out),
+            "--max-iter",
+            "300",
+            "--config",
+            "lbfgs/dense,exact/dense",
+        ]
+    )
+    assert rc == 0, "all four HS problems should score correct on both configs"
+
+    import json
+
+    payload = json.loads((out.with_suffix(".json")).read_text())
+    rows = payload["results"]
+    assert len(rows) == 8  # 4 problems × 2 configs
+    keys = {(r["problem"], r["config"]) for r in rows}
+    assert ("s2mpj/HS71", "exact/dense") in keys
+    assert all(r["correct"] for r in rows)
+    # Rows are flushed sorted, so reports are deterministic across runs.
+    assert rows == sorted(rows, key=lambda r: (r["backend"], r["problem"], r["config"]))
+    assert not out.with_suffix(".inflight").exists()
+
+
 def test_s2mpj_bridge_derivatives_match_finite_differences(bridge_namespace):
     # HS71 exercises objective gradient + a nonlinear inequality and equality, so
     # FD agreement confirms the bridge and the constraint-lowering signs.

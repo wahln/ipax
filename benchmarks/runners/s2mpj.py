@@ -24,6 +24,16 @@ and the largest run on the sparse-direct route alone — so a single full-corpus
 remains as a global ceiling for quick restricted runs; the per-route caps are
 ``--dense-max-vars`` / ``--krylov-max-vars`` / ``--sparse-max-vars``. Exits
 non-zero if any case is not "correct".
+
+``--jobs N`` runs N problems concurrently in worker processes (problems are
+independent; each worker runs one problem's whole config matrix so the shared
+instance cache still amortizes construction). Reports stay deterministic — rows
+are sorted before every flush — and the flush-per-problem crash survival is
+kept. Two caveats: per-solve wall times (and therefore ``--max-time`` hits) can
+inflate under CPU oversubscription, so pin BLAS threads (e.g.
+``OMP_NUM_THREADS=1``) or keep N modest for timing-comparable sweeps; and a
+native crash in a worker breaks the whole pool — the ``.inflight`` file then
+lists the candidate culprits, so ``--resume --exclude <name>`` steps past it.
 """
 
 from __future__ import annotations
@@ -36,6 +46,7 @@ from pathlib import Path
 
 import ipax
 from benchmarks.corpus.s2mpj import (
+    _DEFAULT_NAMES,
     list_s2mpj_problems,
     s2mpj_dir,
     s2mpj_problems,
@@ -181,7 +192,7 @@ def _build_within(root: str, name: str, size: int | None, timeout: float) -> boo
         return False
 
 
-def _select_names(args: argparse.Namespace, root: str) -> tuple[str, ...] | None:
+def _select_names(args: argparse.Namespace, root: str) -> tuple[str, ...]:
     """Resolve the problem selection: a file, explicit names, the whole set, or curated."""
     if args.names_file:
         text = Path(args.names_file).read_text()
@@ -194,7 +205,88 @@ def _select_names(args: argparse.Namespace, root: str) -> tuple[str, ...] | None
         if args.limit:
             names = names[: args.limit]
         return tuple(names)
-    return None  # curated default in s2mpj_problems
+    return _DEFAULT_NAMES  # the curated default set
+
+
+def _run_problem_cases(
+    root: str,
+    bare: str,
+    backend: str,
+    size: int | None,
+    feasibility: bool,
+    configs: list[ConfigSpec],
+    global_max_vars: int,
+    max_build_seconds: float,
+) -> tuple[list[CaseResult], str | None]:
+    """Run one problem across the config matrix; ``(rows, skip_reason)``.
+
+    Top-level (picklable) so ``--jobs`` worker processes can run it; the serial
+    path calls it inline. One problem stays wholly inside one call so the
+    lru-cached S2MPJ instance (and its verified fast evaluator) is shared across
+    the per-config rebuilds. ``skip_reason`` is ``"no_objective"``,
+    ``"too_large"``, ``"slow_build"``, or ``None`` when rows were produced (a
+    genuine build error is recorded as a ``build_error`` row, not a skip).
+    """
+    xp = import_namespace(backend)
+
+    # Optional build guard: abandon a problem whose sized build is too slow
+    # (pure-Python O(n²)) before it stalls an unattended sweep.
+    if max_build_seconds > 0 and not _build_within(root, bare, size, max_build_seconds):
+        return [], "slow_build"
+
+    gate_mode = ("lbfgs", False)
+    modes = {_problem_mode(options) for _, options, _ in configs} | {gate_mode}
+    cases_by_mode = {
+        mode: s2mpj_problems(
+            (bare,),
+            directory=root,
+            backends=(backend,),
+            hessian=mode[0],
+            sparse=mode[1],
+            size=size,
+            feasibility=feasibility,
+        )[0]
+        for mode in modes
+    }
+    gate_case = cases_by_mode[gate_mode]
+
+    # One guarded build to gate applicability/size before the configs:
+    # objective-free problems are not minimization problems, and the size cap
+    # keeps the full sweep tractable. Genuine build errors fall through to
+    # run_case so their traceback is recorded as a row.
+    try:
+        problem, _x0 = gate_case.build(xp)
+    except NotImplementedError:
+        return [], "no_objective"
+    except Exception:
+        row = run_case(
+            gate_case,
+            config=configs[0][0],
+            options=configs[0][1],
+            xp=xp,
+            backend=backend,
+        )
+        return [row], None
+
+    # Run each config only when the problem fits that route's variable cap
+    # (tightened by --max-vars). A problem too large for every route is counted
+    # oversized and contributes no rows.
+    n_vars = int(problem.n_vars)
+    rows: list[CaseResult] = []
+    for label, options, route_cap in configs:
+        cap = _effective_cap(route_cap, global_max_vars)
+        if cap and n_vars > cap:
+            continue
+        rows.append(
+            run_case(
+                cases_by_mode[_problem_mode(options)],
+                config=label,
+                options=options,
+                xp=xp,
+                backend=backend,
+            )
+        )
+    return rows, None if rows else "too_large"
 
 
 def _row_to_case_result(row: dict[str, object]) -> CaseResult:
@@ -321,6 +413,15 @@ def main(argv: list[str] | None = None) -> int:
         "equation systems) as 'min 0' subject to the constraints, instead of "
         "skipping them",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="run this many problems concurrently in worker processes (default 1 = "
+        "serial). Problems are independent, so wall time divides ~linearly; pin "
+        "BLAS threads (e.g. OMP_NUM_THREADS=1) or keep it modest when per-solve "
+        "timings must stay comparable to a serial run",
+    )
     args = parser.parse_args(argv)
 
     root = s2mpj_dir(args.dir)
@@ -332,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
-    names = _select_names(args, root)
+    names = tuple(dict.fromkeys(_select_names(args, root)))  # dedupe, keep order
     size = args.size or None
     configs = default_configs(
         args.max_iter,
@@ -349,12 +450,6 @@ def main(argv: list[str] | None = None) -> int:
         if not configs:
             parser.error(f"--config {args.config!r} matched no known config labels")
     environment = capture_environment()
-
-    # Each config may need a differently-built problem (exact vs L-BFGS Hessian,
-    # dense vs sparse operators), so build one case set per distinct mode and look
-    # the problem up by name. The gate mode (default L-BFGS/dense) is always built.
-    gate_mode = ("lbfgs", False)
-    modes = {_problem_mode(options) for _, options, _ in configs} | {gate_mode}
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -376,94 +471,110 @@ def main(argv: list[str] | None = None) -> int:
     def _flush() -> None:
         # Persist after every problem: an unattended sweep over this corpus can hit
         # a native crash (e.g. a backend factorization on an overflowed model), and
-        # the report must survive it rather than losing the whole run.
-        json_path.write_text(json.dumps(to_payload(results, environment), indent=2))
-        md_path.write_text(format_markdown(results, environment), encoding="utf-8")
+        # the report must survive it rather than losing the whole run. Rows are
+        # sorted so the reports are deterministic regardless of --jobs completion
+        # order (and diff cleanly across runs).
+        rows = sorted(results, key=lambda r: (r.backend, r.problem, r.config))
+        json_path.write_text(json.dumps(to_payload(rows, environment), indent=2))
+        md_path.write_text(format_markdown(rows, environment), encoding="utf-8")
 
-    skipped_no_objective = 0
-    skipped_too_large = 0
-    skipped_slow_build = 0
+    skipped: Counter[str] = Counter()
+    work: list[tuple[str, str]] = []
     for backend in backends:
         try:
-            xp = import_namespace(backend)
+            import_namespace(backend)
         except ImportError:
             continue
-        cases_by_mode = {
-            mode: {
-                case.name: case
-                for case in s2mpj_problems(
-                    names,
-                    directory=root,
-                    backends=(backend,),
-                    hessian=mode[0],
-                    sparse=mode[1],
-                    size=size,
-                    feasibility=args.include_objective_free,
-                )
-            }
-            for mode in modes
-        }
-        for case_name, gate_case in cases_by_mode[gate_mode].items():
-            bare = case_name.split("/", 1)[-1]
+        for bare in names:
             if (backend, bare) in done or bare in exclude:
                 continue
+            work.append((backend, bare))
+
+    def _worker_args(backend: str, bare: str) -> tuple[object, ...]:
+        return (
+            root,
+            bare,
+            backend,
+            size,
+            args.include_objective_free,
+            configs,
+            args.max_vars,
+            args.max_build_seconds,
+        )
+
+    def _record(
+        backend: str, bare: str, rows: list[CaseResult], skip: str | None
+    ) -> None:
+        if skip is not None:
+            skipped[skip] += 1
+        results.extend(rows)
+        done.add((backend, bare))
+        _flush()
+
+    if args.jobs <= 1:
+        for backend, bare in work:
             # Record the in-flight problem so a wrapper can identify (and then
             # --exclude) a problem that natively crashes the process. The file is
             # cleared in ``finally`` once the problem is fully handled, so it only
             # survives a hard crash — naming exactly the culprit.
             inflight_path.write_text(f"{backend} {bare}")
             try:
-                # Optional build guard: abandon a problem whose sized build is too
-                # slow (pure-Python O(n²)) before it stalls an unattended sweep.
-                if args.max_build_seconds > 0 and not _build_within(
-                    root, bare, size, args.max_build_seconds
-                ):
-                    skipped_slow_build += 1
-                    continue
-                # One guarded build to gate applicability/size before the configs:
-                # objective-free problems are not minimization problems, and the
-                # size cap keeps the full sweep tractable. Genuine build errors fall
-                # through to run_case so their traceback is recorded as a row.
-                try:
-                    problem, _x0 = gate_case.build(xp)
-                except NotImplementedError:
-                    skipped_no_objective += 1
-                    continue
-                except Exception:
-                    results.append(
-                        run_case(
-                            gate_case,
-                            config=configs[0][0],
-                            options=configs[0][1],
-                            xp=xp,
-                            backend=backend,
-                        )
-                    )
-                    done.add((backend, bare))
-                    _flush()
-                    continue
-                # Run each config only when the problem fits that route's variable
-                # cap (tightened by --max-vars). A problem too large for every route
-                # is counted oversized and contributes no rows.
-                n_vars = int(problem.n_vars)
-                ran_any = False
-                for label, options, route_cap in configs:
-                    cap = _effective_cap(route_cap, args.max_vars)
-                    if cap and n_vars > cap:
-                        continue
-                    case = cases_by_mode[_problem_mode(options)][case_name]
-                    results.append(
-                        run_case(
-                            case, config=label, options=options, xp=xp, backend=backend
-                        )
-                    )
-                    ran_any = True
-                if not ran_any:
-                    skipped_too_large += 1
-                done.add((backend, bare))
-                _flush()
+                rows, skip = _run_problem_cases(*_worker_args(backend, bare))
+                _record(backend, bare, rows, skip)
             finally:
                 inflight_path.unlink(missing_ok=True)
+    else:
+        # Problems are independent, so fan them out over worker processes. Each
+        # worker runs one problem's whole config matrix (sharing the lru-cached
+        # instance + verified fast evaluator), and the parent flushes after every
+        # completion, preserving the crash-surviving report. The in-flight file
+        # lists every currently-running problem: a native crash in a worker breaks
+        # the pool, and the file then names the candidate culprits for --exclude.
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures.process import BrokenProcessPool
+
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=args.jobs, mp_context=ctx) as pool:
+            futures = {
+                pool.submit(_run_problem_cases, *_worker_args(backend, bare)): (
+                    backend,
+                    bare,
+                )
+                for backend, bare in work
+            }
+
+            def _write_inflight() -> None:
+                if futures:
+                    inflight_path.write_text(
+                        "\n".join(f"{b} {n}" for b, n in futures.values())
+                    )
+                else:
+                    inflight_path.unlink(missing_ok=True)
+
+            _write_inflight()
+            try:
+                for future in as_completed(dict(futures)):
+                    backend, bare = futures[future]
+                    # .result() re-raises BrokenProcessPool for the future whose
+                    # worker died — pop only afterwards, so the except-block's
+                    # candidate list still contains the culprit.
+                    rows, skip = future.result()
+                    del futures[future]
+                    _record(backend, bare, rows, skip)
+                    _write_inflight()
+            except BrokenProcessPool:
+                candidates = sorted(f"{b}/{n}" for b, n in futures.values())
+                _flush()
+                print(
+                    "S2MPJ sweep: a worker process died (native crash?); the "
+                    f"culprit is one of: {', '.join(candidates)} — see "
+                    f"{inflight_path}, then --resume --exclude it"
+                )
+                # Exit 2, not 1: a wrapper must be able to tell "pool broke,
+                # resume after identifying the crasher" apart from the normal
+                # "completed with some incorrect cases" exit 1.
+                return 2
 
     _flush()
     by_status: Counter[str] = Counter(r.status for r in results)
@@ -472,8 +583,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"S2MPJ sweep: {n_correct}/{len(results)} correct, "
         f"{n_converged}/{len(results)} converged (KKT) "
-        f"(skipped {skipped_no_objective} objective-free, {skipped_too_large} oversized,"
-        f" {skipped_slow_build} slow-build)"
+        f"(skipped {skipped['no_objective']} objective-free, "
+        f"{skipped['too_large']} oversized, {skipped['slow_build']} slow-build)"
         f" -> {json_path}, {md_path}"
     )
     for status, count in sorted(by_status.items()):

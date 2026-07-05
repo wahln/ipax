@@ -68,6 +68,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   runner summary, the per-config table, and the report header; the per-case table
   flags a converged-but-not-`correct` case with `≈` (and a non-converged one with
   `⚠️`). Pure benchmark/reporting change — no solver behavior is affected.
+- **Precompiled S2MPJ evaluator** (`benchmarks/corpus/_s2mpj_fast.py`): profiling
+  the S2MPJ sweep showed ~90% of solve wall-time inside `s2mpjlib`'s interpretive
+  `evalgrsum` loop (per-element `eval()` string dispatch, `lil_matrix` row
+  assembly, per-group sparse slicing of the linear term). The bridge now compiles
+  the group-partially-separable structure once per instance — element/group
+  functions resolved via `getattr`, all linear terms as one `A @ x − gconst`
+  product, Jacobians assembled as COO triplets on the precomputed support — while
+  the generated element/group math itself is untouched. It is **verified against
+  the original methods at build time** (start point + a perturbed point) and
+  falls back to them on any unsupported feature or mismatch, so a corpus oddity
+  cannot corrupt scores. Measured: 8–130× per constraint evaluation, 6–37×
+  end-to-end solves (AIRPORT 68.8 s → 1.9 s, BATCH 38.5 s → 1.7 s); many former
+  `max_time` rows now run to completion. Benchmark-side only.
+- The S2MPJ sweep runner gained **`--jobs N`**: problems fan out over worker
+  processes (each worker runs one problem's whole config matrix, keeping the
+  shared instance + verified evaluator amortized). Reports are now flushed in
+  sorted row order, so they are deterministic and diff cleanly regardless of
+  completion order; the per-problem crash-surviving flush is kept, and on a
+  worker's native crash the `.inflight` file lists the candidate culprits for
+  `--resume --exclude`.
 - Public sparse operators `COOOperator`, `CSROperator`, and `CSCOperator`
   (exported from `ipax`), so a `Problem` can return a sparse Jacobian or Hessian
   without a concrete sparse library in user code. They carry Array-API
@@ -95,6 +115,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   point in 1.2 s). New defaults: `dual_inf_tol = constr_viol_tol = compl_inf_tol
   = 1e-6`, `n_iter = 15`; set all three to `None` to restore the old
   grind-to-the-cap behavior.
+- Cheaper S2MPJ exact-Hessian bridge: under gradient-based scaling (`σ = s_f ≠ 1`)
+  the bridge assembled `σ∇²f + Σ y∇²c` with **two** `LgHxy` calls (one for the
+  `(σ−1)∇²f` correction); it now folds the scaling into the multipliers via
+  `σ·LgHxy(x, Y/σ)` for `σ > 0` — one interpretive Hessian assembly instead of
+  two. The bridge also seeds its constraint-value memo from `cJx`'s returned
+  `c(x)`, so the driver's same-point value requests after a Jacobian evaluation
+  skip a full `cx` call. Benchmark-side only.
 - Faster dense KKT solve: the condensed, saddle, and L-BFGS Hessian operators now
   implement native batched `matmat`/`rmatmat` (and `rmatmat` is available across the
   `LinearOperator` subclasses), so materializing the operator for the dense route

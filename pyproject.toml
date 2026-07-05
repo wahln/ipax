@@ -163,7 +163,7 @@ required-imports = ["from __future__ import annotations"]
 # codespell
 # ---------------------------------------------------------------------------
 [tool.codespell]
-ignore-words-list = "coo"
+ignore-words-list = "coo,fiel,crasher"
 skip = ".git,.mypy_cache,.pytest_cache,.ruff_cache,.venv,__pycache__,build,dist,*.egg-info"
 
 # ---------------------------------------------------------------------------
