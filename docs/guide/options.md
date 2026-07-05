@@ -42,9 +42,13 @@ ipax.Options(
 **Acceptable** ([`AcceptableStoppingOptions`](../reference.md#ipax.options.AcceptableStoppingOptions))
 mirrors the same conditions but requires them to hold for `n_iter` *consecutive*
 iterations, and reports [`Status.ACCEPTABLE`](results.md#status) (also a
-success). It is **off by default** and is the right tool when a
-dual-infeasibility-dominated residual plateaus while the objective and primal
-feasibility have already settled:
+success). It follows the **IPOPT convention and is on by default**
+(`dual_inf_tol = constr_viol_tol = compl_inf_tol = 1e-6` — 1e2× the optimality
+default — held for `n_iter = 15`), so a problem whose achievable KKT floor sits
+between the acceptable and optimal tolerances (a degenerate optimum, an
+ill-conditioned least-squares fit) reports `ACCEPTABLE` instead of grinding on
+to `max_iter`/`max_time`. Loosen a tolerance further when a
+dual-infeasibility-dominated residual plateaus early:
 
 ```python
 ipax.Options(
@@ -57,9 +61,19 @@ ipax.Options(
 )
 ```
 
+Set every tolerance to `None` to disable the mechanism entirely and always run
+to `max_iter`/`max_time` on a stagnant residual.
+
 **Limits.** `max_iter` (default `3000`) reports `Status.MAX_ITER`; `max_time`
 in seconds (default `None`, disabled) reports `Status.MAX_TIME`. Both are
 checked at iteration boundaries.
+
+**Unbounded detection.** `diverging_iterates_tol` (default `1e20`) stops the
+solve with [`Status.UNBOUNDED`](results.md#status) once `‖x‖∞` exceeds it while
+the point stays feasible — an IPOPT-style diverging-iterates test that catches
+an objective running away to `-∞` and reports it honestly instead of letting
+the runaway iterate eventually overflow to a misleading `NUMERICAL_ERROR`. Set
+to `None` to disable.
 
 ## Hessian
 

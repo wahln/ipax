@@ -57,9 +57,15 @@ with `Options(corrections="mehrotra" | "gondzio")`.
 - Optimality termination on the scaled KKT residual components — by default each
   of dual infeasibility, constraint violation and complementarity $\le 10^{-8}$
   in a single iteration — reporting `Status.OPTIMAL`.
-- Optional acceptable stopping shares the same conditions (plus a relative
-  objective change `f_tol`) but requires them to hold for `n_iter` consecutive
-  iterates; it is disabled by default and reports `Status.ACCEPTABLE`.
+- Acceptable stopping shares the same conditions (plus a relative objective
+  change `f_tol`) but requires them to hold for `n_iter` consecutive iterates;
+  it follows the IPOPT convention and is **on by default** ($10^{-6}$ for
+  15 iterations), reporting `Status.ACCEPTABLE`. Set every tolerance to `None`
+  to disable it.
 - Optional `max_iter` / `max_time` limits are checked at iteration boundaries and
   report `Status.MAX_ITER` / `Status.MAX_TIME`.
+- An IPOPT-style diverging-iterates test reports `Status.UNBOUNDED` when
+  $\|x\|_\infty$ exceeds `diverging_iterates_tol` (default $10^{20}$), catching
+  an unbounded-below objective before the runaway iterate overflows to a
+  misleading numerical failure.
 - L-BFGS (compact, Powell-damped) Hessian keeps $N$ positive definite.
