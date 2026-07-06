@@ -135,6 +135,11 @@ class TROTSInstance:
     real: int  # original RT variable count (misc.real)
     entries: list[TROTSEntry]
     solution: Any  # reference solutionX (NumPy), or None
+    # Least-squares warm-start data (misc.Initialise*): the tumour dose matrices,
+    # their per-matrix reference dose, and the regularisation matrix id (0 = none).
+    init_matrix_ids: Any = field(default=None)  # 1-based ids, or None
+    init_reference_dose: Any = field(default=None)  # scalar dose per init matrix
+    init_reg_matrix_id: int = 0
     _path: str = field(repr=False, default="")
     _matrix_cache: dict[int, TROTSMatrix] = field(repr=False, default_factory=dict)
 
@@ -201,12 +206,20 @@ def _load_instance(path: str, only_active: bool) -> TROTSInstance:
     import numpy as np
 
     with h5py.File(path, "r") as f:
-        n = int(np.asarray(f["data"]["misc"]["size"][()]).ravel()[0])
-        real = int(np.asarray(f["data"]["misc"]["real"][()]).ravel()[0])
+        misc = f["data"]["misc"]
+        n = int(np.asarray(misc["size"][()]).ravel()[0])
+        real = int(np.asarray(misc["real"][()]).ravel()[0])
         solution = None
         if "solutionX" in f:
             solution = np.asarray(f["solutionX"][()], dtype=float).ravel()
         identifier = os.path.splitext(os.path.basename(path))[0]
+
+        # Least-squares warm-start data (§4 misc): tumour matrix ids, their target
+        # dose, and the regularisation matrix id (a 0 / empty entry means none).
+        init_ids = np.asarray(misc["InitialiseMatrixID"][()]).ravel().astype(int)
+        init_dose = np.asarray(misc["InitialiseReferenceDose"][()]).ravel()
+        reg_raw = np.asarray(misc["InitialiseRegularisationMatrixID"][()]).ravel()
+        reg_id = int(reg_raw[0]) if reg_raw.size and int(reg_raw[0]) > 0 else 0
 
         entries: list[TROTSEntry] = []
         n_entries = f["problem"]["dataID"].shape[0]
@@ -235,6 +248,9 @@ def _load_instance(path: str, only_active: bool) -> TROTSInstance:
         real=real,
         entries=entries,
         solution=solution,
+        init_matrix_ids=init_ids,
+        init_reference_dose=init_dose,
+        init_reg_matrix_id=reg_id,
         _path=path,
     )
 
@@ -278,8 +294,12 @@ def _cost_value(ctype: int, d: Any, par: Any) -> float:
         return float(np.mean(np.exp(-alpha * (d - dp))))
     if ctype == 5:  # DVH (smoothed)
         dc, p = _dvh_params(par)
-        r = np.power(d / dc, p)
-        return float(np.mean(r / (1.0 + r)))
+        # φ = r/(1+r) = 1 − s with s = 1/(1+r): for a high-dose voxel r overflows,
+        # but s → 0 cleanly (1/∞), so 1 − s → 1 with no inf/inf nan.
+        with np.errstate(over="ignore"):
+            r = np.power(d / dc, p)
+        s = 1.0 / (1.0 + r)
+        return float(np.mean(1.0 - s))
     raise ValueError(f"unsupported cost-function type {ctype}")
 
 
@@ -297,12 +317,16 @@ def _cost_grad_d(ctype: int, d: Any, par: Any) -> Any:
         return (-alpha / m) * np.exp(-alpha * (d - dp))
     if ctype == 5:  # DVH
         dc, p = _dvh_params(par)
-        # dφ/dd = [1/(1+r)²]·(p r / d); → 0 as d → 0 (p > 1), so zero-mask d ≤ 0.
+        # dφ/dd = (p/d)·(1−s)·s with s = 1/(1+r) — the overflow-safe form of
+        # (p r/d)/(1+r)² (r s² = (1−s)s). → 0 as d → 0 (p > 1) and as r → ∞ (s → 0),
+        # so a high-dose voxel gives 0 rather than an inf/inf nan.
         safe = d > 0.0
         g = np.zeros_like(d)
         ds = d[safe]
-        r = np.power(ds / dc, p)
-        g[safe] = (1.0 / m) * (p * r / ds) / (1.0 + r) ** 2
+        with np.errstate(over="ignore"):
+            r = np.power(ds / dc, p)
+        s = 1.0 / (1.0 + r)
+        g[safe] = (1.0 / m) * (p / ds) * (1.0 - s) * s
         return g
     raise ValueError(f"unsupported cost-function type {ctype}")
 
@@ -322,15 +346,17 @@ def _cost_hess_d(ctype: int, d: Any, par: Any) -> tuple[Any, Any, Any]:
         dp, alpha = float(par[0]), float(par[1])
         h = (alpha * alpha / m) * np.exp(-alpha * (d - dp))
         return h, zeros, 0.0
-    if ctype == 5:  # DVH: φ'' = (p r/d²)/(1+r)² · [ -2 p r/(1+r) + (p-1) ]
+    if ctype == 5:  # DVH: φ'' = (p/d²)(1−s)s·[ −2p(1−s) + (p−1) ], s = 1/(1+r)
+        # The overflow-safe rewrite of (p r/d²)/(1+r)²·[−2p r/(1+r) + (p−1)] using
+        # r s² = (1−s)s and r s = (1−s); → 0 as d → 0 (p > 1) and as r → ∞ (s → 0).
         dc, p = _dvh_params(par)
-        safe = d > 0.0  # φ'' → 0 as d → 0 (p > 1); zero-mask to avoid 0/0
+        safe = d > 0.0
         h = np.zeros_like(d)
         ds = d[safe]
-        r = np.power(ds / dc, p)
-        h[safe] = (
-            (p * r / ds**2) / (1.0 + r) ** 2 * (-2.0 * p * r / (1.0 + r) + (p - 1.0))
-        )
+        with np.errstate(over="ignore"):
+            r = np.power(ds / dc, p)
+        s = 1.0 / (1.0 + r)
+        h[safe] = (p / ds**2) * (1.0 - s) * s * (-2.0 * p * (1.0 - s) + (p - 1.0))
         return h / m, zeros, 0.0
     if ctype == 3:  # gEUD: diagonal + rank-1 (from S depending on all d_i)
         a = float(par[0])
@@ -568,16 +594,86 @@ class TROTSProblem(Problem):
         upper = np.full((self._n_vars,), np.inf, dtype=float)
         return _from_numpy(self.xp, lower), _from_numpy(self.xp, upper)
 
-    def initial_point(self, scale: float = 1.0) -> Array:
-        """A strictly-positive fluence start with consistent minimax aux values."""
+    def _pad_aux(self, x: Any) -> Any:
+        """Append minimax aux values ``t_k = max/min(A_k x)`` consistent with ``x``."""
         import numpy as np
 
-        x = np.full((self._n,), scale, dtype=float)
         t = np.zeros((self._n_aux,), dtype=float)
         for k, (mat, _w, minimise) in enumerate(self._minimax):
             d = mat.matrix @ x
             t[k] = float(np.max(d)) if minimise else float(np.min(d))
-        return _from_numpy(self.xp, np.concatenate([x, t]))
+        return np.concatenate([x, t])
+
+    def least_squares_fluence(self, ridge: float = 1e-8) -> Any:
+        """The TROTS least-squares warm-start fluence (host NumPy, length ``n``).
+
+        Solves the normal equations ``(A_initᵀ A_init + R) x = A_initᵀ (d_ref − b)``
+        for the tumour matrices ``A_init`` (``misc.InitialiseMatrixID``) driven to
+        their per-matrix reference dose ``d_ref`` (``misc.InitialiseReferenceDose``),
+        with the optional quadratic regularisation ``R``
+        (``misc.InitialiseRegularisationMatrixID``). This is the physically motivated
+        start the dataset ships — a fluence that already delivers roughly the
+        prescribed dose to the targets — far closer to the feasible region than a
+        uniform map. Negative fluences are clipped to zero (non-negativity). Returns
+        a uniform vector when the file carries no initialisation matrices.
+        """
+        import numpy as np
+        import scipy.sparse as sp
+
+        inst = self._inst
+        ids = (
+            np.asarray(inst.init_matrix_ids).ravel()
+            if inst.init_matrix_ids is not None
+            else np.zeros((0,), dtype=int)
+        )
+        if ids.size == 0:
+            return np.ones((self._n,), dtype=float)
+
+        dose = np.asarray(inst.init_reference_dose, dtype=float).ravel()
+        blocks: list[Any] = []
+        rhs_parts: list[Any] = []
+        for k, mid in enumerate(ids):
+            mat = inst.matrix(int(mid))
+            a = sp.csr_matrix(mat.matrix)
+            blocks.append(a)
+            target = (dose[k] if k < dose.size else 0.0) - (
+                mat.b if mat.b.size == a.shape[0] else 0.0
+            )
+            rhs_parts.append(np.full(a.shape[0], 1.0) * target)
+        a_init = sp.vstack(blocks, format="csr")
+        normal = np.asarray((a_init.T @ a_init).todense())
+        rhs = a_init.T @ np.concatenate(rhs_parts)
+        if inst.init_reg_matrix_id:
+            r = inst.matrix(inst.init_reg_matrix_id).matrix
+            r = np.asarray((0.5 * (r + r.T)).todense())
+            normal = normal + r
+        # A small ridge (relative to the block's scale) keeps the solve well-posed
+        # when A_init is rank-deficient or no regularisation matrix is supplied.
+        normal = normal + ridge * (np.trace(normal) / max(self._n, 1)) * np.eye(self._n)
+        x = np.linalg.solve(normal, rhs)
+        return np.maximum(x, 0.0)
+
+    def initial_point(self, scale: float = 1.0, *, warm_start: bool = True) -> Array:
+        """A strictly-positive fluence start with consistent minimax aux values.
+
+        With ``warm_start`` (default) and initialisation data present, uses the
+        dataset's least-squares fluence (:meth:`least_squares_fluence`); otherwise a
+        uniform ``scale`` map. A tiny positive floor is applied so the log-barrier
+        has a non-degenerate interior start on the ``x ≥ 0`` bounds.
+        """
+        import numpy as np
+
+        has_init = (
+            self._inst.init_matrix_ids is not None
+            and np.asarray(self._inst.init_matrix_ids).size > 0
+        )
+        if warm_start and has_init:
+            x = self.least_squares_fluence()
+            peak = float(np.max(x))
+            x = np.maximum(x, 1e-6 * peak if peak > 0.0 else 1e-6)
+        else:
+            x = np.full((self._n,), scale, dtype=float)
+        return _from_numpy(self.xp, self._pad_aux(x))
 
     # -- objective ----------------------------------------------------------
     def objective(self, z: Array) -> Scalar:

@@ -130,13 +130,48 @@ def test_small_case_solves_to_feasible_kkt_point(hessian):
     instance = trots.load_trots_file(f"{_ROOT}/Prostate_BT_01.mat")
     cls = trots.TROTSExactProblem if hessian == "exact" else trots.TROTSProblem
     problem = cls(instance, np, sparse=True)
+    # Uniform start: a deterministic solver-route smoke test. (The least-squares
+    # warm start, covered by its own tests, is tuned for the large convex cases and
+    # can stall this small *non-convex* brachytherapy case — expected sensitivity.)
     result = solve(
         problem,
-        problem.initial_point(),
+        problem.initial_point(warm_start=False),
         options=Options(hessian=hessian, linsolve="sparse", max_iter=100),
     )
     assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
     assert result.constraint_violation <= 1e-6
+
+
+def test_least_squares_warm_start_delivers_target_dose():
+    # The dataset's least-squares start (misc.Initialise*) drives the tumour
+    # matrices toward their reference dose; the delivered mean dose should sit in a
+    # sensible band around the target and the fluence must be non-negative.
+    instance = trots.load_trots_file(f"{_ROOT}/Protons_01.mat")
+    problem = trots.TROTSProblem(instance, np, sparse=True)
+    x = problem.least_squares_fluence()
+    assert x.shape == (instance.n,)
+    assert float(np.min(x)) >= 0.0
+    ids = np.asarray(instance.init_matrix_ids).ravel()
+    dose = np.asarray(instance.init_reference_dose).ravel()
+    assert ids.size > 0
+    for k, mid in enumerate(ids):
+        d = instance.matrix(int(mid)).matrix @ x
+        # Within a factor of ~2 of the reference dose (regularisation pulls it in).
+        assert 0.4 * dose[k] <= float(np.mean(d)) <= 2.0 * dose[k]
+
+
+def test_initial_point_warm_start_beats_uniform_objective():
+    # The warm start should land much closer to the reference objective than a
+    # uniform fluence — the whole point of using the initialisation matrices.
+    instance = trots.load_trots_file(f"{_ROOT}/Protons_01.mat")
+    problem = trots.TROTSProblem(instance, np, sparse=True)
+    ref = trots.reference_for("Protons_01")
+    assert ref is not None
+    warm = np.asarray(problem.initial_point(warm_start=True))[: instance.n]
+    uniform = np.asarray(problem.initial_point(warm_start=False))[: instance.n]
+    warm_err = abs(trots.objective_at(instance, warm) - ref.objective)
+    uniform_err = abs(trots.objective_at(instance, uniform) - ref.objective)
+    assert warm_err < uniform_err
 
 
 def test_list_and_reference_parsing():

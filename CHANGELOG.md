@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- **TROTS radiotherapy benchmark corpus** (`benchmarks/corpus/trots.py`,
+  download-gated on `IPAX_TROTS_DIR`). Loads the TROTS treatment-planning problems
+  (MATLAB v7.3/HDF5) into an ipax `Problem`: all cost functions (linear
+  max/min/mean, quadratic, gEUD, LTCP, smoothed DVH) with the weighted
+  scalarisation, the pointwise-max objectives lowered to a minimax epigraph, the
+  elementwise dose constraints emitted as Array-API sparse operators, an exact
+  Lagrangian Hessian variant, and the dataset's least-squares warm start
+  (`misc.Initialise*`). Objective evaluated at the reference `solutionX` reproduces
+  the published `Objective Function Value` to the significant figures each solve
+  reports (validated across the proton/photon/liver groups). Runner + gated tests
+  included.
+
 ### Fixed
 - **S2MPJ benchmark: batched evaluation preserves overflow semantics.** The
   original (and per-element) S2MPJ code raises `OverflowError` at wild
