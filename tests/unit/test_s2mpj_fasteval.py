@@ -450,6 +450,33 @@ def _eWSQ(self, nargout, *args):
         return f_, g_
 
 
+def _gPSQ(self, nargout, *args):
+    # Generator-style group function: f = p·a² with p = self.grpar[igr_][0].
+    GVAR_ = args[0]
+    igr_ = args[1]
+    f_ = self.grpar[igr_][0] * GVAR_ * GVAR_
+    if nargout > 1:
+        g_ = 2.0 * self.grpar[igr_][0] * GVAR_
+    if nargout == 1:
+        return f_
+    elif nargout == 2:
+        return f_, g_
+
+
+def _gBR(self, nargout, *args):
+    # Data-dependent branch: must stay on the per-row path.
+    GVAR_ = args[0]
+    igr_ = args[1]  # noqa: F841
+    if GVAR_ > 0:
+        f_, g_ = GVAR_**2, 2.0 * GVAR_
+    else:
+        f_, g_ = -(GVAR_**2), -2.0 * GVAR_
+    if nargout == 1:
+        return f_
+    elif nargout == 2:
+        return f_, g_
+
+
 def _eBRANCH(self, nargout, *args):
     # Data-dependent branch: must be rejected by the batch transformer and
     # keep evaluating per element. f = |u|·u (branchy form).
@@ -473,17 +500,18 @@ def _eBRANCH(self, nargout, *args):
 class _BatchInstance:
     """Generator-style fake: batchable eWSQ (weighted, unweighted, repeated
     elemental variables, per-element parameters) mixed with the unbatchable
-    branchy eBRANCH, over one non-TRIVIAL objective group and two TRIVIAL
-    constraint groups with linear terms."""
+    branchy eBRANCH; group functions cover TRIVIAL, batchable gPSQ (twice,
+    with per-group grpar) and the branchy gBR; constraint rows cover an
+    equality, a two-sided range, an upper side, and a lower side."""
 
     n = 4
-    m = 2
+    m = 4
     name = "BATCHFAKE"
     objgrps = np.array([0])
-    congrps = np.array([1, 2])
+    congrps = np.array([1, 2, 3, 4])
     x0 = np.array([[1.0], [2.0], [3.0], [4.0]])
-    clower = np.array([[0.0], [-np.inf]])
-    cupper = np.array([[0.0], [10.0]])
+    clower = np.array([[0.0], [-1.0], [-np.inf], [2.0]])
+    cupper = np.array([[0.0], [10.0], [5.0], [np.inf]])
     elftype: ClassVar = ["eWSQ", "eWSQ", "eWSQ", "eWSQ", "eBRANCH"]
     elvar: ClassVar = [
         np.array([0, 1]),
@@ -493,15 +521,18 @@ class _BatchInstance:
         np.array([0]),
     ]
     elpar: ClassVar = [[2.0], [0.5], [1.5], [1.0], [7.0]]
-    grelt: ClassVar = [np.array([0]), np.array([1, 2]), np.array([3, 4])]
+    grelt: ClassVar = [np.array([0]), np.array([1, 2]), np.array([3, 4]), None, None]
     grelw: ClassVar = [[3.0], None, [2.0, 1.0]]
-    grftype: ClassVar = ["gSQR", None, "TRIVIAL"]
-    gconst = np.array([0.2, 0.0, 0.0])
-    gscale = np.array([2.0, None, 4.0], dtype=object)
+    grftype: ClassVar = ["gSQR", None, "gPSQ", "gPSQ", "gBR"]
+    grpar: ClassVar = [None, None, [3.0], [0.5], None]
+    gconst = np.array([0.2, 0.0, 0.0, 1.0, 0.0])
+    gscale = np.array([2.0, None, 4.0, None, 2.0], dtype=object)
 
     eWSQ = staticmethod(_eWSQ)
     eBRANCH = staticmethod(_eBRANCH)
     gSQR = staticmethod(_gSQR)
+    gPSQ = staticmethod(_gPSQ)
+    gBR = staticmethod(_gBR)
 
     def __init__(self):
         self.A = sp.lil_matrix(
@@ -510,6 +541,8 @@ class _BatchInstance:
                     [1.0, 0.0, 2.0, 0.0],
                     [0.0, 1.0, 0.0, 1.0],
                     [3.0, 0.0, 0.0, 0.5],
+                    [0.0, 2.0, 1.0, 0.0],
+                    [1.0, 1.0, 0.0, 1.0],
                 ]
             )
         )
@@ -562,6 +595,50 @@ def test_batched_instance_passes_verification():
     fast = fast_evaluator(_BatchInstance())
     assert fast is not None
     assert "eWSQ" in fast.batched_elftypes
+
+
+def test_nontrivial_group_functions_batch_by_gftype():
+    fast = FastS2MPJEval(_BatchInstance())
+    assert "gPSQ" in fast.batched_gftypes
+    assert "gBR" not in fast.batched_gftypes
+
+
+def test_bridge_jacobian_split_matches_reference():
+    # eq/lo/up row selection (incl. the two-sided range appearing in both
+    # ineq blocks) must reproduce the sign-lowered rows of the full Jacobian.
+    xp = backends.import_namespace("numpy")
+    inst = _BatchInstance()
+    x = np.array([0.7, -1.3, 2.1, 0.4])
+    _c, J = _ref_cJx(inst, x)
+    J = np.asarray(J.todense())
+    for sparse in (False, True):
+        problem = _S2MPJProblem(_BatchInstance(), xp, sparse=sparse)
+        xv = xp.asarray(x)
+        eq = problem.eq_jacobian(xv)
+        ineq = problem.ineq_jacobian(xv)
+        if sparse:
+            eq = eq.scipy_matrix.todense()
+            ineq = ineq.scipy_matrix.todense()
+        # Row 0 is the equality; lower sides (rows 1, 3) then upper (1, 2).
+        np.testing.assert_allclose(np.asarray(eq), J[[0]], rtol=1e-12)
+        expected = np.vstack((-J[[1, 3]], J[[1, 2]]))
+        np.testing.assert_allclose(np.asarray(ineq), expected, rtol=1e-12)
+
+
+def test_gradient_and_objective_share_one_fgx_evaluation():
+    xp = backends.import_namespace("numpy")
+    problem = _S2MPJProblem(_StructuredInstance(), xp)
+    fgx_calls, fx_calls = [], []
+    orig_fgx, orig_fx = problem._eval_fgx, problem._eval_fx
+    problem._eval_fgx = lambda x_np: (fgx_calls.append(1), orig_fgx(x_np))[1]
+    problem._eval_fx = lambda x_np: (fx_calls.append(1), orig_fx(x_np))[1]
+
+    x = xp.asarray(_X)
+    g = problem.gradient(x)
+    f = problem.objective(x)  # same point: must reuse the memoized fgx value
+    assert len(fgx_calls) == 1 and len(fx_calls) == 0
+    np.testing.assert_allclose(np.asarray(g).ravel(), _G_EXPECTED, rtol=1e-13)
+    assert float(np.asarray(f)) == pytest.approx(_F_EXPECTED, rel=1e-13)
 
 
 def test_lying_batch_source_is_caught_by_type_verification():

@@ -38,6 +38,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   ~4–25× per `cx`/`cJx` call over the pre-batching evaluator (ACOPP14
   1.03→0.04 ms; ~25–250× vs S2MPJ's original `evalgrsum`), ~2× per `fgx`,
   and an element-heavy L-BFGS solve runs ~2× faster end-to-end.
+- **S2MPJ benchmark: remaining per-call hot spots batched/precomputed.**
+  Non-TRIVIAL *group* functions now batch per gftype through the same AST
+  transform + verify-or-demote pipeline (the `gL2` least-squares corpus is
+  the main beneficiary: LUKSAN11LS `fgx` 15×, DTOC1L 9×, PALMER1C 5×); the
+  bridge splits the bundled Jacobian into eq/ineq blocks with precomputed
+  signed row selectors (`P @ J` instead of per-call fancy-slicing + vstack)
+  and memoizes `(f, ∇f)` per point so a same-point objective request after a
+  gradient reuses one `fgx` evaluation; and the fast Lagrangian Hessian's
+  COO→CSR reduction (sort order + duplicate-run starts) is precomputed, so
+  per-call assembly is a gather + `np.add.reduceat` with no COO sort.
 
 ## [0.4.0] - 2026-07-05
 
