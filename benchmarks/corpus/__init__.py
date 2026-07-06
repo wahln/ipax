@@ -7,8 +7,10 @@ Each :class:`BenchmarkProblem` is backend-parametric: ``build(xp)`` returns the
 NumPy, PyTorch, etc. The analytic oracles are shared with ``ipax.testing`` — the
 benchmark layer only adds starting points, metadata, and the corpus listing.
 
-CUTEst/Maros–Mészáros (``pycutest``) and TROTS are deferred to a later phase
-(download-gated); this module is the always-available QC core.
+CUTEst/Maros–Mészáros (``pycutest``) are deferred to a later phase; the S2MPJ
+(:mod:`benchmarks.corpus.s2mpj`) and TROTS (:mod:`benchmarks.corpus.trots`) loaders
+are download-gated (they return ``[]`` without a local dataset). This module is the
+always-available QC core.
 """
 
 from __future__ import annotations
