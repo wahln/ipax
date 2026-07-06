@@ -224,6 +224,33 @@ def test_row_scaled_pattern_signature_propagation(namespace):
     assert _RowScaled(mf, d).coo_pattern_signature() is None
 
 
+def test_row_scaled_gram_folds_scaling_into_weights(namespace, tol):
+    # (DJ)ᵀ diag(w) (DJ) = Jᵀ diag(d²·w) J, so the row-scaled Gram must equal the
+    # dense reference — keeping the condensed dense route's sparse-Gram fast path
+    # alive through gradient-based scaling.
+    from ipax.backend.operators import COOOperator
+    from ipax.problem.scaling import _RowScaled
+
+    if get_sparse_adapter(namespace) is None:
+        pytest.skip(f"no sparse adapter for backend {namespace.__name__!r}")
+
+    inner = COOOperator(
+        namespace.asarray([0, 0, 1]),
+        namespace.asarray([0, 1, 2]),
+        array(namespace, [2.0, -1.0, 3.0]),
+        (2, 3),
+    )
+    d = array(namespace, [2.0, 0.5])
+    scaled = _RowScaled(inner, d)
+    weights = array(namespace, [1.5, 0.75])
+    dense = scaled.matmat(namespace.eye(3, dtype=d.dtype))  # (DJ) as a dense 2×3
+    ref = namespace.matmul(
+        namespace.permute_dims(dense, (1, 0)),
+        namespace.expand_dims(weights, axis=1) * dense,
+    )
+    assert_allclose(namespace, scaled.gram(weights), ref, **tol)
+
+
 def test_scaling_options_validation():
     with pytest.raises(ValueError, match="scaling method"):
         ScalingOptions(method="bogus")  # type: ignore[arg-type]

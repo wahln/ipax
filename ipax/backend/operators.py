@@ -155,6 +155,21 @@ class LinearOperator(ABC):
         """
         raise NotImplementedError("operator does not expose a cheap Gram diagonal")
 
+    def gram(self, weights: Array) -> Array:
+        """Return the full weighted Gram matrix ``Aᵀ diag(weights) A`` (dense ``n×n``).
+
+        The matrix analogue of :meth:`gram_diagonal`: the condensed inequality term
+        ``∇gᵀ Σ_s ∇g`` of the Newton system (Breedveld 2017, eq. 18). For a sparse
+        ``A`` this is formed by sparse arithmetic — scale rows by ``weights`` then a
+        sparse Gram product — yielding the small dense ``n×n`` result *without*
+        densifying ``A`` to ``m×n`` first. That is the whole point at radiotherapy
+        scale, where ``m ≫ n``: the dense condensed route would otherwise materialize
+        a ``m×n`` Jacobian (gigabytes) to form an ``n×n`` matrix. Optional, like
+        :meth:`gram_diagonal`; the dense KKT route falls back to densifying ``A`` when
+        it is unavailable.
+        """
+        raise NotImplementedError("operator does not expose a full weighted Gram")
+
     def row_gram_diagonal(self, weights: Array) -> Array:
         """Return ``diag(A diag(weights) Aᵀ)`` — the weighted *row* energies.
 
@@ -663,6 +678,20 @@ class VStack(LinearOperator):
         xp = array_namespace(result)
         return xp.asarray(result)
 
+    def gram(self, weights: Array) -> Array:
+        # Jᵀ diag(w) J for J = [J1; …; Jk] is Σ_b Jbᵀ diag(w_b) Jb — the vertical
+        # stack sums each block's Gram over its own row (weight) range. Propagates
+        # NotImplementedError if any block cannot form its Gram.
+        result = None
+        offset = 0
+        for op, rows in zip(self._ops, self._rows, strict=True):
+            piece = op.gram(weights[offset : offset + rows])
+            result = piece if result is None else result + piece
+            offset += rows
+        assert result is not None
+        xp = array_namespace(result)
+        return xp.asarray(result)
+
     def row_inf_norms(self, like: Array | None = None) -> Array:
         # Stacked rows ⇒ concatenate each block's row norms (used by scaling).
         xp = None
@@ -831,6 +860,9 @@ class _SparseStructured(LinearOperator):
 
     def gram_diagonal(self, weights: Array) -> Array:
         return self._adapter_op().gram_diagonal(weights)
+
+    def gram(self, weights: Array) -> Array:
+        return self._adapter_op().gram(weights)
 
     def row_gram_diagonal(self, weights: Array) -> Array:
         return self._adapter_op().row_gram_diagonal(weights)

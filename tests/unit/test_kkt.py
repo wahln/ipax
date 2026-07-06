@@ -126,6 +126,74 @@ def test_condensed_dense_matrix_matches_materialized(namespace, tol):
     assert_allclose(namespace, actual, expected, **tol)
 
 
+def test_condensed_dense_matrix_matches_with_sparse_jacobian(namespace, tol):
+    """A sparse inequality Jacobian's condensed block equals the matvec form.
+
+    The condensed dense route forms ``∇gᵀ Σ_s ∇g`` through the operator's sparse
+    ``gram`` (no ``m×n`` densification) for a sparse Jacobian; the result must
+    still agree with the matrix-free ``matmat`` assembly, which never touches the
+    ``gram`` path.
+    """
+    from ipax.backend.operators import COOOperator
+    from ipax.backend.sparse import get_sparse_adapter
+
+    if get_sparse_adapter(namespace) is None:
+        pytest.skip(f"no sparse adapter for backend {namespace.__name__!r}")
+
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    # Sparse J = [[1, 2], [-1, 0.5]] as COO triplets.
+    J = COOOperator(
+        namespace.asarray([0, 0, 1, 1]),
+        namespace.asarray([0, 1, 0, 1]),
+        array(namespace, [1.0, 2.0, -1.0, 0.5]),
+        (2, 2),
+    )
+    op = build_condensed_operator(
+        Dense(W_dense), sigma_x, sigma_s, J, RegularizationState(delta_w=1e-6)
+    )
+
+    actual = op.dense_matrix()
+    expected = op.matmat(namespace.eye(2, dtype=W_dense.dtype))
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_condensed_dense_matrix_never_densifies_sparse_jacobian(namespace, tol):
+    """The condensed block must form ∇gᵀ Σ_s ∇g via ``gram``, not by densifying ∇g.
+
+    A ``dense_matrix`` on the ``m×n`` Jacobian is exactly the gigabytes-scale
+    materialization the sparse Gram path exists to avoid, so a Jacobian whose
+    ``dense_matrix`` raises must still yield the correct condensed block.
+    """
+    from ipax.backend.operators import COOOperator
+    from ipax.backend.sparse import get_sparse_adapter
+
+    if get_sparse_adapter(namespace) is None:
+        pytest.skip(f"no sparse adapter for backend {namespace.__name__!r}")
+
+    class _GramOnlyJacobian(COOOperator):
+        def dense_matrix(self, like=None):
+            raise AssertionError("condensed block must not densify the m×n Jacobian")
+
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    J = _GramOnlyJacobian(
+        namespace.asarray([0, 0, 1, 1]),
+        namespace.asarray([0, 1, 0, 1]),
+        array(namespace, [1.0, 2.0, -1.0, 0.5]),
+        (2, 2),
+    )
+    op = build_condensed_operator(
+        Dense(W_dense), sigma_x, sigma_s, J, RegularizationState(delta_w=1e-6)
+    )
+
+    actual = op.dense_matrix()  # must not raise (gram path, no densification)
+    expected = op.matmat(namespace.eye(2, dtype=W_dense.dtype))
+    assert_allclose(namespace, actual, expected, **tol)
+
+
 def test_condensed_dense_matrix_uses_direct_dense_hooks(namespace, tol):
     W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
     sigma_x = Diagonal(array(namespace, [0.25, 0.75]))

@@ -225,6 +225,17 @@ class SparseOperator(LinearOperator):
         out = squared.T @ _to_numpy(weights)
         return to_xp_array(np.asarray(out).reshape(-1), self._xp)
 
+    def gram(self, weights: Array) -> Array:
+        # Aᵀ diag(w) A as a dense n×n matrix, formed by sparse arithmetic: scale
+        # rows by w (still sparse) then a sparse Aᵀ·(diag(w)A) product, densifying
+        # only the small n×n result — never the m×n matrix A itself (the point at
+        # RT scale, where m ≫ n). ``multiply`` broadcasts the column weight vector
+        # across rows.
+        a = self._csr_matrix
+        w = _to_numpy(weights).reshape((-1, 1))
+        gram = (a.T @ a.multiply(w)).toarray()
+        return to_xp_array(np.asarray(gram), self._xp)
+
     def row_gram_diagonal(self, weights: Array) -> Array:
         # diag(A diag(w) Aᵀ)_j = Σ_k w_k A_jk² = (A∘A) w (row energies).
         squared = self._csr_matrix.multiply(self._csr_matrix)

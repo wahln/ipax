@@ -251,6 +251,15 @@ class SparseOperator(LinearOperator):
         out = squared.T @ _to_cupy(weights)
         return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
 
+    def gram(self, weights: Array) -> Array:
+        # Aᵀ diag(w) A as a dense n×n matrix via sparse arithmetic (row-scale then
+        # sparse Gram), densifying only the small n×n result — mirror of the SciPy
+        # adapter; the condensed dense route's n ≪ m fast path.
+        a = self._matrix
+        w = _to_cupy(weights).reshape((-1, 1))
+        gram = (a.T @ a.multiply(w)).toarray()
+        return cast("Array", to_xp_array(cupy.asarray(gram), self._xp))
+
     def row_gram_diagonal(self, weights: Array) -> Array:
         # diag(A diag(w) Aᵀ)_j = Σ_k w_k A_jk² = (A∘A) w (row energies).
         squared = self._matrix.multiply(self._matrix)

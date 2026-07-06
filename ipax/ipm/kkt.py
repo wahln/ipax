@@ -313,14 +313,39 @@ class _CondensedOperator(LinearOperator):
 
         if self._ineq_jac.shape[0] > 0:
             xp = array_namespace(dense)
-            jac = self._ineq_jac.dense_matrix(dense)
-            if isinstance(self._sigma_s, (Diagonal, Identity)):
-                sigma_s_jac = xp.expand_dims(self._sigma_s.diagonal(jac), axis=1) * jac
+            # Fast path (RT scale, m ≫ n): when Σ_s is diagonal, form the Gram term
+            # ∇gᵀ Σ_s ∇g through the Jacobian's sparse ``gram`` — a small n×n result
+            # built by sparse arithmetic, never densifying the m×n Jacobian. Falls
+            # back to the explicit densify-and-matmul when the operator has no
+            # ``gram`` (e.g. a dense/matrix-free Jacobian) or Σ_s is non-diagonal.
+            gram = self._sparse_gram(dense)
+            if gram is not None:
+                dense = dense + gram
             else:
-                sigma_s_jac = xp.matmul(self._sigma_s.dense_matrix(jac), jac)
-            dense = dense + xp.matmul(xp.permute_dims(jac, (1, 0)), sigma_s_jac)
+                jac = self._ineq_jac.dense_matrix(dense)
+                if isinstance(self._sigma_s, (Diagonal, Identity)):
+                    sigma_s_jac = (
+                        xp.expand_dims(self._sigma_s.diagonal(jac), axis=1) * jac
+                    )
+                else:
+                    sigma_s_jac = xp.matmul(self._sigma_s.dense_matrix(jac), jac)
+                dense = dense + xp.matmul(xp.permute_dims(jac, (1, 0)), sigma_s_jac)
 
         return dense
+
+    def _sparse_gram(self, like: Array) -> Array | None:
+        """``∇gᵀ Σ_s ∇g`` via the Jacobian's sparse Gram, or ``None`` to densify.
+
+        Available only when Σ_s is diagonal (the standard slack scaling) and the
+        inequality Jacobian exposes :meth:`~ipax.backend.operators.LinearOperator.
+        gram`; either absent returns ``None`` so the caller densifies instead.
+        """
+        if not isinstance(self._sigma_s, (Diagonal, Identity)):
+            return None
+        try:
+            return self._ineq_jac.gram(self._sigma_s.diagonal(like))
+        except NotImplementedError:
+            return None
 
     def inequality_border_dense(
         self, like: Array | None = None

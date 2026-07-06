@@ -18,6 +18,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   the published `Objective Function Value` to the significant figures each solve
   reports (validated across the proton/photon/liver groups). Runner + gated tests
   included.
+- **Sparse-Gram condensation for the dense KKT route.** `LinearOperator` gains an
+  optional `gram(weights)` capability returning the dense `n×n` weighted Gram
+  `Aᵀ diag(w) A`, implemented on the sparse operators (`COO`/`CSR`/`CSC`, the
+  per-backend `SparseOperator`, and `VStack`) by sparse arithmetic. The condensed
+  dense route (`ipm/kkt.py`) now forms the inequality term `∇gᵀ Σ_s ∇g` through it
+  instead of densifying the Jacobian to `m×n` first — the decisive change for
+  problems with far more constraints than variables (`n ≪ m`), where the old path
+  materialized a gigabytes-scale dense Jacobian to build a small `n×n` matrix
+  (e.g. a TROTS proton case: a 369k×1101 Jacobian ≈ 3.2 GB, now a ~4 s sparse
+  Gram). Falls back to the previous densify-and-multiply when the Jacobian exposes
+  no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
 - **S2MPJ benchmark: batched evaluation preserves overflow semantics.** The
