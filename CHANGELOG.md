@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+- **S2MPJ benchmark: batched evaluation preserves overflow semantics.** The
+  original (and per-element) S2MPJ code raises `OverflowError` at wild
+  line-search trial points (Python-float powers via `to_scalar`), which the
+  bridge maps to a cleanly rejected trial; the vectorized batch stayed in
+  NumPy and silently returned inf/nan instead. A non-finite batched result
+  now re-evaluates that point on the per-element path, restoring exact
+  behavioral parity (regression test with an overflow-prone generated-style
+  element).
+
 ### Changed
 - **S2MPJ benchmark: precompiled Lagrangian Hessian.** The fast S2MPJ evaluator
   (`benchmarks/corpus/_s2mpj_fast.py`) now also replaces the interpretive

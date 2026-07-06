@@ -133,6 +133,13 @@ class _Side(NamedTuple):
     leftover: list[_LeftElement]
     gfn_batched: list[_GfnBatch]
     gfns: list[tuple[int, Any, int, int, int]]
+    # Complete per-element view (every element / every non-TRIVIAL group fn),
+    # used to re-evaluate a point whose batched result is non-finite: the
+    # original scalar code can raise OverflowError (Python-float powers via
+    # to_scalar) where NumPy batches silently produce inf/nan, and that
+    # exception is solver-visible behavior.
+    elements_all: list[_LeftElement]
+    gfns_all: list[tuple[int, Any, int, int, int]]
 
 
 # Hessian element entry: an _Element plus the precomputed positions of its
@@ -568,6 +575,10 @@ class FastS2MPJEval:
         gsc_data = np.repeat(gsc_rows, np.diff(indptr))
         batched, leftover = self._batch_entries(entries)
         gfn_batched, gfns_left = self._batch_gfns(gfns)
+        elements_all: list[_LeftElement] = [
+            (fn, idx, w, iel, row, slots)
+            for (_nm, fn, idx, w, iel, row, slots) in entries
+        ]
         return _Side(
             grps_arr,
             indices,
@@ -580,6 +591,8 @@ class FastS2MPJEval:
             leftover,
             gfn_batched,
             gfns_left,
+            elements_all,
+            gfns,
         )
 
     def _batch_entries(
@@ -924,19 +937,24 @@ class FastS2MPJEval:
     # -- shared per-side evaluation ------------------------------------------
 
     def _eval_side(
-        self, side: _Side, x: np.ndarray, want_grad: bool
+        self, side: _Side, x: np.ndarray, want_grad: bool, *, per_element: bool = False
     ) -> tuple[np.ndarray, np.ndarray | None]:
         """Row values (scaled) and CSR ``data`` (scaled) for one side at ``x``.
 
         One pass: linear term via the pre-filled ``base`` template, batched
         types in one vectorized call each, leftover elements per element, then
         the non-TRIVIAL group functions (whose ``grada`` scales the row's
-        contiguous data segment) and the group scaling.
+        contiguous data segment) and the group scaling. A non-finite batched
+        result re-runs the point with ``per_element=True`` — every element and
+        group function through its original scalar code — because the original
+        raises OverflowError (Python-float powers via ``to_scalar``) where the
+        NumPy batch silently yields inf/nan, and that exception is behavior
+        the solver sees (the bridge maps it to a rejected trial point).
         """
         inst = self.inst
         fin = (self.A @ x)[side.rows_grps] - self.gconst[side.rows_grps]
         data = side.base.copy() if want_grad else None
-        for bt in side.batched:
+        for bt in [] if per_element else side.batched:
             EV = x[bt.gather]
             if want_grad:
                 fb, gb = bt.fn(inst, 2, EV, None, bt.elpar)
@@ -944,9 +962,10 @@ class FastS2MPJEval:
             else:
                 fb = bt.fn(inst, 1, EV, None, bt.elpar)
             np.add.at(fin, bt.rows, bt.w * np.asarray(fb, dtype=float).reshape(-1))
-        if side.leftover:
+        leftover = side.elements_all if per_element else side.leftover
+        if leftover:
             xc = x.reshape(-1, 1)
-            for fn, idx, w, iel, row, slots in side.leftover:
+            for fn, idx, w, iel, row, slots in leftover:
                 if want_grad:
                     fiel, giel = fn(inst, 2, xc[idx], iel)
                     giel = np.asarray(giel, dtype=float).reshape(-1)
@@ -955,7 +974,7 @@ class FastS2MPJEval:
                     fiel = fn(inst, 1, xc[idx], iel)
                 fv = float(np.asarray(fiel).reshape(-1)[0])
                 fin[row] += fv if w is None else w * fv
-        for gb in side.gfn_batched:
+        for gb in [] if per_element else side.gfn_batched:
             vals = fin[gb.rows]
             if want_grad:
                 fa, ga = gb.fn(inst, 2, vals, None, gb.grpar)
@@ -965,13 +984,17 @@ class FastS2MPJEval:
             else:
                 fa = gb.fn(inst, 1, vals, None, gb.grpar)
             fin[gb.rows] = np.asarray(fa, dtype=float).reshape(-1)
-        for row, gfn, ig, off, size in side.gfns:
+        for row, gfn, ig, off, size in side.gfns_all if per_element else side.gfns:
             if want_grad:
                 fa, grada = gfn(inst, 2, fin[row], ig)
                 data[off : off + size] *= float(np.asarray(grada).reshape(-1)[0])
             else:
                 fa = gfn(inst, 1, fin[row], ig)
             fin[row] = float(np.asarray(fa).reshape(-1)[0])
+        if not per_element and not (
+            np.isfinite(fin).all() and (data is None or np.isfinite(data).all())
+        ):
+            return self._eval_side(side, x, want_grad, per_element=True)
         fin = fin / side.gsc_rows
         if want_grad:
             data /= side.gsc_data

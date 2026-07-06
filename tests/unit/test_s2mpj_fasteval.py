@@ -641,6 +641,85 @@ def test_gradient_and_objective_share_one_fgx_evaluation():
     assert float(np.asarray(f)) == pytest.approx(_F_EXPECTED, rel=1e-13)
 
 
+def _to_scalar(value):
+    # Mimics s2mpjlib.to_scalar: a *Python* float, whose ``**`` raises
+    # OverflowError at extreme magnitudes (NumPy would silently give inf).
+    return float(np.asarray(value).reshape(-1)[0])
+
+
+to_scalar = _to_scalar  # name used inside generated-style element functions
+
+
+def _eOVF(self, nargout, *args):
+    # Generator-style element whose per-element evaluation raises
+    # OverflowError at wild points (Python-float power via to_scalar), while
+    # a naive batched evaluation would silently return inf.
+    import numpy as np
+
+    EV_ = args[0]
+    iel_ = args[1]  # noqa: F841
+    v = to_scalar(EV_[0, 0])
+    f_ = v**6
+    if nargout > 1:
+        g_ = np.zeros(1)
+        g_[0] = 6.0 * v**5
+    if nargout == 1:
+        return f_
+    elif nargout == 2:
+        return f_, g_
+
+
+class _OverflowInstance:
+    """One constraint group with the overflow-prone eOVF element."""
+
+    n = 2
+    m = 1
+    name = "OVFFAKE"
+    objgrps = np.array([0])
+    congrps = np.array([1])
+    x0 = np.array([[1.0], [2.0]])
+    clower = np.array([[-np.inf]])
+    cupper = np.array([[10.0]])
+    elftype: ClassVar = ["eOVF", "eOVF", "eOVF"]
+    elvar: ClassVar = [np.array([0]), np.array([1]), np.array([0])]
+    grelt: ClassVar = [np.array([0]), np.array([1, 2])]
+    grftype: ClassVar = ["TRIVIAL", None]
+    gconst = np.array([0.0, 0.0])
+    gscale = np.array([None, None], dtype=object)
+
+    eOVF = staticmethod(_eOVF)
+
+    def __init__(self):
+        self.A = sp.lil_matrix(np.array([[1.0, 0.0], [0.0, 1.0]]))
+
+    def getglobs(self):
+        pass
+
+
+def test_batched_path_preserves_overflow_semantics():
+    inst = _OverflowInstance()
+    fast = FastS2MPJEval(inst)
+    assert "eOVF" in fast.batched_elftypes  # finite probes batch fine
+
+    x_ok = np.array([1.5, 2.0])
+    assert fast.fx(x_ok) == pytest.approx(1.5**6 + 1.5, rel=1e-13)
+    np.testing.assert_allclose(
+        fast.cx(x_ok).ravel(), [2.0**6 + 1.5**6 + 2.0], rtol=1e-13
+    )
+
+    # A wild point must reproduce the per-element behavior: OverflowError
+    # (which the bridge maps to +inf for the objective), NOT a silent inf.
+    x_wild = np.array([1e60, 1e60])
+    with pytest.raises(OverflowError):
+        fast.cx(x_wild)
+    with pytest.raises(OverflowError):
+        fast.cJx(x_wild)
+    with pytest.raises(OverflowError):
+        fast.fx(x_wild)
+    with pytest.raises(OverflowError):
+        fast.fgx(x_wild)
+
+
 def test_lying_batch_source_is_caught_by_type_verification():
     # A type whose vectorized evaluation would disagree with the per-element
     # original must be demoted to the per-element path, not batched. Simulate
