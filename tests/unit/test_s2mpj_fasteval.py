@@ -424,6 +424,158 @@ def test_bridge_falls_back_to_original_methods_on_mismatch():
     np.testing.assert_allclose(np.asarray(problem.eq_constraints(x)), [9.0])
 
 
+# -- per-elftype batched element evaluation ------------------------------------
+
+
+def _eWSQ(self, nargout, *args):
+    # Generator-style source: EV_[i,0] scalar indexing, np.zeros(dim) gradient
+    # allocation, per-element parameters via self.elpar[iel_] — the patterns
+    # the batch transformer must rewrite. f = p·u²·v.
+    import numpy as np
+
+    EV_ = args[0]
+    iel_ = args[1]
+    f_ = self.elpar[iel_][0] * EV_[0, 0] ** 2 * EV_[1, 0]
+    if nargout > 1:
+        try:
+            dim = len(IV_)  # noqa: F821  (generated-code idiom)
+        except Exception:
+            dim = len(EV_)
+        g_ = np.zeros(dim)
+        g_[0] = 2.0 * self.elpar[iel_][0] * EV_[0, 0] * EV_[1, 0]
+        g_[1] = self.elpar[iel_][0] * EV_[0, 0] ** 2
+    if nargout == 1:
+        return f_
+    elif nargout == 2:
+        return f_, g_
+
+
+def _eBRANCH(self, nargout, *args):
+    # Data-dependent branch: must be rejected by the batch transformer and
+    # keep evaluating per element. f = |u|·u (branchy form).
+    import numpy as np
+
+    EV_ = args[0]
+    iel_ = args[1]  # noqa: F841
+    if EV_[0, 0] > 0:
+        f_ = EV_[0, 0] ** 2
+    else:
+        f_ = -(EV_[0, 0] ** 2)
+    if nargout > 1:
+        g_ = np.zeros(1)
+        g_[0] = 2.0 * abs(EV_[0, 0])
+    if nargout == 1:
+        return f_
+    elif nargout == 2:
+        return f_, g_
+
+
+class _BatchInstance:
+    """Generator-style fake: batchable eWSQ (weighted, unweighted, repeated
+    elemental variables, per-element parameters) mixed with the unbatchable
+    branchy eBRANCH, over one non-TRIVIAL objective group and two TRIVIAL
+    constraint groups with linear terms."""
+
+    n = 4
+    m = 2
+    name = "BATCHFAKE"
+    objgrps = np.array([0])
+    congrps = np.array([1, 2])
+    x0 = np.array([[1.0], [2.0], [3.0], [4.0]])
+    clower = np.array([[0.0], [-np.inf]])
+    cupper = np.array([[0.0], [10.0]])
+    elftype: ClassVar = ["eWSQ", "eWSQ", "eWSQ", "eWSQ", "eBRANCH"]
+    elvar: ClassVar = [
+        np.array([0, 1]),
+        np.array([2, 3]),
+        np.array([2, 2]),  # repeated elemental variable: scatter must accumulate
+        np.array([1, 3]),
+        np.array([0]),
+    ]
+    elpar: ClassVar = [[2.0], [0.5], [1.5], [1.0], [7.0]]
+    grelt: ClassVar = [np.array([0]), np.array([1, 2]), np.array([3, 4])]
+    grelw: ClassVar = [[3.0], None, [2.0, 1.0]]
+    grftype: ClassVar = ["gSQR", None, "TRIVIAL"]
+    gconst = np.array([0.2, 0.0, 0.0])
+    gscale = np.array([2.0, None, 4.0], dtype=object)
+
+    eWSQ = staticmethod(_eWSQ)
+    eBRANCH = staticmethod(_eBRANCH)
+    gSQR = staticmethod(_gSQR)
+
+    def __init__(self):
+        self.A = sp.lil_matrix(
+            np.array(
+                [
+                    [1.0, 0.0, 2.0, 0.0],
+                    [0.0, 1.0, 0.0, 1.0],
+                    [3.0, 0.0, 0.0, 0.5],
+                ]
+            )
+        )
+
+    def getglobs(self):
+        pass
+
+    def fx(self, x):
+        return _ref_fx(self, np.asarray(x, dtype=float).ravel())
+
+    def fgx(self, x):
+        return _ref_fgx(self, np.asarray(x, dtype=float).ravel())
+
+    def cx(self, x):
+        return _ref_cx(self, x)
+
+    def cJx(self, x):
+        return _ref_cJx(self, x)
+
+
+def test_batchable_type_is_batched_and_branchy_type_is_not():
+    fast = FastS2MPJEval(_BatchInstance())
+    assert "eWSQ" in fast.batched_elftypes
+    assert "eBRANCH" not in fast.batched_elftypes
+
+
+def test_batched_evaluation_matches_reference():
+    inst = _BatchInstance()
+    fast = FastS2MPJEval(inst)
+    rng = np.random.default_rng(23)
+    points = [np.asarray(inst.x0, dtype=float).ravel()] + [
+        rng.standard_normal(4) for _ in range(4)
+    ]
+    for x in points:
+        f_ref, g_ref = _ref_fgx(inst, x)
+        assert fast.fx(x) == pytest.approx(_ref_fx(inst, x), rel=1e-12)
+        f, g = fast.fgx(x)
+        assert f == pytest.approx(f_ref, rel=1e-12)
+        np.testing.assert_allclose(g.ravel(), g_ref.ravel(), rtol=1e-12, atol=1e-14)
+        c_ref, J_ref = _ref_cJx(inst, x)
+        np.testing.assert_allclose(
+            fast.cx(x).ravel(), c_ref.ravel(), rtol=1e-12, atol=1e-14
+        )
+        c, J = fast.cJx(x)
+        np.testing.assert_allclose(c.ravel(), c_ref.ravel(), rtol=1e-12, atol=1e-14)
+        np.testing.assert_allclose(J.toarray(), J_ref.toarray(), rtol=1e-12, atol=1e-14)
+
+
+def test_batched_instance_passes_verification():
+    fast = fast_evaluator(_BatchInstance())
+    assert fast is not None
+    assert "eWSQ" in fast.batched_elftypes
+
+
+def test_lying_batch_source_is_caught_by_type_verification():
+    # A type whose vectorized evaluation would disagree with the per-element
+    # original must be demoted to the per-element path, not batched. Simulate
+    # by giving the class a batch-hostile numeric idiom: float() coercion.
+    inst = _StructuredInstance()
+    fast = FastS2MPJEval(inst)
+    # _ePROD uses float(x[0,0]) → raises on a batch column, so it must not batch.
+    assert "ePROD" not in fast.batched_elftypes
+    # And the per-element path still serves correct values (hand-computed).
+    np.testing.assert_allclose(fast.cx(_X).ravel(), _C_EXPECTED, rtol=1e-14)
+
+
 # -- the precompiled Lagrangian Hessian ----------------------------------------
 
 

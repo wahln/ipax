@@ -24,6 +24,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   computed once at build time; each call only fills the `data` vector (no
   per-call `searchsorted`, no COO→CSR sort). ~2× per `cJx` call on
   element-light problems (HS71, DTOC1L), ~20–40% on element-heavy ones.
+- **S2MPJ benchmark: per-elftype batched element evaluation.** S2MPJ's
+  generated element functions are scalar-coded (`EV_[i,0]`, `np.zeros(dim)`,
+  `self.elpar[iel_]`), so the fast evaluator now vectorizes them with a
+  mechanical AST rewrite and evaluates all same-type elements in one call per
+  type, scattering gradients through precomputed CSR slots (the objective
+  gradient becomes support-based in the same stroke). Every batched type is
+  verified numerically against its per-element original at build time and
+  demoted to the per-element path on any mismatch or unsupported construct;
+  the whole-evaluator verification against the original methods still guards
+  the composition. On a 96-problem corpus sample all 158 element types (277k
+  element occurrences) batch, with no verification fallbacks. Measured:
+  ~4–25× per `cx`/`cJx` call over the pre-batching evaluator (ACOPP14
+  1.03→0.04 ms; ~25–250× vs S2MPJ's original `evalgrsum`), ~2× per `fgx`,
+  and an element-heavy L-BFGS solve runs ~2× faster end-to-end.
 
 ## [0.4.0] - 2026-07-05
 

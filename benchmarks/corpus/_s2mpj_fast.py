@@ -11,11 +11,22 @@ problems like ACOPP14 (n=38) cost ~10 ms per constraint evaluation.
 
 :class:`FastS2MPJEval` compiles the same structure **once per instance**: element
 and group functions are resolved to callables via ``getattr``, all linear terms
-become one vectorized ``A @ x − gconst`` product, and the Jacobian is built as
-COO triplets on each group's precomputed sparsity support. The element/group
-functions themselves — the actual math S2MPJ generated from the SIF file — are
-untouched, so values match the original to floating-point roundoff (summation
-order differs). Measured: 8–130× per ``cx`` call, 6–37× end-to-end solves.
+become one pre-filled CSR ``data`` template, and each side's (constraint /
+objective) Jacobian sparsity is a fixed canonical CSR layout that calls only
+fill. On top of that, same-elftype elements are evaluated **in one vectorized
+call per type**: the machine-generated element functions are scalar-coded, so a
+mechanical AST rewrite (see :class:`_BatchRewriter`) vectorizes them across a
+trailing batch axis, and precomputed scatter slots turn the per-element
+gradient writes into a handful of ``np.add.at`` calls. Each batched type is
+numerically verified against its per-element original at build time; a type
+that cannot be transformed or does not agree stays on the per-element path
+(and the whole-evaluator verification below still guards the composition).
+Values match the original to floating-point roundoff (summation order
+differs). Measured vs the original ``evalgrsum``: ~25–250× per ``cx`` call;
+vs the pre-batching evaluator: ~4–25× per ``cx``/``cJx``, ~2× per ``fgx``
+(support-based objective gradient), halving an element-heavy L-BFGS solve
+end-to-end. On a 96-problem corpus sample, 158/158 elftypes (277k element
+occurrences) batch successfully.
 
 :func:`fast_evaluator` is the safe entry point: it builds the fast evaluator and
 **verifies it against the original methods** at the start point (and a perturbed
@@ -40,6 +51,9 @@ the original methods.
 
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -50,36 +64,56 @@ import scipy.sparse as sp
 _Element = tuple[Any, np.ndarray, float | None, int]
 _Group = tuple[list[_Element], Any]
 
-# Jacobian element entry: an _Element plus the precomputed positions of its
-# elemental variables inside the group's support — so no per-call
-# ``searchsorted``.
-_JElement = tuple[Any, np.ndarray, float | None, int, np.ndarray]
+# Leftover (non-batched) element entry: an _Element plus its row index and the
+# precomputed global positions of its elemental variables in the side's CSR
+# ``data`` vector — so no per-call ``searchsorted``.
+_LeftElement = tuple[Any, np.ndarray, float | None, int, int, np.ndarray]
 
 
-class _JacGroup(NamedTuple):
-    """Precompiled per-constraint-group structure for ``cJx``.
+class _BatchType(NamedTuple):
+    """One elftype's elements, evaluated in a single vectorized call.
 
-    The Jacobian's sparsity is fixed: row ``k``'s columns are the group's
-    sorted support (A-row indices ∪ element variables), so the CSR
-    ``indices``/``indptr`` are built once and each call fills only the
-    ``data`` segment starting at ``off``. The linear term's scatter positions
-    (``a_pos``) and constant values (``a_data``) are precomputed too.
+    ``fn`` is the AST-transformed variant of the generated element function
+    (see :func:`_batched_element_fn`): it takes the elemental variables of all
+    ``N`` same-type elements column-stacked as ``EV_ (k, N)`` (plus the
+    pre-gathered per-element parameters ``elpar (p, N)``) and returns the
+    values ``(N,)`` and gradients ``(k, N)`` in one shot. ``gather`` indexes
+    ``x`` into that stack; ``slots`` are the elements' global positions in the
+    side's CSR ``data`` vector; ``rows`` their row indices for the value
+    accumulation; ``w`` the group-element weights (1 where unweighted).
     """
 
-    ig: int
-    elements: list[_JElement]
-    gfn: Any
-    support: np.ndarray
-    a_pos: np.ndarray
-    a_data: np.ndarray
-    off: int
+    name: str
+    fn: Any
+    gather: np.ndarray
+    elpar: np.ndarray | None
+    w: np.ndarray
+    rows: np.ndarray
+    slots: np.ndarray
 
 
-class _JacStructure(NamedTuple):
-    groups: list[_JacGroup]
+class _Side(NamedTuple):
+    """Precompiled structure for one side (constraint rows or objective rows).
+
+    The sparsity is fixed: row ``k``'s columns are its group's sorted support
+    (A-row indices ∪ element variables), so the canonical CSR
+    ``indices``/``indptr`` are built once; ``base`` is the ``data`` template
+    pre-filled with the constant linear-term values. Elements are split into
+    per-elftype vectorized batches (``batched``, verified at build) and a
+    per-element ``leftover`` list; ``gfns`` holds the non-TRIVIAL group
+    functions as ``(row, gfn, ig, off, size)``.
+    """
+
+    rows_grps: np.ndarray
     indices: np.ndarray
     indptr: np.ndarray
     nnz: int
+    base: np.ndarray
+    gsc_rows: np.ndarray
+    gsc_data: np.ndarray
+    batched: list[_BatchType]
+    leftover: list[_LeftElement]
+    gfns: list[tuple[int, Any, int, int, int]]
 
 
 # Hessian element entry: an _Element plus the precomputed positions of its
@@ -133,6 +167,188 @@ _VERIFY_ATOL = 1e-9
 
 _FAST_ATTR = "_ipax_fast_eval"
 _UNSET = object()
+
+
+# -- per-elftype batch compilation ---------------------------------------------
+#
+# S2MPJ's generated element functions are scalar-coded (``EV_[i,0]`` indexing,
+# ``g_ = np.zeros(dim)``, per-element parameters via ``self.elpar[iel_]``), so
+# same-type elements cannot be batched by simply stacking inputs. Because the
+# code is machine-generated from a handful of templates, a *mechanical* AST
+# rewrite vectorizes it across elements:
+#
+#   EV_ becomes (k, N) column-stacked  →  ``EV_[i, 0]``        → ``EV_[i]``
+#   per-element parameters             →  ``self.elpar[iel_]`` → ``ELPAR_`` (p, N)
+#   gradient allocation                →  ``np.zeros(dim)``    → ``np.zeros((dim, NB_))``
+#   internal-variable reduction        →  ``to_scalar(e)``     → row vector (exec binding)
+#
+# Everything else (elementwise arithmetic, the U_ internal-variable transform,
+# the ``try: dim = len(IV_)`` idiom) already broadcasts over the trailing batch
+# axis. Functions with data-dependent control flow (or any construct outside
+# the templates) are rejected and stay on the per-element path; every accepted
+# type is additionally *verified numerically* against the original per-element
+# evaluation at build time, so a semantically wrong transform can never serve
+# values.
+
+_BATCH_FN_CACHE: dict[tuple[type, str], Any] = {}
+
+
+class _BatchRewriter(ast.NodeTransformer):
+    """Vectorize one generated element function; ``ok=False`` on any pattern
+    outside the known machine-generated templates."""
+
+    def __init__(self) -> None:
+        self.ok = True
+        self._depth = 0
+
+    def _reject(self) -> None:
+        self.ok = False
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
+        if self._depth:  # nested function: outside the templates
+            self._reject()
+            return node
+        self._depth += 1
+        self.generic_visit(node)
+        return node
+
+    def visit_Subscript(self, node: ast.Subscript) -> Any:
+        # self.elpar[iel_] -> ELPAR_ (rewrite before descending, so the
+        # attribute guard below never sees the sanctioned elpar access).
+        v = node.value
+        if (
+            isinstance(v, ast.Attribute)
+            and isinstance(v.value, ast.Name)
+            and v.value.id == "self"
+            and v.attr == "elpar"
+            and isinstance(node.slice, ast.Name)
+            and node.slice.id == "iel_"
+        ):
+            return ast.copy_location(ast.Name(id="ELPAR_", ctx=node.ctx), node)
+        self.generic_visit(node)
+        # EV_[i, 0] -> EV_[i] (the batch axis replaces the column axis).
+        if (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "EV_"
+            and isinstance(node.slice, ast.Tuple)
+            and len(node.slice.elts) == 2
+            and all(isinstance(e, ast.Constant) for e in node.slice.elts)
+        ):
+            first, second = node.slice.elts
+            if second.value == 0:  # type: ignore[attr-defined]
+                node.slice = first
+            else:  # EV_[i, j≠0]: outside the generated pattern
+                self._reject()
+        return node
+
+    def visit_Attribute(self, node: ast.Attribute) -> Any:
+        # Only problem-level constants may be read off self (elpar accesses
+        # were rewritten above; anything else is outside the templates).
+        if (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+            and node.attr not in ("efpar",)
+        ):
+            self._reject()
+        self.generic_visit(node)
+        return node
+
+    def visit_If(self, node: ast.If) -> Any:
+        # Only the structural ``nargout`` dispatch may branch; a data-dependent
+        # branch cannot be vectorized.
+        names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+        if names - {"nargout"}:
+            self._reject()
+            return node
+        self.generic_visit(node)
+        return node
+
+    def visit_For(self, node: ast.For) -> Any:
+        self._reject()
+        return node
+
+    def visit_While(self, node: ast.While) -> Any:
+        self._reject()
+        return node
+
+    def visit_Call(self, node: ast.Call) -> Any:
+        self.generic_visit(node)
+        # np.zeros(dim) / np.ones(dim) -> np.zeros((dim, NB_)): the gradient
+        # work vector gains the batch axis. Tuple shapes (U_, H_) stay as-is.
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "np"
+            and node.func.attr in ("zeros", "ones")
+            and len(node.args) == 1
+            and not node.keywords
+            and not isinstance(node.args[0], ast.Tuple)
+        ):
+            node.args[0] = ast.Tuple(
+                elts=[node.args[0], ast.Name(id="NB_", ctx=ast.Load())],
+                ctx=ast.Load(),
+            )
+        return node
+
+
+def _batch_to_scalar(value: Any) -> Any:
+    """Batch-mode ``to_scalar``: a (1, N) reduction row becomes (N,)."""
+    return np.asarray(value).reshape(-1)
+
+
+def _batched_element_fn(cls: type, name: str) -> Any:
+    """The vectorized variant of element function ``name`` on ``cls``, or None.
+
+    Cached per (class, elftype): the transform is source-level, so instances
+    of the same problem class share it. Returns ``None`` when the source is
+    unavailable or uses a construct outside the generated templates; numeric
+    verification against the per-element original happens at the *call site*
+    (``_compile_side``), which demotes a mismatching type to the per-element
+    path.
+    """
+    key = (cls, name)
+    if key in _BATCH_FN_CACHE:
+        return _BATCH_FN_CACHE[key]
+    fn = None
+    try:
+        source = textwrap.dedent(inspect.getsource(getattr(cls, name)))
+        tree = ast.parse(source)
+        fdef = tree.body[0]
+        assert isinstance(fdef, ast.FunctionDef)
+        fdef.decorator_list = []  # drop @staticmethod: exec'd standalone
+        rewriter = _BatchRewriter()
+        tree = rewriter.visit(tree)
+        # Any surviving iel_ *read* means a per-element dependence the elpar
+        # rewrite did not cover.
+        iel_reads = any(
+            isinstance(n, ast.Name) and n.id == "iel_" and isinstance(n.ctx, ast.Load)
+            for n in ast.walk(fdef)
+        )
+        # The batch bindings slot in right after the generated prologue
+        # (``EV_ = args[0]``, ``iel_ = args[1]``).
+        anchor = next(
+            (
+                i
+                for i, stmt in enumerate(fdef.body)
+                if isinstance(stmt, ast.Assign)
+                and isinstance(stmt.targets[0], ast.Name)
+                and stmt.targets[0].id == "iel_"
+            ),
+            None,
+        )
+        if rewriter.ok and not iel_reads and anchor is not None:
+            inject = ast.parse("ELPAR_ = args[2]\nNB_ = EV_.shape[1]").body
+            fdef.body[anchor + 1 : anchor + 1] = inject
+            ast.fix_missing_locations(tree)
+            namespace: dict[str, Any] = {"np": np, "to_scalar": _batch_to_scalar}
+            exec(  # compiling our own transform of the generated source
+                compile(tree, f"<batched {cls.__name__}.{name}>", "exec"), namespace
+            )
+            fn = namespace[fdef.name]  # source name (may be an alias of ``name``)
+    except Exception:
+        fn = None
+    _BATCH_FN_CACHE[key] = fn
+    return fn
 
 
 class FastS2MPJEval:
@@ -190,9 +406,15 @@ class FastS2MPJEval:
         self.obj_groups = [self._compile_group(int(ig)) for ig in self.objgrps]
         self.con_groups = [self._compile_group(int(ig)) for ig in self.congrps]
 
-        # Fixed constraint-Jacobian structure (supports, scatter positions,
-        # canonical CSR layout) — each cJx call only fills values.
-        self._jac = self._compile_jacobian()
+        # Fixed CSR-layout structure per side (constraint rows / objective
+        # rows): supports, scatter positions, linear-term template, and the
+        # per-elftype vectorized batches (each verified numerically against
+        # the per-element original — a failing type stays per-element).
+        self._con = self._compile_side(self.congrps, self.con_groups)
+        self._objside = self._compile_side(self.objgrps, self.obj_groups)
+        self.batched_elftypes = frozenset(
+            bt.name for side in (self._con, self._objside) for bt in side.batched
+        )
 
         self.H = getattr(instance, "H", None)
         self._has_objective = len(self.objgrps) > 0 or self.H is not None
@@ -244,49 +466,158 @@ class FastS2MPJEval:
         gfn = None if gname == "TRIVIAL" else getattr(inst, gname)
         return elements, gfn
 
-    def _compile_jacobian(self) -> _JacStructure:
-        """Precompute the fixed CSR structure of the constraint Jacobian.
+    def _compile_side(self, grps: np.ndarray, groups: list[_Group]) -> _Side:
+        """Precompute one side's fixed CSR structure and element batches.
 
         Row ``k``'s columns are group ``k``'s sorted support (A-row indices ∪
         element variables), so ``indices``/``indptr`` are already in canonical
-        CSR form; per element the scatter positions into the support are
-        recorded once. Each :meth:`cJx` call then only fills the ``data``
-        vector — no ``searchsorted``, no COO→CSR sort.
+        CSR form; the constant linear-term values are pre-filled into the
+        ``base`` template. Elements are grouped by elftype and each type is
+        batch-compiled (:func:`_batched_element_fn`) and *numerically verified*
+        against its per-element original at two probe points — a type that
+        cannot be transformed or does not agree stays on the per-element
+        ``leftover`` path.
         """
         A = self.A
-        groups: list[_JacGroup] = []
-        indptr = np.zeros(len(self.congrps) + 1, dtype=int)
+        indptr = np.zeros(len(grps) + 1, dtype=int)
         parts: list[np.ndarray] = []
+        gfns: list[tuple[int, Any, int, int, int]] = []
+        # (elftype, fn, idx, w, iel, row, slots) per element occurrence
+        entries: list[
+            tuple[str, Any, np.ndarray, float | None, int, int, np.ndarray]
+        ] = []
+        a_fill: list[tuple[np.ndarray, np.ndarray]] = []
         nnz = 0
-        for k, ig_ in enumerate(self.congrps):
+        for k, ig_ in enumerate(grps):
             ig = int(ig_)
-            elements, gfn = self.con_groups[k]
+            elements, gfn = groups[k]
             a0, a1 = A.indptr[ig], A.indptr[ig + 1]
             a_idx = A.indices[a0:a1]
             cols = set(a_idx.tolist())
             for _fn, idx, _w, _iel in elements:
                 cols.update(idx.tolist())
             support = np.fromiter(sorted(cols), dtype=int, count=len(cols))
-            elements_j: list[_JElement] = [
-                (fn, idx, w, iel, np.searchsorted(support, idx))
-                for fn, idx, w, iel in elements
-            ]
-            groups.append(
-                _JacGroup(
-                    ig,
-                    elements_j,
-                    gfn,
-                    support,
-                    np.searchsorted(support, a_idx),
+            for fn, idx, w, iel in elements:
+                slots = nnz + np.searchsorted(support, idx)
+                entries.append((self.inst.elftype[iel], fn, idx, w, iel, k, slots))
+            a_fill.append(
+                (
+                    nnz + np.searchsorted(support, a_idx),
                     np.asarray(A.data[a0:a1], dtype=float),
-                    nnz,
                 )
             )
+            if gfn is not None:
+                gfns.append((k, gfn, ig, nnz, int(support.size)))
             parts.append(support)
             nnz += support.size
             indptr[k + 1] = nnz
         indices = np.concatenate(parts) if parts else np.zeros(0, dtype=int)
-        return _JacStructure(groups, indices, indptr, nnz)
+        base = np.zeros(nnz)
+        for pos, vals in a_fill:
+            base[pos] = vals
+        grps_arr = np.asarray(grps, dtype=int).reshape(-1)
+        gsc_rows = self.gscale[grps_arr]
+        gsc_data = np.repeat(gsc_rows, np.diff(indptr))
+        batched, leftover = self._batch_entries(entries)
+        return _Side(
+            grps_arr,
+            indices,
+            indptr,
+            nnz,
+            base,
+            gsc_rows,
+            gsc_data,
+            batched,
+            leftover,
+            gfns,
+        )
+
+    def _batch_entries(
+        self,
+        entries: list[tuple[str, Any, np.ndarray, float | None, int, int, np.ndarray]],
+    ) -> tuple[list[_BatchType], list[_LeftElement]]:
+        """Split element occurrences into verified batches and leftovers."""
+        by_type: dict[str, list[Any]] = {}
+        for entry in entries:
+            by_type.setdefault(entry[0], []).append(entry)
+        batched: list[_BatchType] = []
+        leftover: list[_LeftElement] = []
+        for name, group in by_type.items():
+            bt = self._try_batch_type(name, group)
+            if bt is not None:
+                batched.append(bt)
+            else:
+                leftover.extend(
+                    (fn, idx, w, iel, row, slots)
+                    for (_nm, fn, idx, w, iel, row, slots) in group
+                )
+        return batched, leftover
+
+    def _try_batch_type(self, name: str, group: list[Any]) -> _BatchType | None:
+        """Build and verify one elftype's batch, or ``None`` to stay per-element."""
+        fn = _batched_element_fn(type(self.inst), name)
+        k = int(group[0][2].size)
+        if fn is None or k == 0 or any(e[2].size != k for e in group):
+            return None
+        try:
+            elpar = self._gather_elpar([e[4] for e in group])
+        except Exception:
+            return None
+        bt = _BatchType(
+            name,
+            fn,
+            np.stack([e[2] for e in group], axis=1),
+            elpar,
+            np.array([1.0 if e[3] is None else e[3] for e in group]),
+            np.array([e[5] for e in group], dtype=int),
+            np.stack([e[6] for e in group], axis=1),
+        )
+        return bt if self._verify_batch(bt, group) else None
+
+    def _gather_elpar(self, iels: list[int]) -> np.ndarray | None:
+        """Column-stack the per-element parameters, ``None`` when absent.
+
+        Raises on ragged/partially-missing parameters (→ type not batchable).
+        """
+        elpar = getattr(self.inst, "elpar", None)
+        rows = [
+            None
+            if elpar is None or iel >= len(elpar) or elpar[iel] is None
+            else np.asarray(elpar[iel], dtype=float).reshape(-1)
+            for iel in iels
+        ]
+        if all(r is None for r in rows):
+            return None
+        if any(r is None for r in rows):
+            raise ValueError("partially missing element parameters")
+        return np.stack(rows, axis=1)  # type: ignore[arg-type]
+
+    def _verify_batch(self, bt: _BatchType, group: list[Any]) -> bool:
+        """Batched (f, g) must reproduce the per-element original at 2 probes."""
+        x0 = np.asarray(self.inst.x0, dtype=float).reshape(-1)
+        probe = x0 + 1e-4 * (1.0 + np.abs(x0)) * np.cos(np.arange(x0.shape[0]))
+        n_batch = bt.rows.size
+        for x in (x0, probe):
+            xc = x.reshape(-1, 1)
+            with np.errstate(all="ignore"):
+                try:
+                    fb, gb = bt.fn(self.inst, 2, x[bt.gather], None, bt.elpar)
+                    fb = np.asarray(fb, dtype=float).reshape(-1)
+                    gb = np.asarray(gb, dtype=float)
+                except Exception:
+                    return False
+                if fb.shape != (n_batch,) or gb.shape != bt.slots.shape:
+                    return False
+                for j, (_nm, fn, idx, _w, iel, _row, _slots) in enumerate(group):
+                    try:
+                        fr, gr = fn(self.inst, 2, xc[idx], iel)
+                    except Exception:
+                        # The original raises here: keep its exact semantics
+                        # (including the raise) via the per-element path.
+                        return False
+                    if not (_close(fr, fb[j]) and _close(gr, gb[:, j])):
+                        return False
+        return True
 
     def _compile_hessian(self) -> _HessStructure:
         """Precompute the fixed COO structure of the Lagrangian Hessian.
@@ -436,69 +767,80 @@ class FastS2MPJEval:
             Hout = Hout + sp.csr_matrix(self.H, dtype=float)
         return Lxy, gx.reshape(-1, 1), Hout
 
+    # -- shared per-side evaluation ------------------------------------------
+
+    def _eval_side(
+        self, side: _Side, x: np.ndarray, want_grad: bool
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Row values (scaled) and CSR ``data`` (scaled) for one side at ``x``.
+
+        One pass: linear term via the pre-filled ``base`` template, batched
+        types in one vectorized call each, leftover elements per element, then
+        the non-TRIVIAL group functions (whose ``grada`` scales the row's
+        contiguous data segment) and the group scaling.
+        """
+        inst = self.inst
+        fin = (self.A @ x)[side.rows_grps] - self.gconst[side.rows_grps]
+        data = side.base.copy() if want_grad else None
+        for bt in side.batched:
+            EV = x[bt.gather]
+            if want_grad:
+                fb, gb = bt.fn(inst, 2, EV, None, bt.elpar)
+                np.add.at(data, bt.slots, bt.w * np.asarray(gb, dtype=float))
+            else:
+                fb = bt.fn(inst, 1, EV, None, bt.elpar)
+            np.add.at(fin, bt.rows, bt.w * np.asarray(fb, dtype=float).reshape(-1))
+        if side.leftover:
+            xc = x.reshape(-1, 1)
+            for fn, idx, w, iel, row, slots in side.leftover:
+                if want_grad:
+                    fiel, giel = fn(inst, 2, xc[idx], iel)
+                    giel = np.asarray(giel, dtype=float).reshape(-1)
+                    np.add.at(data, slots, giel if w is None else w * giel)
+                else:
+                    fiel = fn(inst, 1, xc[idx], iel)
+                fv = float(np.asarray(fiel).reshape(-1)[0])
+                fin[row] += fv if w is None else w * fv
+        for row, gfn, ig, off, size in side.gfns:
+            if want_grad:
+                fa, grada = gfn(inst, 2, fin[row], ig)
+                data[off : off + size] *= float(np.asarray(grada).reshape(-1)[0])
+            else:
+                fa = gfn(inst, 1, fin[row], ig)
+            fin[row] = float(np.asarray(fa).reshape(-1)[0])
+        fin = fin / side.gsc_rows
+        if want_grad:
+            data /= side.gsc_data
+        return fin, data
+
     # -- constraints --------------------------------------------------------
 
     def cx(self, x: Any) -> np.ndarray:
         """Constraint values, shape ``(m, 1)`` (mirrors the original ``cx``)."""
         x = np.asarray(x, dtype=float).reshape(-1)
-        xc = x.reshape(-1, 1)
-        fin = (self.A @ x)[self.congrps] - self.gconst[self.congrps]
-        out = np.empty((len(self.congrps), 1))
-        for k, (elements, gfn) in enumerate(self.con_groups):
-            f = fin[k]
-            for fn, idx, w, iel in elements:
-                fiel = fn(self.inst, 1, xc[idx], iel)
-                f = f + (w * fiel if w is not None else fiel)
-            ig = int(self.congrps[k])
-            if gfn is not None:
-                f = gfn(self.inst, 1, f, ig)
-            out[k, 0] = float(np.asarray(f).reshape(-1)[0]) / self.gscale[ig]
-        return out
+        fin, _data = self._eval_side(self._con, x, want_grad=False)
+        return fin.reshape(-1, 1)
 
     def cJx(self, x: Any) -> tuple[np.ndarray, sp.csr_matrix]:
         """Constraint values and Jacobian ``(c, J)`` with ``J`` in CSR.
 
-        Fills the precompiled canonical CSR layout (``_compile_jacobian``); the
+        Fills the precompiled canonical CSR layout (``_compile_side``); the
         returned matrices share the fixed ``indices``/``indptr`` arrays across
         calls, but each call allocates a fresh ``data`` vector.
         """
         x = np.asarray(x, dtype=float).reshape(-1)
-        xc = x.reshape(-1, 1)
-        m = len(self.congrps)
-        fin = (self.A @ x)[self.congrps] - self.gconst[self.congrps]
-        js = self._jac
-        cvals = np.empty((m, 1))
-        data = np.zeros(js.nnz)
-        for k, grp in enumerate(js.groups):
-            gin = np.zeros(grp.support.size)
-            if grp.a_pos.size:
-                gin[grp.a_pos] += grp.a_data  # CSR column indices are unique
-            f = fin[k]
-            for fn, idx, w, iel, pos in grp.elements:
-                fiel, giel = fn(self.inst, 2, xc[idx], iel)
-                giel = np.asarray(giel, dtype=float).reshape(-1)
-                if w is not None:
-                    f = f + w * fiel
-                    np.add.at(gin, pos, w * giel)
-                else:
-                    f = f + fiel
-                    np.add.at(gin, pos, giel)
-            if grp.gfn is not None:
-                f, grada = grp.gfn(self.inst, 2, f, grp.ig)
-                gin = grada * gin
-            gsc = self.gscale[grp.ig]
-            cvals[k, 0] = float(np.asarray(f).reshape(-1)[0]) / gsc
-            if grp.support.size:
-                data[grp.off : grp.off + grp.support.size] = (
-                    np.asarray(gin, dtype=float).reshape(-1) / gsc
-                )
-        J = sp.csr_matrix((data, js.indices, js.indptr), shape=(m, self.n))
+        side = self._con
+        fin, data = self._eval_side(side, x, want_grad=True)
+        J = sp.csr_matrix(
+            (data, side.indices, side.indptr),
+            shape=(side.rows_grps.size, self.n),
+        )
         # The structure *is* canonical (sorted-unique columns per row); saying
         # so stops scipy from ever running its in-place sort/dedup mutators on
         # the shared ``indices``/``indptr`` template.
         J.has_sorted_indices = True
         J.has_canonical_format = True
-        return cvals, J
+        return fin.reshape(-1, 1), J
 
     # -- objective ----------------------------------------------------------
 
@@ -512,54 +854,23 @@ class FastS2MPJEval:
         if not self._has_objective:
             raise ValueError("S2MPJ problem has no objective function")
         x = np.asarray(x, dtype=float).reshape(-1)
-        xc = x.reshape(-1, 1)
-        n = self.n
-        fx = 0.0
-        gx = np.zeros(n) if want_grad else None
+        side = self._objside
+        fin, data = self._eval_side(side, x, want_grad)
+        fx = float(np.sum(fin))
+        gx = None
+        if want_grad:
+            # The objective "rows" collapse to one gradient: scatter the scaled
+            # per-row data through the shared column indices (support-based —
+            # no dense n-vector per group).
+            gx = np.zeros(self.n)
+            np.add.at(gx, side.indices, data)
         if self.H is not None:
             Hx = np.asarray(self.H @ x).reshape(-1)
             fx += 0.5 * float(x @ Hx)
             if want_grad:
                 gx += Hx
-        fin = (
-            (self.A @ x)[self.objgrps] - self.gconst[self.objgrps]
-            if len(self.objgrps)
-            else np.zeros(0)
-        )
-        A = self.A
-        for k, (elements, gfn) in enumerate(self.obj_groups):
-            ig = int(self.objgrps[k])
-            f = fin[k]
-            if want_grad:
-                gin = np.zeros(n)
-                a0, a1 = A.indptr[ig], A.indptr[ig + 1]
-                if a1 > a0:
-                    gin[A.indices[a0:a1]] += A.data[a0:a1]
-            for fn, idx, w, iel in elements:
-                if want_grad:
-                    fiel, giel = fn(self.inst, 2, xc[idx], iel)
-                    giel = np.asarray(giel, dtype=float).reshape(-1)
-                    if w is not None:
-                        f = f + w * fiel
-                        np.add.at(gin, idx, w * giel)
-                    else:
-                        f = f + fiel
-                        np.add.at(gin, idx, giel)
-                else:
-                    fiel = fn(self.inst, 1, xc[idx], iel)
-                    f = f + (w * fiel if w is not None else fiel)
-            if gfn is not None:
-                if want_grad:
-                    f, grada = gfn(self.inst, 2, f, ig)
-                    gin = grada * gin
-                else:
-                    f = gfn(self.inst, 1, f, ig)
-            gsc = self.gscale[ig]
-            fx += float(np.asarray(f).reshape(-1)[0]) / gsc
-            if want_grad:
-                gx += gin / gsc
         if want_grad:
-            return fx, gx.reshape(-1, 1)
+            return fx, gx.reshape(-1, 1)  # type: ignore[union-attr]
         return fx
 
 
