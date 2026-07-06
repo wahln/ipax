@@ -16,10 +16,12 @@ performance work (use the synthetic RT generator / TROTS surrogate there).
 
 S2MPJ's generic ``evalgrsum`` evaluation loop is interpretive (per-element
 ``eval()`` dispatch, ``lil_matrix`` row assembly) and dominates sweep wall-time,
-so the bridge routes ``fx/fgx/cx/cJx`` through the **precompiled evaluator** in
-:mod:`benchmarks.corpus._s2mpj_fast` whenever it verifies against the original
-methods at build time (else it falls back to the originals — see that module's
-docstring for the mechanism and measured speedups).
+so the bridge routes ``fx/fgx/cx/cJx`` — and the exact-Hessian ``LgHxy`` —
+through the **precompiled evaluator** in :mod:`benchmarks.corpus._s2mpj_fast`
+whenever it verifies against the original methods at build time (else it falls
+back to the originals; the Hessian is gated by its own verification, so it can
+fall back alone — see that module's docstring for the mechanism and measured
+speedups).
 
 S2MPJ has no license file, so its files are **not vendored**. Point
 ``IPAX_S2MPJ_DIR`` (or the ``directory`` argument) at a local checkout; the loader
@@ -201,6 +203,13 @@ class _S2MPJProblem(Problem):
     def _eval_cJx(self, x_np: Any) -> Any:
         return (self._fast or self._inst).cJx(x_np)
 
+    def _eval_lghxy(self, x_col: Any, y_col: Any) -> Any:
+        # The Hessian fast path is gated by its own verification flag: a
+        # Hessian-only mismatch keeps the fast fx/cx while LgHxy falls back.
+        if self._fast is not None and self._fast.lghxy_ok:
+            return self._fast.LgHxy(x_col, y_col)
+        return self._inst.LgHxy(x_col, y_col)
+
     def objective(self, x: Array) -> Scalar:
         import numpy as np
 
@@ -346,9 +355,9 @@ class _S2MPJProblem(Problem):
         common ``σ > 0`` case (gradient-based scaling passes ``σ = s_f`` through
         the scaling wrapper) the identity ``σ∇²f + Σ Y∇²c = σ·(∇²f + Σ(Y/σ)∇²c)``
         folds the objective scaling into the multipliers, so one ``LgHxy`` call
-        suffices — ``LgHxy`` costs a full interpretive Hessian assembly, so the
-        old two-call ``(σ−1)∇²f`` correction doubled the exact-Hessian bridge
-        cost. ``σ ≤ 0`` keeps the general two-call form.
+        suffices — ``LgHxy`` costs a full Hessian assembly (fast or original),
+        so the old two-call ``(σ−1)∇²f`` correction doubled the exact-Hessian
+        bridge cost. ``σ ≤ 0`` keeps the general two-call form.
         """
         import numpy as np
 
@@ -356,13 +365,13 @@ class _S2MPJProblem(Problem):
         xcol = np.reshape(_to_numpy(x), (-1, 1))
         Y = self._s2mpj_multipliers(y_eq, y_ineq)
         if s == 1.0:
-            _lval, _grad, hess = self._inst.LgHxy(xcol, np.reshape(Y, (-1, 1)))
+            _lval, _grad, hess = self._eval_lghxy(xcol, np.reshape(Y, (-1, 1)))
         elif s > 0.0:
-            _lval, _grad, hess = self._inst.LgHxy(xcol, np.reshape(Y / s, (-1, 1)))
+            _lval, _grad, hess = self._eval_lghxy(xcol, np.reshape(Y / s, (-1, 1)))
             hess = s * hess
         else:
-            _lval, _grad, hess = self._inst.LgHxy(xcol, np.reshape(Y, (-1, 1)))
-            _l0, _g0, hess_f = self._inst.LgHxy(xcol, np.zeros((self._m, 1)))
+            _lval, _grad, hess = self._eval_lghxy(xcol, np.reshape(Y, (-1, 1)))
+            _l0, _g0, hess_f = self._eval_lghxy(xcol, np.zeros((self._m, 1)))
             hess = hess + (s - 1.0) * hess_f
         return hess
 

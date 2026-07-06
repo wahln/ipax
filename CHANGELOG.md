@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+- **S2MPJ benchmark: precompiled Lagrangian Hessian.** The fast S2MPJ evaluator
+  (`benchmarks/corpus/_s2mpj_fast.py`) now also replaces the interpretive
+  `LgHxy` path used by the exact-Hessian sweep configs: the Hessian's COO
+  structure is compiled once per instance and each call only fills values
+  (measured ~3–70× per call, median ~10× over a 96-problem sample; e.g. the
+  ACOPP14 `exact/dense` solve drops from 1.7 s to 0.9 s with `LgHxy` gone from
+  the profile top). Verified at build time against the original `LgHxy` with
+  its own independent fallback — a Hessian-only mismatch or an oversized
+  structure keeps the fast `fx/cx` and reverts just the Hessian to the
+  original (94/96 sampled problems verify; 2 very large ones fall back by the
+  structure-size guard).
+- **S2MPJ benchmark: `cJx` fills a precompiled CSR layout.** The constraint
+  Jacobian's sparsity is fixed per instance, so its canonical CSR
+  `indices`/`indptr` and all element/linear-term scatter positions are now
+  computed once at build time; each call only fills the `data` vector (no
+  per-call `searchsorted`, no COO→CSR sort). ~2× per `cJx` call on
+  element-light problems (HS71, DTOC1L), ~20–40% on element-heavy ones.
+
 ## [0.4.0] - 2026-07-05
 
 ### Added

@@ -20,7 +20,7 @@ import scipy.sparse as sp
 
 import ipax.testing.backends as backends
 from benchmarks.corpus._s2mpj_fast import FastS2MPJEval, fast_evaluator
-from benchmarks.corpus.s2mpj import _S2MPJProblem
+from benchmarks.corpus.s2mpj import _S2MPJExactProblem, _S2MPJProblem
 
 # -- reference semantics (naive dense re-implementation of evalgrsum) ---------
 
@@ -74,6 +74,86 @@ def _ref_group_value(inst, ig: int, x: np.ndarray, want_grad: bool):
     return fin / gsc
 
 
+def _ref_group_full(inst, ig: int, x: np.ndarray):
+    """Naive dense evaluation of one group: value, gradient, and Hessian.
+
+    Mirrors ``evalgrsum``'s ``nargout=3`` semantics: the group Hessian is
+    ``(Hessa·gin·ginᵀ + grada·Hin)/gsc`` for a non-TRIVIAL group function and
+    ``Hin/gsc`` for TRIVIAL, with element Hessians scatter-added scalar-by-scalar
+    (so repeated elemental variables accumulate).
+    """
+    n = len(x)
+    fin = 0.0
+    gin = np.zeros(n)
+    Hin = np.zeros((n, n))
+    gconst = getattr(inst, "gconst", None)
+    if gconst is not None and ig < len(gconst) and gconst[ig] is not None:
+        fin = -float(gconst[ig])
+    A = getattr(inst, "A", None)
+    if A is not None and ig < A.shape[0]:
+        row = np.asarray(A.tocsr()[ig, :].todense()).ravel()
+        fin += float(row @ x[: len(row)])
+        gin[: len(row)] += row
+    grelt = getattr(inst, "grelt", None)
+    if grelt is not None and ig < len(grelt) and grelt[ig] is not None:
+        grelw = getattr(inst, "grelw", None)
+        weights = grelw[ig] if grelw is not None and ig < len(grelw) else None
+        for pos, iel in enumerate(grelt[ig]):
+            fn = getattr(inst, inst.elftype[iel])
+            idx = np.asarray(list(inst.elvar[iel]), dtype=int)
+            w = 1.0 if weights is None else float(weights[pos])
+            fiel, giel, Hiel = fn(inst, 3, x[idx].reshape(-1, 1), iel)
+            fin += w * float(fiel)
+            giel = np.asarray(giel, dtype=float).ravel()
+            Hiel = np.asarray(Hiel, dtype=float)
+            for ir, ii in enumerate(idx):
+                gin[ii] += w * giel[ir]
+                for jr, jj in enumerate(idx):
+                    Hin[ii, jj] += w * Hiel[ir, jr]
+    gname = None
+    grftype = getattr(inst, "grftype", None)
+    if grftype is not None and ig < len(grftype) and grftype[ig] is not None:
+        gname = grftype[ig]
+    gsc = 1.0
+    gscale = getattr(inst, "gscale", None)
+    if gscale is not None and ig < len(gscale) and gscale[ig] is not None:
+        v = float(gscale[ig])
+        if abs(v) > 1e-15:
+            gsc = v
+    if gname is not None and gname != "TRIVIAL":
+        gfn = getattr(inst, gname)
+        fa, grada, Hessa = gfn(inst, 3, fin, ig)
+        return (
+            fa / gsc,
+            grada * gin / gsc,
+            (Hessa * np.outer(gin, gin) + grada * Hin) / gsc,
+        )
+    return fin / gsc, gin / gsc, Hin / gsc
+
+
+def _ref_LgHxy(inst, x, y):
+    """Naive dense Lagrangian value/gradient/Hessian: ``L = f + Σ y_i c_i``."""
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    n = len(x)
+    L = 0.0
+    g = np.zeros(n)
+    H = np.zeros((n, n))
+    Hq = getattr(inst, "H", None)
+    if Hq is not None:
+        Hxv = np.asarray(Hq @ x).ravel()
+        L += 0.5 * float(x @ Hxv)
+        g += Hxv
+        H += np.asarray(Hq.todense())
+    for ig in inst.objgrps:
+        v, gr, Hg = _ref_group_full(inst, int(ig), x)
+        L, g, H = L + v, g + gr, H + Hg
+    for k, ig in enumerate(inst.congrps):
+        v, gr, Hg = _ref_group_full(inst, int(ig), x)
+        L, g, H = L + y[k] * v, g + y[k] * gr, H + y[k] * Hg
+    return L, g, H
+
+
 def _ref_fx(inst, x):
     return sum(_ref_group_value(inst, int(ig), x, False) for ig in inst.objgrps)
 
@@ -112,14 +192,18 @@ def _ePROD(self, nargout, x, iel):
     u, v = float(x[0, 0]), float(x[1, 0])
     if nargout == 1:
         return u * v
-    return u * v, np.array([[v], [u]])
+    if nargout == 2:
+        return u * v, np.array([[v], [u]])
+    return u * v, np.array([[v], [u]]), np.array([[0.0, 1.0], [1.0, 0.0]])
 
 
 def _gSQR(self, nargout, fin, ig):
     """Group function f(a) = a**2."""
     if nargout == 1:
         return fin**2
-    return fin**2, 2.0 * fin
+    if nargout == 2:
+        return fin**2, 2.0 * fin
+    return fin**2, 2.0 * fin, 2.0
 
 
 class _StructuredInstance:
@@ -159,6 +243,7 @@ class _StructuredInstance:
         )
         self.cx_calls = 0
         self.cJx_calls = 0
+        self.LgHxy_calls = 0
 
     def getglobs(self):
         pass
@@ -178,6 +263,11 @@ class _StructuredInstance:
         self.cJx_calls += 1
         return _ref_cJx(self, x)
 
+    def LgHxy(self, x, y):
+        self.LgHxy_calls += 1
+        L, g, H = _ref_LgHxy(self, x, y)
+        return L, g.reshape(-1, 1), sp.lil_matrix(H)
+
 
 _X = np.array([1.0, 2.0, 3.0])
 # Hand-computed at x = (1, 2, 3) — see class docstring for the structure:
@@ -188,6 +278,14 @@ _F_EXPECTED = 55.125
 _G_EXPECTED = np.array([73.5, 21.0, 21.0])
 _C_EXPECTED = np.array([8.0, 0.75])
 _J_EXPECTED = np.array([[0.0, 5.0, 1.0], [0.75, 0.0, 0.0]])
+# Lagrangian Hessian at x = (1, 2, 3) with Y = (1, 1) — per-group Hessians:
+#   group 0: gin = [7, 2, 2], Hin[0,2] = Hin[2,0] = 2 (weighted ePROD), gSQR with
+#     grada = 21, Hessa = 2, gscale 2 → outer(gin, gin) + 10.5·Hin
+#   group 1: unweighted ePROD on the repeated var (1, 1) → Hin[1,1] = 2, TRIVIAL
+#   group 2: pure linear → zero Hessian
+_HL_EXPECTED = np.array([[49.0, 14.0, 35.0], [14.0, 6.0, 4.0], [35.0, 4.0, 4.0]])
+_L_EXPECTED = 55.125 + 8.0 + 0.75
+_LG_EXPECTED = np.array([74.25, 26.0, 22.0])
 
 
 def test_fast_eval_matches_hand_computed_values():
@@ -234,6 +332,19 @@ class _QuadraticOnlyInstance:
 
     def getglobs(self):
         pass
+
+
+def test_cjx_results_are_independent_across_calls():
+    # The Jacobian's CSR structure is precompiled and shared across calls; the
+    # *values* must not be — an earlier result must survive later evaluations.
+    inst = _StructuredInstance()
+    fast = FastS2MPJEval(inst)
+    x1 = np.array([1.0, 2.0, 3.0])
+    x2 = np.array([-2.0, 0.5, 4.0])
+    _c1, j1 = fast.cJx(x1)
+    frozen = j1.toarray().copy()
+    fast.cJx(x2)
+    np.testing.assert_array_equal(j1.toarray(), frozen)
 
 
 def test_fast_eval_handles_explicit_quadratic_objective():
@@ -311,6 +422,126 @@ def test_bridge_falls_back_to_original_methods_on_mismatch():
     x = xp.asarray(_X)
     # The bridge must serve the (authoritative) original methods.
     np.testing.assert_allclose(np.asarray(problem.eq_constraints(x)), [9.0])
+
+
+# -- the precompiled Lagrangian Hessian ----------------------------------------
+
+
+def test_fast_lghxy_matches_hand_computed_values():
+    fast = FastS2MPJEval(_StructuredInstance())
+
+    L, g, H = fast.LgHxy(_X, np.array([1.0, 1.0]))
+    assert L == pytest.approx(_L_EXPECTED, rel=1e-14)
+    np.testing.assert_allclose(g.ravel(), _LG_EXPECTED, rtol=1e-14)
+    np.testing.assert_allclose(H.toarray(), _HL_EXPECTED, rtol=1e-14)
+
+
+def test_fast_lghxy_matches_reference_at_random_points():
+    inst = _StructuredInstance()
+    fast = FastS2MPJEval(inst)
+    rng = np.random.default_rng(11)
+    for _ in range(5):
+        x = rng.standard_normal(3)
+        y = rng.standard_normal(2)
+        L_ref, g_ref, H_ref = _ref_LgHxy(inst, x, y)
+        L, g, H = fast.LgHxy(x, y)
+        assert L == pytest.approx(L_ref, rel=1e-12)
+        np.testing.assert_allclose(g.ravel(), g_ref.ravel(), rtol=1e-12)
+        np.testing.assert_allclose(H.toarray(), H_ref, rtol=1e-12, atol=1e-14)
+
+
+def test_fast_lghxy_handles_explicit_quadratic_objective():
+    fast = FastS2MPJEval(_QuadraticOnlyInstance())
+    x = np.array([1.0, 2.0])
+    L, g, H = fast.LgHxy(x, np.zeros((0, 1)))
+    assert L == pytest.approx(9.0, rel=1e-14)
+    np.testing.assert_allclose(g.ravel(), [2.0, 8.0], rtol=1e-14)
+    np.testing.assert_allclose(H.toarray(), [[2.0, 0.0], [0.0, 4.0]], rtol=1e-14)
+
+
+def test_fast_evaluator_verifies_the_hessian():
+    fast = fast_evaluator(_StructuredInstance())
+    assert fast is not None
+    assert fast.lghxy_ok is True
+
+
+def test_hessian_mismatch_disables_only_the_hessian_path():
+    inst = _StructuredInstance()
+    true_lghxy = inst.LgHxy
+
+    def lying_lghxy(x, y):  # original disagrees on the Hessian only
+        L, g, H = true_lghxy(x, y)
+        return L, g, sp.lil_matrix(H.toarray() + 1.0)
+
+    inst.LgHxy = lying_lghxy
+    fast = fast_evaluator(inst)
+    # The base evaluator (fx/fgx/cx/cJx) survives; only the Hessian falls back.
+    assert fast is not None
+    assert fast.lghxy_ok is False
+
+
+def test_exact_bridge_uses_fast_hessian_without_touching_original():
+    xp = backends.import_namespace("numpy")
+    inst = _StructuredInstance()
+    problem = _S2MPJExactProblem(inst, xp)
+    inst.LgHxy_calls = 0  # discard the verification calls
+
+    x = xp.asarray(_X)
+    hess = problem.lagrangian_hessian(x, xp.asarray([1.0]), xp.asarray([1.0]))
+    assert inst.LgHxy_calls == 0
+    # ipax multipliers map onto Y = (y_eq[0], y_ineq[0]) = (1, 1) — group 1 is
+    # the equality, group 2 the (upper-side) inequality with a zero Hessian.
+    np.testing.assert_allclose(np.asarray(hess), _HL_EXPECTED, rtol=1e-14)
+
+
+def test_exact_bridge_honors_sigma_with_fast_hessian():
+    xp = backends.import_namespace("numpy")
+    inst = _StructuredInstance()
+    problem = _S2MPJExactProblem(inst, xp)
+    inst.LgHxy_calls = 0
+
+    sigma = 0.5
+    hess = problem.lagrangian_hessian(
+        xp.asarray(_X), xp.asarray([1.0]), xp.asarray([1.0]), sigma
+    )
+    assert inst.LgHxy_calls == 0
+    # σ·∇²f + Σ Y·∇²c with the objective part scaled: group 0 is the objective.
+    _, _, h_obj = _ref_group_full(inst, 0, _X)
+    _, _, h_eq = _ref_group_full(inst, 1, _X)
+    np.testing.assert_allclose(np.asarray(hess), sigma * h_obj + h_eq, rtol=1e-13)
+
+
+def test_exact_bridge_honors_nonpositive_sigma_with_fast_hessian():
+    # σ ≤ 0 takes the general two-call form: LgHxy(Y) + (σ−1)·LgHxy(0).
+    xp = backends.import_namespace("numpy")
+    inst = _StructuredInstance()
+    problem = _S2MPJExactProblem(inst, xp)
+    inst.LgHxy_calls = 0
+
+    hess = problem.lagrangian_hessian(
+        xp.asarray(_X), xp.asarray([1.0]), xp.asarray([1.0]), 0.0
+    )
+    assert inst.LgHxy_calls == 0
+    # σ = 0 zeroes the objective curvature: only the equality group remains.
+    _, _, h_eq = _ref_group_full(inst, 1, _X)
+    np.testing.assert_allclose(np.asarray(hess), h_eq, rtol=1e-13, atol=1e-14)
+
+
+def test_exact_bridge_falls_back_to_original_hessian_on_mismatch():
+    xp = backends.import_namespace("numpy")
+    inst = _StructuredInstance()
+    true_lghxy = inst.LgHxy
+
+    def lying_lghxy(x, y):  # the (authoritative) original must win
+        L, g, H = true_lghxy(x, y)
+        return L, g, sp.lil_matrix(H.toarray() + 1.0)
+
+    inst.LgHxy = lying_lghxy
+    problem = _S2MPJExactProblem(inst, xp)
+    hess = problem.lagrangian_hessian(
+        xp.asarray(_X), xp.asarray([1.0]), xp.asarray([1.0])
+    )
+    np.testing.assert_allclose(np.asarray(hess), _HL_EXPECTED + 1.0, rtol=1e-14)
 
 
 def test_cjx_seeds_the_value_memo():

@@ -25,16 +25,22 @@ oddity can therefore never silently corrupt benchmark scores. The result is
 cached on the instance, so the per-config problem rebuilds share one
 verification.
 
-Scope: values, gradients, and Jacobians (``fx/fgx/cx/cJx``, ``nargout ≤ 2``).
-The Lagrangian-Hessian path (``LgHxy``) keeps the original implementation.
-Problems that declare *partial* derivative levels (``objderlvl``/``conderlvl``
-< 2, where the original substitutes NaNs) are rejected at construction and fall
-back to the original methods.
+Scope: values, gradients, Jacobians (``fx/fgx/cx/cJx``), and the Lagrangian
+Hessian (``LgHxy``: value, gradient, and Hessian of ``f + Σ y_i c_i``). The
+Hessian's COO structure is fixed per instance, so it is precompiled once and
+each call only fills values (measured: ~3–70× per call vs the interpretive
+``evalgrsum`` at ``nargout=3``). It is verified — and can fall back —
+**independently** of the base methods: a Hessian-only mismatch or an oversized
+structure (``_MAX_HESS_NNZ``) sets ``lghxy_ok=False`` and only ``LgHxy``
+reverts to the original, keeping the verified fast ``fx/cx``. Problems that
+declare *partial* derivative levels (``objderlvl``/``conderlvl`` < 2, where
+the original substitutes NaNs) are rejected at construction and fall back to
+the original methods.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import scipy.sparse as sp
@@ -43,6 +49,82 @@ import scipy.sparse as sp
 # element index). Group entry: (elements, group function or None for TRIVIAL).
 _Element = tuple[Any, np.ndarray, float | None, int]
 _Group = tuple[list[_Element], Any]
+
+# Jacobian element entry: an _Element plus the precomputed positions of its
+# elemental variables inside the group's support — so no per-call
+# ``searchsorted``.
+_JElement = tuple[Any, np.ndarray, float | None, int, np.ndarray]
+
+
+class _JacGroup(NamedTuple):
+    """Precompiled per-constraint-group structure for ``cJx``.
+
+    The Jacobian's sparsity is fixed: row ``k``'s columns are the group's
+    sorted support (A-row indices ∪ element variables), so the CSR
+    ``indices``/``indptr`` are built once and each call fills only the
+    ``data`` segment starting at ``off``. The linear term's scatter positions
+    (``a_pos``) and constant values (``a_data``) are precomputed too.
+    """
+
+    ig: int
+    elements: list[_JElement]
+    gfn: Any
+    support: np.ndarray
+    a_pos: np.ndarray
+    a_data: np.ndarray
+    off: int
+
+
+class _JacStructure(NamedTuple):
+    groups: list[_JacGroup]
+    indices: np.ndarray
+    indptr: np.ndarray
+    nnz: int
+
+
+# Hessian element entry: an _Element plus the precomputed positions of its
+# elemental variables inside the group's full support (``gpos``, for the inner
+# gradient) and inside its element-variable support (``hpos``, for the inner
+# Hessian block) — so no per-call ``searchsorted``.
+_HElement = tuple[Any, np.ndarray, float | None, int, np.ndarray, np.ndarray]
+
+
+class _HessGroup(NamedTuple):
+    """Precompiled per-group structure for the Lagrangian Hessian.
+
+    ``k`` is the group's position in S2MPJ's constraint list (its multiplier
+    index), or ``-1`` for an objective group (coefficient 1). The group's
+    Hessian occupies up to two fixed COO blocks in the assembled triplet
+    vector: the ``gsupp × gsupp`` outer-product block ``Hessa·gin·ginᵀ`` at
+    ``off_outer`` (only for a non-TRIVIAL group function, whose curvature acts
+    on the full inner gradient including the linear term) and the
+    ``hsupp × hsupp`` element-curvature block ``grada·Hin`` at ``off_hloc``
+    (only when the group has elements; ``hsupp`` spans the element variables).
+    """
+
+    ig: int
+    k: int
+    elements: list[_HElement]
+    gfn: Any
+    gsupp: np.ndarray
+    a_pos: np.ndarray
+    a_data: np.ndarray
+    off_outer: int
+    off_hloc: int
+    hsize: int
+
+
+class _HessStructure(NamedTuple):
+    groups: list[_HessGroup]
+    rows: np.ndarray
+    cols: np.ndarray
+    nnz: int
+
+
+# Refuse to precompile a Hessian whose fixed COO structure would be enormous
+# (a non-TRIVIAL group over a very wide support squares its size); the original
+# interpretive path stays available.
+_MAX_HESS_NNZ = 20_000_000
 
 # Agreement gates for verify-at-build: a genuine reimplementation bug is orders
 # of magnitude larger than the summation-order roundoff these absorb.
@@ -108,18 +190,22 @@ class FastS2MPJEval:
         self.obj_groups = [self._compile_group(int(ig)) for ig in self.objgrps]
         self.con_groups = [self._compile_group(int(ig)) for ig in self.congrps]
 
-        # Per-constraint-group Jacobian support: A-row indices ∪ element vars.
-        self.con_support: list[np.ndarray] = []
-        for k, ig in enumerate(self.congrps):
-            cols = set(A.indices[A.indptr[ig] : A.indptr[ig + 1]].tolist())
-            for _fn, idx, _w, _iel in self.con_groups[k][0]:
-                cols.update(idx.tolist())
-            self.con_support.append(
-                np.fromiter(sorted(cols), dtype=int, count=len(cols))
-            )
+        # Fixed constraint-Jacobian structure (supports, scatter positions,
+        # canonical CSR layout) — each cJx call only fills values.
+        self._jac = self._compile_jacobian()
 
         self.H = getattr(instance, "H", None)
         self._has_objective = len(self.objgrps) > 0 or self.H is not None
+
+        # Lagrangian-Hessian structure, compiled separately so an unsupported
+        # feature only loses the Hessian path, never the fx/cx one. Whether it
+        # is *used* is decided by verification (``lghxy_ok``, set by
+        # :func:`fast_evaluator`).
+        self.lghxy_ok = False
+        try:
+            self._hess: _HessStructure | None = self._compile_hessian()
+        except Exception:
+            self._hess = None
 
     @staticmethod
     def _dense_per_group(values: Any, n_groups: int, *, default: float) -> np.ndarray:
@@ -158,6 +244,198 @@ class FastS2MPJEval:
         gfn = None if gname == "TRIVIAL" else getattr(inst, gname)
         return elements, gfn
 
+    def _compile_jacobian(self) -> _JacStructure:
+        """Precompute the fixed CSR structure of the constraint Jacobian.
+
+        Row ``k``'s columns are group ``k``'s sorted support (A-row indices ∪
+        element variables), so ``indices``/``indptr`` are already in canonical
+        CSR form; per element the scatter positions into the support are
+        recorded once. Each :meth:`cJx` call then only fills the ``data``
+        vector — no ``searchsorted``, no COO→CSR sort.
+        """
+        A = self.A
+        groups: list[_JacGroup] = []
+        indptr = np.zeros(len(self.congrps) + 1, dtype=int)
+        parts: list[np.ndarray] = []
+        nnz = 0
+        for k, ig_ in enumerate(self.congrps):
+            ig = int(ig_)
+            elements, gfn = self.con_groups[k]
+            a0, a1 = A.indptr[ig], A.indptr[ig + 1]
+            a_idx = A.indices[a0:a1]
+            cols = set(a_idx.tolist())
+            for _fn, idx, _w, _iel in elements:
+                cols.update(idx.tolist())
+            support = np.fromiter(sorted(cols), dtype=int, count=len(cols))
+            elements_j: list[_JElement] = [
+                (fn, idx, w, iel, np.searchsorted(support, idx))
+                for fn, idx, w, iel in elements
+            ]
+            groups.append(
+                _JacGroup(
+                    ig,
+                    elements_j,
+                    gfn,
+                    support,
+                    np.searchsorted(support, a_idx),
+                    np.asarray(A.data[a0:a1], dtype=float),
+                    nnz,
+                )
+            )
+            parts.append(support)
+            nnz += support.size
+            indptr[k + 1] = nnz
+        indices = np.concatenate(parts) if parts else np.zeros(0, dtype=int)
+        return _JacStructure(groups, indices, indptr, nnz)
+
+    def _compile_hessian(self) -> _HessStructure:
+        """Precompute the fixed COO structure of the Lagrangian Hessian.
+
+        Walks the objective and constraint groups once, recording each group's
+        support, its elements' scatter positions, and the offsets of its (up to
+        two) dense-block segments in the concatenated triplet vector — so each
+        :meth:`LgHxy` call only fills values into a preallocated layout.
+        """
+        A = self.A
+        groups: list[_HessGroup] = []
+        rows_parts: list[np.ndarray] = []
+        cols_parts: list[np.ndarray] = []
+        nnz = 0
+        specs = [(int(ig), -1, self.obj_groups[j]) for j, ig in enumerate(self.objgrps)]
+        specs += [(int(ig), k, self.con_groups[k]) for k, ig in enumerate(self.congrps)]
+        for ig, k, (elements, gfn) in specs:
+            a0, a1 = A.indptr[ig], A.indptr[ig + 1]
+            a_idx = A.indices[a0:a1]
+            evars: set[int] = set()
+            for _fn, idx, _w, _iel in elements:
+                evars.update(idx.tolist())
+            gcols = evars | set(a_idx.tolist())
+            gsupp = np.fromiter(sorted(gcols), dtype=int, count=len(gcols))
+            hsupp = np.fromiter(sorted(evars), dtype=int, count=len(evars))
+            elements_h: list[_HElement] = [
+                (
+                    fn,
+                    idx,
+                    w,
+                    iel,
+                    np.searchsorted(gsupp, idx),
+                    np.searchsorted(hsupp, idx),
+                )
+                for fn, idx, w, iel in elements
+            ]
+            # Size gate *before* materializing the blocks, so an enormous
+            # group cannot transiently allocate its row/col arrays first.
+            grow = (gsupp.size**2 if gfn is not None else 0) + hsupp.size**2
+            if nnz + grow > _MAX_HESS_NNZ:
+                raise NotImplementedError("Hessian COO structure too large")
+            off_outer = -1
+            if gfn is not None and gsupp.size:
+                off_outer = nnz
+                rows_parts.append(np.repeat(gsupp, gsupp.size))
+                cols_parts.append(np.tile(gsupp, gsupp.size))
+                nnz += gsupp.size * gsupp.size
+            off_hloc = -1
+            if hsupp.size:
+                off_hloc = nnz
+                rows_parts.append(np.repeat(hsupp, hsupp.size))
+                cols_parts.append(np.tile(hsupp, hsupp.size))
+                nnz += hsupp.size * hsupp.size
+            groups.append(
+                _HessGroup(
+                    ig,
+                    k,
+                    elements_h,
+                    gfn,
+                    gsupp,
+                    np.searchsorted(gsupp, a_idx),
+                    np.asarray(A.data[a0:a1], dtype=float),
+                    off_outer,
+                    off_hloc,
+                    int(hsupp.size),
+                )
+            )
+        rows = np.concatenate(rows_parts) if rows_parts else np.zeros(0, dtype=int)
+        cols = np.concatenate(cols_parts) if cols_parts else np.zeros(0, dtype=int)
+        return _HessStructure(groups, rows, cols, nnz)
+
+    # -- Lagrangian value / gradient / Hessian --------------------------------
+
+    def LgHxy(self, x: Any, y: Any) -> tuple[float, np.ndarray, sp.csr_matrix]:
+        """``(L, ∇L, ∇²L)`` of ``L = f + Σ_i y_i c_i`` (mirrors the original).
+
+        One pass over all groups: objective groups contribute with coefficient
+        1, constraint group ``k`` with ``y[k]`` (a zero multiplier skips the
+        group entirely). Per group the Hessian is ``evalgrsum``'s
+        ``(Hessa·gin·ginᵀ + grada·Hin)/gsc`` (``Hin/gsc`` for TRIVIAL), written
+        into the precompiled COO layout; duplicate (i, j) entries across groups
+        sum in the CSR conversion.
+        """
+        hs = self._hess
+        if hs is None:
+            raise NotImplementedError("no precompiled Hessian structure")
+        x = np.asarray(x, dtype=float).reshape(-1)
+        yv = np.asarray(y, dtype=float).reshape(-1)
+        xc = x.reshape(-1, 1)
+        n = self.n
+        Lxy = 0.0
+        gx = np.zeros(n)
+        vals = np.zeros(hs.nnz)
+        if self.H is not None:
+            Hx = np.asarray(self.H @ x).reshape(-1)
+            Lxy += 0.5 * float(x @ Hx)
+            gx += Hx
+        fin_all = self.A @ x
+        for grp in hs.groups:
+            coeff = 1.0 if grp.k < 0 else float(yv[grp.k])
+            if coeff == 0.0:
+                continue
+            f: Any = fin_all[grp.ig] - self.gconst[grp.ig]
+            gin = np.zeros(grp.gsupp.size)
+            if grp.a_pos.size:
+                gin[grp.a_pos] += grp.a_data  # CSR column indices are unique
+            Hloc = np.zeros((grp.hsize, grp.hsize)) if grp.hsize else None
+            for fn, idx, w, iel, gpos, hpos in grp.elements:
+                fiel, giel, Hiel = fn(self.inst, 3, xc[idx], iel)
+                giel = np.asarray(giel, dtype=float).reshape(-1)
+                Hiel = np.asarray(Hiel, dtype=float)
+                if w is not None:
+                    f = f + w * fiel
+                    np.add.at(gin, gpos, w * giel)
+                    np.add.at(Hloc, (hpos[:, None], hpos[None, :]), w * Hiel)
+                else:
+                    f = f + fiel
+                    np.add.at(gin, gpos, giel)
+                    np.add.at(Hloc, (hpos[:, None], hpos[None, :]), Hiel)
+            gsc = self.gscale[grp.ig]
+            if grp.gfn is not None:
+                fa, grada, Hessa = grp.gfn(self.inst, 3, f, grp.ig)
+                grada = float(np.asarray(grada).reshape(-1)[0])
+                Hessa = float(np.asarray(Hessa).reshape(-1)[0])
+                fval = float(np.asarray(fa).reshape(-1)[0]) / gsc
+                gvec = (grada / gsc) * gin
+                if grp.off_outer >= 0:
+                    seg = slice(grp.off_outer, grp.off_outer + gin.size * gin.size)
+                    vals[seg] = (coeff * Hessa / gsc) * np.outer(gin, gin).ravel()
+                if Hloc is not None:
+                    seg = slice(grp.off_hloc, grp.off_hloc + grp.hsize * grp.hsize)
+                    vals[seg] = (coeff * grada / gsc) * Hloc.ravel()
+            else:
+                fval = float(np.asarray(f).reshape(-1)[0]) / gsc
+                gvec = gin / gsc
+                if Hloc is not None:
+                    seg = slice(grp.off_hloc, grp.off_hloc + grp.hsize * grp.hsize)
+                    vals[seg] = (coeff / gsc) * Hloc.ravel()
+            Lxy += coeff * fval
+            gx[grp.gsupp] += coeff * gvec  # gsupp is sorted-unique: plain add
+        Hout = sp.coo_matrix((vals, (hs.rows, hs.cols)), shape=(n, n)).tocsr()
+        # The fixed dense-block layout stores zeros the original's value-sparse
+        # assembly would not; drop them so sparse-direct consumers factor a
+        # comparable nnz.
+        Hout.eliminate_zeros()
+        if self.H is not None:
+            Hout = Hout + sp.csr_matrix(self.H, dtype=float)
+        return Lxy, gx.reshape(-1, 1), Hout
+
     # -- constraints --------------------------------------------------------
 
     def cx(self, x: Any) -> np.ndarray:
@@ -178,50 +456,48 @@ class FastS2MPJEval:
         return out
 
     def cJx(self, x: Any) -> tuple[np.ndarray, sp.csr_matrix]:
-        """Constraint values and Jacobian ``(c, J)`` with ``J`` in CSR."""
+        """Constraint values and Jacobian ``(c, J)`` with ``J`` in CSR.
+
+        Fills the precompiled canonical CSR layout (``_compile_jacobian``); the
+        returned matrices share the fixed ``indices``/``indptr`` arrays across
+        calls, but each call allocates a fresh ``data`` vector.
+        """
         x = np.asarray(x, dtype=float).reshape(-1)
         xc = x.reshape(-1, 1)
         m = len(self.congrps)
         fin = (self.A @ x)[self.congrps] - self.gconst[self.congrps]
-        A = self.A
+        js = self._jac
         cvals = np.empty((m, 1))
-        rows: list[np.ndarray] = []
-        cols: list[np.ndarray] = []
-        vals: list[np.ndarray] = []
-        for k, (elements, gfn) in enumerate(self.con_groups):
-            ig = int(self.congrps[k])
-            support = self.con_support[k]
-            gin = np.zeros(len(support))
-            a0, a1 = A.indptr[ig], A.indptr[ig + 1]
-            if a1 > a0:
-                gin[np.searchsorted(support, A.indices[a0:a1])] += A.data[a0:a1]
+        data = np.zeros(js.nnz)
+        for k, grp in enumerate(js.groups):
+            gin = np.zeros(grp.support.size)
+            if grp.a_pos.size:
+                gin[grp.a_pos] += grp.a_data  # CSR column indices are unique
             f = fin[k]
-            for fn, idx, w, iel in elements:
+            for fn, idx, w, iel, pos in grp.elements:
                 fiel, giel = fn(self.inst, 2, xc[idx], iel)
                 giel = np.asarray(giel, dtype=float).reshape(-1)
-                pos = np.searchsorted(support, idx)
                 if w is not None:
                     f = f + w * fiel
                     np.add.at(gin, pos, w * giel)
                 else:
                     f = f + fiel
                     np.add.at(gin, pos, giel)
-            if gfn is not None:
-                f, grada = gfn(self.inst, 2, f, ig)
+            if grp.gfn is not None:
+                f, grada = grp.gfn(self.inst, 2, f, grp.ig)
                 gin = grada * gin
-            gsc = self.gscale[ig]
+            gsc = self.gscale[grp.ig]
             cvals[k, 0] = float(np.asarray(f).reshape(-1)[0]) / gsc
-            if len(support):
-                rows.append(np.full(len(support), k))
-                cols.append(support)
-                vals.append(np.asarray(gin, dtype=float).reshape(-1) / gsc)
-        if rows:
-            J = sp.csr_matrix(
-                (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
-                shape=(m, self.n),
-            )
-        else:
-            J = sp.csr_matrix((m, self.n))
+            if grp.support.size:
+                data[grp.off : grp.off + grp.support.size] = (
+                    np.asarray(gin, dtype=float).reshape(-1) / gsc
+                )
+        J = sp.csr_matrix((data, js.indices, js.indptr), shape=(m, self.n))
+        # The structure *is* canonical (sorted-unique columns per row); saying
+        # so stops scipy from ever running its in-place sort/dedup mutators on
+        # the shared ``indices``/``indptr`` template.
+        J.has_sorted_indices = True
+        J.has_canonical_format = True
         return cvals, J
 
     # -- objective ----------------------------------------------------------
@@ -321,12 +597,45 @@ def _build_and_verify(instance: Any) -> FastS2MPJEval | None:
     # (x0 is often special — e.g. all zeros kills every linear term).
     probe = x0 + 1e-4 * (1.0 + np.abs(x0)) * np.cos(np.arange(x0.shape[0]))
     verified = 0
-    for x in (x0, probe):
+    # The Hessian path is gated separately: a mismatch (or missing structure)
+    # only disables ``LgHxy``, the verified base methods stay in use.
+    hess_ok: bool | None = None if fast._hess is not None else False
+    m = len(fast.congrps)
+    for shift, x in enumerate((x0, probe)):
         agree = _agrees_at(instance, fast, x)
         if agree is False:
             return None
         verified += agree is True
+        if hess_ok is not False:
+            # Deterministic sign-varied multipliers (shifted per probe point);
+            # all-equal or all-zero y would mask per-group mix-ups.
+            y = (np.cos(np.arange(m) + shift) + 0.25).reshape(-1, 1)
+            hess_agree = _hess_agrees_at(instance, fast, x, y)
+            if hess_agree is not None:
+                hess_ok = hess_agree
+    fast.lghxy_ok = bool(hess_ok)
     return fast if verified else None
+
+
+def _hess_agrees_at(
+    instance: Any, fast: FastS2MPJEval, x: np.ndarray, y: np.ndarray
+) -> bool | None:
+    """Tri-state ``LgHxy`` agreement at one point (same policy as base methods)."""
+    ref_fn = getattr(instance, "LgHxy", None)
+    if ref_fn is None:
+        return None
+    with np.errstate(all="ignore"):
+        try:
+            l_ref, g_ref, h_ref = ref_fn(x.copy().reshape(-1, 1), y.copy())
+        except Exception:
+            return None  # the original is the authority on exceptions
+        try:
+            l_new, g_new, h_new = fast.LgHxy(x, y)
+        except Exception:
+            return False
+        return bool(
+            _close(l_ref, l_new) and _close(g_ref, g_new) and _jac_close(h_ref, h_new)
+        )
 
 
 def _agrees_at(instance: Any, fast: FastS2MPJEval, x: np.ndarray) -> bool | None:
