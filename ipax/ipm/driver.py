@@ -53,9 +53,23 @@ from ipax.backend.operators import (
     VStack,
     as_operator,
 )
-from ipax.ipm.barrier import fraction_to_boundary, update_mu
+from ipax.ipm.barrier import (
+    FreeModeMonitor,
+    adaptive_mu,
+    breedveld_mu,
+    complementarity_measures,
+    fallback_mu,
+    fraction_to_boundary,
+    update_mu,
+)
 from ipax.ipm.breedveld_ls import BreedveldController
-from ipax.ipm.corrections import CorrectionContext, select_corrector
+from ipax.ipm.corrections import (
+    CenteringOnly,
+    CorrectionContext,
+    HigherOrderCorrection,
+    probing_mu,
+    select_corrector,
+)
 from ipax.ipm.filter_ls import Filter, FilterLineSearch
 from ipax.ipm.hessian import LBFGSOperator
 from ipax.ipm.init import apply_warm_start, initialize
@@ -81,7 +95,7 @@ from ipax.result import (
 
 if TYPE_CHECKING:
     from ipax.linalg.solver import LinearSolver
-    from ipax.options import OptimalityConditionOptions, Options
+    from ipax.options import MuSchedule, OptimalityConditionOptions, Options
     from ipax.problem.base import Problem
     from ipax.result import IterationCallback, WarmStart
     from ipax.typing import Array, Namespace
@@ -227,7 +241,13 @@ class IPMDriver:
         # (``active`` is False), so the predictor direction is used unchanged.
         corrections = options.corrections
         assert not isinstance(corrections, str)  # normalized by Options.__post_init__
-        self._corrector = select_corrector(corrections)
+        self._corrector: HigherOrderCorrection = select_corrector(corrections)
+        # Standalone "probing" (no corrector requested) runs the corrector path
+        # with a plain centered re-solve, since the probing oracle needs the
+        # affine direction anyway (Nocedal, Wächter & Waltz 2009, §3).
+        self._mu_schedule: MuSchedule = options.mu_schedule
+        if self._mu_schedule == "probing" and not self._corrector.active:
+            self._corrector = CenteringOnly()
         self._problem_time_total = 0.0
         self._linear_eq_data = self._normalize_linear_eq(problem.linear_eq())
         self._n = int(problem.n_vars)
@@ -537,6 +557,15 @@ class IPMDriver:
         history: list[IterationRecord] = []
         alpha_p = 1.0
         alpha_d = 1.0
+        # Last *accepted* combined steplength (Breedveld 2017, eq. (11)); the
+        # steplength-driven μ schedule must not consume the α = 1 sentinel
+        # above before a first step has actually been taken.
+        last_alpha: float | None = None
+        # Free-mode safeguard (NWW 2009, §5.1): suspends a non-monotone μ
+        # oracle while the KKT error fails to make sufficient progress. Inert
+        # for the monotone schedule (its μ handling is already monotone).
+        mu_monitor = FreeModeMonitor(opts.barrier)
+        free_mode = True
         reg_applied = 0.0
         status = Status.MAX_ITER
         message = "maximum iterations reached"
@@ -623,6 +652,31 @@ class IPMDriver:
             # iterative route can drive an inexact-Newton forcing sequence (loose
             # early, tight near convergence); direct solvers ignore it.
             self._solver.set_outer_residual(e0)
+            if self._mu_schedule != "monotone":
+                free_mode, entered_monotone = mu_monitor.observe(e0)
+                if entered_monotone and m + n_bounds > 0:
+                    # NWW 2009, §5.1: restart the monotone strategy from a
+                    # fraction of the current complementarity.
+                    avg_compl, _ = complementarity_measures(
+                        s=s,
+                        y_ineq=y_ineq,
+                        z_lower=z_lower,
+                        z_upper=z_upper,
+                        x_minus_l=x_minus_l,
+                        u_minus_x=u_minus_x,
+                        mask_l=mask_l,
+                        mask_u=mask_u,
+                        m=m,
+                        n_bounds=n_bounds,
+                    )
+                    mu = fallback_mu(avg_compl, opts.barrier, opts.optimality.kkt_tol)
+                    logger.debug(
+                        "iter %d: free-mode safeguard tripped (e0=%.3e); "
+                        "monotone mode from mu=%.3e",
+                        it,
+                        e0,
+                        mu,
+                    )
             theta = self._theta(
                 x, g, s, c, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
             )
@@ -755,7 +809,7 @@ class IPMDriver:
             }
 
             if self._corrector.active:
-                # Mehrotra/Gondzio: the affine and correction directions
+                # Mehrotra/Gondzio/probing: the affine and correction directions
                 # share one KKT operator. Sparse-direct reuses its factorization;
                 # dense/Krylov perform another solve against that operator.
                 corrected = self._corrected_step(
@@ -770,6 +824,13 @@ class IPMDriver:
                     solve_step_timed=solve_step_timed,
                     rhs_kwargs=rhs_kwargs,
                     recover_kwargs=recover_kwargs,
+                    mu=mu,
+                    last_alpha=last_alpha,
+                    free_mode=free_mode,
+                    infeasibility=max(
+                        residuals.dual_infeasibility, residuals.primal_infeasibility
+                    ),
+                    err_kwargs=err_kwargs,
                 )
                 if corrected is None:
                     status, message = _classify_step_failure(
@@ -777,8 +838,39 @@ class IPMDriver:
                     )
                     break
                 mu, step, reg_applied = corrected
+                # A step must have descent properties for the barrier problem
+                # at the current μ (NWW 2009, §5). A corrected direction built
+                # on a low-quality (quasi-Newton) affine probe can lose them —
+                # the complementarity-target perturbation is amplified through
+                # the near-singular condensed operator — leaving the line
+                # search only rejectable ascent trials. The corrector is a
+                # step-quality mechanism, not part of the μ selection, so fall
+                # back to the plain centered step toward the same μ.
+                if (
+                    self._dphi(
+                        x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
+                    )
+                    >= 0.0
+                ):
+                    rhs = self._condensed_rhs(mu, mu, mu, **rhs_kwargs)
+                    dx, dy_eq, reg_fallback, ok = solve_step_timed(
+                        w, sigma_x, sigma_s, ineq_jac, rhs, eq_jac, m_eq, -c, delta_c
+                    )
+                    if ok:
+                        step = recover_eliminated(
+                            dx, mu=mu, dy_eq=dy_eq, **recover_kwargs
+                        )
+                        reg_applied = max(reg_applied, reg_fallback)
             else:
-                mu = self._reduce_mu(mu, **err_kwargs)
+                mu = self._next_mu(
+                    mu,
+                    last_alpha=last_alpha,
+                    free_mode=free_mode,
+                    infeasibility=max(
+                        residuals.dual_infeasibility, residuals.primal_infeasibility
+                    ),
+                    **err_kwargs,
+                )
                 rhs = self._condensed_rhs(mu, mu, mu, **rhs_kwargs)
                 dx, dy_eq, reg_applied, ok = solve_step_timed(
                     w, sigma_x, sigma_s, ineq_jac, rhs, eq_jac, m_eq, -c, delta_c
@@ -999,6 +1091,9 @@ class IPMDriver:
                     )
                     break
                 alpha_p = 0.0
+                # A restoration jump is a blocked Newton step for the schedule:
+                # σ(0) = 0.01 re-centers on the next iteration (eq. (12)).
+                last_alpha = 0.0
                 # The restoration jump is not a Newton step, so the next
                 # curvature pair would be meaningless — drop the history anchor.
                 prev_x = None
@@ -1024,6 +1119,9 @@ class IPMDriver:
             z_upper = xp.where(
                 mask_u, z_upper + alpha_d * step.dz_upper, xp.zeros_like(x)
             )
+            # Combined steplength over all blocks (Breedveld 2017, eq. (11)),
+            # feeding the σ(α) duality-gap reduction on the next iteration.
+            last_alpha = min(alpha_p, alpha_d)
             last_step_solve_time = self._step_solve_seconds
 
         x_minus_l, u_minus_x = bound_gaps(x)
@@ -1124,6 +1222,62 @@ class IPMDriver:
             _norm_inf(xp, xp.maximum(xp.where(mask_u, x - upper_safe, zero), zero)),
         )
         return viol
+
+    def _next_mu(
+        self,
+        mu: float,
+        *,
+        last_alpha: float | None,
+        free_mode: bool = True,
+        infeasibility: float = 0.0,
+        **err_kwargs: Any,
+    ) -> float:
+        """Advance μ by the configured schedule (``Options.mu_schedule``).
+
+        ``"monotone"`` runs the guarded Fiacco–McCormick reduction loop below;
+        the free-mode schedules instead re-target μ from the current
+        complementarity on every iteration: ``"adaptive"`` via the LOQO
+        centrality rule (Nocedal, Wächter & Waltz 2009, eqs. (3.1)/(3.6)),
+        ``"breedveld"`` via the steplength-driven duality-gap reduction
+        (Breedveld 2017, eqs. (10)–(12)). ``"probing"`` never reaches this
+        method — it needs the affine direction, so it is applied on the
+        corrector path (see ``_corrected_step``). Problems without
+        complementarity pairs — and, for the steplength rule, iterations before
+        the first accepted step — fall back to keeping/reducing μ monotonically.
+        With ``free_mode`` ``False`` (the NWW §5.1 safeguard tripped) every
+        oracle is suspended in favor of the monotone reduction.
+        """
+        opts = self._options
+        schedule = self._mu_schedule
+        m = int(err_kwargs["m"])
+        n_bounds = int(err_kwargs["n_bounds"])
+        if not free_mode or schedule == "monotone" or m + n_bounds == 0:
+            return self._reduce_mu(mu, **err_kwargs)
+        if schedule == "breedveld" and last_alpha is None:
+            # σ(α) needs an accepted steplength; keep μ_init for the first solve.
+            return mu
+        avg_compl, min_compl = complementarity_measures(
+            s=err_kwargs["s"],
+            y_ineq=err_kwargs["y_ineq"],
+            z_lower=err_kwargs["z_lower"],
+            z_upper=err_kwargs["z_upper"],
+            x_minus_l=err_kwargs["x_minus_l"],
+            u_minus_x=err_kwargs["u_minus_x"],
+            mask_l=err_kwargs["mask_l"],
+            mask_u=err_kwargs["mask_u"],
+            m=m,
+            n_bounds=n_bounds,
+        )
+        tol = opts.optimality.kkt_tol
+        if schedule == "adaptive":
+            mu_next = adaptive_mu(avg_compl, min_compl, opts.barrier, tol)
+        else:
+            assert last_alpha is not None  # narrowed above
+            mu_next = breedveld_mu(avg_compl, last_alpha, opts.barrier, tol)
+        # Centrality floor (El-Bakry et al. 1996): μ must not vanish faster
+        # than the primal/dual infeasibility, or the barrier decenters at a
+        # still-unsolved iterate (see BarrierOptions.kappa_centrality).
+        return max(mu_next, opts.barrier.kappa_centrality * infeasibility)
 
     def _reduce_mu(self, mu: float, **err_kwargs: object) -> float:
         opts = self._options
@@ -1233,12 +1387,21 @@ class IPMDriver:
         solve_step_timed: Callable[..., tuple[Array, Array, float, bool]],
         rhs_kwargs: dict[str, Any],
         recover_kwargs: dict[str, Any],
+        mu: float,
+        last_alpha: float | None,
+        free_mode: bool,
+        infeasibility: float,
+        err_kwargs: dict[str, Any],
     ) -> tuple[float, NewtonStep, float] | None:
-        """Affine predictor + higher-order corrector.
+        """Affine predictor + μ oracle + higher-order corrector.
 
-        Returns ``(μ, step, δ_w)`` where ``μ`` is the barrier target the
-        corrected ``step`` aims at (adopted by the line search), or ``None`` if
-        the affine operator setup/solve failed despite regularization.
+        The affine direction doubles as the probe for the ``"probing"`` oracle;
+        any other ``mu_schedule`` picks the target via ``_next_mu`` and the
+        corrector merely aims at it (Nocedal, Wächter & Waltz 2009: the
+        corrector is not part of the barrier-parameter selection). Returns
+        ``(μ, step, δ_w)`` where ``μ`` is the barrier target the corrected
+        ``step`` aims at (adopted by the line search), or ``None`` if the
+        affine operator setup/solve failed despite regularization.
         """
         affine_rhs = self._condensed_rhs(0.0, 0.0, 0.0, **rhs_kwargs)
         dx_aff, dy_aff, reg_applied, ok = solve_step_timed(
@@ -1289,7 +1452,21 @@ class IPMDriver:
                 self._options.barrier.mu_min, self._options.optimality.kkt_tol / 10.0
             ),
         )
-        result = self._corrector.correct(context)
+        if free_mode and self._mu_schedule == "probing":
+            # Centrality floor (El-Bakry et al. 1996) — see BarrierOptions.
+            mu_target = max(
+                probing_mu(context),
+                self._options.barrier.kappa_centrality * infeasibility,
+            )
+        else:
+            mu_target = self._next_mu(
+                mu,
+                last_alpha=last_alpha,
+                free_mode=free_mode,
+                infeasibility=infeasibility,
+                **err_kwargs,
+            )
+        result = self._corrector.correct(context, mu_target)
         return result.mu, result.step, reg_applied
 
     def _inertia_acceptable(self, operator: LinearOperator) -> bool:

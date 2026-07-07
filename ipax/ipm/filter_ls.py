@@ -200,11 +200,13 @@ class FilterLineSearch:
         if self._switching(dphi, alpha, theta0):
             # f-type step: require Armijo decrease on the barrier objective.
             return phi_t <= phi0 + o.eta_phi * alpha * dphi
-        # θ-type step: sufficient decrease in θ or φ vs the current point.
-        return (
-            theta_t <= (1.0 - o.gamma_theta) * theta0
-            or phi_t <= phi0 - o.gamma_phi * theta0
-        )
+        # θ-type step: sufficient decrease in θ or φ vs the current point
+        # (W&B eq. 20). At a feasible iterate (θ0 = 0) no θ-progress step
+        # exists — the branch would degenerate to "0 ≤ 0" and accept an
+        # arbitrary ascent direction (W&B §2.3: only f-type/φ-decrease
+        # acceptance applies there), so it requires θ0 > 0.
+        theta_progress = theta0 > 0.0 and theta_t <= (1.0 - o.gamma_theta) * theta0
+        return theta_progress or phi_t <= phi0 - o.gamma_phi * theta0
 
 
 __all__ = ["Filter", "FilterLineSearch", "LineSearchResult"]

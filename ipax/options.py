@@ -27,7 +27,8 @@ from typing import Literal
 HessianMode = Literal["auto", "lbfgs", "exact", "autodiff-hvp"]
 LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
 Globalization = Literal["filter", "breedveld"]
-MuSchedule = Literal["monotone", "adaptive", "breedveld"]
+MuSchedule = Literal["monotone", "adaptive", "breedveld", "probing"]
+MuFallback = Literal["kkt-error", "never"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
 DenseKKTRoute = Literal["condensed", "augmented"]
@@ -56,6 +57,37 @@ class BarrierOptions:
     kappa_mu: float = 0.2  # μ ← max(ε/10, κ_μ μ^θ_μ)
     theta_mu: float = 1.5
     tau_min: float = 0.99  # fraction-to-boundary floor
+    # Free-mode safeguard (Nocedal, Wächter & Waltz 2009, §5.1, Algorithm A):
+    # under a non-monotone μ oracle the scaled KKT error must stay below
+    # κ·max(last l_max+1 free-mode errors); otherwise the oracle is suspended
+    # and μ is handled monotonically — re-initialized at
+    # ``fallback_mu_factor``·(average complementarity) — until the error drops
+    # back below that threshold. ``"never"`` disables the safeguard (pure free
+    # mode). Inert for the monotone schedule itself.
+    fallback: MuFallback = "kkt-error"
+    fallback_kappa: float = 0.9999  # κ ∈ (0, 1)
+    fallback_window: int = 5  # l_max ≥ 0
+    fallback_mu_factor: float = 0.8  # monotone re-entry μ factor
+    # Centrality floor for the free-mode oracles: μ ≥ κ_cent·max(dual, primal
+    # infeasibility). El-Bakry et al. (1996)'s convergence theory requires the
+    # complementarity gap not to vanish faster than the KKT residual; without
+    # this floor an aggressive oracle can crush μ near a saddle while the dual
+    # infeasibility is still O(1), pinning the iterate to the boundary with no
+    # barrier left to re-center (and leaving the KKT-error fallback's
+    # complementarity-based re-entry μ powerless). The complementarity
+    # component is deliberately excluded so superlinear μ decrease near a
+    # solution is unimpeded. ``0.0`` disables the floor.
+    kappa_centrality: float = 1e-2
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.fallback_kappa < 1.0:
+            raise ValueError("fallback_kappa must lie in (0, 1)")
+        if self.fallback_window < 0:
+            raise ValueError("fallback_window must be non-negative")
+        if self.fallback_mu_factor <= 0.0:
+            raise ValueError("fallback_mu_factor must be positive")
+        if not math.isfinite(self.kappa_centrality) or self.kappa_centrality < 0.0:
+            raise ValueError("kappa_centrality must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,7 +460,19 @@ class Options:
     hessian: HessianMode = "auto"
     linsolve: LinSolveMode = "auto"
     globalization: Globalization = "filter"
-    mu_schedule: MuSchedule = "monotone"
+    # The μ oracle. ``"probing"`` (default) uses the Mehrotra σ-rule from an
+    # affine probe — the strongest strategy in the NWW 2009 comparison (their
+    # eqs. (3.2)–(3.5)); it costs one extra KKT solve per iteration when no
+    # corrector is active (with corrections the affine solve is shared).
+    # ``"monotone"`` holds μ until the barrier KKT test passes, then reduces it
+    # (Wächter & Biegler 2006, eq. (7)); ``"adaptive"`` re-targets μ every
+    # iteration by the LOQO centrality rule (NWW 2009, eq. (3.6));
+    # ``"breedveld"`` scales the duality gap by the last accepted steplength
+    # (Breedveld et al. 2017, eqs. (10)–(12)). The oracle is orthogonal to
+    # ``corrections``: an active corrector aims at the oracle's μ. The
+    # non-monotone oracles are safeguarded by the KKT-error fallback
+    # (``BarrierOptions.fallback``; NWW 2009, §5.1).
+    mu_schedule: MuSchedule = "probing"
 
     barrier: BarrierOptions = field(default_factory=BarrierOptions)
     line_search: LineSearchOptions = field(default_factory=LineSearchOptions)
@@ -482,6 +526,7 @@ __all__ = [
     "LBFGSOptions",
     "LinSolveMode",
     "LineSearchOptions",
+    "MuFallback",
     "MuSchedule",
     "OptimalityConditionOptions",
     "Options",

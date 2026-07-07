@@ -162,12 +162,62 @@ bounds, so they never hurt there. Tune Gondzio via
 - `"breedveld"` — a lighter Markov-filter + ratio-control step controller tuned
   for convex/RT-like problems ([`BreedveldOptions`](../reference.md#ipax.options.BreedveldOptions)).
 
-The barrier μ schedule (`mu_schedule`), the filter constants
-([`LineSearchOptions`](../reference.md#ipax.options.LineSearchOptions)), and the
+The filter constants
+([`LineSearchOptions`](../reference.md#ipax.options.LineSearchOptions)) and the
 regularization escalation
 ([`RegularizationOptions`](../reference.md#ipax.options.RegularizationOptions))
 are rarely-touched advanced knobs; the defaults follow Wächter & Biegler (2006)
 and Friedlander & Orban (2012).
+
+## Barrier μ schedule
+
+`mu_schedule` selects the μ oracle — how the barrier parameter is driven:
+
+- `"probing"` *(default)* — Mehrotra σ-rule: an affine (predictor) probe sets
+  σ = (μ_aff/μ)³ (Mehrotra 1992; NWW 2009, eqs. (3.2)–(3.5)) — the strongest
+  strategy in the NWW comparison. Without a corrector this costs one extra KKT
+  solve per iteration; with corrections active the affine solve is shared.
+- `"monotone"` — Fiacco–McCormick: hold μ fixed until the barrier
+  subproblem is solved to `κ_ε·μ`, then reduce it
+  (Wächter & Biegler 2006, eq. (7)). The most conservative choice.
+- `"adaptive"` — LOQO centrality rule: μ = σ·(average complementarity), where σ
+  grows with the deviation of the smallest complementarity product from the
+  average (Nocedal, Wächter & Waltz 2009, eq. (3.6)). Re-targeted every
+  iteration; μ may increase but never above 0.8× the current complementarity.
+- `"breedveld"` — duality-gap update μ = σ(α)·(average complementarity) with
+  σ = ((α−1)/(α+10))² built from the last accepted steplength
+  (Breedveld et al. 2017, eqs. (10)–(12)): full steps drive μ superlinearly to
+  zero, blocked steps re-center. Pairs naturally with
+  `globalization="breedveld"` on convex/RT-like problems.
+
+```python
+ipax.Options(mu_schedule="adaptive")
+```
+
+The oracle is orthogonal to [`corrections`](#higher-order-corrections): the
+corrector improves the *step* toward whatever μ the oracle picked (Nocedal,
+Wächter & Waltz 2009 — "the corrector is not part of the selection of the
+barrier parameter"), so e.g. the LOQO oracle can steer Gondzio corrections.
+
+The non-monotone oracles run in *free mode*, safeguarded twice:
+
+- **KKT-error fallback** (NWW 2009 §5.1, Algorithm A): if the scaled KKT error
+  fails to drop below `fallback_kappa` × (max of the last `fallback_window`+1
+  free-mode values), the oracle is suspended and μ is handled monotonically —
+  re-initialized at `fallback_mu_factor` × (average complementarity) — until
+  the error recovers. Defaults follow the paper (κ = 0.9999, l_max = 5,
+  factor 0.8); set `BarrierOptions(fallback="never")` for pure free mode.
+  Iterates are never rolled back — the filter line search already globalizes
+  each step, so the safeguard gates only the μ rule (matching IPOPT's
+  `adaptive_mu_globalization="kkt-error"`).
+- **Centrality floor**: μ never drops below
+  `kappa_centrality` × max(dual, primal infeasibility) (default `1e-2`).
+  El-Bakry et al. (1996)'s convergence theory requires the complementarity gap
+  not to vanish faster than the KKT residual; without the floor an aggressive
+  oracle can crush μ near a saddle while the iterate is far from stationary,
+  pinning it to the boundary with no barrier left to re-center. The
+  complementarity component is excluded from the floor, so superlinear μ
+  decrease near a solution is unimpeded. `kappa_centrality=0.0` disables it.
 
 ## Verbosity
 

@@ -36,6 +36,47 @@ def test_filter_augment_removes_entries_dominated_by_new_pair():
     assert (0.5, 8.0) in filt.entries
 
 
+def test_ascent_step_rejected_at_feasible_point():
+    # Regression: at a feasible iterate (θ0 = 0) the θ-progress branch
+    # degenerates to "0 ≤ 0" and accepted *any* feasible trial — including a
+    # corrector direction with dφ > 0 that inflated φ by orders of magnitude
+    # (RT least-squares example). W&B §2.3: no θ-type step exists at θ = 0;
+    # only Armijo/φ-decrease acceptance applies.
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=0.0,
+        phi0=1.0,
+        dphi=5.0,  # ascent direction: switching can never hold
+        theta_max=1e4,
+        eval_point=lambda alpha: (0.0, 1.0 + 10.0 * alpha),
+        entries=[],
+    )
+
+    assert not result.accepted
+    assert result.restoration
+
+
+def test_phi_decrease_still_accepted_at_feasible_point():
+    # The φ sub-branch (φ_t ≤ φ0 − γ_φ·θ0, i.e. non-increase at θ0 = 0) must
+    # survive the θ-branch fix so re-centering steps remain acceptable.
+    line_search = FilterLineSearch(LineSearchOptions())
+
+    result = line_search.search(
+        alpha_max=1.0,
+        theta0=0.0,
+        phi0=1.0,
+        dphi=5.0,
+        theta_max=1e4,
+        eval_point=lambda alpha: (0.0, 0.5),
+        entries=[],
+    )
+
+    assert result.accepted
+    assert result.alpha == 1.0
+
+
 def test_switching_condition_survives_overflowing_directional_derivative():
     # Regression (INDEF): a badly-scaled iterate yields an enormous |dphi|; the
     # switching condition's ``(-dphi) ** s_phi`` must not raise OverflowError.

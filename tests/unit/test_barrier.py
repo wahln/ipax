@@ -8,12 +8,23 @@ from tests._helpers import array, assert_scalar_close, implemented
 
 
 def test_update_mu_uses_monotone_fiacco_mccormick_formula():
+    # Wächter & Biegler 2006, eq. (7): μ⁺ = max(ε/10, min(κ_μ·μ, μ^θ_μ)).
     options = BarrierOptions(kappa_mu=0.2, theta_mu=1.5)
 
     with implemented("mu schedule"):
         mu_next = update_mu(1e-1, options, tol=1e-8)
 
-    assert_scalar_close(mu_next, max(1e-9, 0.2 * ((1e-1) ** 1.5)))
+    assert_scalar_close(mu_next, max(1e-9, min(0.2 * 1e-1, (1e-1) ** 1.5)))
+
+
+def test_update_mu_decreases_from_any_mu():
+    # Regression: the previous κ_μ·μ^θ_μ variant *increases* for μ ≥ 25
+    # (κ_μ = 0.2, θ_μ = 1.5), permanently locking μ once an adaptive oracle
+    # inflated it — eq. (7)'s min() decreases linearly from any magnitude.
+    options = BarrierOptions(kappa_mu=0.2, theta_mu=1.5)
+    mu_next = update_mu(1e4, options, tol=1e-8)
+    assert mu_next < 1e4
+    assert_scalar_close(mu_next, 0.2 * 1e4)
 
 
 def test_fraction_to_boundary_limits_negative_components(namespace):

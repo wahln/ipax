@@ -60,6 +60,10 @@ def test_breedveld_globalization_uses_breedveld_tau(namespace, monkeypatch):
             hessian="exact",
             linsolve="dense",
             globalization="breedveld",
+            # The probing default's affine probe legitimately measures the
+            # maximal steplength at τ = 1, which would contaminate the captured
+            # values; monotone keeps every _alpha_primal call a line-search one.
+            mu_schedule="monotone",
             barrier=BarrierOptions(tau_min=0.99),
             breedveld=BreedveldOptions(tau=0.5),
         ),

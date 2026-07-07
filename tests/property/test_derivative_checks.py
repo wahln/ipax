@@ -170,7 +170,11 @@ def test_hs_oracle_derivatives_match_finite_differences(namespace, problem_cls, 
     )
 )
 @hypothesis.settings(
-    suppress_health_check=[hypothesis.HealthCheck.function_scoped_fixture]
+    suppress_health_check=[hypothesis.HealthCheck.function_scoped_fixture],
+    # The first example pays the backend's lazy-import/warm-up cost, which
+    # under full-suite load exceeded the 200 ms default deadline and flaked
+    # as hypothesis.errors.FlakyFailure (339 ms first call, 0.1 ms replay).
+    deadline=None,
 )
 def test_quadratic_solution_is_invariant_to_positive_objective_scaling(
     namespace, scale

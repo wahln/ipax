@@ -10,6 +10,7 @@ from ipax.ipm.corrections import (
     GondzioCorrector,
     MehrotraCorrector,
     NoCorrection,
+    probing_mu,
     select_corrector,
 )
 from ipax.ipm.step import NewtonStep, recover_eliminated
@@ -29,7 +30,7 @@ def _step(xp, *, ds: float, dy: float) -> NewtonStep:
     )
 
 
-def _context(xp, affine, *, solve, alpha_primal, alpha_dual):
+def _context(xp, affine, *, solve, alpha_primal, alpha_dual, mu_min=0.0):
     zero = array(xp, [0.0])
     gap = array(xp, [1.0])
     no_bound = zero > 0.5
@@ -46,6 +47,7 @@ def _context(xp, affine, *, solve, alpha_primal, alpha_dual):
         solve=solve,
         alpha_primal=alpha_primal,
         alpha_dual=alpha_dual,
+        mu_min=mu_min,
     )
 
 
@@ -115,6 +117,80 @@ def test_recover_eliminated_complementarity_target_override(namespace):
     assert_scalar_close(float(override.dy_ineq[0]), -3.0 + 10.0 / 2.0)  # 2
 
 
+def test_probing_mu_matches_mehrotra_sigma_rule(namespace):
+    # μ = 2·3 = 6; α_p = α_d = 0.5 ⇒ μ_aff = 1.5·2.5 = 3.75;
+    # σ = (μ_aff/μ)³ (Mehrotra 1992; NWW 2009, eqs. (3.2)–(3.5)).
+    xp = namespace
+    affine = _step(xp, ds=-1.0, dy=-1.0)
+    context = _context(
+        xp,
+        affine,
+        solve=lambda *args: None,
+        alpha_primal=lambda step, *, tau: 0.5,
+        alpha_dual=lambda step, *, tau: 0.5,
+    )
+    assert_scalar_close(probing_mu(context), (3.75 / 6.0) ** 3 * 6.0)
+
+
+def test_probing_mu_never_exceeds_average_complementarity(namespace):
+    # Regression: a quasi-Newton affine probe can *inflate* the products
+    # (μ_aff > μ), making σ = (μ_aff/μ)³ arbitrarily large and exploding μ
+    # within a few iterations (RT least-squares example, L-BFGS Hessian).
+    # σ is therefore clipped at 1: probing may hold μ but never raise it.
+    xp = namespace
+    inflating = _step(xp, ds=1.0, dy=1.0)  # trial products (2+1)(3+1) = 12 > 6
+    context = _context(
+        xp,
+        inflating,
+        solve=lambda *args: None,
+        alpha_primal=lambda step, *, tau: 1.0,
+        alpha_dual=lambda step, *, tau: 1.0,
+    )
+    assert_scalar_close(probing_mu(context), 6.0)  # σ clipped to 1 ⇒ μ = μ_avg
+
+
+def test_probing_mu_respects_floor(namespace):
+    xp = namespace
+    affine = _step(xp, ds=-1.0, dy=-1.0)
+    context = _context(
+        xp,
+        affine,
+        solve=lambda *args: None,
+        alpha_primal=lambda step, *, tau: 0.5,
+        alpha_dual=lambda step, *, tau: 0.5,
+        mu_min=2.0,
+    )
+    assert probing_mu(context) == 2.0
+
+
+def test_mehrotra_second_order_targets_clipped_to_symmetric_box(namespace):
+    # Regression: the −ΔΔ term from a *quasi-Newton* affine direction can be
+    # arbitrarily large (RT least-squares example: targets ~1e5 inflated the
+    # duals by five orders of magnitude in one step). Targets are clipped into
+    # the symmetric neighbourhood [γμ, μ/γ] (Colombo & Gondzio 2008).
+    xp = namespace
+    affine = _step(xp, ds=-100.0, dy=100.0)  # −ΔsΔλ = +1e4 ≫ μ
+    captured = []
+
+    def solve(comp_s, comp_l, comp_u):
+        captured.append((comp_s, comp_l, comp_u))
+        return None
+
+    context = _context(
+        xp,
+        affine,
+        solve=solve,
+        alpha_primal=lambda step, *, tau: 0.5,
+        alpha_dual=lambda step, *, tau: 0.5,
+    )
+    corrector = MehrotraCorrector(CorrectionsOptions(method="mehrotra"))
+    corrector.correct(context, 1.0)
+
+    # γ = 0.1 (gondzio_gamma default): box [0.1, 10]; 1.0 + 1e4 clips to 10.
+    assert len(captured) == 1
+    assert_scalar_close(float(captured[0][0][0]), 10.0)
+
+
 def test_mehrotra_failed_corrector_matches_affine_zero_target(namespace):
     xp = namespace
     affine = _step(xp, ds=-1.0, dy=-1.0)
@@ -126,8 +202,11 @@ def test_mehrotra_failed_corrector_matches_affine_zero_target(namespace):
         alpha_dual=lambda step, *, tau: 0.5,
     )
 
-    result = MehrotraCorrector(CorrectionsOptions(method="mehrotra")).correct(context)
+    corrector = MehrotraCorrector(CorrectionsOptions(method="mehrotra"))
+    result = corrector.correct(context, probing_mu(context))
 
+    # The corrector solve failed, so the affine direction (which targeted zero
+    # complementarity) is returned with that zero target, not the oracle's μ.
     assert result.step is affine
     assert result.mu == 0.0
 
@@ -180,12 +259,16 @@ def test_gondzio_accumulates_partial_trial_residual_and_uses_gamma(namespace):
         CorrectionsOptions(
             method="gondzio", gondzio_max_corrections=2, gondzio_gamma=gamma
         )
-    ).correct(context)
+    ).correct(context, probing_mu(context))
 
     mu = 2.0 * 3.0
     mu_aff = (2.0 - 0.5) * (3.0 - 0.5)
     mu_target = (mu_aff / mu) ** 3 * mu
-    base_target = mu_target - (-1.0) * (-1.0)
+    # The Mehrotra −ΔΔ target is clipped into the symmetric box [γμ, μ/γ]
+    # (Colombo & Gondzio 2008) before the Gondzio corrections accumulate on it.
+    base_target = min(
+        max(mu_target - (-1.0) * (-1.0), gamma * mu_target), mu_target / gamma
+    )
     trial_product = (2.0 + 0.3 * -0.4) * (3.0 + 0.4 * -0.5)
     projected = min(max(trial_product, gamma * mu_target), mu_target / gamma)
     expected = base_target + projected - trial_product

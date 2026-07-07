@@ -7,6 +7,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Barrier μ oracles, orthogonal to higher-order corrections.**
+  `Options(mu_schedule=...)` is now honored and grew a value: `"adaptive"`
+  re-targets μ every iteration by the LOQO centrality rule (Nocedal, Wächter &
+  Waltz 2009, eq. (3.6)), `"breedveld"` applies the steplength-driven
+  duality-gap reduction σ(α) = ((α−1)/(α+10))² of Breedveld et al. 2017
+  (eqs. (10)–(12)), `"probing"` runs the Mehrotra σ-rule from an affine probe
+  (also standalone, without a corrector), and `"monotone"` is the guarded
+  Fiacco–McCormick loop. Mehrotra/Gondzio correctors now *consume* the oracle's
+  μ target instead of choosing it, so any oracle can steer any corrector.
+  Previously the non-monotone values were accepted but silently ran the
+  monotone schedule.
+- **Centrality floor for the free-mode oracles**
+  (`BarrierOptions.kappa_centrality`, default `1e-2`): μ never drops below
+  κ_cent·max(dual, primal infeasibility), the practical rendering of the
+  centrality condition in El-Bakry et al. (1996)'s Newton interior-point
+  convergence theory. Without it an aggressive oracle can crush μ near a
+  saddle while the iterate is far from stationary, pinning it to the boundary
+  beyond the reach of the KKT-error fallback's complementarity-based re-entry.
+- **Free-mode KKT-error safeguard** (NWW 2009, §5.1, Algorithm A): a
+  non-monotone μ oracle is suspended when the scaled KKT error stops making
+  sufficient progress (`fallback_kappa`/`fallback_window`, paper defaults
+  κ = 0.9999, l_max = 5), falling back to the monotone reduction re-initialized
+  at 0.8× the average complementarity until the error recovers —
+  the counterpart of IPOPT's `adaptive_mu_globalization="kkt-error"`.
+  `BarrierOptions(fallback="never")` restores pure free mode.
 - **TROTS radiotherapy benchmark corpus** (`benchmarks/corpus/trots.py`,
   download-gated on `IPAX_TROTS_DIR`). Loads the TROTS treatment-planning problems
   (MATLAB v7.3/HDF5) into an ipax `Problem`: all cost functions (linear
@@ -31,6 +56,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **Non-monotone μ oracles ran away on ill-scaled problems** (found via the
+  radiotherapy example: every free-mode oracle stagnated at a huge constant μ
+  with L-BFGS, with or without correctors). Five stacked defects, each with a
+  regression test (`tests/regression/test_mu_oracle_inflation.py`):
+  the monotone reducer computed κ_μ·μ^θ_μ — which *increases* for μ ≥ 25 and
+  locked any inflated μ forever — instead of Wächter & Biegler eq. (7)'s
+  min(κ_μ·μ, μ^θ_μ); the Mehrotra probing σ = (μ_aff/μ)³ was unguarded above 1
+  and exploded μ on a quasi-Newton affine probe (now clipped at 1); the filter
+  line search's θ-progress branch degenerated to "0 ≤ 0" at feasible iterates
+  (θ = 0) and accepted arbitrary ascent steps (W&B §2.3: only f-type/φ-decrease
+  acceptance applies there); the Mehrotra −ΔΔ corrector targets built from a
+  low-quality affine direction were unbounded (now clipped into the symmetric
+  neighbourhood [γμ, μ/γ], Colombo & Gondzio 2008); and a corrected direction
+  that loses the barrier descent property (NWW 2009 §5) is now discarded for
+  the plain centered step toward the same μ.
 - **S2MPJ benchmark: batched evaluation preserves overflow semantics.** The
   original (and per-element) S2MPJ code raises `OverflowError` at wild
   line-search trial points (Python-float powers via `to_scalar`), which the
@@ -41,6 +81,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   element).
 
 ### Changed
+- **Default μ schedule is now `"probing"`** (was the monotone Fiacco–McCormick
+  strategy without corrections): the Mehrotra σ-rule was the strongest barrier
+  strategy in the Nocedal, Wächter & Waltz 2009 comparison, and the new
+  KKT-error fallback plus centrality floor supply the robustness safeguards
+  that made monotone the conservative default. Standalone probing costs one
+  extra KKT solve per iteration; pass `mu_schedule="monotone"` to restore the
+  previous behavior. (Pre-1.0 behavioral change.)
 - **S2MPJ benchmark: precompiled Lagrangian Hessian.** The fast S2MPJ evaluator
   (`benchmarks/corpus/_s2mpj_fast.py`) now also replaces the interpretive
   `LgHxy` path used by the exact-Hessian sweep configs: the Hessian's COO

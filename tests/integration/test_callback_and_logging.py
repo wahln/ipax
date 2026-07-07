@@ -167,6 +167,11 @@ def test_objective_stagnation_is_guarded_and_skips_the_initial_record(namespace)
             array(namespace, [1.0]),
             options=Options(
                 linsolve="dense",
+                # Monotone μ keeps this degenerate problem un-converged for a
+                # few iterations so the acceptable-stagnation checker (the
+                # subject of this test) actually fires; the probing default
+                # solves it to full optimality straight away.
+                mu_schedule="monotone",
                 acceptable=AcceptableStoppingOptions(
                     f_rel_change_tol=0.0,
                     dual_inf_tol=1.0,
