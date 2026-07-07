@@ -46,6 +46,8 @@ def cupy_sparse_module(monkeypatch: pytest.MonkeyPatch):
     cupy.arange = np.arange
     cupy.diff = np.diff
     cupy.repeat = np.repeat
+    cupy.searchsorted = np.searchsorted
+    cupy.result_type = np.result_type
 
     class FakeRuntime:
         current_device = 0
@@ -633,3 +635,28 @@ def test_cudss_solver_recreates_context_on_device_change(
     solver.factor(operator)
 
     assert fake.create_calls == 2
+
+
+def test_cupy_gram_memo_hits_for_equal_weights(
+    cupy_sparse_module: types.ModuleType,
+) -> None:
+    # Mirrors the SciPy adapter's per-operator Gram cache (n ≪ m fast path):
+    # equal weights reuse the memoized n×n result; changed weights recompute.
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    rows = np.asarray([0, 0, 1, 2, 2, 3])
+    cols = np.asarray([0, 2, 1, 0, 1, 2])
+    values = np.asarray([2.0, 1.0, 3.0, -1.0, 0.5, 4.0])
+    operator = adapter.from_coo(rows, cols, values, shape=(4, 3))
+
+    w1 = np.asarray([0.5, 2.0, 1.0, 0.25])
+    first = np.asarray(operator.gram(w1))
+    second = np.asarray(operator.gram(np.array(w1, copy=True)))
+    assert operator._gram_compute_count == 1
+    np.testing.assert_array_equal(first, second)
+
+    dense = np.zeros((4, 3))
+    dense[rows, cols] = values
+    w2 = 2.0 * w1
+    third = np.asarray(operator.gram(w2))
+    assert operator._gram_compute_count == 2
+    np.testing.assert_allclose(third, dense.T @ (w2[:, None] * dense), rtol=1e-14)

@@ -97,3 +97,63 @@ def test_select_solver_rejects_unavailable_sparse_backend():
         assert "sparse" in str(exc).lower()
     else:
         pytest.fail("expected a RuntimeError when sparse solving is unavailable")
+
+
+# --- n ≪ m (tall, Gram-capable) auto-selection ------------------------------
+
+
+def test_select_solver_auto_tall_gram_capable_prefers_dense():
+    # Above the plain dense cutoff, but with m ≫ n and a Gram-capable inequality
+    # Jacobian the condensed normal-equations (dense) route factors an n×n block
+    # instead of Krylov matvecs through the huge m×n Jacobian.
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=300_000,
+        ineq_gram_capable=lambda: True,
+    )
+    assert isinstance(solver, DenseSolver)
+
+
+def test_select_solver_auto_tall_without_gram_stays_krylov():
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=300_000,
+        ineq_gram_capable=lambda: False,
+    )
+    assert isinstance(solver, KrylovSolver)
+
+
+def test_select_solver_auto_tall_needs_row_excess():
+    # m comparable to n: no normal-equations advantage, keep Krylov.
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=30_000,
+        ineq_gram_capable=lambda: True,
+    )
+    assert isinstance(solver, KrylovSolver)
+
+
+def test_select_solver_small_problems_skip_gram_probe():
+    # The capability probe may evaluate the Jacobian at x0 — it must only run
+    # when the decision actually depends on it.
+    def probe() -> bool:
+        raise AssertionError("gram probe must not run for small problems")
+
+    solver = select_solver(
+        n_vars=100,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=10_000,
+        ineq_gram_capable=probe,
+    )
+    assert isinstance(solver, DenseSolver)

@@ -170,6 +170,17 @@ class LinearOperator(ABC):
         """
         raise NotImplementedError("operator does not expose a full weighted Gram")
 
+    def gram_capable(self) -> bool:
+        """Whether :meth:`gram` is expected to succeed (no densify fallback).
+
+        A cheap *structural* probe — no Gram is formed — used by solver
+        auto-selection to prefer the condensed normal-equations route for tall
+        (``n ≪ m``) inequality Jacobians. Wrapper operators that forward
+        :meth:`gram` to an inner operator must override this to forward the
+        probe as well. Conservative: the default only reports the override.
+        """
+        return type(self).gram is not LinearOperator.gram
+
     def row_gram_diagonal(self, weights: Array) -> Array:
         """Return ``diag(A diag(weights) Aᵀ)`` — the weighted *row* energies.
 
@@ -692,6 +703,10 @@ class VStack(LinearOperator):
         xp = array_namespace(result)
         return xp.asarray(result)
 
+    def gram_capable(self) -> bool:
+        # The stacked Gram succeeds only when every block's does.
+        return all(op.gram_capable() for op in self._ops)
+
     def row_inf_norms(self, like: Array | None = None) -> Array:
         # Stacked rows ⇒ concatenate each block's row norms (used by scaling).
         xp = None
@@ -863,6 +878,15 @@ class _SparseStructured(LinearOperator):
 
     def gram(self, weights: Array) -> Array:
         return self._adapter_op().gram(weights)
+
+    def gram_capable(self) -> bool:
+        # Capability lives in the backend adapter operator (e.g. scipy/cupy
+        # implement ``gram``; torch/jax sparse do not yet). No adapter ⇒ the
+        # matvec family itself would fail, so report incapable rather than raise.
+        try:
+            return self._adapter_op().gram_capable()
+        except NotImplementedError:
+            return False
 
     def row_gram_diagonal(self, weights: Array) -> Array:
         return self._adapter_op().row_gram_diagonal(weights)

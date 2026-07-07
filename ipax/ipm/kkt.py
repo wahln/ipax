@@ -364,6 +364,12 @@ class _CondensedOperator(LinearOperator):
         jac = _dense_or_matmat_probe(self._ineq_jac, self.shape[0], template)
         return jac, neg_inv_sigma_s
 
+    def augmented_assembled_size(self) -> int:
+        """Rows of :meth:`augmented_dense_matrix` — computable *without*
+        materializing it, so the dense solver can refuse an oversized bordered
+        matrix (``m ≫ n``) before allocating ``(n + m_ineq)²``."""
+        return self.shape[0] + int(self._ineq_jac.shape[0])
+
     def augmented_dense_matrix(self, like: Array | None = None) -> Array:
         """Dense bordered KKT block for the augmented route (§5.1).
 
@@ -759,6 +765,13 @@ class _SaddleOperator(LinearOperator):
             (eq, -self._delta_c * xp.eye(self._m, dtype=n_dense.dtype)), axis=1
         )
         return xp.concat((top, bottom), axis=0)
+
+    def augmented_assembled_size(self) -> int:
+        """Rows of :meth:`augmented_dense_matrix` without materializing it:
+        the ``n + m_eq`` saddle plus the condensed block's inequality border."""
+        inner = getattr(self._condensed, "augmented_assembled_size", None)
+        ineq_rows = (inner() - self._n) if inner is not None else 0
+        return self._n + self._m + ineq_rows
 
     def augmented_dense_matrix(self, like: Array | None = None) -> Array:
         """Dense bordered saddle for the augmented route (§5.1).

@@ -65,6 +65,13 @@ _CUDSS_R_64I = 24
 # Cached nvmath cuDSS bindings module (``nvmath.bindings.cudss``).
 _CUDSS_BINDINGS: Any | None = None
 
+# Density crossover / chunk cap for the weighted-Gram dense-GEMM strategy —
+# mirrors ``ipax.backend.sparse.numpy_scipy`` (kept local to avoid importing
+# the SciPy adapter into GPU-only environments); see that module for the flop
+# model and TROTS measurements behind the values.
+_GRAM_DENSE_MIN_DENSITY = 0.05
+_GRAM_DENSE_CHUNK_ELEMENTS = 50_000_000
+
 
 class _CuDSSUnavailableError(ImportError):
     """The nvmath binding or user-managed cuDSS runtime cannot be loaded."""
@@ -197,6 +204,16 @@ class SparseOperator(LinearOperator):
         # Structural symmetry hint from the assembler (None ⇒ test numerically).
         self._symmetric_hint = symmetric
         self._pattern_signature = pattern_signature
+        # Gram-path caches — mirror of the SciPy adapter (see its ``gram``):
+        # a last-weights memo plus one-time Aᵀ CSR / scaled-buffer / row-map
+        # symbolic work, leaving only value work + the SpGEMM on a miss.
+        self._gram_transpose: Any = None  # Aᵀ as CSR
+        self._gram_scaled: Any = None  # diag(w)A same-pattern buffer
+        self._gram_row_index: Any = None  # nnz → row map for w expansion
+        self._gram_weights: Any = None  # memo key (last weights, device)
+        self._gram_value: Any = None  # memoized dense n×n result (device)
+        self._gram_compute_count = 0  # observability/testing: actual SpGEMM runs
+        self._squared: Any = None  # A∘A (shared by the Gram diagonals)
         self._symmetric: bool | None = None
 
     @property
@@ -245,25 +262,92 @@ class SparseOperator(LinearOperator):
         del like
         return cast("Array", to_xp_array(self._matrix.diagonal(), self._xp))
 
+    @property
+    def _squared_csr(self) -> Any:
+        """The elementwise square ``A∘A``, built once (shared by both Gram
+        diagonals, which are recomputed every IPM iteration)."""
+        if self._squared is None:
+            self._squared = self._matrix.multiply(self._matrix).tocsr()
+        return self._squared
+
     def gram_diagonal(self, weights: Array) -> Array:
         # diag(Aᵀ diag(w) A)_k = Σ_i w_i A_ik² = (A∘A)ᵀ w (column energies).
-        squared = self._matrix.multiply(self._matrix)
-        out = squared.T @ _to_cupy(weights)
+        out = self._squared_csr.T @ _to_cupy(weights)
         return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
 
     def gram(self, weights: Array) -> Array:
         # Aᵀ diag(w) A as a dense n×n matrix via sparse arithmetic (row-scale then
         # sparse Gram), densifying only the small n×n result — mirror of the SciPy
-        # adapter; the condensed dense route's n ≪ m fast path.
+        # adapter's cached ``gram`` (see its comment for the caching rationale).
+        # The memo compare costs one device reduction + host sync per call; the
+        # SpGEMM it skips is orders of magnitude more work at n ≪ m scale.
+        w = _to_cupy(weights).reshape(-1)
+        if self._gram_value is not None and bool(
+            cupy.array_equal(w, self._gram_weights)
+        ):
+            return cast("Array", to_xp_array(self._gram_value, self._xp))
+
         a = self._matrix
-        w = _to_cupy(weights).reshape((-1, 1))
-        gram = (a.T @ a.multiply(w)).toarray()
-        return cast("Array", to_xp_array(cupy.asarray(gram), self._xp))
+        m, n = a.shape
+        size = int(m) * int(n)
+        if size > 0 and a.nnz / size >= _GRAM_DENSE_MIN_DENSITY:
+            # Dense-ish rows: chunked dense GEMM (cuBLAS) beats SpGEMM — the
+            # CPU-calibrated crossover of the SciPy adapter, if anything more
+            # pronounced on GPU tensor pipelines.
+            gram = self._gram_dense_accumulate(a, w)
+        else:
+            if self._gram_transpose is None:
+                self._gram_transpose = a.T.tocsr()
+                self._gram_scaled = a.copy()
+                # nnz→row map, device-native: row of stored element k is the
+                # indptr bucket containing k (no host round-trip of an O(m)
+                # row-count vector, which cupy.repeat's list repeats would need).
+                self._gram_row_index = (
+                    cupy.searchsorted(a.indptr, cupy.arange(int(a.nnz)), side="right")
+                    - 1
+                )
+            scaled = self._gram_scaled
+            scaled.data = a.data * w[self._gram_row_index]
+            gram = cupy.asarray((self._gram_transpose @ scaled).toarray())
+        self._gram_weights = w.copy()
+        self._gram_value = gram
+        self._gram_compute_count += 1
+        return cast("Array", to_xp_array(gram, self._xp))
+
+    @staticmethod
+    def _gram_dense_accumulate(a: Any, w: Any) -> Any:
+        """``Aᵀ diag(w) A`` by cuBLAS over zero-copy row windows of ``a``.
+
+        Mirror of the SciPy adapter's dense-accumulation strategy: densify
+        ``m_chunk × n`` row windows (bounded by ``_GRAM_DENSE_CHUNK_ELEMENTS``)
+        and accumulate ``blockᵀ @ (w_chunk ∘ block)``.
+        """
+        from cupyx.scipy import sparse as cupyx_sparse
+
+        m, n = a.shape
+        chunk = max(1, _GRAM_DENSE_CHUNK_ELEMENTS // max(int(n), 1))
+        # One consolidated host transfer of the chunk-boundary offsets instead
+        # of two 0-d syncs per chunk inside the loop.
+        starts = [*range(0, m, chunk), m]
+        bounds = [int(v) for v in cupy.asnumpy(a.indptr[cupy.asarray(starts)])]
+        out: Any = None
+        for i, start in enumerate(starts[:-1]):
+            end = starts[i + 1]
+            lo, hi = bounds[i], bounds[i + 1]
+            window = cupyx_sparse.csr_matrix(
+                (a.data[lo:hi], a.indices[lo:hi], a.indptr[start : end + 1] - lo),
+                shape=(end - start, n),
+            )
+            block = window.toarray()
+            piece = block.T @ (w[start:end, None] * block)
+            out = piece if out is None else out + piece
+        if out is None:
+            out = cupy.zeros((n, n), dtype=cupy.result_type(a.dtype, w.dtype))
+        return out
 
     def row_gram_diagonal(self, weights: Array) -> Array:
         # diag(A diag(w) Aᵀ)_j = Σ_k w_k A_jk² = (A∘A) w (row energies).
-        squared = self._matrix.multiply(self._matrix)
-        out = squared @ _to_cupy(weights)
+        out = self._squared_csr @ _to_cupy(weights)
         return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
 
     def row_inf_norms(self, like: Array | None = None) -> Array:

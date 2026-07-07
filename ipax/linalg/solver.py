@@ -19,10 +19,23 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ipax.backend.namespace import Capabilities
     from ipax.backend.operators import LinearOperator
     from ipax.options import Options
     from ipax.typing import Array
+
+# Auto-selection thresholds. Below ``_DENSE_AUTO_MAX_VARS`` the dense route is
+# the reference choice regardless of constraint shape. Between that and
+# ``_TALL_DENSE_MAX_VARS`` the dense condensed (normal-equations) route is still
+# preferred *when the problem is tall*: with ``m ≥ _TALL_ROW_EXCESS · n``
+# inequality rows and a Gram-capable Jacobian, one n×n Cholesky per iteration
+# beats Krylov's repeated O(nnz(∇g)) matvecs through the huge Jacobian
+# (Breedveld 2017 §2: the condensed system is n×n however large m grows).
+_DENSE_AUTO_MAX_VARS = 10_000
+_TALL_DENSE_MAX_VARS = 20_000
+_TALL_ROW_EXCESS = 10
 
 
 class LinearSolveError(RuntimeError):
@@ -64,8 +77,16 @@ def select_solver(
     has_equalities: bool,
     capabilities: Capabilities,
     options: Options,
+    m_ineq: int = 0,
+    ineq_gram_capable: Callable[[], bool] | None = None,
 ) -> LinearSolver:
-    """Pick a concrete linear solver from user preference and backend features."""
+    """Pick a concrete linear solver from user preference and backend features.
+
+    ``m_ineq`` (total inequality rows) and ``ineq_gram_capable`` (a *lazy*
+    structural probe of the inequality Jacobian — it may evaluate the Jacobian
+    at ``x0``, so it is only called when the tall-problem heuristic actually
+    needs it) extend auto-selection to tall ``n ≪ m`` problems.
+    """
     from ipax.linalg.dense import DenseSolver
     from ipax.linalg.krylov import KrylovSolver
 
@@ -88,10 +109,21 @@ def select_solver(
 
         return SparseDirectSolver()
 
+    dense_viable = has_dense_solve() and (
+        not has_equalities or "cholesky" in capabilities.linalg_functions
+    )
+    if n_vars < _DENSE_AUTO_MAX_VARS and dense_viable:
+        return DenseSolver(options.dense)
+
+    # Tall n ≪ m: the condensed block stays n×n however many inequality rows
+    # exist, and a Gram-capable Jacobian forms it without densifying m×n —
+    # prefer the direct dense route over Krylov through the huge Jacobian.
     if (
-        n_vars < 10_000
-        and has_dense_solve()
-        and (not has_equalities or "cholesky" in capabilities.linalg_functions)
+        n_vars < _TALL_DENSE_MAX_VARS
+        and dense_viable
+        and m_ineq >= _TALL_ROW_EXCESS * n_vars
+        and ineq_gram_capable is not None
+        and ineq_gram_capable()
     ):
         return DenseSolver(options.dense)
 

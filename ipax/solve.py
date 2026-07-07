@@ -65,12 +65,13 @@ def _has_nonlinear_equalities(problem: Problem, x: Array) -> bool:
     return int(values.shape[0]) > 0
 
 
-def _has_inequalities(problem: Problem, x: Array) -> bool:
+def _count_inequalities(problem: Problem, x: Array) -> int:
+    """Total inequality rows at ``x`` (nonlinear + lowered linear), 0 if none."""
     try:
         values = problem.ineq_constraints(x)
     except NotImplementedError:
-        return False
-    return int(values.shape[0]) > 0
+        return 0
+    return int(values.shape[0])
 
 
 def _bound_violation(
@@ -172,7 +173,8 @@ def solve(
     # no-op when the problem declares no ``linear_ineq``.
     resolved = lower_linear_inequalities(resolved, x0, xp)
 
-    has_ineq = _has_inequalities(resolved, x0)
+    m_ineq = _count_inequalities(resolved, x0)
+    has_ineq = m_ineq > 0
     has_eq = _has_nonlinear_equalities(resolved, x0)
     has_equalities = has_eq or resolved.linear_eq() is not None
 
@@ -195,11 +197,28 @@ def solve(
     if warm_start is not None and problem_scaling is not None:
         effective_warm = _scale_warm_start(warm_start, problem_scaling)
 
+    def _ineq_gram_capable() -> bool:
+        """Lazy structural probe for the tall n ≪ m selection heuristic.
+
+        Evaluates the (scaled) inequality Jacobian once at ``x0`` — only when
+        ``select_solver`` actually reaches the tall-problem branch — and asks
+        whether it can form ``∇gᵀ diag(w) ∇g`` without densifying to m×n.
+        """
+        from ipax.backend.operators import as_operator
+
+        try:
+            jac = model.ineq_jacobian(x0)
+        except NotImplementedError:
+            return False
+        return as_operator(jac).gram_capable()
+
     solver = select_solver(
         n_vars=int(resolved.n_vars),
         has_equalities=has_equalities,
         capabilities=capabilities(xp),
         options=opts,
+        m_ineq=m_ineq,
+        ineq_gram_capable=_ineq_gram_capable if has_ineq else None,
     )
 
     # Pre-solve diagnostics (verbosity tiers 3–5; gated by the logger threshold

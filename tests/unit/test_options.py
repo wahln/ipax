@@ -187,3 +187,10 @@ def test_dense_options_accepts_augmented():
 def test_dense_options_rejects_unsupported_kkt_route(route):
     with pytest.raises(ValueError, match="kkt_route"):
         DenseOptions(kkt_route=route)  # type: ignore[arg-type]
+
+
+def test_dense_options_augmented_max_size_default_and_validation():
+    assert DenseOptions().augmented_max_size > 0
+    assert DenseOptions(augmented_max_size=5).augmented_max_size == 5
+    with pytest.raises(ValueError, match="augmented_max_size"):
+        DenseOptions(augmented_max_size=0)

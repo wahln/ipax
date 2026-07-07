@@ -217,13 +217,23 @@ class DenseOptions:
     automatically whenever the operator can't expose the unformed bordered
     matrix (e.g. an L-BFGS Hessian, already PD by Powell damping — there is
     nothing to gain there).
+
+    ``augmented_max_size`` guards the augmented route against tall problems:
+    the bordered matrix is ``(n + m_eq + m_ineq)²`` dense, so with ``m ≫ n``
+    (e.g. radiotherapy-scale inequality counts) materializing it would allocate
+    gigabytes for a system whose condensed form is only ``n × n``. When the
+    assembled size would exceed this bound the solver silently falls back to
+    the condensed route (losing only the inertia diagnostic, not correctness).
     """
 
     kkt_route: DenseKKTRoute = "condensed"
+    augmented_max_size: int = 20_000
 
     def __post_init__(self) -> None:
         if self.kkt_route not in ("condensed", "augmented"):
             raise ValueError("dense kkt_route must be 'condensed' or 'augmented'")
+        if self.augmented_max_size < 1:
+            raise ValueError("augmented_max_size must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)

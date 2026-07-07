@@ -7,6 +7,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Condensed normal-equations tuning for tall (`n ≪ m`) problems.** The
+  SciPy/CuPy sparse adapters now cache the Gram fast path per operator: a
+  last-weights memo returns the memoized `∇gᵀ Σ_s ∇g` for the bit-identical
+  Σ_s re-requested by δ_w retries, SOC and Mehrotra re-solves within an IPM
+  iteration, and cache misses reuse a one-time `Aᵀ` CSR transpose +
+  same-pattern scaled buffer (plus a shared `A∘A` for the Gram diagonals), so
+  only value work and the SpGEMM itself remain per iteration. Dense-ish
+  Jacobians (row density ≥ 5%, e.g. TROTS dose matrices at ~30%) switch to a
+  chunked dense-GEMM accumulation instead — SpGEMM's Σ nnz_row² hash
+  arithmetic plus its per-call symbolic pass is the wrong algorithm there
+  (measured 27× on TROTS Prostate_CK: 90 s → 3.4 s per Gram). Solver
+  auto-selection gained the same awareness: `select_solver` now accepts the
+  inequality row count and a lazy `gram_capable()` probe (new
+  `LinearOperator.gram_capable`, forwarded by row scaling and `VStack`) and
+  keeps the dense condensed route up to 20k variables when `m ≥ 10·n`, where
+  one `n×n` factorization per iteration beats Krylov matvecs through the huge
+  Jacobian (Breedveld et al. 2017). `DenseOptions.augmented_max_size`
+  (default 20 000) guards the dense augmented route against materializing the
+  `(n+m_eq+m_I)²` bordered matrix at such row counts — it falls back to the
+  condensed route before allocating, losing only the inertia diagnostic.
 - **Barrier μ oracles, orthogonal to higher-order corrections.**
   `Options(mu_schedule=...)` is now honored and grew a value: `"adaptive"`
   re-targets μ every iteration by the LOQO centrality rule (Nocedal, Wächter &

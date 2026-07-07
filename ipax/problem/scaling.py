@@ -88,6 +88,11 @@ class _RowScaled(LinearOperator):
         # path through gradient-based scaling instead of densifying the Jacobian.
         return self._jac.gram(self._d * self._d * weights)
 
+    def gram_capable(self) -> bool:
+        # Row scaling folds into the weights (see ``gram``), so capability is
+        # exactly the wrapped Jacobian's.
+        return self._jac.gram_capable()
+
     def row_gram_diagonal(self, weights: Array) -> Array:
         # diag((DJ) W (DJ)ᵀ)_j = d_j² Σ_k W_k J_jk² = d²·J.row_gram_diagonal(W).
         return self._d * self._d * self._jac.row_gram_diagonal(weights)

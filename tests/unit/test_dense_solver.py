@@ -496,3 +496,42 @@ def test_dense_solver_default_kkt_route_matches_no_arg_construction(namespace, t
     expected = no_arg_solver.solve(rhs)
 
     assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_dense_solver_augmented_route_guards_oversized_border(namespace, tol):
+    # With m inequality rows the augmented matrix is (n + m)². When that exceeds
+    # DenseOptions.augmented_max_size the solver must fall back to the condensed
+    # route *without materializing the bordered matrix* (m ≫ n would otherwise
+    # allocate gigabytes), so inertia stays unavailable and the solution matches.
+    op = _condensed_with_inequalities(namespace)  # n=2, m_ineq=2 → assembled 4
+
+    calls = {"n": 0}
+    original = type(op).augmented_dense_matrix
+
+    def counting(self, like=None):
+        calls["n"] += 1
+        return original(self, like)
+
+    op.augmented_dense_matrix = counting.__get__(op, type(op))
+
+    solver = DenseSolver(DenseOptions(kkt_route="augmented", augmented_max_size=3))
+    solver.factor(op)
+    rhs = array(namespace, [1.0, -2.0])
+    actual = solver.solve(rhs)
+
+    condensed_solver = DenseSolver()
+    condensed_solver.factor(op)
+    expected = condensed_solver.solve(rhs)
+
+    assert calls["n"] == 0
+    assert solver.inertia_or_none() is None
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_condensed_and_saddle_expose_augmented_assembled_size(namespace):
+    op = _condensed_with_inequalities(namespace)
+    assert op.augmented_assembled_size() == 4  # n=2 + m_ineq=2
+
+    eq_jac = Dense(array(namespace, [[1.0, 1.0]]))
+    saddle = build_saddle_operator(op, eq_jac, 1e-8)
+    assert saddle.augmented_assembled_size() == 5  # n=2 + m_eq=1 + m_ineq=2

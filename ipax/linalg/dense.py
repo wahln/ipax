@@ -171,6 +171,17 @@ class DenseSolver:
         augmented_dense_matrix = getattr(self._operator, "augmented_dense_matrix", None)
         if augmented_dense_matrix is None:
             return
+        # Size guard for tall problems: the bordered matrix is
+        # (n + m_eq + m_ineq)² dense, so with m ≫ n materializing it would
+        # allocate gigabytes for a system whose condensed form is n × n. Checked
+        # via the operator's size hook *before* materialization; fall back to
+        # the condensed route silently (losing only the inertia diagnostic).
+        assembled_size_hook = getattr(self._operator, "augmented_assembled_size", None)
+        if (
+            assembled_size_hook is not None
+            and int(assembled_size_hook()) > self._options.augmented_max_size
+        ):
+            return
         try:
             matrix = augmented_dense_matrix()
         except NotImplementedError:

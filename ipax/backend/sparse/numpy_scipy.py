@@ -55,6 +55,19 @@ if TYPE_CHECKING:
 # inertia provider (MUMPS/PARDISO) is required instead.
 _DENSE_INERTIA_MAX = 1000
 
+# Density at or above which the weighted Gram Aᵀ diag(w) A is accumulated by
+# chunked dense GEMM instead of SpGEMM. Flop model: the dense path does m·n²
+# MACs at BLAS speed (O(100) GFLOP/s multithreaded), while scipy's SpGEMM does
+# ~2·Σ nnz_row² hash-probe ops at O(1) Gop/s *plus* a symbolic pass of the same
+# order every call — so dense wins once the mean row density exceeds a few
+# percent. Measured on TROTS Prostate_CK (28% dense, n=2266, m=8.9e4): SpGEMM
+# 90 s vs chunked GEMM 3.4 s per Gram. The Gram result is a dense n×n either
+# way, so nothing is lost structurally.
+_GRAM_DENSE_MIN_DENSITY = 0.05
+# Row-chunk cap (elements) for the dense-GEMM path: two m_chunk×n float64
+# buffers ≈ 800 MB at this cap, independent of m.
+_GRAM_DENSE_CHUNK_ELEMENTS = 50_000_000
+
 
 def _to_numpy(arr: Array) -> np.ndarray:
     """Bring an Array-API array onto the host as a NumPy ndarray.
@@ -158,6 +171,17 @@ class SparseOperator(LinearOperator):
         # fast path) is the factorization form directly — no per-iteration tocsc.
         self._csc: scipy.sparse.csc_matrix | None = csc
         self._symmetric: bool | None = None
+        # Gram-path caches (the condensed n ≪ m route calls ``gram(Σ_s)`` on
+        # every KKT factor — per IPM iteration *and* per δ_w retry / SOC /
+        # Mehrotra re-solve with bit-identical weights, so an O(m) value compare
+        # amortizes the Σ nnz_row² SpGEMM):
+        self._gram_transpose: scipy.sparse.csr_matrix | None = None  # Aᵀ as CSR
+        self._gram_scaled: scipy.sparse.csr_matrix | None = None  # diag(w)A buffer
+        self._gram_row_index: np.ndarray | None = None  # nnz → row map for w
+        self._gram_weights: np.ndarray | None = None  # memo key (last weights)
+        self._gram_value: np.ndarray | None = None  # memoized dense n×n result
+        self._gram_compute_count = 0  # observability/testing: actual SpGEMM runs
+        self._squared: scipy.sparse.csr_matrix | None = None  # A∘A (Gram diagonals)
 
     @property
     def _csr_matrix(self) -> scipy.sparse.csr_matrix:
@@ -219,27 +243,97 @@ class SparseOperator(LinearOperator):
         del like
         return to_xp_array(self._csr_matrix.diagonal(), self._xp)
 
+    @property
+    def _squared_csr(self) -> scipy.sparse.csr_matrix:
+        """The elementwise square ``A∘A``, built once (shared by both Gram
+        diagonals, which are recomputed every IPM iteration)."""
+        if self._squared is None:
+            self._squared = self._csr_matrix.multiply(self._csr_matrix).tocsr()
+        return self._squared
+
     def gram_diagonal(self, weights: Array) -> Array:
         # diag(Aᵀ diag(w) A)_k = Σ_i w_i A_ik² = (A∘A)ᵀ w (column energies).
-        squared = self._csr_matrix.multiply(self._csr_matrix)
-        out = squared.T @ _to_numpy(weights)
+        out = self._squared_csr.T @ _to_numpy(weights)
         return to_xp_array(np.asarray(out).reshape(-1), self._xp)
 
     def gram(self, weights: Array) -> Array:
         # Aᵀ diag(w) A as a dense n×n matrix, formed by sparse arithmetic: scale
         # rows by w (still sparse) then a sparse Aᵀ·(diag(w)A) product, densifying
         # only the small n×n result — never the m×n matrix A itself (the point at
-        # RT scale, where m ≫ n). ``multiply`` broadcasts the column weight vector
-        # across rows.
+        # RT scale, where m ≫ n).
+        #
+        # The wrapped matrix is fixed for this operator's lifetime, so two levels
+        # of caching amortize the per-iteration cost (the SpGEMM arithmetic floor
+        # is Σ_i nnz_row_i²): a last-weights memo — δ_w retries, SOC and Mehrotra
+        # re-solves within one IPM iteration re-request the *same* Σ_s — and,
+        # on a miss, a cached Aᵀ CSR + same-pattern ``diag(w)A`` buffer so only
+        # value work (no CSC→CSR conversion, no ``multiply`` allocation) remains
+        # besides the product itself. Callers must treat the returned array as
+        # read-only; the condensed route only ever adds it out-of-place.
+        w = _to_numpy(weights).reshape(-1)
+        if (
+            self._gram_value is not None
+            and self._gram_weights is not None
+            and np.array_equal(w, self._gram_weights)
+        ):
+            return to_xp_array(self._gram_value, self._xp)
+
         a = self._csr_matrix
-        w = _to_numpy(weights).reshape((-1, 1))
-        gram = (a.T @ a.multiply(w)).toarray()
-        return to_xp_array(np.asarray(gram), self._xp)
+        m, n = a.shape
+        size = int(m) * int(n)
+        if size > 0 and a.nnz / size >= _GRAM_DENSE_MIN_DENSITY:
+            # Dense-ish rows (e.g. RT dose matrices): accumulate by chunked
+            # dense GEMM — SpGEMM's Σ nnz_row² hash arithmetic (plus its
+            # per-call symbolic pass) is the wrong algorithm here (see
+            # _GRAM_DENSE_MIN_DENSITY for the model and measurements).
+            gram = self._gram_dense_accumulate(a, w)
+        else:
+            if self._gram_transpose is None:
+                # One-time symbolic work: the n×m transpose CSR (scipy would
+                # otherwise re-derive it inside every ``Aᵀ @ ·`` product), the
+                # scaled same-pattern buffer, and the nnz→row map expanding w
+                # to A's data.
+                self._gram_transpose = a.T.tocsr()
+                self._gram_scaled = a.copy()
+                self._gram_row_index = np.repeat(
+                    np.arange(a.shape[0]), np.diff(a.indptr)
+                )
+            scaled = self._gram_scaled
+            assert scaled is not None and self._gram_row_index is not None
+            scaled.data = a.data * w[self._gram_row_index]
+            gram = np.asarray((self._gram_transpose @ scaled).toarray())
+        self._gram_weights = np.array(w, copy=True)
+        self._gram_value = gram
+        self._gram_compute_count += 1
+        return to_xp_array(gram, self._xp)
+
+    @staticmethod
+    def _gram_dense_accumulate(a: scipy.sparse.csr_matrix, w: np.ndarray) -> np.ndarray:
+        """``Aᵀ diag(w) A`` by BLAS over zero-copy row windows of ``a``.
+
+        Each chunk densifies ``m_chunk × n`` rows (bounded by
+        ``_GRAM_DENSE_CHUNK_ELEMENTS``) and accumulates
+        ``blockᵀ @ (w_chunk ∘ block)`` — O(m·n²) FLOPs total, but at dense-GEMM
+        speed, with peak extra memory two chunk buffers regardless of ``m``.
+        """
+        m, n = a.shape
+        dtype = np.result_type(a.dtype, w.dtype)
+        out = np.zeros((n, n), dtype=dtype)
+        chunk = max(1, _GRAM_DENSE_CHUNK_ELEMENTS // max(int(n), 1))
+        for start in range(0, m, chunk):
+            end = min(m, start + chunk)
+            lo, hi = int(a.indptr[start]), int(a.indptr[end])
+            window = scipy.sparse.csr_matrix(
+                (a.data[lo:hi], a.indices[lo:hi], a.indptr[start : end + 1] - lo),
+                shape=(end - start, n),
+            )
+            block = window.toarray()
+            out += block.T @ (w[start:end, None] * block)
+        return out
 
     def row_gram_diagonal(self, weights: Array) -> Array:
         # diag(A diag(w) Aᵀ)_j = Σ_k w_k A_jk² = (A∘A) w (row energies).
-        squared = self._csr_matrix.multiply(self._csr_matrix)
-        out = squared @ _to_numpy(weights)
+        out = self._squared_csr @ _to_numpy(weights)
         return to_xp_array(np.asarray(out).reshape(-1), self._xp)
 
     def row_inf_norms(self, like: Array | None = None) -> Array:
