@@ -43,12 +43,15 @@ def _mu_floor(options: BarrierOptions, tol: float) -> float:
 
 
 def update_mu(mu: float, options: BarrierOptions, tol: float) -> float:
-    """Monotone Fiacco-McCormick barrier reduction (Wächter & Biegler, eq. (7)).
+    """Monotone Fiacco-McCormick barrier reduction.
 
-    ``μ⁺ = max(ε_tol/10, min(κ_μ·μ, μ^θ_μ))`` — the ``min`` matters: the
-    superlinear branch ``μ^θ_μ`` *increases* for ``μ > 1``, so without the
-    linear ``κ_μ·μ`` alternative any μ inflated past
-    ``(1/κ_μ)^(1/(θ_μ−1))`` by an adaptive oracle would be locked forever
+    ``μ⁺ = max(ε_tol/10, κ_μ·min(μ, μ^θ_μ))`` — an aggressive variant of
+    Wächter & Biegler 2006, eq. (7) with ``κ_μ`` multiplying *both* branches.
+    For ``μ ≤ 1`` this is the historical ipax pace ``κ_μ·μ^θ_μ`` (the paper's
+    plain ``min(κ_μ·μ, μ^θ_μ)`` reduces μ 3–5× slower there, which cost
+    HS268/S268 in the S2MPJ v9 sweep); the ``min`` still matters for ``μ > 1``,
+    where the superlinear branch *increases* and, unguarded, locked forever
+    any μ an adaptive oracle had inflated
     (regression: tests/regression/test_mu_oracle_inflation.py).
     """
     if mu <= 0.0:
@@ -56,7 +59,7 @@ def update_mu(mu: float, options: BarrierOptions, tol: float) -> float:
     return float(
         max(
             _mu_floor(options, tol),
-            min(options.kappa_mu * mu, mu**options.theta_mu),
+            options.kappa_mu * min(mu, mu**options.theta_mu),
         )
     )
 

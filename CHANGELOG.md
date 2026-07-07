@@ -101,8 +101,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   with L-BFGS, with or without correctors). Five stacked defects, each with a
   regression test (`tests/regression/test_mu_oracle_inflation.py`):
   the monotone reducer computed κ_μ·μ^θ_μ — which *increases* for μ ≥ 25 and
-  locked any inflated μ forever — instead of Wächter & Biegler eq. (7)'s
-  min(κ_μ·μ, μ^θ_μ); the Mehrotra probing σ = (μ_aff/μ)³ was unguarded above 1
+  locked any inflated μ forever — and is now κ_μ·min(μ, μ^θ_μ), an aggressive
+  variant of Wächter & Biegler eq. (7) that keeps the historical (S2MPJ-tuned)
+  pace for μ ≤ 1 while decreasing linearly from any inflated magnitude;
+  the Mehrotra probing σ = (μ_aff/μ)³ was unguarded above 1
   and exploded μ on a quasi-Newton affine probe (now clipped at 1); the filter
   line search's θ-progress branch degenerated to "0 ≤ 0" at feasible iterates
   (θ = 0) and accepted arbitrary ascent steps (W&B §2.3: only f-type/φ-decrease
