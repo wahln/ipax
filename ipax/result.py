@@ -34,6 +34,7 @@ class Status(Enum):
     INFEASIBLE = "infeasible"
     UNBOUNDED = "unbounded"
     MAX_ITER = "max_iter"
+    STALLED = "stalled"  # frozen iterates: no accepted step, KKT error constant
     RESTORATION_FAILED = "restoration_failed"
     NUMERICAL_ERROR = "numerical_error"
     STOPPED = "stopped"  # user iteration callback requested termination

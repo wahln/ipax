@@ -440,7 +440,7 @@ class Options:
     the analytic operator (errors otherwise), ``"autodiff-hvp"`` uses backend
     autodiff Hessian-vector products.
 
-    Termination has five sources, checked in priority order:
+    Termination has six sources, checked in priority order:
 
     * ``optimality`` (:class:`OptimalityConditionOptions`) — single-iteration
       test reporting :attr:`Status.OPTIMAL`.
@@ -450,6 +450,12 @@ class Options:
       tolerances to ``None`` to disable.
     * ``diverging_iterates_tol`` — ‖x‖_∞ exceeding the threshold reports
       :attr:`Status.UNBOUNDED` (``None`` disables it).
+    * ``max_stall_iter`` — after this many *consecutive* frozen iterations (no
+      accepted step, KKT error unchanged) the run stops honestly with
+      :attr:`Status.STALLED` — or :attr:`Status.ACCEPTABLE` when the iterate is
+      within the relaxed KKT tolerance — instead of burning the whole
+      iteration budget re-deriving the same rejected direction
+      (``None`` disables it).
     * ``max_iter`` — iteration cap, reports :attr:`Status.MAX_ITER`.
     * ``max_time`` — wall-clock cap in seconds, reports :attr:`Status.MAX_TIME`
       (``None`` disables it).
@@ -462,6 +468,7 @@ class Options:
         default_factory=AcceptableStoppingOptions
     )
     max_iter: int = 3000
+    max_stall_iter: int | None = 25
     max_time: float | None = None
     # IPOPT ``diverging_iterates_tol``: if ‖x‖_∞ exceeds this the iterates are
     # declared diverging and the solve stops with :attr:`Status.UNBOUNDED` (the
@@ -512,6 +519,8 @@ class Options:
         )
         if self.max_iter < 1:
             raise ValueError("max_iter must be a positive integer")
+        if self.max_stall_iter is not None and self.max_stall_iter < 1:
+            raise ValueError("max_stall_iter must be a positive integer or None")
         if isinstance(self.scaling, str):
             object.__setattr__(self, "scaling", ScalingOptions(method=self.scaling))
         if isinstance(self.corrections, str):

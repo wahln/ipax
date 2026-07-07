@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Stall detection** (`Options.max_stall_iter`, default 25; new
+  `Status.STALLED`): consecutive frozen iterations — no accepted step and a
+  bit-for-bit unchanged KKT error — now terminate honestly (or as
+  `ACCEPTABLE` within the relaxed KKT tolerance) instead of re-deriving the
+  identical rejected direction until `max_iter` (S2MPJ POWELLBSLS burned
+  10 001 iterations this way). Limit cycles that keep moving the iterate reset
+  the counter and still run to the ordinary budgets.
 - **Condensed normal-equations tuning for tall (`n ≪ m`) problems.** The
   SciPy/CuPy sparse adapters now cache the Gram fast path per operator: a
   last-weights memo returns the memoized `∇gᵀ Σ_s ∇g` for the bit-identical
@@ -76,6 +83,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **Iterative KKT solves could freeze the solver at feasible iterates with a
+  non-descent direction.** CG on an indefinite condensed operator can
+  "succeed" with a garbage direction — success is not a descent certificate —
+  and at θ = 0 the filter line search rightly rejects every ascent trial while
+  restoration is a no-op, so nothing ever changed (85 of the 126 S2MPJ v9
+  `exact/krylov` regressions, mostly `*LS` problems). A step with a
+  meaningful positive barrier-directional-derivative at a feasible iterate is
+  now treated like a failed factorization: δ_w is escalated and the system
+  re-solved until the direction is descent — the Krylov analogue of the dense
+  route's Cholesky PD-probe (Wächter & Biegler 2006, §3.1 inertia-correction
+  semantics). POWELLBSLS/SANTALS/PALMER2A now solve to the reference optima
+  on `exact/krylov` (regression:
+  `tests/regression/test_feasible_ascent_stall.py`).
 - **Non-monotone μ oracles ran away on ill-scaled problems** (found via the
   radiotherapy example: every free-mode oracle stagnated at a huge constant μ
   with L-BFGS, with or without correctors). Five stacked defects, each with a

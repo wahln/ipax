@@ -15,7 +15,7 @@ knobs you are most likely to touch. Every field is documented in the
 
 ## Termination
 
-Four independent sources stop the solve, checked in priority order. The first
+Six independent sources stop the solve, checked in priority order. The first
 two share the same five conditions; `None` disables a condition.
 
 | Condition | Meaning |
@@ -74,6 +74,16 @@ the point stays feasible — an IPOPT-style diverging-iterates test that catches
 an objective running away to `-∞` and reports it honestly instead of letting
 the runaway iterate eventually overflow to a misleading `NUMERICAL_ERROR`. Set
 to `None` to disable.
+
+**Stall detection.** `max_stall_iter` (default `25`) stops the solve after that
+many *consecutive* frozen iterations — no accepted step (α = 0) and a
+bit-for-bit unchanged KKT error — reporting `Status.STALLED`, or
+`Status.ACCEPTABLE` when the frozen iterate already sits within the relaxed
+KKT tolerance. A frozen iterate cannot recover by repetition (identical state
+reproduces the identical rejected direction), so this converts a
+whole-budget burn into a fast, honest verdict. Genuine limit cycles — where
+restoration keeps *moving* the iterate — change the KKT error and reset the
+counter, so they still run to the ordinary budgets. Set to `None` to disable.
 
 ## Hessian
 

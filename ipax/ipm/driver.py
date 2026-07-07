@@ -107,6 +107,15 @@ T = TypeVar("T")
 # IPOPT (Wächter & Biegler 2006) constants kept out of the loop body.
 _S_MAX = 100.0  # eq. (5): cap on the dual/complementarity scaling factors
 _KAPPA_EPSILON = 10.0  # eq. (7): barrier sub-problem tolerance factor κ_ε
+# Relative tolerance for the stall detector's "KKT error unchanged" test.
+_STALL_REL_TOL = 1e-12
+# δ_w escalation attempts for the feasible-point descent enforcement.
+_MAX_DESCENT_ATTEMPTS = 25
+# dφ must exceed this fraction of the barrier objective's scale to count as a
+# *meaningful* ascent direction: near convergence dφ is float noise around
+# zero (and the near-zero step passes Armijo anyway), so escalating δ_w there
+# would only distort an already-converged step with futile re-solves.
+_DESCENT_NOISE_FACTOR = 1e-12
 _MAX_REG_ATTEMPTS = 40
 _MAX_MU_REDUCTIONS = 64
 # A step solve that fails at a point already within this multiple of the
@@ -566,6 +575,11 @@ class IPMDriver:
         # for the monotone schedule (its μ handling is already monotone).
         mu_monitor = FreeModeMonitor(opts.barrier)
         free_mode = True
+        # Stall detector: consecutive iterations with no accepted step and a
+        # bit-frozen KKT error mean the loop is re-deriving the same rejected
+        # direction — terminate honestly instead of burning the budget.
+        stalled_iters = 0
+        prev_e0: float | None = None
         reg_applied = 0.0
         status = Status.MAX_ITER
         message = "maximum iterations reached"
@@ -743,6 +757,32 @@ class IPMDriver:
                 status = Status.STOPPED
                 message = "stopped: iteration callback requested termination"
                 break
+            # A frozen iterate (zero accepted steplength + unchanged KKT error)
+            # cannot recover by repetition: with identical state every derived
+            # quantity — and thus the rejected direction — is identical too.
+            # Genuine limit cycles (restoration jumps that keep *moving* the
+            # iterate) change e0 and reset the counter, so they still run to
+            # the ordinary budgets rather than being misreported here.
+            frozen = (
+                prev_e0 is not None
+                and alpha_p == 0.0
+                and abs(e0 - prev_e0) <= _STALL_REL_TOL * max(1.0, abs(prev_e0))
+            )
+            stalled_iters = stalled_iters + 1 if frozen else 0
+            prev_e0 = e0
+            if opts.max_stall_iter is not None and stalled_iters >= opts.max_stall_iter:
+                if _within_relaxed_tol(opts.optimality, record):
+                    status = Status.ACCEPTABLE
+                    message = (
+                        "acceptable: iteration stalled within the relaxed KKT tolerance"
+                    )
+                else:
+                    status = Status.STALLED
+                    message = (
+                        f"stalled: no accepted step and no KKT-error progress "
+                        f"for {stalled_iters} consecutive iterations"
+                    )
+                break
             if it == opts.max_iter:
                 break
 
@@ -764,11 +804,21 @@ class IPMDriver:
                 m_eq: int,
                 r_y: Array,
                 delta_c: float,
+                delta_w_floor: float = 0.0,
             ) -> tuple[Array, Array, float, bool]:
                 problem_before = self._problem_time_total
                 start = perf_counter()
                 result = self._solve_step(
-                    w, sigma_x, sigma_s, ineq_jac, rhs_x, eq_jac, m_eq, r_y, delta_c
+                    w,
+                    sigma_x,
+                    sigma_s,
+                    ineq_jac,
+                    rhs_x,
+                    eq_jac,
+                    m_eq,
+                    r_y,
+                    delta_c,
+                    delta_w_floor,
                 )
                 elapsed = perf_counter() - start
                 problem_elapsed = self._problem_time_total - problem_before
@@ -881,6 +931,61 @@ class IPMDriver:
                     )
                     break
                 step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
+
+            # Descent enforcement at feasible iterates. At θ = 0 only
+            # f-type (Armijo) acceptance exists (W&B 2006, §2.3), which no
+            # ascent trial can pass — and an *iterative* KKT solve can return
+            # a non-descent direction without failing (CG on an indefinite
+            # condensed operator "succeeds" with garbage; success is not a
+            # descent certificate, unlike the dense route's Cholesky PD-probe).
+            # Left alone, the rejected step changes nothing and the identical
+            # direction is recomputed forever (S2MPJ POWELLBSLS burned the
+            # whole 10k budget this way). Escalating δ_w until the direction
+            # is descent is the same inertia-correction response W&B 2006 §3.1
+            # prescribe when the (1,1) block is not positive definite.
+            theta0 = self._theta_l1(x, s, m, m_eq)
+            phi0 = self._phi(x, s, mu, m, mask_l, mask_u, lower_safe, upper_safe)
+            if theta0 == 0.0:
+                ascent_noise = _DESCENT_NOISE_FACTOR * max(1.0, abs(phi0))
+                descent_floor = reg_applied
+                for _ in range(_MAX_DESCENT_ATTEMPTS):
+                    dphi_probe = self._dphi(
+                        x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
+                    )
+                    if dphi_probe <= ascent_noise:
+                        break
+                    descent_floor = (
+                        opts.regularization.delta_w_init
+                        if descent_floor <= 0.0
+                        else descent_floor * opts.regularization.delta_w_factor
+                    )
+                    if descent_floor > opts.regularization.delta_w_max:
+                        break
+                    logger.debug(
+                        "iter %d: non-descent direction at feasible iterate "
+                        "(dphi=%.3e); re-solving with delta_w >= %.2e",
+                        it,
+                        dphi_probe,
+                        descent_floor,
+                    )
+                    rhs = self._condensed_rhs(mu, mu, mu, **rhs_kwargs)
+                    dx, dy_eq, reg_descent, ok = solve_step_timed(
+                        w,
+                        sigma_x,
+                        sigma_s,
+                        ineq_jac,
+                        rhs,
+                        eq_jac,
+                        m_eq,
+                        -c,
+                        delta_c,
+                        delta_w_floor=descent_floor,
+                    )
+                    if not ok:
+                        break
+                    step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
+                    reg_applied = max(reg_applied, reg_descent)
+                    descent_floor = max(descent_floor, reg_descent)
 
             if use_breedveld:
                 tau = opts.breedveld.tau
@@ -1022,8 +1127,8 @@ class IPMDriver:
                     ),
                 )
 
-            theta0 = self._theta_l1(x, s, m, m_eq)
-            phi0 = self._phi(x, s, mu, m, mask_l, mask_u, lower_safe, upper_safe)
+            # θ0/φ0 were computed above for the descent enforcement; x, s and
+            # μ are unchanged since.
             dphi = self._dphi(
                 x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
             )
@@ -1501,16 +1606,19 @@ class IPMDriver:
         m_eq: int,
         r_y: Array,
         delta_c: float,
+        delta_w_floor: float = 0.0,
     ) -> tuple[Array, Array, float, bool]:
         """Factor/solve the condensed (or bordered saddle) step (§2.3, §4.4).
 
         Returns ``(Δx, Δy_eq, δ_w, ok)``. With equalities present the condensed
         block is bordered into the quasidefinite saddle (Friedlander–Orban) and
         solved through the same injected ``LinearSolver``; Breedveld δ_w
-        escalation handles a failed factorization.
+        escalation handles a failed factorization. ``delta_w_floor`` starts the
+        ladder above zero — the descent-enforcement re-solve uses it to demand
+        a more strongly regularized (more convex) system than the last attempt.
         """
         xp = self._xp
-        reg = RegularizationState()
+        reg = RegularizationState(delta_w=delta_w_floor)
         sigma_x_op = Diagonal(sigma_x)
         sigma_s_op = Diagonal(sigma_s)
         empty = xp.zeros((0,), dtype=rhs_x.dtype)
