@@ -83,6 +83,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **False "locally infeasible" verdicts on feasible problems** (S2MPJ audit:
+  52 feasible problems reported INFEASIBLE across the configs, most since
+  v8). Two changes: a local-infeasibility claim is now *vetoed* when an
+  accepted iterate already reached the verdict's own believe-threshold — a
+  diverged endgame (degenerate duals at tiny μ) is a stall at a feasible
+  problem, not evidence of infeasibility, and reports `Status.STALLED`
+  instead; and every failure status now returns the accepted iterate with
+  the lowest scaled KKT error rather than the final iteration's wreckage
+  (DEGENLPA: previously INFEASIBLE at a diverged point, now STALLED
+  returning its essentially optimal iterate, f = 3.05986 at KKT 1.7e-6).
+  The W&B eq. (16) κ_Σ dual clip was prototyped as a further cure and
+  measured on the same subset: it fixed nothing and broke CRESC4, so it was
+  deliberately not shipped (regression:
+  `tests/regression/test_false_infeasible_veto.py`).
 - **Iterative KKT solves could freeze the solver at feasible iterates with a
   non-descent direction.** CG on an indefinite condensed operator can
   "succeed" with a garbage direction — success is not a descent certificate —

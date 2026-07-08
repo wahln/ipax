@@ -109,6 +109,17 @@ _S_MAX = 100.0  # eq. (5): cap on the dual/complementarity scaling factors
 _KAPPA_EPSILON = 10.0  # eq. (7): barrier sub-problem tolerance factor κ_ε
 # Relative tolerance for the stall detector's "KKT error unchanged" test.
 _STALL_REL_TOL = 1e-12
+# Failure statuses that return the best accepted iterate instead of the last.
+_FAILURE_RETURNS_BEST = frozenset(
+    {
+        Status.INFEASIBLE,
+        Status.STALLED,
+        Status.MAX_ITER,
+        Status.MAX_TIME,
+        Status.NUMERICAL_ERROR,
+        Status.RESTORATION_FAILED,
+    }
+)
 # δ_w escalation attempts for the feasible-point descent enforcement.
 _MAX_DESCENT_ATTEMPTS = 25
 # dφ must exceed this fraction of the barrier objective's scale to count as a
@@ -171,6 +182,19 @@ def _within_relaxed_tol(
     return bool(enabled) and all(value <= factor * tol for tol, value in enabled)
 
 
+def _feasible_evidence_tol(optimality: OptimalityConditionOptions) -> float:
+    """The θ level below which an iterate counts as evidence of feasibility.
+
+    The same threshold the local-infeasibility verdict uses: a restored point
+    is believed infeasible only above it, so an *accepted* iterate below it
+    directly contradicts any later infeasibility claim.
+    """
+    tol = optimality.constr_viol_tol
+    return _RESTORATION_INFEASIBLE_FACTOR * (
+        tol if tol is not None else optimality.kkt_tol
+    )
+
+
 def _restoration_reports_infeasible(
     theta_restored: float, optimality: OptimalityConditionOptions
 ) -> bool:
@@ -188,11 +212,7 @@ def _restoration_reports_infeasible(
     that it is feasible (S2MPJ Task 1). A genuinely infeasible stationary point
     has a violation bounded well away from zero, far above this threshold.
     """
-    tol = optimality.constr_viol_tol
-    feasible_tol = _RESTORATION_INFEASIBLE_FACTOR * (
-        tol if tol is not None else optimality.kkt_tol
-    )
-    return theta_restored > feasible_tol
+    return theta_restored > _feasible_evidence_tol(optimality)
 
 
 def _classify_step_failure(
@@ -580,6 +600,15 @@ class IPMDriver:
         # direction — terminate honestly instead of burning the budget.
         stalled_iters = 0
         prev_e0: float | None = None
+        # Best-iterate bookkeeping: the accepted iterate with the lowest scaled
+        # KKT error, returned instead of the final wreckage when the run ends
+        # in a failure status, plus the feasibility evidence for the
+        # local-infeasibility veto (an accepted iterate below the verdict's own
+        # believe-threshold contradicts any later "infeasible" claim).
+        theta_best = float("inf")
+        best_state: (
+            tuple[IterationRecord, Array, Array, Array, Array, Array, Array] | None
+        ) = None
         reg_applied = 0.0
         status = Status.MAX_ITER
         message = "maximum iterations reached"
@@ -715,6 +744,9 @@ class IPMDriver:
                 record = self._record_transform(record)
             problem_time_mark = self._problem_time_total
             history.append(record)
+            theta_best = min(theta_best, theta)
+            if best_state is None or e0 < best_state[0].kkt_error:
+                best_state = (record, x, s, y_eq, y_ineq, z_lower, z_upper)
             if logger.isEnabledFor(ITERATION):
                 if rows_logged % HEADER_REPEAT_INTERVAL == 0:
                     logger.log(ITERATION, format_header())
@@ -1189,6 +1221,22 @@ class IPMDriver:
                 if infeasible and _restoration_reports_infeasible(
                     self._theta_l1(x, s, m, m_eq), self._options.optimality
                 ):
+                    # Veto: a local-infeasibility claim is contradicted by the
+                    # run's own history whenever an *accepted* iterate already
+                    # reached the verdict's believe-threshold — a diverged
+                    # endgame (degenerate duals, tiny μ) is a stall at a
+                    # feasible problem, not evidence of infeasibility
+                    # (S2MPJ v10: DEGENLPA reached θ = 1.7e-7 before the
+                    # collapse that used to be reported as INFEASIBLE).
+                    if theta_best <= _feasible_evidence_tol(opts.optimality):
+                        status = Status.STALLED
+                        message = (
+                            "stalled: restoration could not re-reduce the "
+                            "constraint violation, but an accepted iterate "
+                            f"already reached theta={theta_best:.3e} — the "
+                            "problem is not locally infeasible"
+                        )
+                        break
                     status = Status.INFEASIBLE
                     message = (
                         "locally infeasible: restoration could not reduce the "
@@ -1224,19 +1272,44 @@ class IPMDriver:
             z_upper = xp.where(
                 mask_u, z_upper + alpha_d * step.dz_upper, xp.zeros_like(x)
             )
+            # NOTE: the W&B 2006 eq. (16) κ_Σ dual clip was prototyped here and
+            # measured on the S2MPJ false-infeasible subset (2026-07): it fixed
+            # nothing (the DEGENLPA-class divergence lives in the *equality*
+            # multipliers, which eq. (16) does not touch) and broke CRESC4
+            # exact/krylov (optimal@59 → max_iter). Deliberately not shipped.
             # Combined steplength over all blocks (Breedveld 2017, eq. (11)),
             # feeding the σ(α) duality-gap reduction on the next iteration.
             last_alpha = min(alpha_p, alpha_d)
             last_step_solve_time = self._step_solve_seconds
 
+        final_record = history[-1]
+        # On a failure status, return the best accepted iterate instead of
+        # whatever state the failing tail left behind (e.g. DEGENLPA's
+        # diverged endgame after an essentially optimal iterate). Success
+        # statuses keep the terminating iterate; UNBOUNDED keeps the diverging
+        # one (it *is* the diagnosis), and a user STOP returns the current
+        # point (least surprise).
+        # ``<=`` matters: a restoration jump reassigns x *after* the final
+        # record was written, so on a tie the snapshot restores a state
+        # consistent with that record instead of the jumped-to point.
+        if (
+            best_state is not None
+            and status in _FAILURE_RETURNS_BEST
+            and best_state[0].kkt_error <= final_record.kkt_error
+        ):
+            final_record, x, s, y_eq, y_ineq, z_lower, z_upper = best_state
+            message = (
+                f"{message}; returning the best accepted iterate "
+                f"(KKT {final_record.kkt_error:.3e} at iteration "
+                f"{final_record.iteration})"
+            )
         x_minus_l, u_minus_x = bound_gaps(x)
         g = self._ineq(x)
         c = self._eq(x)
         final_theta = self._theta(
             x, g, s, c, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
         )
-        final_kkt = history[-1].kkt_error
-        final_record = history[-1]
+        final_kkt = final_record.kkt_error
 
         # The human-readable result/timing summary is emitted by ``solve`` once
         # the solution has been unscaled; the driver only assembles the Result.

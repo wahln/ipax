@@ -85,6 +85,15 @@ whole-budget burn into a fast, honest verdict. Genuine limit cycles — where
 restoration keeps *moving* the iterate — change the KKT error and reset the
 counter, so they still run to the ordinary budgets. Set to `None` to disable.
 
+**Failure results carry the best iterate.** On a failure status (`STALLED`,
+`MAX_ITER`, `MAX_TIME`, `INFEASIBLE`, `NUMERICAL_ERROR`), the result returns
+the accepted iterate with the lowest scaled KKT error — not whatever state a
+diverging final phase left behind — and the message names the iteration it
+came from. Relatedly, a "locally infeasible" verdict is vetoed (reported as
+`STALLED`) whenever an accepted iterate already reached the feasibility level
+the verdict itself uses: a run that has visited feasibility cannot honestly
+call the problem locally infeasible.
+
 ## Hessian
 
 `hessian` selects how the Lagrangian Hessian is obtained:
