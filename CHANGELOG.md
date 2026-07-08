@@ -83,6 +83,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **Second-chance restoration anchored at the starting point.** Feasibility
+  restoration is a local method: entered from a wandered-off iterate it can
+  converge to a nonzero local minimizer of the constraint infeasibility on a
+  perfectly feasible problem, and the driver then declared `INFEASIBLE`. The
+  2026-07 S2MPJ audit found 28 of the 52 falsely-INFEASIBLE problems (160
+  config-rows) restorable directly from the user's `x0` (CATENARY, CRESC4/50,
+  ELATTAR, GASOIL, HS39/87/90/91/101/102/111, MESH, ROBOT, SWOPF, TRAINH,
+  TRUSPYR1, UBH5, ...). The driver now probes a believed local-infeasibility
+  claim once with a restoration anchored at the starting point and resumes the
+  main loop when that reaches believable feasibility (CATENARY exact/dense:
+  INFEASIBLE → OPTIMAL; TRUSPYR1: INFEASIBLE → ACCEPTABLE). Genuine
+  infeasibility verdicts are unaffected — the probe simply fails there too.
+- **Restoration Levenberg–Marquardt damping control.** A rejected trial step
+  now retries with a larger damping *without* rebuilding the Jacobian and
+  Gauss-Newton normal matrix (they belong to the unchanged iterate); the outer
+  budget spent on genuinely converging runs grew 80 → 200 iterations, paid for
+  by a trailing-window progress guard that exits accept/reject limit cycles
+  near a nonzero local minimizer early. Stationarity is now tested on the
+  **projected** gradient, so an active-bound stall (MANNE-class) is recognized
+  as first-order stationary for the bound-constrained infeasibility problem
+  instead of grinding the damping to its ceiling with one Jacobian rebuild per
+  projection-swallowed trial.
 - **False "locally infeasible" verdicts on feasible problems** (S2MPJ audit:
   52 feasible problems reported INFEASIBLE across the configs, most since
   v8). Two changes: a local-infeasibility claim is now *vetoed* when an

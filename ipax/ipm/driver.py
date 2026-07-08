@@ -619,6 +619,14 @@ class IPMDriver:
         line_search = FilterLineSearch(opts.line_search)
         # eq. (18): θ_max guard, fixed from the initial constraint violation.
         theta_max = _THETA_MAX_FACTOR * max(1.0, self._theta_l1(x, s, m, m_eq))
+        # Second-chance restoration anchor (S2MPJ 2026-07 audit): restoration
+        # from a wandered-off iterate often converges to a nonzero LOCAL
+        # minimizer of the infeasibility even though feasibility is directly
+        # reachable from the user's starting point (28 of the 52 falsely
+        # INFEASIBLE problems). A local-infeasibility claim therefore gets one
+        # extra probe anchored here before it is believed.
+        x_restore_anchor = x
+        second_chance_used = False
         breedveld = BreedveldController(opts.breedveld)
         use_breedveld = opts.globalization == "breedveld"
 
@@ -1221,6 +1229,43 @@ class IPMDriver:
                 if infeasible and _restoration_reports_infeasible(
                     self._theta_l1(x, s, m, m_eq), self._options.optimality
                 ):
+                    # Second chance: restoration is a LOCAL method, so from a
+                    # wandered-off iterate it can converge to a nonzero local
+                    # minimizer of the infeasibility on a perfectly feasible
+                    # problem (S2MPJ 2026-07 audit: 28 of 52 falsely INFEASIBLE
+                    # problems are restorable directly from x0). Probe the
+                    # claim once from the starting point; a believable feasible
+                    # outcome resumes the main loop there instead.
+                    if not second_chance_used:
+                        second_chance_used = True
+                        logger.debug(
+                            "iter %d: probing the infeasibility claim with a "
+                            "restoration anchored at the starting point",
+                            it,
+                        )
+                        x_r, s_r, infeasible_r = self._restore(
+                            x_restore_anchor,
+                            s,
+                            m,
+                            m_eq,
+                            mask_l,
+                            mask_u,
+                            lower_safe,
+                            upper_safe,
+                        )
+                        if not (
+                            infeasible_r
+                            and _restoration_reports_infeasible(
+                                self._theta_l1(x_r, s_r, m, m_eq),
+                                self._options.optimality,
+                            )
+                        ):
+                            x, s = x_r, s_r
+                            alpha_p = 0.0
+                            last_alpha = 0.0
+                            prev_x = None
+                            last_step_solve_time = self._step_solve_seconds
+                            continue
                     # Veto: a local-infeasibility claim is contradicted by the
                     # run's own history whenever an *accepted* iterate already
                     # reached the verdict's believe-threshold — a diverged

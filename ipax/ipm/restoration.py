@@ -35,7 +35,9 @@ if TYPE_CHECKING:
     from ipax.backend.operators import LinearOperator
     from ipax.typing import Array, Namespace
 
-_MAX_ITER = 80
+_MAX_ITER = 200  # outer (Jacobian-rebuild) iterations; stalls exit via the window
+_STALL_WINDOW = 12  # exit when f fails to improve by _STALL_RTOL over this window
+_STALL_RTOL = 1e-3
 _LM_INIT = 1e-8  # Levenberg–Marquardt damping seed
 _LM_GROW = 10.0
 _LM_SHRINK = 0.1
@@ -71,13 +73,14 @@ def restore(
     identity = xp.eye(n, dtype=dtype)
     feasible_tol = max(tol, 1e-8)
 
+    margin = feasible_tol
+    both = xp.logical_and(mask_l, mask_u)
+    narrow = xp.logical_and(both, upper_safe - lower_safe <= 2.0 * margin)
+    midpoint = 0.5 * (lower_safe + upper_safe)
+    lower_target = xp.where(narrow, midpoint, lower_safe + margin)
+    upper_target = xp.where(narrow, midpoint, upper_safe - margin)
+
     def project(x: Array) -> Array:
-        margin = feasible_tol
-        both = xp.logical_and(mask_l, mask_u)
-        narrow = xp.logical_and(both, upper_safe - lower_safe <= 2.0 * margin)
-        midpoint = 0.5 * (lower_safe + upper_safe)
-        lower_target = xp.where(narrow, midpoint, lower_safe + margin)
-        upper_target = xp.where(narrow, midpoint, upper_safe - margin)
         x = xp.where(mask_l, xp.maximum(x, lower_target), x)
         return xp.where(mask_u, xp.minimum(x, upper_target), x)
 
@@ -102,8 +105,26 @@ def restore(
 
     x = project(x)
     lam = _LM_INIT
+    f_window: list[float] = []
     for _ in range(_MAX_ITER):
         f, c, g, gpos = infeasibility(x)
+
+        theta = float(xp.max(xp.abs(c))) if m_eq > 0 else 0.0
+        if m > 0:
+            theta = max(theta, float(xp.max(xp.abs(gpos))))
+        if theta <= feasible_tol:
+            break
+
+        # Trailing-window progress guard: a plateau (an LM accept/reject limit
+        # cycle near a nonzero local minimizer of F) exits here instead of
+        # consuming the full budget, which is what pays for the larger
+        # _MAX_ITER that genuinely converging runs (CORE1-class) need.
+        f_window.append(f)
+        if len(f_window) > _STALL_WINDOW:
+            del f_window[0]
+            if f > (1.0 - _STALL_RTOL) * f_window[0]:
+                break
+
         hessian = xp.zeros((n, n), dtype=dtype)
         grad = xp.zeros((n,), dtype=dtype)
         if m_eq > 0:
@@ -118,47 +139,58 @@ def restore(
             hessian = hessian + xp.matmul(xp.permute_dims(jg, (1, 0)), jg_w)
             grad = grad + xp.matmul(xp.permute_dims(jg, (1, 0)), gpos)
 
-        theta = float(xp.max(xp.abs(c))) if m_eq > 0 else 0.0
-        if m > 0:
-            theta = max(theta, float(xp.max(xp.abs(gpos))))
-        grad_norm = float(xp.max(xp.abs(grad))) if n > 0 else 0.0
-
-        if theta <= feasible_tol:
-            break
+        # First-order stationarity for the BOUND-CONSTRAINED infeasibility
+        # problem: a component whose descent direction points out of the box is
+        # blocked and carries no reducibility information (projected-gradient
+        # optimality; Bertsekas 1999, prop. 2.1.2). Testing the raw gradient
+        # here misses active-bound stalls (MANNE, S2MPJ 2026-07 audit) and
+        # grinds the damping to its ceiling with one Jacobian rebuild per
+        # projection-swallowed trial.
+        blocked_lo = xp.logical_and(
+            mask_l, xp.logical_and(x <= lower_target, grad > 0.0)
+        )
+        blocked_hi = xp.logical_and(
+            mask_u, xp.logical_and(x >= upper_target, grad < 0.0)
+        )
+        pg = xp.where(xp.logical_or(blocked_lo, blocked_hi), xp.zeros_like(grad), grad)
+        grad_norm = float(xp.max(xp.abs(pg))) if n > 0 else 0.0
         if grad_norm <= _GRAD_TOL:
             # Stationary point of the infeasibility with θ > 0 ⇒ infeasible.
             s_out = recover_slack(g)
             return x, s_out, True
 
-        # Damped Gauss-Newton step. A rank-deficient or extreme-scale normal
-        # matrix (e.g. the (1+x1²)² Jacobian of HS7 reaching ~1e201 at a bad
-        # iterate) can make the backend's solve raise or return a non-finite
-        # step; both are a failed LM step ⇒ grow λ and retry, exactly as a
-        # rejected step. The exception type is backend-specific (numpy
-        # ``LinAlgError``, torch ``_LinAlgError``, …) and cannot be named without
-        # importing a concrete library (invariant #1), so it is caught broadly.
-        try:
-            dx = xp.linalg.solve(hessian + lam * identity, -grad)
-            step_ok = bool(xp.all(xp.isfinite(dx)))
-        except MemoryError:  # a genuine resource failure must propagate, not retry
-            raise
-        except Exception:  # backend-specific singular-solve error (see comment)
-            step_ok = False
-        if not step_ok:
+        # Damped Gauss-Newton step with an INNER damping loop: the normal
+        # matrix, gradient and residuals belong to the unchanged iterate, so a
+        # rejected trial retries with a larger λ without rebuilding them
+        # (Levenberg–Marquardt damping control; Nocedal & Wright 2006, §10.3).
+        # A rank-deficient or extreme-scale normal matrix (e.g. the (1+x1²)²
+        # Jacobian of HS7 reaching ~1e201 at a bad iterate) can make the
+        # backend's solve raise or return a non-finite step; both count as a
+        # rejected trial. The exception type is backend-specific (numpy
+        # ``LinAlgError``, torch ``_LinAlgError``, …) and cannot be named
+        # without importing a concrete library (invariant #1), so it is caught
+        # broadly.
+        accepted = False
+        while lam <= _LM_MAX:
+            try:
+                dx = xp.linalg.solve(hessian + lam * identity, -grad)
+                step_ok = bool(xp.all(xp.isfinite(dx)))
+            except MemoryError:  # a genuine resource failure must propagate
+                raise
+            except Exception:  # backend-specific singular-solve error
+                step_ok = False
+            if step_ok:
+                x_trial = project(x + dx)
+                f_trial, _, _, _ = infeasibility(x_trial)
+                if f_trial < f:
+                    x = x_trial
+                    lam = max(_LM_INIT, lam * _LM_SHRINK)
+                    accepted = True
+                    break
             lam = lam * _LM_GROW
-            if lam > _LM_MAX:
-                break
-            continue
-
-        x_trial = project(x + dx)
-        f_trial, _, _, _ = infeasibility(x_trial)
-        if f_trial < f:
-            x = x_trial
-            lam = max(_LM_INIT, lam * _LM_SHRINK)
-        else:
-            lam = lam * _LM_GROW
-            if lam > _LM_MAX:
-                break
+        if not accepted:
+            # No damping yields descent: a numerically stationary stall.
+            break
 
     _, c, g, _ = infeasibility(x)
     s_out = recover_slack(g)

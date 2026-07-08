@@ -150,6 +150,91 @@ def test_restoration_survives_singular_gauss_newton_system(namespace):
     assert bool(xp.all(xp.isfinite(x_new)))
 
 
+def test_rejected_lm_trials_reuse_the_jacobian(namespace):
+    # Levenberg-Marquardt damping control: a rejected trial step must retry with
+    # a larger damping WITHOUT rebuilding the Jacobian/normal matrix — they
+    # belong to the unchanged current iterate. arctan(x)=0 from x=2 makes the
+    # undamped Gauss-Newton step overshoot (|dx| = |atan(x)|(1+x^2) > |x|), so
+    # the first several trials are rejected while the damping grows.
+    xp = namespace
+    calls = {"jac": 0}
+
+    def eq_fn(z):
+        return xp.atan(z)
+
+    def eq_jac_fn(z):
+        calls["jac"] += 1
+        return as_operator(xp.reshape(1.0 / (1.0 + z * z), (1, 1)))
+
+    x = array(xp, [2.0])
+    s = xp.zeros((0,), dtype=x.dtype)
+    x_new, _, infeasible = restore(
+        xp=xp,
+        x=x,
+        s=s,
+        m=0,
+        m_eq=1,
+        eq_fn=eq_fn,
+        eq_jac_fn=eq_jac_fn,
+        ineq_fn=_no_ineq,
+        ineq_jac_fn=_no_ineq,
+        mask_l=xp.zeros((1,), dtype=xp.bool),
+        mask_u=xp.zeros((1,), dtype=xp.bool),
+        lower_safe=xp.zeros((1,), dtype=x.dtype),
+        upper_safe=xp.zeros((1,), dtype=x.dtype),
+        tol=1e-8,
+    )
+
+    assert not infeasible
+    assert float(xp.max(xp.abs(xp.atan(x_new)))) <= 1e-8
+    # One Jacobian build per accepted iterate (plus the final check), never one
+    # per rejected trial: the pre-fix loop rebuilt it ~13 times here.
+    assert calls["jac"] <= 9
+
+
+def test_bound_blocked_infeasibility_is_box_stationary(namespace):
+    # c(x) = x - 1 = 0 with the upper bound x <= 0: the descent direction points
+    # out of the box, so the projected gradient is zero — a first-order
+    # stationary point of the bound-constrained infeasibility. The verdict must
+    # come from that test directly instead of grinding the LM damping to its
+    # ceiling with one Jacobian rebuild per rejected (projection-swallowed)
+    # trial (the MANNE stall anatomy, S2MPJ 2026-07 audit).
+    xp = namespace
+    calls = {"jac": 0}
+
+    def eq_fn(z):
+        return z - 1.0
+
+    def eq_jac_fn(z):
+        calls["jac"] += 1
+        return as_operator(xp.ones((1, 1), dtype=z.dtype))
+
+    x = array(xp, [-0.5])
+    s = xp.zeros((0,), dtype=x.dtype)
+    x_new, _, infeasible = restore(
+        xp=xp,
+        x=x,
+        s=s,
+        m=0,
+        m_eq=1,
+        eq_fn=eq_fn,
+        eq_jac_fn=eq_jac_fn,
+        ineq_fn=_no_ineq,
+        ineq_jac_fn=_no_ineq,
+        mask_l=xp.zeros((1,), dtype=xp.bool),
+        mask_u=xp.asarray([True], dtype=xp.bool),
+        lower_safe=xp.zeros((1,), dtype=x.dtype),
+        upper_safe=xp.zeros((1,), dtype=x.dtype),
+        tol=1e-8,
+    )
+
+    assert infeasible
+    assert bool(xp.all(xp.isfinite(x_new)))
+    # x rides to the bound in one accepted step; the next iterate detects the
+    # blocked gradient. The pre-fix loop burned ~26 Jacobian builds here.
+    assert calls["jac"] <= 4
+
+
 def test_restoration_recovers_inequality_slack_without_filter_residual(namespace):
     class InactiveInequality(Problem):
         @property
