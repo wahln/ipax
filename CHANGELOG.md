@@ -83,6 +83,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **CG breakdown on a vanished preconditioned inner product.** ``⟨r, M⁻¹r⟩``
+  can underflow to an exact zero with a nonzero residual on an ill-scaled
+  problem (MGH09LS under ``preconditioner="auto"`` crashed with
+  ``ZeroDivisionError: 0/0`` in the β update); a zero, negative or non-finite
+  preconditioned inner product now raises ``KrylovConvergenceError`` so the
+  driver escalates δ_w — MGH09LS lbfgs/krylov pc=auto: crash → OPTIMAL.
 - **Second-chance restoration anchored at the starting point.** Feasibility
   restoration is a local method: entered from a wandered-off iterate it can
   converge to a nonzero local minimizer of the constraint infeasibility on a

@@ -836,3 +836,35 @@ def test_factor_required_before_solve(namespace):
     solver = _solver()
     with pytest.raises(RuntimeError):
         solver.solve(array(namespace, [1.0, 2.0, 3.0]))
+
+
+def test_cg_orthogonal_preconditioner_breakdown_raises_convergence_error(namespace):
+    """<r, M^-1 r> can vanish exactly with a nonzero residual (an underflowed
+    or non-SPD approximate preconditioner: MGH09LS under pc=auto hit 0/0 at
+    the beta update). CG must surface KrylovConvergenceError so the driver
+    escalates delta_w instead of crashing with ZeroDivisionError."""
+    xp = namespace
+    A = array(xp, [[4.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 2.0]])
+    rhs = array(xp, [1.0, 0.0, 0.0])
+    solver = _solver(method="cg", rtol=1e-12, max_iter=10)
+    solver.factor(Dense(A))
+
+    def swap_precond(r):
+        # returns a vector exactly orthogonal to r = e1 (IEEE-exact zero inner)
+        return xp.stack((r[1], r[0], xp.zeros_like(r[2])))
+
+    with pytest.raises(KrylovConvergenceError):
+        solver._cg(Dense(A), rhs, xp, 10, 1e-12, swap_precond)
+
+
+def test_cg_zero_preconditioner_breakdown_raises_convergence_error(namespace):
+    """A preconditioner that annihilates the residual (z = 0) is a breakdown of
+    the preconditioned inner product, not evidence of indefiniteness: it must
+    raise KrylovConvergenceError, not misdiagnose via the curvature test."""
+    xp = namespace
+    A, rhs, _ = _spd_system(namespace)
+    solver = _solver(method="cg", rtol=1e-12, max_iter=10)
+    solver.factor(Dense(A))
+
+    with pytest.raises(KrylovConvergenceError):
+        solver._cg(Dense(A), rhs, xp, 10, 1e-12, lambda r: xp.zeros_like(r))
