@@ -83,6 +83,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **Restoration solves the reduced Gauss-Newton system on the free set.**
+  With variables pinned at their bounds, the full-space GN step is dominated
+  by the blocked components; the box projection swallowed it and the
+  Levenberg–Marquardt loop degraded into a microscopic gradient crawl (S2MPJ
+  DRUGDIS: θ 0.19 → 0.16 in a full 200-iteration restoration budget; UBH5
+  crawled through nine consecutive budgets). Bound-blocked variables (the
+  binding set of the projected-gradient test) now have their rows/columns
+  removed from the normal system — projected Newton on the free set
+  (Bertsekas 1999, §2.3) — restoring the GN rate: DRUGDIS reaches θ 8e-4 and
+  UBH5 drops 4× further per budget, box-stationary certificates arrive in
+  seconds instead of full budgets (MESH: 300 s → 3 s), and CSFI2/DEGENLPB/
+  CORE2 gain converged finishes on the false-infeasible subset.
 - **Uncertified restoration stalls no longer report `INFEASIBLE`.** The
   feasibility restoration now distinguishes *how* it ended: only a
   stationarity-type exit (projected gradient ≈ 0, or no descent at the

@@ -281,6 +281,62 @@ def test_restoration_recovers_inequality_slack_without_filter_residual(namespace
     )
 
 
+def test_blocked_bound_solves_the_reduced_system_on_the_free_set(namespace):
+    # DRUGDIS/UBH5 anatomy (S2MPJ 2026-07 probe): with a variable pinned at its
+    # bound by a dominant residual, the FULL-space Gauss-Newton step is ruled
+    # by the blocked component; projection swallows it, the trial fails to
+    # descend, and the LM loop degrades into a microscopic gradient crawl
+    # (DRUGDIS: theta 0.19 -> 0.16 in 200 iterations). Solving the normal
+    # system reduced to the FREE variables (projected Newton on the binding
+    # set; Bertsekas 1999, §2.3) must instead place the free variable at its
+    # optimum in a couple of iterations.
+    #
+    # Residuals: r1 = x1 + x2 - 1 (feasible part), r2 = M (x1 + 1) with x1 >= 0
+    # (pins x1 at the lower bound, gradient pointing out of the box). The
+    # box-constrained infeasibility minimum is x = (0, 1).
+    xp = namespace
+    big = 1.0e3
+    calls = {"jac": 0}
+
+    def eq_fn(z):
+        return xp.stack((z[0] + z[1] - 1.0, big * (z[0] + 1.0)))
+
+    def eq_jac_fn(z):
+        calls["jac"] += 1
+        one = 1.0 + xp.zeros_like(z[0])
+        return as_operator(
+            xp.stack((xp.stack((one, one)), xp.stack((big * one, 0.0 * one))))
+        )
+
+    x = array(xp, [0.0, 0.0])
+    s = xp.zeros((0,), dtype=x.dtype)
+    x_new, _, exit_reason = restore(
+        xp=xp,
+        x=x,
+        s=s,
+        m=0,
+        m_eq=2,
+        eq_fn=eq_fn,
+        eq_jac_fn=eq_jac_fn,
+        ineq_fn=_no_ineq,
+        ineq_jac_fn=_no_ineq,
+        mask_l=xp.asarray([True, False], dtype=xp.bool),
+        mask_u=xp.zeros((2,), dtype=xp.bool),
+        lower_safe=array(xp, [0.0, 0.0]),
+        upper_safe=array(xp, [0.0, 0.0]),
+        tol=1e-8,
+    )
+
+    # The reduced solve reaches the box-stationary point (0, 1) and certifies
+    # it in a handful of Jacobian builds; the full-space crawl needed dozens
+    # and returned x2 far from 1. (The certificate may be NO_DESCENT rather
+    # than STATIONARY: f ≈ ½M² dominates, so free-residual improvements below
+    # ~1e-5 sit under f's float64 resolution — numerically stationary.)
+    assert exit_reason.certifies_infeasibility
+    assert float(xp.abs(x_new[1] - 1.0)) <= 1e-3
+    assert calls["jac"] <= 6
+
+
 def test_budget_exit_is_not_an_infeasibility_certificate(namespace, monkeypatch):
     # An exhausted iteration budget says nothing about local infeasibility —
     # HS6 restoration converges given iterations, so a 1-iteration budget must

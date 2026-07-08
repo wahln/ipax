@@ -181,13 +181,30 @@ def restore(
         blocked_hi = xp.logical_and(
             mask_u, xp.logical_and(x >= upper_target, grad < 0.0)
         )
-        pg = xp.where(xp.logical_or(blocked_lo, blocked_hi), xp.zeros_like(grad), grad)
+        blocked = xp.logical_or(blocked_lo, blocked_hi)
+        pg = xp.where(blocked, xp.zeros_like(grad), grad)
         grad_norm = float(xp.max(xp.abs(pg))) if n > 0 else 0.0
         if grad_norm <= _GRAD_TOL:
             # Stationary point of the infeasibility with θ > 0 ⇒ a local-
             # infeasibility certificate.
             s_out = recover_slack(g)
             return x, s_out, RestorationExit.STATIONARY
+
+        # Bound-blocked variables are fixed for this step: zero their rows and
+        # columns of the normal matrix (unit diagonal, zero rhs) so the free
+        # block solves the *reduced* Gauss-Newton system — projected Newton on
+        # the binding set (Bertsekas 1999, §2.3). On strongly coupled
+        # Jacobians the full-space step is dominated by the blocked
+        # components; projection swallows it and the LM loop degrades into a
+        # microscopic gradient crawl (S2MPJ DRUGDIS: θ 0.19 → 0.16 in a full
+        # 200-iteration budget, vs 8e-4 with the reduction).
+        blocked_f = xp.astype(blocked, dtype)
+        free_f = 1.0 - blocked_f
+        hessian = (
+            hessian * (xp.expand_dims(free_f, axis=1) * xp.expand_dims(free_f, axis=0))
+            + identity * blocked_f
+        )
+        grad = pg
 
         # Damped Gauss-Newton step with an INNER damping loop: the normal
         # matrix, gradient and residuals belong to the unchanged iterate, so a
