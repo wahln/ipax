@@ -477,19 +477,22 @@ class Options:
     hessian: HessianMode = "auto"
     linsolve: LinSolveMode = "auto"
     globalization: Globalization = "filter"
-    # The μ oracle. ``"probing"`` (default) uses the Mehrotra σ-rule from an
-    # affine probe — the strongest strategy in the NWW 2009 comparison (their
-    # eqs. (3.2)–(3.5)); it costs one extra KKT solve per iteration when no
-    # corrector is active (with corrections the affine solve is shared).
-    # ``"monotone"`` holds μ until the barrier KKT test passes, then reduces it
-    # (Wächter & Biegler 2006, eq. (7)); ``"adaptive"`` re-targets μ every
-    # iteration by the LOQO centrality rule (NWW 2009, eq. (3.6));
-    # ``"breedveld"`` scales the duality gap by the last accepted steplength
-    # (Breedveld et al. 2017, eqs. (10)–(12)). The oracle is orthogonal to
-    # ``corrections``: an active corrector aims at the oracle's μ. The
-    # non-monotone oracles are safeguarded by the KKT-error fallback
-    # (``BarrierOptions.fallback``; NWW 2009, §5.1).
-    mu_schedule: MuSchedule = "probing"
+    # The μ oracle. ``"monotone"`` (default) holds μ until the barrier KKT test
+    # passes, then reduces it (Wächter & Biegler 2006, eq. (7)) — the default
+    # was decided by the S2MPJ v10 paired A/B (2026-07): monotone beat probing
+    # on every solver/Hessian config, 3837 vs 3770 correct in total, because an
+    # aggressive oracle can crash μ faster than the duals converge (tail stalls
+    # just above tolerance). ``"probing"`` uses the Mehrotra σ-rule from an
+    # affine probe (NWW 2009, eqs. (3.2)–(3.5); one extra KKT solve per
+    # iteration without a corrector) and uniquely rescues 12–18 problems per
+    # config; ``"adaptive"`` re-targets μ every iteration by the LOQO
+    # centrality rule (NWW 2009, eq. (3.6)); ``"breedveld"`` scales the duality
+    # gap by the last accepted steplength (Breedveld et al. 2017,
+    # eqs. (10)–(12)). The oracle is orthogonal to ``corrections``: an active
+    # corrector aims at the oracle's μ. The non-monotone oracles are
+    # safeguarded by the KKT-error fallback (``BarrierOptions.fallback``;
+    # NWW 2009, §5.1) and the centrality floor.
+    mu_schedule: MuSchedule = "monotone"
 
     barrier: BarrierOptions = field(default_factory=BarrierOptions)
     line_search: LineSearchOptions = field(default_factory=LineSearchOptions)

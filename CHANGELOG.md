@@ -123,13 +123,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   element).
 
 ### Changed
-- **Default μ schedule is now `"probing"`** (was the monotone Fiacco–McCormick
-  strategy without corrections): the Mehrotra σ-rule was the strongest barrier
-  strategy in the Nocedal, Wächter & Waltz 2009 comparison, and the new
-  KKT-error fallback plus centrality floor supply the robustness safeguards
-  that made monotone the conservative default. Standalone probing costs one
-  extra KKT solve per iteration; pass `mu_schedule="monotone"` to restore the
-  previous behavior. (Pre-1.0 behavioral change.)
+- **Default μ schedule stays `"monotone"`**, now by measurement: the S2MPJ v10
+  paired A/B (full CUTEst matrix, identical flags per arm) had monotone beat
+  probing on every solver/Hessian config — 3837 vs 3770 correct overall — an
+  aggressive oracle can crash μ faster than the duals converge, stalling just
+  above tolerance. `"probing"` remains a supported opt-in (it uniquely solves
+  12–18 problems per config that monotone misses). One behavioral change vs
+  the previous release survives: Mehrotra/Gondzio corrections now aim at the
+  oracle's μ, so with the monotone default they no longer imply the probing
+  σ-rule — pass `mu_schedule="probing"` alongside `corrections=` to restore
+  the old pairing.
 - **S2MPJ benchmark: precompiled Lagrangian Hessian.** The fast S2MPJ evaluator
   (`benchmarks/corpus/_s2mpj_fast.py`) now also replaces the interpretive
   `LgHxy` path used by the exact-Hessian sweep configs: the Hessian's COO

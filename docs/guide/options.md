@@ -183,13 +183,17 @@ and Friedlander & Orban (2012).
 
 `mu_schedule` selects the μ oracle — how the barrier parameter is driven:
 
-- `"probing"` *(default)* — Mehrotra σ-rule: an affine (predictor) probe sets
-  σ = (μ_aff/μ)³ (Mehrotra 1992; NWW 2009, eqs. (3.2)–(3.5)) — the strongest
-  strategy in the NWW comparison. Without a corrector this costs one extra KKT
-  solve per iteration; with corrections active the affine solve is shared.
-- `"monotone"` — Fiacco–McCormick: hold μ fixed until the barrier
+- `"monotone"` *(default)* — Fiacco–McCormick: hold μ fixed until the barrier
   subproblem is solved to `κ_ε·μ`, then reduce it
-  (Wächter & Biegler 2006, eq. (7)). The most conservative choice.
+  (Wächter & Biegler 2006, eq. (7)). The default was decided empirically: in
+  the S2MPJ v10 paired A/B it beat probing on every solver/Hessian config
+  (3837 vs 3770 correct overall) — an aggressive oracle can crash μ faster
+  than the duals converge, stalling just above tolerance.
+- `"probing"` — Mehrotra σ-rule: an affine (predictor) probe sets
+  σ = (μ_aff/μ)³ (Mehrotra 1992; NWW 2009, eqs. (3.2)–(3.5)). Without a
+  corrector this costs one extra KKT solve per iteration; with corrections
+  active the affine solve is shared. Rescues 12–18 problems per config that
+  monotone misses — worth trying when monotone stalls.
 - `"adaptive"` — LOQO centrality rule: μ = σ·(average complementarity), where σ
   grows with the deviation of the smallest complementarity product from the
   average (Nocedal, Wächter & Waltz 2009, eq. (3.6)). Re-targeted every

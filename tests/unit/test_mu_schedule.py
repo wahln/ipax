@@ -218,24 +218,26 @@ def test_probing_standalone_solves_and_changes_mu_trace(namespace):
     assert _mu_trace(result) != _mu_trace(monotone)
 
 
-def test_default_schedule_is_probing(namespace):
-    # The default oracle is Mehrotra probing — NWW 2009's strongest performer —
-    # with or without a corrector (standalone it costs one extra KKT solve).
-    assert Options().mu_schedule == "probing"
+def test_default_schedule_is_monotone(namespace):
+    # Default decided by the S2MPJ v10 paired A/B (2026-07-08): monotone beat
+    # probing on every config, 3837 vs 3770 correct in total — probing crashes
+    # μ faster than the duals can follow on enough problems (tail stalls at
+    # kkt ~1e-4). The non-monotone oracles remain explicit opt-ins.
+    assert Options().mu_schedule == "monotone"
 
     problem = HS35(namespace)
     x0 = array(namespace, [0.5, 0.5, 0.5])
     default = solve(problem, x0, options=Options(hessian="exact", linsolve="dense"))
-    _, probing = _solve_hs35(namespace, "probing")
-    assert _mu_trace(default) == _mu_trace(probing)
+    _, monotone = _solve_hs35(namespace, "monotone")
+    assert _mu_trace(default) == _mu_trace(monotone)
 
     default_corr = solve(
         problem,
         x0,
         options=Options(hessian="exact", linsolve="dense", corrections="mehrotra"),
     )
-    _, probing_corr = _solve_hs35(namespace, "probing", corrections="mehrotra")
-    assert _mu_trace(default_corr) == _mu_trace(probing_corr)
+    _, monotone_corr = _solve_hs35(namespace, "monotone", corrections="mehrotra")
+    assert _mu_trace(default_corr) == _mu_trace(monotone_corr)
 
 
 @pytest.mark.parametrize("corrections", ["mehrotra", "gondzio"])
