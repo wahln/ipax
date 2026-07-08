@@ -83,6 +83,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **Uncertified restoration stalls no longer report `INFEASIBLE`.** The
+  feasibility restoration now distinguishes *how* it ended: only a
+  stationarity-type exit (projected gradient ≈ 0, or no descent at the
+  Levenberg–Marquardt damping ceiling) certifies local infeasibility
+  (Wächter & Biegler 2006, §3.3). A trailing-window plateau or an exhausted
+  iteration budget resumes the main loop while restoration keeps reducing the
+  violation between stalls, spends the one-shot x0-anchored probe before
+  giving up, and then terminates as the honest `Status.RESTORATION_FAILED`
+  (previously never emitted) — an early window exit could relabel an
+  out-of-budget failure as a false claim about the problem (S2MPJ:
+  LAKES/NASH/SWOPF on the Krylov routes). On the 53-problem false-infeasible
+  subset × 6 configs: +5 correct / +9 converged, ~16 false-INFEASIBLE rows per
+  config relabeled, zero regressions on previously-optimal runs, and the
+  genuinely infeasible control (BURKEHAN) still reports `INFEASIBLE`
+  everywhere.
 - **CG breakdown on a vanished preconditioned inner product.** ``⟨r, M⁻¹r⟩``
   can underflow to an exact zero with a nonzero residual on an ill-scaled
   problem (MGH09LS under ``preconditioner="auto"`` crashed with

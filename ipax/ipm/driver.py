@@ -74,7 +74,7 @@ from ipax.ipm.filter_ls import Filter, FilterLineSearch
 from ipax.ipm.hessian import LBFGSOperator
 from ipax.ipm.init import apply_warm_start, initialize
 from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
-from ipax.ipm.restoration import restore
+from ipax.ipm.restoration import RestorationExit, restore
 from ipax.ipm.step import NewtonStep, recover_eliminated
 from ipax.ipm.termination import ConditionChecker
 from ipax.linalg.regularize import (
@@ -148,6 +148,12 @@ _THETA_MAX_FACTOR = 1e4
 # The multiple is generous but far below any genuinely-infeasible stationary
 # point (whose violation is bounded away from zero, ≫ tol).
 _RESTORATION_INFEASIBLE_FACTOR = 1e3
+# An *uncertified* restoration stall (window/budget exit, no stationarity
+# certificate) resumes the main loop only while restoration keeps reducing the
+# violation by at least this factor between stalls; otherwise the run ends as
+# RESTORATION_FAILED. Bounds the resume loop: θ must shrink geometrically, so
+# at most ~log(θ0/tol)/log(1/factor) resumes can occur.
+_RESTORATION_PROGRESS_FACTOR = 0.9
 
 
 def _norm_inf(xp: Namespace, v: Array) -> float:
@@ -627,6 +633,9 @@ class IPMDriver:
         # extra probe anchored here before it is believed.
         x_restore_anchor = x
         second_chance_used = False
+        # θ at the last *uncertified* restoration stall: resuming is only
+        # justified while restoration keeps making progress between stalls.
+        uncertified_stall_theta = float("inf")
         breedveld = BreedveldController(opts.breedveld)
         use_breedveld = opts.globalization == "breedveld"
 
@@ -1214,28 +1223,44 @@ class IPMDriver:
                     break
                 logger.debug("iter %d: entering feasibility restoration", it)
                 filt.augment(theta0, phi0)
-                x, s, infeasible = self._restore(
+                x, s, rest_exit = self._restore(
                     x, s, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
                 )
-                # Only believe an "infeasible" verdict when the returned iterate
-                # is genuinely infeasible by the driver's own θ. Restoration's raw
-                # ℓ∞ measure can stall marginally above its (differently scaled)
-                # tolerance at a point that is feasible here — declaring it locally
-                # infeasible would be a false claim (S2MPJ Task 1). A feasible
-                # restored point means restoration stalled on *optimality*, not
-                # feasibility, so resume the main iteration from it (a genuine
-                # limit cycle then terminates at the iteration/time budget rather
-                # than as a false "infeasible").
-                if infeasible and _restoration_reports_infeasible(
-                    self._theta_l1(x, s, m, m_eq), self._options.optimality
-                ):
+                theta_restored = self._theta_l1(x, s, m, m_eq)
+                still_infeasible = _restoration_reports_infeasible(
+                    theta_restored, self._options.optimality
+                )
+                # A local-infeasibility *claim* needs both the driver's own θ to
+                # be genuinely large (restoration's raw ℓ∞ measure can stall
+                # marginally above its differently scaled tolerance at a point
+                # that is feasible here — S2MPJ Task 1) AND a stationarity-type
+                # exit. An *uncertified* stall (window/budget exit) is not
+                # evidence of infeasibility (S2MPJ restfix audit: LAKES/NASH/
+                # SWOPF were honest out-of-budget failures relabeled
+                # "infeasible" by the early window exit): it resumes the main
+                # loop while restoration keeps reducing θ between stalls, and a
+                # repeat without progress terminates below — after the one-shot
+                # x0 probe had its say — as RESTORATION_FAILED, never as
+                # INFEASIBLE.
+                claim_certified = still_infeasible and rest_exit.certifies_infeasibility
+                uncertified_stall = (
+                    still_infeasible and not rest_exit.certifies_infeasibility
+                )
+                stall_progressed = (
+                    theta_restored
+                    <= _RESTORATION_PROGRESS_FACTOR * uncertified_stall_theta
+                )
+                if uncertified_stall and stall_progressed:
+                    uncertified_stall_theta = theta_restored
+                if claim_certified or (uncertified_stall and not stall_progressed):
                     # Second chance: restoration is a LOCAL method, so from a
                     # wandered-off iterate it can converge to a nonzero local
                     # minimizer of the infeasibility on a perfectly feasible
                     # problem (S2MPJ 2026-07 audit: 28 of 52 falsely INFEASIBLE
-                    # problems are restorable directly from x0). Probe the
-                    # claim once from the starting point; a believable feasible
-                    # outcome resumes the main loop there instead.
+                    # problems are restorable directly from x0). Probe once from
+                    # the starting point before terminating on either a
+                    # certified claim or an exhausted uncertified stall; a
+                    # believable feasible outcome resumes the main loop there.
                     if not second_chance_used:
                         second_chance_used = True
                         logger.debug(
@@ -1243,7 +1268,7 @@ class IPMDriver:
                             "restoration anchored at the starting point",
                             it,
                         )
-                        x_r, s_r, infeasible_r = self._restore(
+                        x_r, s_r, exit_r = self._restore(
                             x_restore_anchor,
                             s,
                             m,
@@ -1253,19 +1278,42 @@ class IPMDriver:
                             lower_safe,
                             upper_safe,
                         )
+                        theta_probe = self._theta_l1(x_r, s_r, m, m_eq)
                         if not (
-                            infeasible_r
+                            exit_r.certifies_infeasibility
                             and _restoration_reports_infeasible(
-                                self._theta_l1(x_r, s_r, m, m_eq),
-                                self._options.optimality,
+                                theta_probe, self._options.optimality
                             )
                         ):
                             x, s = x_r, s_r
+                            # A probe that stayed infeasible is itself the next
+                            # stall baseline; a believably feasible rescue is a
+                            # fresh basin, so the stall streak restarts.
+                            uncertified_stall_theta = (
+                                theta_probe
+                                if _restoration_reports_infeasible(
+                                    theta_probe, self._options.optimality
+                                )
+                                else float("inf")
+                            )
                             alpha_p = 0.0
                             last_alpha = 0.0
                             prev_x = None
                             last_step_solve_time = self._step_solve_seconds
                             continue
+                        # The anchored probe itself reached a stationary point
+                        # of the infeasibility: a certificate even when the
+                        # triggering stall carried none.
+                        claim_certified = True
+                    if not claim_certified:
+                        status = Status.RESTORATION_FAILED
+                        message = (
+                            "restoration failed: the infeasibility minimization "
+                            "stalled without a stationarity certificate and "
+                            "without reducing the constraint violation "
+                            f"(theta={theta_restored:.3e})"
+                        )
+                        break
                     # Veto: a local-infeasibility claim is contradicted by the
                     # run's own history whenever an *accepted* iterate already
                     # reached the verdict's believe-threshold — a diverged
@@ -1931,7 +1979,7 @@ class IPMDriver:
         mask_u: Array,
         lower_safe: Array,
         upper_safe: Array,
-    ) -> tuple[Array, Array, bool]:
+    ) -> tuple[Array, Array, RestorationExit]:
         """Run the Gauss-Newton restoration phase (delegates to ``restore``)."""
         return restore(
             xp=self._xp,

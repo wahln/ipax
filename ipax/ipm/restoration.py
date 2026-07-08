@@ -21,14 +21,16 @@ This is a **damped Gauss-Newton / Levenberg–Marquardt** minimization of the
     F(x) = ½‖c(x)‖² + ½‖max(g(x), 0)‖²
 
 (the slacks are recovered as ``s = max(-g(x), floor)`` afterwards, which is the
-minimizer of ``‖g+s‖`` over ``s ≥ 0``). It returns a point with reduced
-violation, or declares local infeasibility when the infeasibility minimization
-stalls at a stationary point with ``θ`` above tolerance.
+minimizer of ``‖g+s‖`` over ``s ≥ 0``). It returns the reached point together
+with a :class:`RestorationExit` reason; only a stationarity-type exit with
+``θ`` above tolerance is evidence of *local infeasibility* — a stall or an
+exhausted budget merely says the minimization gave up.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -44,6 +46,30 @@ _LM_SHRINK = 0.1
 _LM_MAX = 1e16  # ceiling on the damping before declaring no further progress
 _GRAD_TOL = 1e-10  # stationarity test for the infeasibility objective
 _SLACK_FLOOR = 1e-12
+
+
+class RestorationExit(Enum):
+    """How the infeasibility minimization ended.
+
+    Only :attr:`STATIONARY` and :attr:`NO_DESCENT` are certificates of local
+    infeasibility (a first-order stationary point of the bound-constrained
+    infeasibility with ``θ > 0``; Wächter & Biegler 2006, §3.3). A window or
+    budget exit is a mere stall: the S2MPJ restfix audit (2026-07) showed the
+    trailing-window guard exiting *early* on slow problems (LAKES/NASH/SWOPF),
+    and treating that as an infeasibility verdict relabels an honest
+    out-of-budget failure as a false claim about the problem.
+    """
+
+    FEASIBLE = "feasible"  # θ_∞ reached the feasibility tolerance
+    STATIONARY = "stationary"  # projected-gradient stationary point of F
+    NO_DESCENT = "no_descent"  # no LM damping in [init, max] yields descent
+    STALL_WINDOW = "stall_window"  # trailing-window plateau (uncertified)
+    BUDGET = "budget"  # iteration budget exhausted (uncertified)
+
+    @property
+    def certifies_infeasibility(self) -> bool:
+        """Whether this exit is first-order evidence of local infeasibility."""
+        return self in (RestorationExit.STATIONARY, RestorationExit.NO_DESCENT)
 
 
 def _dense(op: LinearOperator, xp: Namespace, dtype: object) -> Array:
@@ -66,8 +92,8 @@ def restore(
     lower_safe: Array,
     upper_safe: Array,
     tol: float,
-) -> tuple[Array, Array, bool]:
-    """Minimize the constraint infeasibility; return ``(x, s, infeasible)``."""
+) -> tuple[Array, Array, RestorationExit]:
+    """Minimize the constraint infeasibility; return ``(x, s, exit_reason)``."""
     dtype = x.dtype
     n = int(x.shape[0])
     identity = xp.eye(n, dtype=dtype)
@@ -106,6 +132,7 @@ def restore(
     x = project(x)
     lam = _LM_INIT
     f_window: list[float] = []
+    exit_reason = RestorationExit.BUDGET
     for _ in range(_MAX_ITER):
         f, c, g, gpos = infeasibility(x)
 
@@ -113,6 +140,7 @@ def restore(
         if m > 0:
             theta = max(theta, float(xp.max(xp.abs(gpos))))
         if theta <= feasible_tol:
+            exit_reason = RestorationExit.FEASIBLE
             break
 
         # Trailing-window progress guard: a plateau (an LM accept/reject limit
@@ -123,6 +151,7 @@ def restore(
         if len(f_window) > _STALL_WINDOW:
             del f_window[0]
             if f > (1.0 - _STALL_RTOL) * f_window[0]:
+                exit_reason = RestorationExit.STALL_WINDOW
                 break
 
         hessian = xp.zeros((n, n), dtype=dtype)
@@ -155,9 +184,10 @@ def restore(
         pg = xp.where(xp.logical_or(blocked_lo, blocked_hi), xp.zeros_like(grad), grad)
         grad_norm = float(xp.max(xp.abs(pg))) if n > 0 else 0.0
         if grad_norm <= _GRAD_TOL:
-            # Stationary point of the infeasibility with θ > 0 ⇒ infeasible.
+            # Stationary point of the infeasibility with θ > 0 ⇒ a local-
+            # infeasibility certificate.
             s_out = recover_slack(g)
-            return x, s_out, True
+            return x, s_out, RestorationExit.STATIONARY
 
         # Damped Gauss-Newton step with an INNER damping loop: the normal
         # matrix, gradient and residuals belong to the unchanged iterate, so a
@@ -189,12 +219,18 @@ def restore(
                     break
             lam = lam * _LM_GROW
         if not accepted:
-            # No damping yields descent: a numerically stationary stall.
+            # No damping in [_LM_INIT, _LM_MAX] yields descent: numerically
+            # stationary, which certifies like the gradient test above.
+            exit_reason = RestorationExit.NO_DESCENT
             break
 
     _, c, g, _ = infeasibility(x)
     s_out = recover_slack(g)
-    return x, s_out, filter_theta(c, g, s_out) > feasible_tol
+    if filter_theta(c, g, s_out) <= feasible_tol:
+        # The final point is feasible by the driver's own (ℓ1 filter) measure,
+        # whatever ended the loop — never report a stall from a feasible point.
+        exit_reason = RestorationExit.FEASIBLE
+    return x, s_out, exit_reason
 
 
-__all__ = ["restore"]
+__all__ = ["RestorationExit", "restore"]

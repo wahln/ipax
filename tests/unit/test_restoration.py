@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ipax.backend.operators import as_operator
-from ipax.ipm.restoration import restore
+from ipax.ipm.restoration import RestorationExit, restore
 from ipax.problem.base import Problem
 from ipax.testing.problems import HS6, InfeasibleEqualities
 from tests._helpers import array, assert_allclose
@@ -20,7 +20,7 @@ def test_restoration_reduces_equality_violation(namespace):
     s = namespace.zeros((0,), dtype=x.dtype)
     theta0 = float(namespace.max(namespace.abs(problem.eq_constraints(x))))
 
-    x_new, _, infeasible = restore(
+    x_new, _, exit_reason = restore(
         xp=namespace,
         x=x,
         s=s,
@@ -37,7 +37,7 @@ def test_restoration_reduces_equality_violation(namespace):
         tol=1e-8,
     )
     theta_new = float(namespace.max(namespace.abs(problem.eq_constraints(x_new))))
-    assert not infeasible
+    assert exit_reason is RestorationExit.FEASIBLE
     assert theta_new < theta0
     assert theta_new <= 1e-6
 
@@ -47,7 +47,7 @@ def test_restoration_flags_inconsistent_equalities(namespace):
     x = array(namespace, [0.5])
     s = namespace.zeros((0,), dtype=x.dtype)
 
-    _, _, infeasible = restore(
+    _, _, exit_reason = restore(
         xp=namespace,
         x=x,
         s=s,
@@ -63,7 +63,9 @@ def test_restoration_flags_inconsistent_equalities(namespace):
         upper_safe=namespace.zeros((1,), dtype=x.dtype),
         tol=1e-8,
     )
-    assert infeasible
+    # A genuinely infeasible problem must end with a *certificate* — a
+    # stationary point of the infeasibility — not a mere stall.
+    assert exit_reason.certifies_infeasibility
 
 
 def test_restoration_keeps_projected_bound_point_strictly_interior(namespace):
@@ -86,7 +88,7 @@ def test_restoration_keeps_projected_bound_point_strictly_interior(namespace):
     x = array(namespace, [0.5])
     s = namespace.zeros((0,), dtype=x.dtype)
 
-    x_new, _, infeasible = restore(
+    x_new, _, exit_reason = restore(
         xp=namespace,
         x=x,
         s=s,
@@ -103,7 +105,7 @@ def test_restoration_keeps_projected_bound_point_strictly_interior(namespace):
         tol=1e-8,
     )
 
-    assert not infeasible
+    assert exit_reason is RestorationExit.FEASIBLE
     assert bool(x_new[0] > 0.0)
 
 
@@ -127,7 +129,7 @@ def test_restoration_survives_singular_gauss_newton_system(namespace):
         del z
         return as_operator(jac)
 
-    x_new, _, infeasible = restore(
+    x_new, _, exit_reason = restore(
         xp=xp,
         x=x,
         s=s,
@@ -145,8 +147,8 @@ def test_restoration_survives_singular_gauss_newton_system(namespace):
     )
 
     # It cannot reduce the (decoupled) violation, but it returns a finite point
-    # and reports infeasibility instead of raising.
-    assert infeasible
+    # and reports a no-descent stationarity certificate instead of raising.
+    assert exit_reason.certifies_infeasibility
     assert bool(xp.all(xp.isfinite(x_new)))
 
 
@@ -168,7 +170,7 @@ def test_rejected_lm_trials_reuse_the_jacobian(namespace):
 
     x = array(xp, [2.0])
     s = xp.zeros((0,), dtype=x.dtype)
-    x_new, _, infeasible = restore(
+    x_new, _, exit_reason = restore(
         xp=xp,
         x=x,
         s=s,
@@ -185,7 +187,7 @@ def test_rejected_lm_trials_reuse_the_jacobian(namespace):
         tol=1e-8,
     )
 
-    assert not infeasible
+    assert exit_reason is RestorationExit.FEASIBLE
     assert float(xp.max(xp.abs(xp.atan(x_new)))) <= 1e-8
     # One Jacobian build per accepted iterate (plus the final check), never one
     # per rejected trial: the pre-fix loop rebuilt it ~13 times here.
@@ -211,7 +213,7 @@ def test_bound_blocked_infeasibility_is_box_stationary(namespace):
 
     x = array(xp, [-0.5])
     s = xp.zeros((0,), dtype=x.dtype)
-    x_new, _, infeasible = restore(
+    x_new, _, exit_reason = restore(
         xp=xp,
         x=x,
         s=s,
@@ -228,7 +230,7 @@ def test_bound_blocked_infeasibility_is_box_stationary(namespace):
         tol=1e-8,
     )
 
-    assert infeasible
+    assert exit_reason is RestorationExit.STATIONARY
     assert bool(xp.all(xp.isfinite(x_new)))
     # x rides to the bound in one accepted step; the next iterate detects the
     # blocked gradient. The pre-fix loop burned ~26 Jacobian builds here.
@@ -256,7 +258,7 @@ def test_restoration_recovers_inequality_slack_without_filter_residual(namespace
     x = array(namespace, [0.0])
     s = array(namespace, [1.0])
 
-    _, s_new, infeasible = restore(
+    _, s_new, exit_reason = restore(
         xp=namespace,
         x=x,
         s=s,
@@ -273,7 +275,73 @@ def test_restoration_recovers_inequality_slack_without_filter_residual(namespace
         tol=1e-8,
     )
 
-    assert not infeasible
+    assert exit_reason is RestorationExit.FEASIBLE
     assert_allclose(
         namespace, problem.ineq_constraints(x) + s_new, array(namespace, [0.0])
     )
+
+
+def test_budget_exit_is_not_an_infeasibility_certificate(namespace, monkeypatch):
+    # An exhausted iteration budget says nothing about local infeasibility —
+    # HS6 restoration converges given iterations, so a 1-iteration budget must
+    # exit as BUDGET (uncertified), never as a stationarity certificate.
+    import ipax.ipm.restoration as restoration_mod
+
+    monkeypatch.setattr(restoration_mod, "_MAX_ITER", 1)
+    problem = HS6(namespace)
+    x = array(namespace, [2.0, 0.0])
+    s = namespace.zeros((0,), dtype=x.dtype)
+
+    _, _, exit_reason = restore(
+        xp=namespace,
+        x=x,
+        s=s,
+        m=0,
+        m_eq=1,
+        eq_fn=problem.eq_constraints,
+        eq_jac_fn=lambda z: as_operator(problem.eq_jacobian(z)),
+        ineq_fn=_no_ineq,
+        ineq_jac_fn=_no_ineq,
+        mask_l=namespace.zeros((2,), dtype=namespace.bool),
+        mask_u=namespace.zeros((2,), dtype=namespace.bool),
+        lower_safe=namespace.zeros((2,), dtype=x.dtype),
+        upper_safe=namespace.zeros((2,), dtype=x.dtype),
+        tol=1e-8,
+    )
+
+    assert exit_reason is RestorationExit.BUDGET
+    assert not exit_reason.certifies_infeasibility
+
+
+def test_stall_window_exit_is_not_an_infeasibility_certificate(namespace, monkeypatch):
+    # A plateau exit (accepted steps whose improvement is microscopic) is a
+    # stall, not a stationarity certificate: here the gradient stays at
+    # |2x - 1| ~ 9 throughout, but a pinned huge LM damping makes every
+    # accepted step (and hence every f improvement) tiny, so the trailing
+    # window fires. That exit must be reported as an uncertified stall.
+    import ipax.ipm.restoration as restoration_mod
+
+    monkeypatch.setattr(restoration_mod, "_LM_INIT", 1e14)
+    problem = InfeasibleEqualities(namespace)
+    x = array(namespace, [5.0])
+    s = namespace.zeros((0,), dtype=x.dtype)
+
+    _, _, exit_reason = restore(
+        xp=namespace,
+        x=x,
+        s=s,
+        m=0,
+        m_eq=2,
+        eq_fn=problem.eq_constraints,
+        eq_jac_fn=lambda z: as_operator(problem.eq_jacobian(z)),
+        ineq_fn=_no_ineq,
+        ineq_jac_fn=_no_ineq,
+        mask_l=namespace.zeros((1,), dtype=namespace.bool),
+        mask_u=namespace.zeros((1,), dtype=namespace.bool),
+        lower_safe=namespace.zeros((1,), dtype=x.dtype),
+        upper_safe=namespace.zeros((1,), dtype=x.dtype),
+        tol=1e-8,
+    )
+
+    assert exit_reason is RestorationExit.STALL_WINDOW
+    assert not exit_reason.certifies_infeasibility

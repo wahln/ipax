@@ -24,6 +24,7 @@ from __future__ import annotations
 from ipax import Options, Status, solve
 from ipax.ipm.driver import IPMDriver
 from ipax.ipm.filter_ls import FilterLineSearch, LineSearchResult
+from ipax.ipm.restoration import RestorationExit
 from ipax.testing.problems import EqualityConstrainedQP
 from tests._helpers import array
 
@@ -55,7 +56,8 @@ def test_infeasible_verdict_vetoed_by_feasible_history(namespace, monkeypatch):
     _fail_search_after(monkeypatch, 0)
 
     def bogus_restore(self, x, s, m, m_eq, mask_l, mask_u, lower_safe, upper_safe):
-        return array(xp, [10.0, 10.0]), s, True  # θ = 19, claims "infeasible"
+        # θ = 19, claims "infeasible" with a stationarity certificate
+        return array(xp, [10.0, 10.0]), s, RestorationExit.STATIONARY
 
     monkeypatch.setattr(IPMDriver, "_restore", bogus_restore)
     result = solve(
@@ -83,7 +85,8 @@ def test_failure_status_returns_best_iterate(namespace, monkeypatch):
     _fail_search_after(monkeypatch, 3)
 
     def bogus_restore(self, x, s, m, m_eq, mask_l, mask_u, lower_safe, upper_safe):
-        return array(xp, [10.0, 0.5]), s, False  # bad interior jump, no claim
+        # bad interior jump, no claim
+        return array(xp, [10.0, 0.5]), s, RestorationExit.FEASIBLE
 
     monkeypatch.setattr(IPMDriver, "_restore", bogus_restore)
     result = solve(

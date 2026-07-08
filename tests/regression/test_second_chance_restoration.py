@@ -16,6 +16,7 @@ from __future__ import annotations
 from ipax import Options, Status, solve
 from ipax.ipm.driver import IPMDriver
 from ipax.ipm.filter_ls import FilterLineSearch, LineSearchResult
+from ipax.ipm.restoration import RestorationExit
 from ipax.testing.problems import HS7
 from tests._helpers import array
 
@@ -53,9 +54,11 @@ def test_second_chance_restoration_rescues_a_bad_basin(namespace, monkeypatch):
         restore_calls.append(dist_to_x0)
         if dist_to_x0 < 1e-9:
             # anchored at the starting point: feasibility is reachable
-            return array(xp, [0.0, 1.7320508075688772]), s, False  # sqrt(3)
+            feasible = array(xp, [0.0, 1.7320508075688772])  # sqrt(3)
+            return feasible, s, RestorationExit.FEASIBLE
         # from the wandered-off iterate: a genuinely stuck local minimizer
-        return array(xp, [5.0, -5.0]), s, True  # theta = |26^2 + 25 - 4| = 697
+        # (theta = |26^2 + 25 - 4| = 697, with a stationarity certificate)
+        return array(xp, [5.0, -5.0]), s, RestorationExit.STATIONARY
 
     monkeypatch.setattr(IPMDriver, "_restore", stub_restore)
     result = solve(
@@ -85,7 +88,7 @@ def test_second_chance_fires_at_most_once(namespace, monkeypatch):
 
     def stub_restore(self, x, s, m, m_eq, mask_l, mask_u, lower_safe, upper_safe):
         restore_calls.append(float(xp.max(xp.abs(x - x0))))
-        return array(xp, [5.0, -5.0]), s, True
+        return array(xp, [5.0, -5.0]), s, RestorationExit.STATIONARY
 
     monkeypatch.setattr(IPMDriver, "_restore", stub_restore)
     result = solve(
