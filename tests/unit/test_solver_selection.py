@@ -142,6 +142,54 @@ def test_select_solver_auto_tall_needs_row_excess():
     assert isinstance(solver, KrylovSolver)
 
 
+def test_select_solver_auto_tall_sparse_jacobian_stays_krylov():
+    # 2026-07 tall-crossover measurement: at ~1% density the condensed dense
+    # route loses to Krylov above the plain dense cutoff (n=10k: 75.5 vs
+    # 46.5 s/iter) — the tall-dense win comes from the adapter's dense-GEMM
+    # Gram, which only engages at >= ~5% density. A sparse tall Jacobian must
+    # therefore stay on Krylov.
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=300_000,
+        ineq_gram_capable=lambda: True,
+        ineq_density=lambda: 0.01,
+    )
+    assert isinstance(solver, KrylovSolver)
+
+
+def test_select_solver_auto_tall_dense_jacobian_prefers_dense():
+    # Dense-ish rows (TROTS dose matrices: 11-53%) keep the dense-GEMM Gram
+    # fast path — the measured 13-19x TROTS per-iteration wins.
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=300_000,
+        ineq_gram_capable=lambda: True,
+        ineq_density=lambda: 0.2,
+    )
+    assert isinstance(solver, DenseSolver)
+
+
+def test_select_solver_auto_tall_unknown_density_prefers_dense():
+    # A Gram-capable operator without COO structure (matrix-free with a
+    # structured Gram) reports no density; keep the previous behavior.
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=300_000,
+        ineq_gram_capable=lambda: True,
+        ineq_density=lambda: None,
+    )
+    assert isinstance(solver, DenseSolver)
+
+
 def test_select_solver_small_problems_skip_gram_probe():
     # The capability probe may evaluate the Jacobian at x0 — it must only run
     # when the decision actually depends on it.

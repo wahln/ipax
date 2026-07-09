@@ -182,6 +182,9 @@ class SparseOperator(LinearOperator):
         self._gram_value: np.ndarray | None = None  # memoized dense n×n result
         self._gram_compute_count = 0  # observability/testing: actual SpGEMM runs
         self._squared: scipy.sparse.csr_matrix | None = None  # A∘A (Gram diagonals)
+        # Sparse-Gram (COO) memo for the sparse normal-equations route.
+        self._gram_coo_weights: np.ndarray | None = None
+        self._gram_coo_value: scipy.sparse.coo_matrix | None = None
 
     @property
     def _csr_matrix(self) -> scipy.sparse.csr_matrix:
@@ -306,6 +309,48 @@ class SparseOperator(LinearOperator):
         self._gram_value = gram
         self._gram_compute_count += 1
         return to_xp_array(gram, self._xp)
+
+    def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
+        # ``Aᵀ diag(w) A`` kept SPARSE: the sparse normal-equations route
+        # factors the n×n condensed matrix directly, so the product is never
+        # densified. Reuses the cached transpose/scaled-buffer machinery of
+        # :meth:`gram`. Pattern stability across weight changes holds because
+        # SciPy's SpGEMM structure depends only on the operand patterns (no
+        # numerical pruning) and ``tocoo`` of the canonical CSR product is
+        # deterministic — callers may cache the (rows, cols) and reuse
+        # symbolic factorizations.
+        w = _to_numpy(weights).reshape(-1)
+        if (
+            self._gram_coo_value is not None
+            and self._gram_coo_weights is not None
+            and np.array_equal(w, self._gram_coo_weights)
+        ):
+            product = self._gram_coo_value
+        else:
+            a = self._csr_matrix
+            if self._gram_transpose is None:
+                self._gram_transpose = a.T.tocsr()
+                self._gram_scaled = a.copy()
+                self._gram_row_index = np.repeat(
+                    np.arange(a.shape[0]), np.diff(a.indptr)
+                )
+            scaled = self._gram_scaled
+            assert scaled is not None and self._gram_row_index is not None
+            scaled.data = a.data * w[self._gram_row_index]
+            product = (self._gram_transpose @ scaled).tocoo()
+            self._gram_coo_weights = np.array(w, copy=True)
+            self._gram_coo_value = product
+            self._gram_compute_count += 1
+        n = int(self.shape[1])
+        return (
+            to_xp_array(np.asarray(product.row), self._xp),
+            to_xp_array(np.asarray(product.col), self._xp),
+            to_xp_array(np.asarray(product.data), self._xp),
+            (n, n),
+        )
+
+    def gram_coo_capable(self) -> bool:
+        return True
 
     @staticmethod
     def _gram_dense_accumulate(a: scipy.sparse.csr_matrix, w: np.ndarray) -> np.ndarray:

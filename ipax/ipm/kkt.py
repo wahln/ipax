@@ -454,7 +454,7 @@ class _CondensedOperator(LinearOperator):
             d = d + self._delta_w
         return d
 
-    def assemble(self) -> _Assembly:
+    def assemble(self, *, condense_inequalities: bool = False) -> _Assembly:
         """Assemble the condensed Newton operator ``N`` as a bordered system.
 
         The logical block holds the diagonal-ish primal part; every dense product
@@ -468,11 +468,17 @@ class _CondensedOperator(LinearOperator):
           memory; §4.3) — the dense term is never formed. Otherwise an assemblable
           (analytic/sparse) ``W`` emits its triplets directly. A ``W`` that is
           neither (e.g. an autodiff-HVP black box) propagates ``NotImplementedError``.
-        - **Inequalities.** The Gram term ``∇gᵀ Σ_s ∇g`` is kept implicit as the
-          indefinite augmented border (``∇g`` with the ``−Σ_s⁻¹`` slack block), so
-          the factor stays as sparse as ``∇g`` instead of densifying the product.
+        - **Inequalities.** By default the Gram term ``∇gᵀ Σ_s ∇g`` is kept
+          implicit as the indefinite augmented border (``∇g`` with the ``−Σ_s⁻¹``
+          slack block), so the factor stays as sparse as ``∇g`` instead of
+          densifying the product. With ``condense_inequalities=True`` (the sparse
+          normal-equations route) the Gram is instead formed *sparsely* through
+          the Jacobian's :meth:`~ipax.backend.operators.LinearOperator.gram_coo`
+          and folded into the logical ``n×n`` block — right when ``∇g`` has
+          localized rows so the Gram stays sparse; raises ``NotImplementedError``
+          when the Jacobian cannot form it or Σ_s is non-diagonal.
 
-        With both present (the RT case: low-rank Hessian + inequality caps) the two
+        With both present (the RT case: low-rank Hessian + inequality caps) the
         borders stack — their Schur terms add, recovering ``N`` exactly.
         """
         n = self._W.shape[0]
@@ -506,9 +512,62 @@ class _CondensedOperator(LinearOperator):
             values = xp.concat((wv, shift_diag))
 
         if self._ineq_jac.shape[0] > 0:
-            borders.append(_inequality_border(self._ineq_jac, self._sigma_s))
+            if condense_inequalities:
+                gr, gc, gv, _ = self._gram_coo_triplets()
+                rows = xp.concat((rows, gr))
+                cols = xp.concat((cols, gc))
+                values = xp.concat((values, gv))
+            else:
+                borders.append(_inequality_border(self._ineq_jac, self._sigma_s))
 
         return _Assembly(rows, cols, values, logical_size=n, borders=tuple(borders))
+
+    def _gram_coo_triplets(self) -> tuple[Array, Array, Array, tuple[int, int]]:
+        """Sparse COO of ``∇gᵀ Σ_s ∇g`` (raises when the route is unsupported)."""
+        if not isinstance(self._sigma_s, (Diagonal, Identity)):
+            raise NotImplementedError(
+                "the sparse normal-equations form requires a diagonal slack scaling"
+            )
+        return self._ineq_jac.gram_coo(self._sigma_s.diagonal())
+
+    def normal_equations_coo(
+        self,
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        """COO of ``N`` with the inequality Gram condensed sparsely (see
+        :meth:`assemble` with ``condense_inequalities=True``); the low-rank
+        Hessian border, if any, still borders the block."""
+        return _border(self.assemble(condense_inequalities=True))
+
+    def normal_equations_values(self, like: Array | None = None) -> Array:
+        del like
+        logical, borders = self._value_parts(condense_inequalities=True)
+        xp = array_namespace(logical[0])
+        return xp.concat(tuple(logical + borders))
+
+    def normal_equations_pattern_signature(self) -> object | None:
+        """Stable pattern key for the condensed-Gram form.
+
+        The Gram's sparsity is a function of the inequality Jacobian's pattern
+        (SpGEMM structure has no numerical pruning), so the signature reduces to
+        the same ingredients as :meth:`coo_pattern_signature` under a distinct
+        tag.
+        """
+        base = self.coo_pattern_signature()
+        if base is None:
+            return None
+        return ("normal_equations", base)
+
+    def normal_equations_inertia_offset(self) -> tuple[int, int, int]:
+        """Inertia delta between the bordered and the condensed-Gram assembly.
+
+        :meth:`expected_inertia` targets the *bordered* system, whose ``−Σ_s⁻¹``
+        slack block contributes exactly ``m_I`` negative eigenvalues on top of
+        the condensed matrix's (Haynsworth inertia additivity: ``In(bordered) =
+        In(−Σ_s⁻¹) + In(N)``). A solver factoring the condensed-Gram form adds
+        this offset when reporting inertia, so the driver's inertia check keeps
+        one target for both assemblies.
+        """
+        return (0, int(self._ineq_jac.shape[0]), 0)
 
     def to_coo(
         self, like: Array | None = None
@@ -522,7 +581,9 @@ class _CondensedOperator(LinearOperator):
         del like
         return _border(self.assemble())
 
-    def _value_parts(self) -> tuple[list[Array], list[Array]]:
+    def _value_parts(
+        self, *, condense_inequalities: bool = False
+    ) -> tuple[list[Array], list[Array]]:
         """Return ``(logical_values, border_values)`` in :meth:`to_coo` order.
 
         The values-only counterpart of :meth:`assemble`: it recomputes just the
@@ -530,6 +591,9 @@ class _CondensedOperator(LinearOperator):
         (``arange``, the low-rank border's ``_grid_indices`` grids, the concat of
         row/column coordinates). The solver caches the fixed structure and calls
         this each iteration, so the per-step assembly cost drops to value work.
+        With ``condense_inequalities=True`` the order matches
+        :meth:`normal_equations_coo` instead (Gram values in the logical block,
+        no inequality border).
         """
         sigma_x_diag = self._sigma_x.diagonal()
         xp = array_namespace(sigma_x_diag)
@@ -561,11 +625,16 @@ class _CondensedOperator(LinearOperator):
             logical.append(shift_diag)
 
         if self._ineq_jac.shape[0] > 0:
-            # Inequality border: ∇g as C/Cᵀ (shared values), −Σ_s⁻¹ as the E block.
-            g_values = self._ineq_jac.coo_values()
-            borders.append(g_values)
-            borders.append(g_values)
-            borders.append(-1.0 / self._sigma_s.diagonal())
+            if condense_inequalities:
+                # Gram values live in the logical block (see assemble()).
+                _, _, g_values, _ = self._gram_coo_triplets()
+                logical.append(g_values)
+            else:
+                # Inequality border: ∇g as C/Cᵀ (shared values), −Σ_s⁻¹ as E.
+                g_values = self._ineq_jac.coo_values()
+                borders.append(g_values)
+                borders.append(g_values)
+                borders.append(-1.0 / self._sigma_s.diagonal())
 
         return logical, borders
 

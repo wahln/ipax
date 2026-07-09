@@ -94,7 +94,9 @@ def _to_index(arr: Array) -> Any:
 
 def _scatter_add(out: Any, idx: Any, vals: Any) -> None:
     """Device unbuffered scatter-add (sums duplicate targets) for canonical maps."""
-    cupyx.scatter_add(out, idx, vals)
+    # ``cupyx.scatter_add`` delegates to the deprecated ``ndarray.scatter_add``
+    # (warns as of CuPy 14); ``cupy.add.at`` is its documented replacement.
+    cupy.add.at(out, idx, vals)
 
 
 def _to_float(value: Any) -> float:
@@ -214,6 +216,9 @@ class SparseOperator(LinearOperator):
         self._gram_value: Any = None  # memoized dense n×n result (device)
         self._gram_compute_count = 0  # observability/testing: actual SpGEMM runs
         self._squared: Any = None  # A∘A (shared by the Gram diagonals)
+        # Sparse-Gram (COO) memo for the sparse normal-equations route.
+        self._gram_coo_weights: Any = None
+        self._gram_coo_value: Any = None
         self._symmetric: bool | None = None
 
     @property
@@ -313,6 +318,41 @@ class SparseOperator(LinearOperator):
         self._gram_value = gram
         self._gram_compute_count += 1
         return cast("Array", to_xp_array(gram, self._xp))
+
+    def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
+        # ``Aᵀ diag(w) A`` kept SPARSE for the sparse normal-equations route —
+        # mirror of the SciPy adapter's ``gram_coo`` (see its comment for the
+        # pattern-stability contract), on the device via cuSPARSE SpGEMM.
+        w = _to_cupy(weights).reshape(-1)
+        if self._gram_coo_value is not None and bool(
+            cupy.array_equal(w, self._gram_coo_weights)
+        ):
+            product = self._gram_coo_value
+        else:
+            a = self._matrix
+            if self._gram_transpose is None:
+                self._gram_transpose = a.T.tocsr()
+                self._gram_scaled = a.copy()
+                self._gram_row_index = (
+                    cupy.searchsorted(a.indptr, cupy.arange(int(a.nnz)), side="right")
+                    - 1
+                )
+            scaled = self._gram_scaled
+            scaled.data = a.data * w[self._gram_row_index]
+            product = (self._gram_transpose @ scaled).tocoo()
+            self._gram_coo_weights = w.copy()
+            self._gram_coo_value = product
+            self._gram_compute_count += 1
+        n = int(self.shape[1])
+        return (
+            cast("Array", to_xp_array(product.row, self._xp)),
+            cast("Array", to_xp_array(product.col, self._xp)),
+            cast("Array", to_xp_array(product.data, self._xp)),
+            (n, n),
+        )
+
+    def gram_coo_capable(self) -> bool:
+        return True
 
     @staticmethod
     def _gram_dense_accumulate(a: Any, w: Any) -> Any:

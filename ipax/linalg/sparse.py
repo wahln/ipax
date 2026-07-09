@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, Any
 from ipax.backend.namespace import _namespace_name, array_namespace
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ipax.backend.operators import LinearOperator
     from ipax.typing import Array
 
@@ -53,10 +55,27 @@ def _dlpack_device_kind(arr: Array) -> int | None:
 
 
 class SparseDirectSolver:
-    """``LinearSolver`` that factors via the per-backend sparse adapter."""
+    """``LinearSolver`` that factors via the per-backend sparse adapter.
 
-    def __init__(self, *, require_inertia: bool = False) -> None:
+    ``form`` selects what is assembled: ``"augmented"`` (default) factors the
+    operator's bordered COO emission (inequalities as an indefinite ``∇g`` /
+    ``−Σ_s⁻¹`` border — the factor stays as sparse as ``∇g``), while
+    ``"normal_equations"`` condenses the inequality Gram term sparsely into the
+    logical ``n×n`` block (``normal_equations_coo``), for tall problems whose
+    Jacobian rows are localized enough that ``∇gᵀ Σ_s ∇g`` stays sparse.
+    Opt-in: on non-localized sparsity the Gram fills in, and no cheap
+    structural probe can detect that in advance.
+    """
+
+    def __init__(
+        self, *, require_inertia: bool = False, form: str = "augmented"
+    ) -> None:
+        if form not in ("augmented", "normal_equations"):
+            raise ValueError(
+                "SparseDirectSolver form must be 'augmented' or 'normal_equations'"
+            )
         self._require_inertia = require_inertia
+        self._form = form
         self._adapter: Any = None
         self._adapter_key: tuple[str, int | None] | None = None
         self._inner: Any = None
@@ -65,6 +84,9 @@ class SparseDirectSolver:
         # pad/truncate the RHS and solution across that gap (see ``solve``).
         self._logical_size = 0
         self._assembled_size = 0
+        # Bordered-equivalent inertia delta for the normal-equations form
+        # (Haynsworth: the eliminated −Σ_s⁻¹ block's m_I negatives).
+        self._inertia_offset: tuple[int, int, int] = (0, 0, 0)
         # Cached COO row/column structure for the current pattern signature: the
         # KKT pattern is fixed across IPM iterations, so on a cache hit only the
         # value vector is recomputed (``coo_values``) instead of the full triplet.
@@ -85,27 +107,55 @@ class SparseDirectSolver:
         """No-op: a direct factorization has no inner tolerance to adapt."""
         del residual
 
+    def _emission(
+        self, K: LinearOperator
+    ) -> tuple[Callable[[], object | None], Callable[..., Any], Callable[..., Any]]:
+        """The (signature, to_coo, values) emission triple for the active form."""
+        if self._form == "normal_equations":
+            to_coo = getattr(K, "normal_equations_coo", None)
+            values = getattr(K, "normal_equations_values", None)
+            signature_fn = getattr(K, "normal_equations_pattern_signature", None)
+            if to_coo is None or values is None or signature_fn is None:
+                raise RuntimeError(
+                    "the sparse normal-equations form requires a condensed KKT "
+                    "operator that can fold the inequality Gram sparsely "
+                    "(no equality constraints; a gram_coo-capable sparse "
+                    "inequality Jacobian); use the default 'augmented' form "
+                    "or another linsolve mode instead"
+                )
+            return signature_fn, to_coo, values
+        return K.coo_pattern_signature, K.to_coo, K.coo_values
+
     def factor(self, K: LinearOperator) -> None:
         # The core emits structure; the adapter builds and factors the matrix.
         # On a fixed pattern (stable signature) reuse the cached row/column
         # vectors and recompute only the values — the index arrays (and the
         # low-rank border's index grids) are identical every iteration.
-        signature = K.coo_pattern_signature()
-        if (
-            signature is not None
-            and self._struct is not None
-            and self._struct_signature == signature
-        ):
-            rows, cols, shape = self._struct
-            values = K.coo_values()
-        else:
-            rows, cols, values, shape = K.to_coo()
-            if signature is not None:
-                self._struct = (rows, cols, shape)
-                self._struct_signature = signature
+        signature_fn, to_coo_fn, values_fn = self._emission(K)
+        signature = signature_fn()
+        try:
+            if (
+                signature is not None
+                and self._struct is not None
+                and self._struct_signature == signature
+            ):
+                rows, cols, shape = self._struct
+                values = values_fn()
             else:
-                self._struct = None
-                self._struct_signature = None
+                rows, cols, values, shape = to_coo_fn()
+                if signature is not None:
+                    self._struct = (rows, cols, shape)
+                    self._struct_signature = signature
+                else:
+                    self._struct = None
+                    self._struct_signature = None
+        except NotImplementedError as exc:
+            if self._form == "normal_equations":
+                raise RuntimeError(
+                    "the sparse normal-equations form is unavailable for this "
+                    f"problem: {exc}"
+                ) from exc
+            raise
         xp = array_namespace(values)
         adapter_key = (_namespace_name(xp), _dlpack_device_kind(values))
         # Forward the operator's structural symmetry hint (the condensed/saddle
@@ -147,6 +197,12 @@ class SparseDirectSolver:
         self._inner.factor(operator)
         self._logical_size = int(K.shape[0])
         self._assembled_size = int(shape[0])
+        offset_fn = (
+            getattr(K, "normal_equations_inertia_offset", None)
+            if self._form == "normal_equations"
+            else None
+        )
+        self._inertia_offset = offset_fn() if offset_fn is not None else (0, 0, 0)
 
     def solve(self, rhs: Array) -> Array:
         if self._inner is None:
@@ -163,12 +219,31 @@ class SparseDirectSolver:
             solution = solution[: self._logical_size]
         return solution
 
+    @staticmethod
+    def _offset_inertia(
+        inertia: tuple[int, int, int] | None, offset: tuple[int, int, int]
+    ) -> tuple[int, int, int] | None:
+        if inertia is None:
+            return None
+        return (
+            inertia[0] + offset[0],
+            inertia[1] + offset[1],
+            inertia[2] + offset[2],
+        )
+
     @property
     def inertia(self) -> tuple[int, int, int]:
-        """Inertia ``(n₊, n₋, n₀)`` of the factored operator (if requested)."""
+        """Inertia ``(n₊, n₋, n₀)`` of the factored system, in *bordered* terms.
+
+        For the normal-equations form the eliminated slack block's negatives
+        are added back (see ``normal_equations_inertia_offset``), so the value
+        is comparable with the operator's ``expected_inertia`` target either way.
+        """
         if self._inner is None:
             raise RuntimeError("factor() must be called before reading inertia")
-        return self._inner.inertia  # type: ignore[no-any-return]
+        result = self._offset_inertia(self._inner.inertia, self._inertia_offset)
+        assert result is not None
+        return result
 
     def inertia_or_none(self) -> tuple[int, int, int] | None:
         """Best-effort inertia of the factored operator; ``None`` if unavailable.
@@ -182,7 +257,8 @@ class SparseDirectSolver:
         if self._inner is None:
             return None
         fn = getattr(self._inner, "inertia_or_none", None)
-        return fn() if fn is not None else None
+        inner = fn() if fn is not None else None
+        return self._offset_inertia(inner, self._inertia_offset)
 
 
 __all__ = ["SparseDirectSolver"]

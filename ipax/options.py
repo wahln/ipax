@@ -32,6 +32,7 @@ MuFallback = Literal["kkt-error", "never"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
 DenseKKTRoute = Literal["condensed", "augmented"]
+SparseKKTRoute = Literal["augmented", "normal_equations"]
 ScalingMethod = Literal["none", "gradient-based"]
 CorrectionsMethod = Literal["none", "mehrotra", "gondzio"]
 
@@ -234,6 +235,36 @@ class DenseOptions:
             raise ValueError("dense kkt_route must be 'condensed' or 'augmented'")
         if self.augmented_max_size < 1:
             raise ValueError("augmented_max_size must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class SparseOptions:
+    """Sparse-direct KKT assembly: augmented vs. sparse normal equations.
+
+    ``"augmented"`` (default) factors the bordered indefinite system — the
+    inequality Jacobian ``∇g`` stays an explicit border with the ``−Σ_s⁻¹``
+    slack block, so the factor is as sparse as ``∇g`` regardless of its
+    column overlap (Friedlander & Orban 2012; Wächter & Biegler 2006 §3.1).
+    ``"normal_equations"`` instead condenses the Gram term ``∇gᵀ Σ_s ∇g``
+    *sparsely* into the logical ``n×n`` block via the Jacobian's ``gram_coo``
+    (Breedveld 2017 §2: the condensed system is ``n×n`` however large ``m``
+    grows) — the right choice for tall (``m ≫ n``) problems whose Jacobian
+    rows are **localized** (banded/block dose-influence structure), where the
+    Gram stays sparse and one small factorization per iteration replaces a
+    ``(n+m)`` bordered factor. Deliberately **opt-in**: with non-localized
+    rows the Gram fills in toward dense ``n²`` and no cheap structural probe
+    can see that in advance. Requires a ``gram_coo``-capable inequality
+    Jacobian (a sparse-operator Jacobian on a sparse-adapter backend),
+    diagonal slack scaling, and no equality constraints.
+    """
+
+    kkt_route: SparseKKTRoute = "augmented"
+
+    def __post_init__(self) -> None:
+        if self.kkt_route not in ("augmented", "normal_equations"):
+            raise ValueError(
+                "sparse kkt_route must be 'augmented' or 'normal_equations'"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,6 +532,7 @@ class Options:
     lbfgs: LBFGSOptions = field(default_factory=LBFGSOptions)
     krylov: KrylovOptions = field(default_factory=KrylovOptions)
     dense: DenseOptions = field(default_factory=DenseOptions)
+    sparse: SparseOptions = field(default_factory=SparseOptions)
     scaling: ScalingOptions | ScalingMethod = field(default_factory=ScalingOptions)
     corrections: CorrectionsOptions | CorrectionsMethod = field(
         default_factory=CorrectionsOptions
@@ -555,4 +587,6 @@ __all__ = [
     "RegularizationOptions",
     "ScalingMethod",
     "ScalingOptions",
+    "SparseKKTRoute",
+    "SparseOptions",
 ]

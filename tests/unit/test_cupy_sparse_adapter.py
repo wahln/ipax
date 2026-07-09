@@ -48,6 +48,9 @@ def cupy_sparse_module(monkeypatch: pytest.MonkeyPatch):
     cupy.repeat = np.repeat
     cupy.searchsorted = np.searchsorted
     cupy.result_type = np.result_type
+    # Unbuffered scatter-add used by the canonical COO map (cupy.add.at is
+    # the documented replacement for the deprecated cupyx.scatter_add).
+    cupy.add = np.add
 
     class FakeRuntime:
         current_device = 0

@@ -7,6 +7,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Sparse condensed normal-equations route**
+  (`Options(linsolve="sparse", sparse=SparseOptions(kkt_route="normal_equations"))`).
+  The condensed matrix ``N = W + Σ_x + δ_w I + ∇gᵀ Σ_s ∇g`` is assembled
+  *sparsely*: a new ``LinearOperator.gram_coo`` capability (SciPy and CuPy
+  adapters, forwarded through `COOOperator`/`CSROperator`, `VStack` and the
+  gradient-scaling wrapper) emits ``∇gᵀ Σ_s ∇g`` as pattern-stable COO
+  triplets, and the condensed KKT operator folds them into its logical
+  ``n×n`` block (`normal_equations_coo`; an L-BFGS Hessian keeps its
+  low-rank border). `SparseDirectSolver(form="normal_equations")` factors
+  the result with full structure/symbolic reuse and translates the factor's
+  inertia back into bordered terms (Haynsworth additivity: the eliminated
+  ``−Σ_s⁻¹`` block's ``m_I`` negatives), so the inertia-guided δ_w
+  correction works unchanged. For tall (``m ≫ n``) problems with
+  **localized** Jacobian rows (banded/block dose-influence structure) this
+  replaces a ``(n+m)``-sized bordered factor or a Krylov iteration with one
+  small sparse Cholesky-sized factorization per iteration (Breedveld 2017
+  §2). Measured on banded tall QPs (``m = 10n``, 20 nnz/row): 3–4.6× faster
+  per iteration than the bordered augmented factor at ``n`` = 10k–30k
+  (6.2 vs 15.6 s at 20k), 32× faster than the dense condensed route at 10k
+  (1.27 vs 40.4 s, 237 MB vs 3.3 GB peak), and on par with matrix-free
+  Krylov on early well-conditioned iterations — but decisively ahead at
+  convergence, where the late-IPM Σ blows up CG's inner iteration counts
+  while the direct factor's cost stays flat: at ``n`` = 20k the sparse-NE
+  solve reaches OPTIMAL (KKT 4e-9) in 25 iterations / 62 s, while the
+  Krylov route had not converged after 50+ minutes. Deliberately opt-in:
+  with non-localized rows the Gram fills in toward dense ``n²``, which no
+  cheap structural probe can detect.
+- **Tall sparse QP generator** (`benchmarks.generators.make_tall_sparse_problem`):
+  seeded ``m ≫ n`` bound-constrained QPs with a Gram-capable sparse-operator
+  Jacobian, random or banded (``bandwidth=``) column structure — the
+  measurement vehicle for the tall-selection thresholds and the sparse-NE
+  route.
+- **Tall auto-selection is now density-gated.** The tall-crossover
+  measurement (2026-07, tall QPs at ``m = 10n``) showed the dense condensed
+  route beating Krylov 5.4× at ``n = 5000`` but *losing* (75.5 vs
+  46.5 s/iteration) at ``n = 10 000`` with a ~1%-dense Jacobian: the
+  tall-dense advantage comes from the adapters' dense-GEMM Gram, which only
+  engages at ≥ ~5% density. `select_solver`'s tall branch now also probes
+  ``nnz/(m·n)`` of the inequality Jacobian and keeps Krylov below 5%
+  density; dense-ish Jacobians (TROTS dose matrices, 11–53%) keep the
+  measured 13–19× dense-route wins.
 - **Stall detection** (`Options.max_stall_iter`, default 25; new
   `Status.STALLED`): consecutive frozen iterations — no accepted step and a
   bit-for-bit unchanged KKT error — now terminate honestly (or as
@@ -83,6 +124,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **CuPy adapter no longer calls the deprecated ``ndarray.scatter_add``.**
+  ``cupyx.scatter_add`` delegates to it and warns as of CuPy 14 (which
+  escalates to an error under pytest's warning filter, breaking every CuPy
+  ``from_coo`` assembly); the canonical-map scatter now uses its documented
+  replacement ``cupy.add.at``.
 - **Restoration solves the reduced Gauss-Newton system on the free set.**
   With variables pinned at their bounds, the full-space GN step is dominated
   by the blocked components; the box projection swallowed it and the

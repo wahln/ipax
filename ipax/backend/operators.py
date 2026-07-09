@@ -181,6 +181,32 @@ class LinearOperator(ABC):
         """
         return type(self).gram is not LinearOperator.gram
 
+    def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
+        """``Aᵀ diag(weights) A`` as *sparse* COO triplets (invariant #4).
+
+        The sparse sibling of :meth:`gram`, for the sparse condensed
+        normal-equations route: when ``A`` has localized (banded/block) rows,
+        the Gram stays sparse and an ``n×n`` sparse factorization of the
+        condensed matrix beats both the dense route (O(n²) memory) and
+        matrix-free Krylov. Contract: for a fixed operator, the returned
+        *pattern* (rows/cols, canonical order) is identical across calls with
+        different ``weights`` — only the values move — so sparse-direct
+        callers may cache structure and symbolic analyses. Duplicate entries,
+        if any, are summed by the consumer. Optional; on non-localized
+        sparsity the result may be near-dense, which is why route selection
+        treats this as opt-in rather than probing it.
+        """
+        del weights
+        raise NotImplementedError("operator does not expose a sparse COO Gram")
+
+    def gram_coo_capable(self) -> bool:
+        """Whether :meth:`gram_coo` is expected to succeed.
+
+        Structural probe like :meth:`gram_capable`; wrappers forwarding
+        :meth:`gram_coo` must forward this too.
+        """
+        return type(self).gram_coo is not LinearOperator.gram_coo
+
     def row_gram_diagonal(self, weights: Array) -> Array:
         """Return ``diag(A diag(weights) Aᵀ)`` — the weighted *row* energies.
 
@@ -707,6 +733,34 @@ class VStack(LinearOperator):
         # The stacked Gram succeeds only when every block's does.
         return all(op.gram_capable() for op in self._ops)
 
+    def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
+        # Σ_b Jbᵀ diag(w_b) Jb as concatenated n×n triplets: overlapping
+        # entries across blocks are duplicates the consumer sums. Per-block
+        # patterns are stable, so the concatenation is too.
+        rows_parts: list[Array] = []
+        cols_parts: list[Array] = []
+        vals_parts: list[Array] = []
+        offset = 0
+        xp = None
+        for op, n_rows in zip(self._ops, self._rows, strict=True):
+            r, c, v, _ = op.gram_coo(weights[offset : offset + n_rows])
+            if xp is None:
+                xp = array_namespace(v)
+            rows_parts.append(r)
+            cols_parts.append(c)
+            vals_parts.append(v)
+            offset += n_rows
+        assert xp is not None
+        return (
+            xp.concat(tuple(rows_parts)),
+            xp.concat(tuple(cols_parts)),
+            xp.concat(tuple(vals_parts)),
+            (self._n, self._n),
+        )
+
+    def gram_coo_capable(self) -> bool:
+        return all(op.gram_coo_capable() for op in self._ops)
+
     def row_inf_norms(self, like: Array | None = None) -> Array:
         # Stacked rows ⇒ concatenate each block's row norms (used by scaling).
         xp = None
@@ -885,6 +939,15 @@ class _SparseStructured(LinearOperator):
         # matvec family itself would fail, so report incapable rather than raise.
         try:
             return self._adapter_op().gram_capable()
+        except NotImplementedError:
+            return False
+
+    def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
+        return self._adapter_op().gram_coo(weights)
+
+    def gram_coo_capable(self) -> bool:
+        try:
+            return self._adapter_op().gram_coo_capable()
         except NotImplementedError:
             return False
 

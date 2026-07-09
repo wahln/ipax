@@ -93,6 +93,14 @@ class _RowScaled(LinearOperator):
         # exactly the wrapped Jacobian's.
         return self._jac.gram_capable()
 
+    def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
+        # (DJ)ᵀ diag(W) (DJ) = Jᵀ diag(d²·W) J — same folding as ``gram``, so
+        # the sparse normal-equations route survives gradient-based scaling.
+        return self._jac.gram_coo(self._d * self._d * weights)
+
+    def gram_coo_capable(self) -> bool:
+        return self._jac.gram_coo_capable()
+
     def row_gram_diagonal(self, weights: Array) -> Array:
         # diag((DJ) W (DJ)ᵀ)_j = d_j² Σ_k W_k J_jk² = d²·J.row_gram_diagonal(W).
         return self._d * self._d * self._jac.row_gram_diagonal(weights)

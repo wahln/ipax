@@ -52,6 +52,7 @@ from ipax.result import (
 )
 
 if TYPE_CHECKING:
+    from ipax.backend.operators import LinearOperator
     from ipax.problem.base import Problem
     from ipax.result import IterationCallback
     from ipax.typing import Array, Namespace
@@ -197,20 +198,40 @@ def solve(
     if warm_start is not None and problem_scaling is not None:
         effective_warm = _scale_warm_start(warm_start, problem_scaling)
 
+    # Lazy structural probes for the tall n ≪ m selection heuristic: they
+    # evaluate the (scaled) inequality Jacobian once at ``x0`` — only when
+    # ``select_solver`` actually reaches the tall-problem branch — and share
+    # the evaluated operator so the Jacobian is built at most once.
+    _probe_cache: list[LinearOperator | None] = []
+
+    def _ineq_jac_probe() -> LinearOperator | None:
+        if not _probe_cache:
+            from ipax.backend.operators import as_operator
+
+            try:
+                _probe_cache.append(as_operator(model.ineq_jacobian(x0)))
+            except NotImplementedError:
+                _probe_cache.append(None)
+        return _probe_cache[0]
+
     def _ineq_gram_capable() -> bool:
-        """Lazy structural probe for the tall n ≪ m selection heuristic.
+        """Whether ∇g can form ``∇gᵀ diag(w) ∇g`` without densifying to m×n."""
+        op = _ineq_jac_probe()
+        return op is not None and op.gram_capable()
 
-        Evaluates the (scaled) inequality Jacobian once at ``x0`` — only when
-        ``select_solver`` actually reaches the tall-problem branch — and asks
-        whether it can form ``∇gᵀ diag(w) ∇g`` without densifying to m×n.
-        """
-        from ipax.backend.operators import as_operator
-
+    def _ineq_density() -> float | None:
+        """``nnz/(m·n)`` of ∇g, or ``None`` without explicit COO structure."""
+        op = _ineq_jac_probe()
+        if op is None:
+            return None
+        rows, cols = op.shape
+        if rows == 0 or cols == 0:
+            return None
         try:
-            jac = model.ineq_jacobian(x0)
+            values = op.to_coo()[2]
         except NotImplementedError:
-            return False
-        return as_operator(jac).gram_capable()
+            return None
+        return int(values.shape[0]) / (int(rows) * int(cols))
 
     solver = select_solver(
         n_vars=int(resolved.n_vars),
@@ -219,6 +240,7 @@ def solve(
         options=opts,
         m_ineq=m_ineq,
         ineq_gram_capable=_ineq_gram_capable if has_ineq else None,
+        ineq_density=_ineq_density if has_ineq else None,
     )
 
     # Pre-solve diagnostics (verbosity tiers 3–5; gated by the logger threshold
