@@ -124,6 +124,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **The Mehrotra corrector degrades gracefully when the correction hurts.**
+  The corrected direction was accepted unconditionally, but its ``−ΔΔ`` term
+  presumes a Newton predictor whose full step reduces complementarity — on
+  nonconvex or quasi-Newton curvature it can instead collapse the maximal
+  fraction-to-boundary step, leaving the solve at a convergence knife-edge
+  (S2MPJ HS71 × ``exact/dense+mehrotra``: converged in ~10 iterations or
+  stalled at KKT ≈ 36 depending on last-bit arithmetic across Torch builds).
+  A corrected step that retains less than half the predictor's combined
+  boundary step length is now discarded for the plain centered Newton step
+  at the same μ target (the direction ``corrections="none"`` computes),
+  falling back to the affine predictor only if that re-solve fails. The
+  Gondzio corrector builds on the same guarded base. The HS71
+  ``exclude_configs`` workaround in the QC corpus is removed; the gate runs
+  200/200 with the corrector configs swept again.
 - **Budget exhaustion at a near-optimal iterate now reports `ACCEPTABLE`.**
   The driver already returns the best accepted iterate on failure statuses;
   when that iterate satisfies the relaxed KKT tolerances (1e2 × the

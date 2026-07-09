@@ -211,6 +211,89 @@ def test_mehrotra_failed_corrector_matches_affine_zero_target(namespace):
     assert result.mu == 0.0
 
 
+def test_mehrotra_falls_back_to_centered_when_correction_collapses_the_step(
+    namespace,
+):
+    # Task-6 fragility (S2MPJ HS71 × exact/dense+mehrotra): the −ΔΔ term
+    # presumes a Newton predictor, and on nonconvex curvature the corrected
+    # direction can collapse the maximal boundary step. When the corrected
+    # step keeps less than half the predictor's combined step length, the
+    # corrector must degrade to the plain centered Newton step at the same
+    # μ target (what corrections="none" would compute) instead of handing the
+    # driver a crippled direction.
+    xp = namespace
+    affine = _step(xp, ds=-1.0, dy=-1.0)
+    corrected = _step(xp, ds=-0.9, dy=-0.9)
+    centered = _step(xp, ds=-0.5, dy=-0.5)
+    solves = []
+
+    def solve(comp_s, comp_l, comp_u):
+        solves.append(comp_s)
+        return corrected if len(solves) == 1 else centered
+
+    alphas = {id(affine): 0.45, id(corrected): 0.05, id(centered): 0.4}
+
+    def alpha(step, *, tau):
+        return alphas[id(step)]
+
+    context = _context(xp, affine, solve=solve, alpha_primal=alpha, alpha_dual=alpha)
+    corrector = MehrotraCorrector(CorrectionsOptions(method="mehrotra"))
+    result = corrector.correct(context, 1.0)
+
+    assert result.step is centered
+    assert result.mu == 1.0
+    # The fallback re-solve targets the plain μ·e (no second-order term).
+    assert len(solves) == 2
+    assert_scalar_close(float(solves[1][0]), 1.0)
+
+
+def test_mehrotra_keeps_a_correction_with_a_comparable_step(namespace):
+    xp = namespace
+    affine = _step(xp, ds=-1.0, dy=-1.0)
+    corrected = _step(xp, ds=-0.9, dy=-0.9)
+    solves = []
+
+    def solve(comp_s, comp_l, comp_u):
+        solves.append(comp_s)
+        return corrected
+
+    alphas = {id(affine): 0.45, id(corrected): 0.40}
+
+    def alpha(step, *, tau):
+        return alphas[id(step)]
+
+    context = _context(xp, affine, solve=solve, alpha_primal=alpha, alpha_dual=alpha)
+    corrector = MehrotraCorrector(CorrectionsOptions(method="mehrotra"))
+    result = corrector.correct(context, 1.0)
+
+    assert result.step is corrected
+    assert result.mu == 1.0
+    assert len(solves) == 1  # no fallback re-solve on the accepted path
+
+
+def test_mehrotra_fallback_returns_affine_when_the_centered_solve_fails(namespace):
+    xp = namespace
+    affine = _step(xp, ds=-1.0, dy=-1.0)
+    corrected = _step(xp, ds=-0.9, dy=-0.9)
+    solves = []
+
+    def solve(comp_s, comp_l, comp_u):
+        solves.append(comp_s)
+        return corrected if len(solves) == 1 else None
+
+    alphas = {id(affine): 0.45, id(corrected): 0.05}
+
+    def alpha(step, *, tau):
+        return alphas[id(step)]
+
+    context = _context(xp, affine, solve=solve, alpha_primal=alpha, alpha_dual=alpha)
+    corrector = MehrotraCorrector(CorrectionsOptions(method="mehrotra"))
+    result = corrector.correct(context, 1.0)
+
+    assert result.step is affine
+    assert result.mu == 0.0
+
+
 def test_gondzio_accumulates_partial_trial_residual_and_uses_gamma(namespace):
     xp = namespace
     affine = _step(xp, ds=-1.0, dy=-1.0)

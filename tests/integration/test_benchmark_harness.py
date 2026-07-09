@@ -24,13 +24,17 @@ def _bound_qp_case():
 
 
 def test_run_sweep_honors_per_problem_excluded_configs(backend_name):
-    # HS71 excludes the corrector configs (a known nonconvex corrector-robustness
-    # edge case); the sweep must not emit rows for them on that problem.
-    hs71 = next(c for c in default_corpus() if c.name == "hs71")
-    assert "exact/dense+mehrotra" in hs71.exclude_configs
-    results, _env = run_sweep([hs71], default_configs(), [backend_name])
+    # A per-problem exclude_configs entry must suppress exactly those rows.
+    # (Tested on a synthetic exclusion: the corpus no longer ships one since
+    # the HS71 corrector-fragility workaround was replaced by the corrector's
+    # step-length acceptance fallback.)
+    from dataclasses import replace
+
+    base = _bound_qp_case()
+    case = replace(base, exclude_configs=("exact/dense+mehrotra",))
+    results, _env = run_sweep([case], default_configs(), [backend_name])
     emitted = {r.config for r in results}
-    assert emitted.isdisjoint(hs71.exclude_configs)
+    assert emitted.isdisjoint(case.exclude_configs)
     assert "exact/dense" in emitted  # stable configs still run
 
 

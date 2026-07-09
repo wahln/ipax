@@ -71,6 +71,16 @@ _ENLARGE = 0.1
 _ACCEPT = 0.1
 # Fraction-to-boundary used for the predictor/trial *maximal* step lengths.
 _TAU_BOUNDARY = 1.0
+# The Mehrotra corrected direction is accepted only while it retains this
+# fraction of the predictor's combined boundary step length. The −ΔΔ term
+# presumes a Newton predictor whose full step reduces complementarity; on
+# nonconvex or quasi-Newton curvature it can instead collapse the maximal
+# step, and an unconditionally accepted corrector then sits at a convergence
+# knife-edge (S2MPJ HS71 × exact/dense+mehrotra: converges in ~10 iterations
+# or stalls at kkt ≈ 36 depending on last-bit arithmetic). Below the
+# threshold the corrector degrades to the plain centered Newton step at the
+# same μ target — the direction ``corrections="none"`` would compute.
+_MEHROTRA_KEEP_FRACTION = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +280,33 @@ def _mehrotra_step(
         zero_x = xp.zeros_like(ctx.x_minus_l)
         return _CorrectionState(
             CorrectionResult(ctx.affine, 0.0), zero_s, zero_x, zero_x
+        )
+
+    # Step-length acceptance (see _MEHROTRA_KEEP_FRACTION): a corrected
+    # direction that collapses the predictor's boundary step is worse than no
+    # correction — re-solve for the plain centered step at the same μ target,
+    # and only fall back to the affine direction if even that solve fails.
+    alpha_affine = ctx.alpha_primal(ctx.affine, tau=_TAU_BOUNDARY) + ctx.alpha_dual(
+        ctx.affine, tau=_TAU_BOUNDARY
+    )
+    alpha_corrected = ctx.alpha_primal(step, tau=_TAU_BOUNDARY) + ctx.alpha_dual(
+        step, tau=_TAU_BOUNDARY
+    )
+    if mu_target > 0.0 and alpha_corrected < _MEHROTRA_KEEP_FRACTION * alpha_affine:
+        zero_l = xp.zeros_like(ctx.x_minus_l)
+        zero_u = xp.zeros_like(ctx.u_minus_x)
+        centered_s = mu_target * xp.ones_like(ctx.s)
+        centered_l = xp.where(ctx.mask_l, mu_target * xp.ones_like(zero_l), zero_l)
+        centered_u = xp.where(ctx.mask_u, mu_target * xp.ones_like(zero_u), zero_u)
+        centered = ctx.solve(centered_s, centered_l, centered_u)
+        if centered is None:
+            zero_s = xp.zeros_like(ctx.s)
+            zero_x = xp.zeros_like(ctx.x_minus_l)
+            return _CorrectionState(
+                CorrectionResult(ctx.affine, 0.0), zero_s, zero_x, zero_x
+            )
+        return _CorrectionState(
+            CorrectionResult(centered, mu_target), centered_s, centered_l, centered_u
         )
     return _CorrectionState(CorrectionResult(step, mu_target), comp_s, comp_l, comp_u)
 
