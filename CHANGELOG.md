@@ -124,6 +124,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **Budget exhaustion at a near-optimal iterate now reports `ACCEPTABLE`.**
+  The driver already returns the best accepted iterate on failure statuses;
+  when that iterate satisfies the relaxed KKT tolerances (1e2 × the
+  optimality tolerances, IPOPT ``acceptable_tol``), `MAX_ITER`/`MAX_TIME`
+  now report `ACCEPTABLE` like the stall and step-failure salvage paths
+  already did — previously a run that oscillated at the acceptable level
+  without holding it for the consecutive-iteration window read as a harsh
+  budget failure from an essentially optimal point (S2MPJ budget-cluster
+  audit: DIAMON2DLS at KKT 6.7e-7 reported ``max_time``).
 - **CuPy adapter no longer calls the deprecated ``ndarray.scatter_add``.**
   ``cupyx.scatter_add`` delegates to it and warns as of CuPy 14 (which
   escalates to an error under pytest's warning filter, breaking every CuPy

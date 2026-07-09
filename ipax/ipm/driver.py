@@ -1396,6 +1396,22 @@ class IPMDriver:
                 f"(KKT {final_record.kkt_error:.3e} at iteration "
                 f"{final_record.iteration})"
             )
+        # Budget exhaustion at an essentially optimal returned iterate reports
+        # ACCEPTABLE, mirroring the stall/step-failure salvage paths: a stall
+        # at KKT 6e-7 already reports ACCEPTABLE through the relaxed
+        # tolerance, so running out of iterations or clock at the same quality
+        # must not read as a harsher failure (S2MPJ budget-cluster audit:
+        # DIAMON2DLS oscillates at the acceptable level without holding it for
+        # the acceptable-iter window, then reported MAX_TIME from a 6.7e-7
+        # best iterate).
+        if status in (Status.MAX_ITER, Status.MAX_TIME) and _within_relaxed_tol(
+            self._options.optimality, final_record
+        ):
+            status = Status.ACCEPTABLE
+            message = (
+                "acceptable: the iteration/time budget ran out at an iterate "
+                f"within the relaxed KKT tolerance ({message})"
+            )
         x_minus_l, u_minus_x = bound_gaps(x)
         g = self._ineq(x)
         c = self._eq(x)
