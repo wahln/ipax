@@ -124,6 +124,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **Unbounded detection requires the objective to diverge, not just ‖x‖.**
+  The diverging-iterates test fired on the iterate norm alone, misreporting
+  convergent problems whose iterates wander astronomically far before
+  returning (S2MPJ KOEBHELB: ‖x‖ grows monotonically past 1e22 across ~30
+  iterations, then converges to f = 112 — flagged ``unbounded`` on the
+  exact/dense and exact/sparse routes in every sweep since v5) or whose
+  optimum is legitimately huge. "Unbounded below" means f → −∞, so
+  `Status.UNBOUNDED` now additionally requires the objective to sit below
+  ``−diverging_iterates_tol``. KOEBHELB exact/dense: ``unbounded`` →
+  ``optimal`` (KKT 2.4e-9); genuinely unbounded problems (INDEF,
+  f → −3.6e21) are detected at the same iteration as before.
 - **The Mehrotra corrector degrades gracefully when the correction hurts.**
   The corrected direction was accepted unconditionally, but its ``−ΔΔ`` term
   presumes a Newton predictor whose full step reduces complementarity — on

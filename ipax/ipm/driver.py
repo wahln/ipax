@@ -784,16 +784,26 @@ class IPMDriver:
                 status = decision.status
                 message = decision.message
                 break
-            # IPOPT-style diverging-iterates test: an unbounded-below problem drives
-            # ‖x‖ off to infinity while the KKT residual never falls (e.g. INDEF).
-            # Report it honestly as UNBOUNDED rather than waiting for the runaway
+            # IPOPT-style diverging-iterates test: an unbounded-below problem
+            # drives ‖x‖ off to infinity while the objective diverges below
+            # (e.g. INDEF: f → −1e155). BOTH signals are required — the
+            # iterate norm alone false-positives on problems whose iterates
+            # wander astronomically far before converging (S2MPJ KOEBHELB:
+            # ‖x‖ grows monotonically past 1e22 across ~30 iterations, then
+            # returns and converges to f = 112 — a *bounded-below* objective
+            # throughout, which is exactly what "unbounded" must not claim).
+            # Report honest UNBOUNDED rather than waiting for the runaway
             # iterate to overflow into a NUMERICAL_ERROR.
             if (
                 opts.diverging_iterates_tol is not None
                 and float(xp.max(xp.abs(x))) > opts.diverging_iterates_tol
+                and float(objective) <= -opts.diverging_iterates_tol
             ):
                 status = Status.UNBOUNDED
-                message = "iterates diverging; the problem may be unbounded below"
+                message = (
+                    "iterates and objective diverging; the problem appears "
+                    "unbounded below"
+                )
                 break
             if (
                 opts.max_time is not None

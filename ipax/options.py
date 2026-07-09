@@ -479,7 +479,8 @@ class Options:
       reporting :attr:`Status.ACCEPTABLE`; enabled by default (IPOPT convention:
       tolerances of ``1e-6`` held for 15 consecutive iterations). Set all its
       tolerances to ``None`` to disable.
-    * ``diverging_iterates_tol`` — ‖x‖_∞ exceeding the threshold reports
+    * ``diverging_iterates_tol`` — ‖x‖_∞ exceeding the threshold *while the
+      objective has diverged below its negation* reports
       :attr:`Status.UNBOUNDED` (``None`` disables it).
     * ``max_stall_iter`` — after this many *consecutive* frozen iterations (no
       accepted step, KKT error unchanged) the run stops honestly with
@@ -501,9 +502,13 @@ class Options:
     max_iter: int = 3000
     max_stall_iter: int | None = 25
     max_time: float | None = None
-    # IPOPT ``diverging_iterates_tol``: if ‖x‖_∞ exceeds this the iterates are
-    # declared diverging and the solve stops with :attr:`Status.UNBOUNDED` (the
-    # problem is likely unbounded below). ``None`` disables the test.
+    # IPOPT ``diverging_iterates_tol``: if ‖x‖_∞ exceeds this WHILE the
+    # objective sits below its negation, the solve stops with
+    # :attr:`Status.UNBOUNDED` (unbounded below means f → −∞; the iterate norm
+    # alone false-positives on convergent problems whose iterates wander
+    # astronomically first — S2MPJ KOEBHELB — or whose optimum is legitimately
+    # that large). ``None`` disables the test; slowly-diverging objectives
+    # (e.g. −log x) then end at the iteration/time budget instead.
     diverging_iterates_tol: float | None = 1e20
     hessian: HessianMode = "auto"
     linsolve: LinSolveMode = "auto"
