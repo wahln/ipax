@@ -73,6 +73,47 @@ def test_warm_start_with_scaling_round_trips(namespace):
     assert_allclose(xp, warm.y_eq, array(xp, [-0.5e6]), rtol=1e-6, atol=1e-3)
 
 
+def _badly_scaled_ineq_qp(xp):
+    """``min 0.5*K*‖x‖²`` s.t. ``x0 + x1 ≥ 1`` (as ``g(x) = 1 − Σx ≤ 0``)."""
+    k = 1.0e6
+    return FunctionProblem(
+        2,
+        lambda x: 0.5 * k * xp.sum(x * x),
+        gradient=lambda x: k * x,
+        ineq_constraints=lambda x: 1.0 - xp.sum(x, keepdims=True),
+        ineq_jacobian=lambda x: -xp.ones((1, 2), dtype=x.dtype),
+        lagrangian_hessian=lambda x, ye, yi, sigma: sigma * k * xp.eye(2),
+    )
+
+
+def test_warm_start_with_scaling_round_trips_inequalities(namespace):
+    # The inequality counterpart of the round-trip above: the warm start's
+    # slacks and inequality multipliers are given in original units and must be
+    # rescaled into the scaled subproblem (s̃ = d_ineq·s, ỹ = y·s_f/d_ineq).
+    xp = namespace
+    problem = _badly_scaled_ineq_qp(xp)
+    opts = Options(
+        hessian="exact",
+        linsolve="dense",
+        scaling=ScalingOptions(method="gradient-based"),
+    )
+    x0 = array(xp, [1.0, 1.0])
+
+    with implemented("dense solver"):
+        cold = solve(problem, x0, options=opts)
+    assert cold.status is Status.OPTIMAL
+    assert_allclose(xp, cold.x, array(xp, [0.5, 0.5]), rtol=1e-6, atol=1e-6)
+
+    warm_start = WarmStart.from_result(cold, s=array(xp, [1e-3]))
+    with implemented("dense solver"):
+        warm = solve(problem, cold.x, options=opts, warm_start=warm_start)
+    assert warm.status is Status.OPTIMAL
+    assert_allclose(xp, warm.x, array(xp, [0.5, 0.5]), rtol=1e-6, atol=1e-6)
+    # Active constraint: ∇f + λ∇g = 0 at (0.5, 0.5) gives λ = 0.5e6 in
+    # original units — the round-trip must land there, not at a scaled value.
+    assert_allclose(xp, warm.y_ineq, array(xp, [0.5e6]), rtol=1e-6, atol=1e-3)
+
+
 def test_warm_start_dimension_mismatch_raises(namespace):
     import pytest
 
