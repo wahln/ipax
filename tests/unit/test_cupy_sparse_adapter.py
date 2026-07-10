@@ -45,7 +45,16 @@ def cupy_sparse_module(monkeypatch: pytest.MonkeyPatch):
     cupy.cumsum = np.cumsum
     cupy.arange = np.arange
     cupy.diff = np.diff
-    cupy.repeat = np.repeat
+
+    # Model the most restrictive supported CuPy: array-valued ``repeats`` are
+    # only accepted from CuPy v14, so the fake rejects them like older CuPy
+    # (message verbatim, typo included) instead of inheriting NumPy's leniency.
+    def _repeat(a: np.ndarray, repeats: object, axis: int | None = None) -> np.ndarray:
+        if isinstance(repeats, np.ndarray):
+            raise ValueError("cupy.ndaray cannot be specified as `repeats` argument.")
+        return np.repeat(a, repeats, axis)
+
+    cupy.repeat = _repeat
     cupy.searchsorted = np.searchsorted
     cupy.result_type = np.result_type
     # Unbuffered scatter-add used by the canonical COO map (cupy.add.at is
@@ -152,7 +161,11 @@ def test_cupy_solver_requires_cudss_for_inertia(
 
 
 class _CuDSSError(Exception):
-    """Stand-in for ``nvmath.bindings.cudss.cuDSSError``."""
+    """Stand-in for ``nvmath.bindings.cudss.cuDSSError`` (carries ``status``)."""
+
+    def __init__(self, *args: object, status: int | None = None) -> None:
+        super().__init__(*args)
+        self.status = status
 
 
 class _Phase(enum.IntEnum):
@@ -178,6 +191,7 @@ class _IndexBase(enum.IntEnum):
 
 
 class _Layout(enum.IntEnum):
+    COL_MAJOR = 0
     ROW_MAJOR = 1
 
 
@@ -204,7 +218,7 @@ class _FakeCudss:
         self.next_handle = 100
         self.phases: list[int] = []
         self.streams: list[int] = []
-        self.dense_matrices: dict[int, tuple[int, int, int, int]] = {}
+        self.dense_matrices: dict[int, tuple[int, int, int, int, int, int]] = {}
         self.matrix_set_values_calls = 0
         self.create_calls = 0
 
@@ -230,13 +244,13 @@ class _FakeCudss:
         self,
         nrows: int,
         ncols: int,
-        _ld: int,
+        ld: int,
         values: int,
         value_type: int,
-        _layout: int,
+        layout: int,
     ) -> int:
         handle = self._handle()
-        self.dense_matrices[handle] = (nrows, ncols, values, value_type)
+        self.dense_matrices[handle] = (nrows, ncols, ld, values, value_type, layout)
         return handle
 
     def matrix_set_values(self, *args: Any) -> None:
@@ -255,8 +269,8 @@ class _FakeCudss:
     ) -> None:
         self.phases.append(int(phase))
         if int(phase) == int(_Phase.SOLVE):
-            nrows, ncols, solution_ptr, value_type = self.dense_matrices[solution]
-            _, _, rhs_ptr, _ = self.dense_matrices[rhs]
+            nrows, ncols, _, solution_ptr, value_type, _ = self.dense_matrices[solution]
+            _, _, _, rhs_ptr, _, _ = self.dense_matrices[rhs]
             scalar = ctypes.c_float if value_type == 0 else ctypes.c_double
             length = nrows * ncols
             solution_values = (scalar * length).from_address(solution_ptr)
@@ -266,17 +280,25 @@ class _FakeCudss:
     def set_stream(self, _handle: int, stream: int) -> None:
         self.streams.append(int(stream))
 
+    def get_property(self, prop: int) -> int:
+        # libraryPropertyType: MAJOR_VERSION=0, MINOR_VERSION=1, PATCH_LEVEL=2.
+        return (0, 7, 1)[int(prop)]
+
     def data_get(
         self,
         _handle: int,
         _data: int,
         param: int,
         value: int,
-        _size: int,
+        size: int,
         written: int,
     ) -> None:
         assert int(param) == int(_DataParam.INERTIA)
-        inertia = (ctypes.c_int64 * 2).from_address(value)
+        # Real cuDSS (observed on 0.7) fills INERTIA as int32[2] and rejects
+        # any other buffer size with INVALID_VALUE; the fake mirrors that.
+        if int(size) != 8:
+            raise _CuDSSError("INVALID_VALUE (3)", status=3)
+        inertia = (ctypes.c_int32 * 2).from_address(value)
         inertia[0] = 1
         inertia[1] = 1
         ctypes.c_size_t.from_address(written).value = ctypes.sizeof(inertia)
@@ -312,6 +334,51 @@ def test_cudss_solver_reports_inertia(
 
     assert solver.inertia == (1, 1, 0)
     assert fake.phases == [int(_Phase.ANALYSIS) | int(_Phase.FACTORIZATION)]
+
+
+def test_cudss_inertia_is_best_effort_on_symmetric_factors(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Parity with the Feral adapter: LDLᵀ inertia is a free by-product of a
+    # symmetric cuDSS factorization and must be reported best-effort through
+    # ``inertia_or_none`` even without ``require_inertia`` — the IPM's
+    # inertia-guided δ_w correction depends on it (a cuDSS route returning None
+    # converges to saddle points the CPU route escapes). It is read lazily so
+    # solves that never consult it (L-BFGS) pay no per-factor host sync.
+    fake = _FakeCudss()
+    monkeypatch.setattr(cupy_sparse_module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    operator = adapter.from_coo(
+        np.asarray([0, 1]), np.asarray([0, 1]), np.asarray([1.0, -1.0]), shape=(2, 2)
+    )
+    solver = adapter.solver()  # note: no require_inertia
+    solver.factor(operator)
+
+    assert solver.inertia_or_none() == (1, 1, 0)
+
+
+def test_cudss_inertia_or_none_is_none_for_general_factors(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # cuDSS defines inertia only for symmetric factorizations; a GENERAL-route
+    # factor must report None, not read garbage.
+    fake = _FakeCudss()
+    monkeypatch.setattr(cupy_sparse_module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    operator = adapter.from_coo(
+        np.asarray([0, 0, 1]),
+        np.asarray([0, 1, 1]),
+        np.asarray([1.0, 2.0, 1.0]),  # (0,1) has no (1,0) mirror ⇒ not symmetric
+        shape=(2, 2),
+    )
+    solver = adapter.solver()
+    solver.factor(operator)
+
+    assert solver.inertia_or_none() is None
 
 
 def test_cudss_solver_binds_current_stream_and_solves(
@@ -589,6 +656,86 @@ def test_cudss_reuses_dense_descriptors_across_solves(
     # neither solve allocated a fresh pair.
     assert dense_after_factor == 2
     assert len(fake.dense_matrices) == 2
+
+
+def test_cudss_dense_descriptors_are_column_major(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # cuDSS supports only column-major dense matrices (``cudssMatrixCreateDn``
+    # returns NOT_SUPPORTED for ROW_MAJOR on a real runtime), so every dense
+    # RHS/solution descriptor must be created COL_MAJOR with ld = nrows.
+    fake = _FakeCudss()
+    monkeypatch.setattr(cupy_sparse_module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    operator = adapter.from_coo(
+        np.asarray([0, 1]), np.asarray([0, 1]), np.asarray([2.0, 4.0]), shape=(2, 2)
+    )
+    solver = adapter.solver()
+    solver.factor(operator)
+    solver.solve(np.asarray([2.0, 8.0]))
+
+    assert fake.dense_matrices  # descriptors were created through the fake
+    for nrows, _ncols, ld, _values, _vt, layout in fake.dense_matrices.values():
+        assert layout == int(_Layout.COL_MAJOR)
+        assert ld == nrows
+
+
+def test_cudss_creation_rejection_degrades_to_spsolve_with_warning(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A cuDSS runtime that rejects matrix creation outright (INVALID_VALUE /
+    # NOT_SUPPORTED — the signature of an ABI mismatch between the installed
+    # cuDSS library and the nvmath-python bindings) is unusable, not a numerical
+    # failure: the solver must degrade to spsolve with a loud warning instead of
+    # letting the driver burn its regularization ladder on identical errors.
+    fake = _FakeCudss()
+
+    def rejecting_create_csr(*args: Any) -> int:
+        del args
+        raise _CuDSSError("INVALID_VALUE (3)", status=3)
+
+    monkeypatch.setattr(fake, "matrix_create_csr", rejecting_create_csr)
+    monkeypatch.setattr(cupy_sparse_module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    rows = np.asarray([0, 1, 1, 2])
+    cols = np.asarray([0, 0, 1, 2])
+    values = np.asarray([2.0, 1.0, 3.0, 4.0])
+    operator = adapter.from_coo(rows, cols, values, shape=(3, 3))
+    solver = adapter.solver()
+
+    with pytest.warns(RuntimeWarning, match="spsolve"):
+        solver.factor(operator)
+
+    assert "spsolve" in solver.describe()
+    actual = solver.solve(np.asarray([2.0, 7.0, 8.0]))
+    np.testing.assert_allclose(actual, np.asarray([1.0, 2.0, 2.0]))
+
+
+def test_spsolve_fallback_on_missing_cudss_warns(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Degrading to spsolve costs a full factorization per solve; it must never
+    # happen silently (two real-world environments hit this without noticing).
+    monkeypatch.setattr(
+        cupy_sparse_module,
+        "_load_cudss",
+        lambda: (_ for _ in ()).throw(ImportError("missing cuDSS")),
+    )
+
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    operator = adapter.from_coo(
+        np.asarray([0, 1]), np.asarray([0, 1]), np.asarray([2.0, 4.0]), shape=(2, 2)
+    )
+    solver = adapter.solver()
+
+    with pytest.warns(RuntimeWarning, match="spsolve"):
+        solver.factor(operator)
+
+    assert "spsolve" in solver.describe()
 
 
 def test_cudss_solve_result_is_independent_of_reused_buffer(

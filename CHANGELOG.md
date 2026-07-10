@@ -124,6 +124,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
+- **The cuDSS route now actually works against a real runtime** (first
+  hardware validation of the GPU sparse-direct path; previously it was only
+  exercised through NumPy-backed fakes). Three defects found by running on
+  a live cuDSS 0.7/CUDA 12 stack, each now also modeled by the fake so the
+  CPU test suite guards them:
+  - **Dense RHS/solution descriptors were created ``ROW_MAJOR``**, which
+    cuDSS rejects (`NOT_SUPPORTED` — it supports only column-major dense
+    matrices). They are now ``COL_MAJOR`` over Fortran-ordered device
+    buffers with ``ld = nrows``.
+  - **The LDLᵀ inertia was read as ``int64[2]``**, which cuDSS rejects
+    (`INVALID_VALUE`; observed layout is ``int32[2]``). The read now tries
+    the observed layout first and falls back to the widened one. Inertia is
+    also reported **best-effort** through ``inertia_or_none`` (lazily, one
+    host sync at most per factor, symmetric factors only) instead of only
+    under ``require_inertia`` — parity with the Feral CPU adapter, so the
+    IPM's inertia-guided δ_w correction now engages on the cuDSS route
+    (verified on GPU: the saddle-trap QP now escapes to the minimizer).
+  - **A cuDSS runtime whose ABI does not match the nvmath-python bindings**
+    (e.g. cuDSS 0.8 under nvmath 0.9, which is built against 0.7; nvmath's
+    high-level API refuses the pairing, the raw bindings do not check)
+    failed every ``matrix_create`` with `INVALID_VALUE`, which the driver's
+    regularization ladder retried until reporting an inscrutable
+    ``numerical_error`` at iteration 0. Creation-time rejections now
+    degrade to the spsolve fallback instead.
+  Additionally, **every silent degrade to CuPy spsolve now emits a
+  ``RuntimeWarning``** (missing runtime or ABI mismatch): spsolve
+  re-factorizes from scratch on every solve, and two real environments hit
+  the silent fallback without noticing.
+- **The cuDSS symmetric route no longer crashes on CuPy < 14.** The
+  compiled full-CSR → lower-triangle map (`compile_lower_triangle`) built its
+  nnz→row ownership vector with ``xp.repeat(arange(n), diff(indptr))``;
+  NumPy accepts array-valued repeat counts but CuPy only does from v14, so
+  the first symmetric factorization through a real cuDSS runtime raised
+  ``ValueError: cupy.ndaray cannot be specified as `repeats` argument.`` on
+  older CuPy. The map is now derived with ``searchsorted`` over ``indptr``
+  (the same construction as the adapters' Gram row maps), which is
+  version-independent and avoids materializing the repeat. The fake-CuPy
+  test fixture that masked this now models the restrictive ``repeat``
+  semantics, and the canonical-map tests run against both a CuPy-semantics
+  namespace stub and (GPU-gated) real CuPy.
 - **Unbounded detection requires the objective to diverge, not just ‖x‖.**
   The diverging-iterates test fired on the iterate norm alone, misreporting
   convergent problems whose iterates wander astronomically far before

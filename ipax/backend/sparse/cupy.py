@@ -31,6 +31,7 @@ user-managed CUDA dependencies.
 from __future__ import annotations
 
 import ctypes
+import warnings
 from typing import TYPE_CHECKING, Any, cast
 
 # Allowed import boundary (invariants #1, #4): backend/sparse/ adapters only.
@@ -64,6 +65,15 @@ _CUDSS_R_64I = 24
 
 # Cached nvmath cuDSS bindings module (``nvmath.bindings.cudss``).
 _CUDSS_BINDINGS: Any | None = None
+
+# ``cudssStatus_t`` codes that, on a *matrix creation* call, mean the runtime is
+# unusable rather than the system numerically hard — the canonical cause is a
+# cuDSS library whose ABI does not match the installed nvmath-python bindings
+# (nvmath's own high-level API refuses such a pairing up front; the raw
+# bindings do not check). Creation takes no matrix values, so no amount of
+# regularization can repair it — degrade to spsolve instead.
+_CUDSS_STATUS_INVALID_VALUE = 3
+_CUDSS_STATUS_NOT_SUPPORTED = 4
 
 # Density crossover / chunk cap for the weighted-Gram dense-GEMM strategy —
 # mirrors ``ipax.backend.sparse.numpy_scipy`` (kept local to avoid importing
@@ -524,6 +534,12 @@ class CuDSSSparseSolver:
         self._xp: Namespace | None = None
         self._dtype: Any | None = None
         self._inertia: tuple[int, int, int] | None = None
+        # Lazy best-effort inertia state: whether the current factor is a
+        # symmetric LDLᵀ (inertia defined), its size, and whether the read was
+        # already attempted (so ``inertia_or_none`` syncs the host at most once).
+        self._symmetric_factor = False
+        self._n_factored = 0
+        self._inertia_read = False
         self._device_id: int | None = None
 
     def describe(self) -> str:
@@ -567,6 +583,8 @@ class CuDSSSparseSolver:
             self._xp = None
             self._dtype = None
             self._inertia = None
+            self._symmetric_factor = False
+            self._inertia_read = False
 
     def factor(self, K: LinearOperator) -> None:
         matrix, xp = _require_csr(K)
@@ -598,10 +616,14 @@ class CuDSSSparseSolver:
                 matrix_view,
                 pattern_signature=pattern_signature,
             )
+            # Under ``require_inertia`` read eagerly (implausible inertia must
+            # fail the factor); otherwise defer to ``inertia_or_none`` so
+            # callers that never consult it pay no per-factor host sync.
+            self._symmetric_factor = symmetric
+            self._n_factored = int(matrix.shape[0])
+            self._inertia_read = self._require_inertia
             self._inertia = (
-                self._read_inertia(int(matrix.shape[0]))
-                if self._require_inertia
-                else None
+                self._read_inertia(self._n_factored) if self._require_inertia else None
             )
 
     def solve(self, rhs: Array) -> Array:
@@ -658,7 +680,30 @@ class CuDSSSparseSolver:
         return self._inertia
 
     def inertia_or_none(self) -> tuple[int, int, int] | None:
-        """Best-effort inertia; only populated under ``require_inertia``."""
+        """Best-effort LDLᵀ inertia of the current symmetric factor.
+
+        Parity with the Feral CPU adapter: inertia is a free by-product of the
+        symmetric factorization and the IPM's inertia-guided δ_w correction
+        depends on it, so it is reported even without ``require_inertia``. The
+        ``data_get`` is a host sync, so it runs lazily and at most once per
+        factor; a GENERAL (non-symmetric) factor has no defined inertia and
+        reports ``None``.
+        """
+        if self._inertia is not None:
+            return self._inertia
+        if (
+            self._inertia_read
+            or not self._symmetric_factor
+            or self._data is None
+            or self._device_id is None
+        ):
+            return None
+        self._inertia_read = True
+        with cupy.cuda.Device(self._device_id):
+            try:
+                self._inertia = self._read_inertia(self._n_factored)
+            except LinearSolveError:
+                self._inertia = None
         return self._inertia
 
     def _guard(self, fn: Any, *args: Any) -> Any:
@@ -667,6 +712,45 @@ class CuDSSSparseSolver:
         try:
             return fn(*args)
         except self._cudss.cuDSSError as exc:
+            raise LinearSolveError(f"cuDSS {fn.__name__} failed: {exc}") from exc
+
+    def _runtime_version(self) -> str:
+        """Best-effort ``major.minor.patch`` of the loaded cuDSS runtime."""
+        get_property = getattr(self._cudss, "get_property", None)
+        if get_property is None:
+            return "unknown"
+        try:
+            # libraryPropertyType: MAJOR_VERSION=0, MINOR_VERSION=1, PATCH_LEVEL=2.
+            return ".".join(str(int(get_property(i))) for i in (0, 1, 2))
+        except Exception:
+            return "unknown"
+
+    def _guard_create(self, fn: Any, *args: Any) -> Any:
+        """Like :meth:`_guard`, but for *matrix creation* calls.
+
+        Creation rejections (INVALID_VALUE / NOT_SUPPORTED) carry no numerical
+        content — the classic cause is a cuDSS runtime that does not match the
+        nvmath-python bindings (observed: cuDSS 0.8 under nvmath 0.9, which was
+        built against 0.7). They are raised as :class:`_CuDSSUnavailableError`
+        so the dispatching solver degrades to spsolve instead of feeding an
+        unfixable failure into the driver's regularization ladder.
+        """
+        assert self._cudss is not None
+        try:
+            return fn(*args)
+        except self._cudss.cuDSSError as exc:
+            status = getattr(exc, "status", None)
+            if status is not None and int(status) in (
+                _CUDSS_STATUS_INVALID_VALUE,
+                _CUDSS_STATUS_NOT_SUPPORTED,
+            ):
+                raise _CuDSSUnavailableError(
+                    f"cuDSS {fn.__name__} rejected its arguments ({exc}); the "
+                    f"loaded cuDSS runtime (version {self._runtime_version()}) "
+                    "likely does not match the version this nvmath-python "
+                    "release was built against — install the matching "
+                    "nvidia-cudss wheel"
+                ) from exc
             raise LinearSolveError(f"cuDSS {fn.__name__} failed: {exc}") from exc
 
     def _ensure_context(self, device_id: int) -> None:
@@ -823,8 +907,10 @@ class CuDSSSparseSolver:
         if self._dn_shape == (n, ncols) and self._rhs_matrix is not None:
             return
         self._destroy_dense()
-        self._b_buf = cupy.zeros((n, ncols), dtype=self._dtype)
-        self._x_buf = cupy.zeros((n, ncols), dtype=self._dtype)
+        # Fortran order to match the COL_MAJOR descriptors (cuDSS supports only
+        # column-major dense matrices; ROW_MAJOR returns NOT_SUPPORTED).
+        self._b_buf = cupy.zeros((n, ncols), dtype=self._dtype, order="F")
+        self._x_buf = cupy.zeros((n, ncols), dtype=self._dtype, order="F")
         self._rhs_matrix = self._create_dense_matrix(n, ncols, self._b_buf)
         self._sol_matrix = self._create_dense_matrix(n, ncols, self._x_buf)
         self._dn_shape = (n, ncols)
@@ -858,7 +944,7 @@ class CuDSSSparseSolver:
         # fits a signed 32-bit int, else int64).
         return cast(
             int,
-            self._guard(
+            self._guard_create(
                 cudss.matrix_create_csr,
                 int(matrix.shape[0]),
                 int(matrix.shape[1]),
@@ -879,16 +965,19 @@ class CuDSSSparseSolver:
         cudss = self._cudss
         if cudss is None:
             raise RuntimeError("cuDSS context was not initialized")
+        # cuDSS supports only column-major dense matrices (cudssMatrixCreateDn
+        # returns NOT_SUPPORTED for ROW_MAJOR), so ld is the row count and the
+        # backing buffers are allocated Fortran-order in _ensure_dense.
         return cast(
             int,
-            self._guard(
+            self._guard_create(
                 cudss.matrix_create_dn,
                 int(nrows),
                 int(ncols),
-                int(ncols),
+                int(nrows),
                 _ptr(values),
                 _value_type(values.dtype),
-                int(cudss.Layout.ROW_MAJOR),
+                int(cudss.Layout.COL_MAJOR),
             ),
         )
 
@@ -896,23 +985,35 @@ class CuDSSSparseSolver:
         cudss = self._cudss
         if cudss is None or self._handle is None or self._data is None:
             raise RuntimeError("cuDSS context was not initialized")
-        counts = (ctypes.c_int64 * 2)()
-        written = ctypes.c_size_t()
-        self._guard(
-            cudss.data_get,
-            self._handle,
-            self._data,
-            int(cudss.DataParam.INERTIA),
-            ctypes.addressof(counts),
-            ctypes.sizeof(counts),
-            ctypes.addressof(written),
-        )
-        pos = int(counts[0])
-        neg = int(counts[1])
-        zero = n - pos - neg
-        if pos < 0 or neg < 0 or zero < 0:
-            raise LinearSolveError("cuDSS returned an implausible inertia")
-        return pos, neg, zero
+        # cuDSS validates the output-buffer size exactly and (observed on 0.7)
+        # fills INERTIA as int32[2], rejecting an int64[2] buffer with
+        # INVALID_VALUE — so try the known layout first, then the widened one
+        # for runtimes that grow it.
+        last_error: LinearSolveError | None = None
+        for count_type in (ctypes.c_int32, ctypes.c_int64):
+            counts = (count_type * 2)()
+            written = ctypes.c_size_t()
+            try:
+                self._guard(
+                    cudss.data_get,
+                    self._handle,
+                    self._data,
+                    int(cudss.DataParam.INERTIA),
+                    ctypes.addressof(counts),
+                    ctypes.sizeof(counts),
+                    ctypes.addressof(written),
+                )
+            except LinearSolveError as exc:
+                last_error = exc
+                continue
+            pos = int(counts[0])
+            neg = int(counts[1])
+            zero = n - pos - neg
+            if pos < 0 or neg < 0 or zero < 0:
+                raise LinearSolveError("cuDSS returned an implausible inertia")
+            return pos, neg, zero
+        assert last_error is not None
+        raise last_error
 
     def _destroy_matrix(self) -> None:
         if self._cudss is not None and self._matrix is not None:
@@ -953,6 +1054,16 @@ class CuPySparseSolver:
                         "GPU sparse inertia requires a user-managed NVIDIA cuDSS "
                         "runtime compatible with the installed CUDA toolkit"
                     ) from exc
+                # Loud on purpose: spsolve re-factorizes from scratch on every
+                # solve (no symbolic reuse), typically orders of magnitude
+                # slower per IPM iteration — a silent downgrade here has cost
+                # real users long, unexplained runs.
+                warnings.warn(
+                    f"cuDSS is unavailable ({exc}); falling back to CuPy "
+                    "spsolve, which re-factorizes on every solve",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             else:
                 return
 
