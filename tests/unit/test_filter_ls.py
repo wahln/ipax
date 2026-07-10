@@ -75,6 +75,7 @@ def test_phi_decrease_still_accepted_at_feasible_point():
 
     assert result.accepted
     assert result.alpha == 1.0
+    assert result.n_trials == 1
 
 
 def test_switching_condition_survives_overflowing_directional_derivative():
@@ -116,6 +117,7 @@ def test_line_search_reports_accepted_soc_trial():
     assert result.accepted
     assert result.used_soc
     assert not result.restoration
+    assert result.n_trials == 1
 
 
 def test_theta_max_guard_rejects_exploding_infeasibility():
@@ -204,6 +206,9 @@ def test_search_backtracks_past_non_finite_gradient_region():
 
     assert result.accepted
     assert result.alpha == 0.25
+    # Trials at alpha = 1.0, 0.5, 0.25: the first two rejected on a non-finite
+    # gradient, the third accepted.
+    assert result.n_trials == 3
 
 
 def test_search_hands_off_to_restoration_when_gradient_never_finite():
@@ -225,3 +230,5 @@ def test_search_hands_off_to_restoration_when_gradient_never_finite():
 
     assert not result.accepted
     assert result.restoration
+    # Every halving of alpha down to alpha_min_frac counts as one trial.
+    assert result.n_trials > 1

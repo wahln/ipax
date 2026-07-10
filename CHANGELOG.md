@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **More informative progress logging.** The `verbose >= 1` (info) tier now
+  opens with a condensed one-line problem/solver headline before the result
+  summary — variable/bound counts, equality/inequality counts, the resolved
+  linear solver, and the resolved Hessian source (`format_setup`). The
+  `verbose >= 2` per-iteration table gains an `ls` column reporting the
+  number of backtracking trial step sizes the line search (filter or
+  Breedveld) evaluated to reach each row, and rows produced by a
+  feasibility-restoration jump are now tagged with a trailing `R`
+  (`IterationRecord.line_search_iters`/`.restored`, combinable with the
+  existing acceptable-iterate `*` tag).
 - **Sparse condensed normal-equations route**
   (`Options(linsolve="sparse", sparse=SparseOptions(kkt_route="normal_equations"))`).
   The condensed matrix ``N = W + Σ_x + δ_w I + ∇gᵀ Σ_s ∇g`` is assembled

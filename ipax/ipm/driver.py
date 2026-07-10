@@ -654,6 +654,13 @@ class IPMDriver:
         prev_eq_jac: LinearOperator | None = None
         problem_time_mark = self._problem_time_total
         last_step_solve_time = 0.0
+        # Line-search backtracking count and restoration marker, both computed
+        # at the tail of an iteration (once the search/restoration outcome is
+        # known) and surfaced on the *next* row — mirroring how
+        # ``last_step_solve_time`` reports the cost of the step that produced
+        # that row.
+        last_line_search_iters = 0
+        pending_restored = False
 
         def bound_gaps(x: Array) -> tuple[Array, Array]:
             x_minus_l = xp.where(mask_l, x - lower_safe, ones)
@@ -756,7 +763,10 @@ class IPMDriver:
                 complementarity=residuals.complementarity,
                 problem_time=record_problem_time,
                 step_solve_time=last_step_solve_time,
+                line_search_iters=last_line_search_iters,
+                restored=pending_restored,
             )
+            pending_restored = False
             if self._record_transform is not None:
                 record = self._record_transform(record)
             problem_time_mark = self._problem_time_total
@@ -1194,7 +1204,7 @@ class IPMDriver:
 
             used_soc = False
             if use_breedveld:
-                alpha_p, restoration = breedveld.search(
+                alpha_p, restoration, last_line_search_iters = breedveld.search(
                     alpha_max=alpha_p_max,
                     theta0=theta0,
                     phi0=phi0,
@@ -1217,6 +1227,7 @@ class IPMDriver:
                 alpha_p = result.alpha
                 restoration = result.restoration
                 used_soc = result.used_soc
+                last_line_search_iters = result.n_trials
                 if result.accepted and result.augment:
                     filt.augment(theta0, phi0)
 
@@ -1310,6 +1321,7 @@ class IPMDriver:
                             last_alpha = 0.0
                             prev_x = None
                             last_step_solve_time = self._step_solve_seconds
+                            pending_restored = True
                             continue
                         # The anchored probe itself reached a stationary point
                         # of the infeasibility: a certificate even when the
@@ -1354,6 +1366,7 @@ class IPMDriver:
                 # curvature pair would be meaningless — drop the history anchor.
                 prev_x = None
                 last_step_solve_time = self._step_solve_seconds
+                pending_restored = True
                 continue
 
             if used_soc and soc_primal is not None:

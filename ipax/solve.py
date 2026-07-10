@@ -31,6 +31,7 @@ from ipax._logging import (
     format_options,
     format_problem,
     format_result,
+    format_setup,
     format_solver,
     format_timing,
     logger,
@@ -299,8 +300,14 @@ def _log_setup(
     has_ineq: bool,
     has_eq: bool,
 ) -> None:
-    """Emit the problem/solver/options diagnostics (verbosity tiers 3–5)."""
-    if logger.isEnabledFor(PROBLEM):
+    """Emit the problem/solver/options diagnostics (verbosity tiers 1, 3–5).
+
+    ``RESULT`` (tier 1, ``verbose >= 1``) is the least restrictive tier that
+    needs the problem counts, so they are only evaluated (an extra constraint
+    callback each) when at least that tier is enabled — a silent/``verbose=0``
+    solve pays nothing extra.
+    """
+    if logger.isEnabledFor(RESULT):
         n_ineq = int(resolved.ineq_constraints(x0).shape[0]) if has_ineq else 0
         n_eq_nl = int(resolved.eq_constraints(x0).shape[0]) if has_eq else 0
         linear = resolved.linear_eq()
@@ -308,20 +315,45 @@ def _log_setup(
         n_lower = _count_finite(xp, lower)
         n_upper = _count_finite(xp, upper)
         logger.log(
-            PROBLEM,
-            format_problem(
+            RESULT,
+            format_setup(
                 n_vars=int(resolved.n_vars),
-                n_ineq=n_ineq,
-                n_eq_nonlinear=n_eq_nl,
-                n_eq_linear=n_eq_lin,
                 n_lower=n_lower,
                 n_upper=n_upper,
+                n_eq=n_eq_nl + n_eq_lin,
+                n_ineq=n_ineq,
+                linear_solver=_describe_solver(solver),
+                hessian=_hessian_source(resolved),
             ),
         )
+        if logger.isEnabledFor(PROBLEM):
+            logger.log(
+                PROBLEM,
+                format_problem(
+                    n_vars=int(resolved.n_vars),
+                    n_ineq=n_ineq,
+                    n_eq_nonlinear=n_eq_nl,
+                    n_eq_linear=n_eq_lin,
+                    n_lower=n_lower,
+                    n_upper=n_upper,
+                ),
+            )
     if logger.isEnabledFor(SOLVER):
         logger.log(SOLVER, format_solver(opts, type(solver).__name__))
     if logger.isEnabledFor(OPTIONS):
         logger.log(OPTIONS, format_options(opts))
+
+
+def _hessian_source(resolved: Problem) -> str:
+    """The resolved Hessian source (``"analytic"``/``"autodiff-hvp"``/``"lbfgs"``).
+
+    ``resolve()`` always attaches ``sources`` to the returned
+    :class:`~ipax.problem.derivatives.ResolvedProblem`, but the static type here
+    is the ``Problem`` ABC (which doesn't declare it) — mirrors the ``getattr``
+    fallback the driver uses for the same attribute.
+    """
+    sources = getattr(resolved, "sources", None)
+    return "unknown" if sources is None else str(sources.hessian)
 
 
 def _describe_solver(solver: object) -> str:

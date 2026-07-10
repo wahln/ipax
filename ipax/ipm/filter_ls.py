@@ -78,6 +78,7 @@ class LineSearchResult:
     augment: bool  # θ-type accepted steps augment the filter
     restoration: bool
     used_soc: bool = False
+    n_trials: int = 1  # number of backtracking trial step sizes evaluated
 
 
 class FilterLineSearch:
@@ -136,7 +137,9 @@ class FilterLineSearch:
         alpha = alpha_max
         alpha_min = o.alpha_min_frac
         first = True
+        trials = 0
         while alpha >= alpha_min:
+            trials += 1
             theta_t, phi_t = eval_point(alpha)
 
             # SOC on the first (full-ish) trial that worsens feasibility.
@@ -151,16 +154,20 @@ class FilterLineSearch:
                         # finiteness is checked inside ``soc`` (which returns None
                         # to reject a non-finite-derivative corrected trial).
                         switching = self._switching(dphi, alpha, theta0)
-                        return LineSearchResult(alpha, True, not switching, False, True)
+                        return LineSearchResult(
+                            alpha, True, not switching, False, True, trials
+                        )
             first = False
 
             if self._accept(
                 theta_t, phi_t, theta0, phi0, dphi, alpha, theta_max, entries
             ) and (grad_finite is None or grad_finite(alpha)):
                 switching = self._switching(dphi, alpha, theta0)
-                return LineSearchResult(alpha, True, not switching, False)
+                return LineSearchResult(
+                    alpha, True, not switching, False, n_trials=trials
+                )
             alpha *= 0.5
-        return LineSearchResult(alpha_min, False, False, True)
+        return LineSearchResult(alpha_min, False, False, True, n_trials=trials)
 
     def _switching(self, dphi: float, alpha: float, theta0: float) -> bool:
         o = self._o

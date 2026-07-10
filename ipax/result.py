@@ -92,6 +92,8 @@ class IterationRecord:
     dual_infeasibility: float = float("inf")
     primal_infeasibility: float = float("inf")
     complementarity: float = float("inf")
+    line_search_iters: int = 0  # backtracking trials in the search reaching this row
+    restored: bool = False  # this iterate is the result of a restoration jump
 
 
 @dataclass(frozen=True, slots=True)

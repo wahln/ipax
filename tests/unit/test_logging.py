@@ -15,6 +15,7 @@ from ipax._logging import (
     format_problem,
     format_record,
     format_result,
+    format_setup,
     format_solver,
     format_timing,
     logger,
@@ -103,6 +104,48 @@ def test_format_record_marks_acceptable_iterates():
     marked = format_record(record, acceptable=True)
     assert not plain.endswith("*")
     assert marked == f"{plain} *"
+
+
+def test_format_record_reports_line_search_trials():
+    record = IterationRecord(
+        3, 1.0, 1e-9, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.0, 0.0, line_search_iters=4
+    )
+    row = format_record(record)
+    assert "   4 " in row  # right-justified "ls" column
+
+
+def test_format_record_marks_restored_iterates():
+    record = IterationRecord(
+        3, 1.0, 1e-9, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.0, 0.0, restored=True
+    )
+    row = format_record(record)
+    assert row.rstrip().endswith("R")
+
+
+def test_format_record_combines_restored_and_acceptable_tags():
+    record = IterationRecord(
+        3, 1.0, 1e-9, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.0, 0.0, restored=True
+    )
+    row = format_record(record, acceptable=True)
+    assert row.rstrip().endswith("R *")
+
+
+def test_format_setup_reports_condensed_headline():
+    line = format_setup(
+        n_vars=120,
+        n_lower=45,
+        n_upper=30,
+        n_eq=12,
+        n_ineq=8,
+        linear_solver="dense (DenseSolver)",
+        hessian="lbfgs",
+    )
+    assert "120 variables" in line
+    assert "45 lower, 30 upper" in line
+    assert "12 equalities" in line
+    assert "8 inequalities" in line
+    assert "linear solver = dense (DenseSolver)" in line
+    assert "hessian = lbfgs" in line
 
 
 def test_format_result_reports_status_and_sources():
