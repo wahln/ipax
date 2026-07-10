@@ -29,6 +29,9 @@ _ADAPTER_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "ipax/problem/autodiff/jax.py": ("jax",),
     "ipax/backend/sparse/cupy.py": ("cupy",),
     "ipax/backend/sparse/numpy_scipy.py": ("numpy", "scipy"),
+    "ipax/backend/dense/cupy.py": ("cupy",),
+    "ipax/backend/dense/numpy_scipy.py": ("numpy", "scipy"),
+    "ipax/backend/dense/torch.py": ("torch",),
 }
 
 
