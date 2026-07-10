@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from ipax.backend.operators import Dense, Diagonal
+from ipax.backend.namespace import array_namespace
+from ipax.backend.operators import Dense, Diagonal, LinearOperator
 from ipax.ipm.hessian import LBFGSOperator
 from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
 from ipax.linalg.regularize import RegularizationState
@@ -122,6 +123,74 @@ def test_condensed_dense_matrix_matches_materialized(namespace, tol):
     actual = op.dense_matrix()
     expected = op.matmat(namespace.eye(2, dtype=W_dense.dtype))
 
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_condensed_dense_matrix_matches_with_sparse_jacobian(namespace, tol):
+    """A sparse inequality Jacobian's condensed block equals the matvec form.
+
+    The condensed dense route forms ``∇gᵀ Σ_s ∇g`` through the operator's sparse
+    ``gram`` (no ``m×n`` densification) for a sparse Jacobian; the result must
+    still agree with the matrix-free ``matmat`` assembly, which never touches the
+    ``gram`` path.
+    """
+    from ipax.backend.operators import COOOperator
+    from ipax.backend.sparse import get_sparse_adapter
+
+    if get_sparse_adapter(namespace) is None:
+        pytest.skip(f"no sparse adapter for backend {namespace.__name__!r}")
+
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    # Sparse J = [[1, 2], [-1, 0.5]] as COO triplets.
+    J = COOOperator(
+        namespace.asarray([0, 0, 1, 1]),
+        namespace.asarray([0, 1, 0, 1]),
+        array(namespace, [1.0, 2.0, -1.0, 0.5]),
+        (2, 2),
+    )
+    op = build_condensed_operator(
+        Dense(W_dense), sigma_x, sigma_s, J, RegularizationState(delta_w=1e-6)
+    )
+
+    actual = op.dense_matrix()
+    expected = op.matmat(namespace.eye(2, dtype=W_dense.dtype))
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_condensed_dense_matrix_never_densifies_sparse_jacobian(namespace, tol):
+    """The condensed block must form ∇gᵀ Σ_s ∇g via ``gram``, not by densifying ∇g.
+
+    A ``dense_matrix`` on the ``m×n`` Jacobian is exactly the gigabytes-scale
+    materialization the sparse Gram path exists to avoid, so a Jacobian whose
+    ``dense_matrix`` raises must still yield the correct condensed block.
+    """
+    from ipax.backend.operators import COOOperator
+    from ipax.backend.sparse import get_sparse_adapter
+
+    if get_sparse_adapter(namespace) is None:
+        pytest.skip(f"no sparse adapter for backend {namespace.__name__!r}")
+
+    class _GramOnlyJacobian(COOOperator):
+        def dense_matrix(self, like=None):
+            raise AssertionError("condensed block must not densify the m×n Jacobian")
+
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    J = _GramOnlyJacobian(
+        namespace.asarray([0, 0, 1, 1]),
+        namespace.asarray([0, 1, 0, 1]),
+        array(namespace, [1.0, 2.0, -1.0, 0.5]),
+        (2, 2),
+    )
+    op = build_condensed_operator(
+        Dense(W_dense), sigma_x, sigma_s, J, RegularizationState(delta_w=1e-6)
+    )
+
+    actual = op.dense_matrix()  # must not raise (gram path, no densification)
+    expected = op.matmat(namespace.eye(2, dtype=W_dense.dtype))
     assert_allclose(namespace, actual, expected, **tol)
 
 
@@ -648,6 +717,228 @@ def test_saddle_approximate_schur_falls_back_to_identity_dual(namespace, tol):
     saddle = build_saddle_operator(condensed, mf_eq, 0.1)
     dual = saddle._approximate_schur_diagonal(condensed.diagonal())
     assert_allclose(namespace, dual, array(namespace, [1.0]), **tol)
+
+
+# --- augmented dense route (Friedlander & Orban 2012 bordered system) -------
+
+
+def test_condensed_logical_dense_block_excludes_inequality_gram(namespace, tol):
+    """``logical_dense_block`` is W + Sigma_x + delta_w*I, with no Gram term."""
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    jac = Dense(array(namespace, [[1.0, 2.0], [-1.0, 0.5]]))
+    op = build_condensed_operator(
+        Dense(W_dense), sigma_x, sigma_s, jac, RegularizationState(delta_w=1e-6)
+    )
+
+    actual = op.logical_dense_block()
+    expected = (
+        W_dense
+        + namespace.asarray([[0.25, 0.0], [0.0, 0.75]], dtype=W_dense.dtype)
+        + 1e-6 * namespace.eye(2, dtype=W_dense.dtype)
+    )
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_inequality_border_dense_matches_jacobian_and_sigma_s(namespace, tol):
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    jac_dense = array(namespace, [[1.0, 2.0], [-1.0, 0.5]])
+    op = build_condensed_operator(
+        Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        Diagonal(array(namespace, [0.25, 0.75])),
+        sigma_s,
+        Dense(jac_dense),
+        RegularizationState(),
+    )
+
+    border = op.inequality_border_dense()
+    assert border is not None
+    jac, neg_inv_sigma_s = border
+    assert_allclose(namespace, jac, jac_dense, **tol)
+    assert_allclose(namespace, neg_inv_sigma_s, array(namespace, [-0.5, -2.0]), **tol)
+
+
+def test_inequality_border_dense_none_without_inequalities(namespace):
+    empty_sigma_s, empty_jac = _empty_ineq(namespace)
+    op = build_condensed_operator(
+        Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        Diagonal(array(namespace, [0.25, 0.75])),
+        empty_sigma_s,
+        empty_jac,
+        RegularizationState(),
+    )
+    assert op.inequality_border_dense() is None
+
+
+def test_condensed_augmented_dense_matrix_matches_bordered_formula(namespace, tol):
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    jac_dense = array(namespace, [[1.0, 2.0], [-1.0, 0.5]])
+    op = build_condensed_operator(
+        Dense(W_dense),
+        sigma_x,
+        sigma_s,
+        Dense(jac_dense),
+        RegularizationState(delta_w=1e-6),
+    )
+
+    actual = op.augmented_dense_matrix()
+
+    primal = (
+        W_dense
+        + namespace.asarray([[0.25, 0.0], [0.0, 0.75]], dtype=W_dense.dtype)
+        + 1e-6 * namespace.eye(2, dtype=W_dense.dtype)
+    )
+    e_block = namespace.asarray([[-0.5, 0.0], [0.0, -2.0]], dtype=W_dense.dtype)
+    top = namespace.concat((primal, transpose(namespace, jac_dense)), axis=1)
+    bottom = namespace.concat((jac_dense, e_block), axis=1)
+    expected = namespace.concat((top, bottom), axis=0)
+
+    assert actual.shape == (4, 4)
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_condensed_augmented_dense_matrix_without_inequalities(namespace, tol):
+    """No inequalities: the augmented route has no border to add."""
+    empty_sigma_s, empty_jac = _empty_ineq(namespace)
+    op = build_condensed_operator(
+        Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        Diagonal(array(namespace, [0.25, 0.75])),
+        empty_sigma_s,
+        empty_jac,
+        RegularizationState(delta_w=1e-6),
+    )
+    assert_allclose(namespace, op.augmented_dense_matrix(), op.dense_matrix(), **tol)
+
+
+class _MatmatOnlyJacobian(LinearOperator):
+    """A Jacobian exposing only matvec/matmat, no ``dense_matrix`` override.
+
+    Mirrors ``ipax.problem.scaling._RowScaled`` (the operator a scaled
+    problem's inequality Jacobian actually is by default, since scaling is
+    on by default) — the augmented route must still materialize it.
+    """
+
+    def __init__(self, matrix):
+        self._matrix = matrix
+
+    @property
+    def shape(self):
+        return int(self._matrix.shape[0]), int(self._matrix.shape[1])
+
+    def matvec(self, v):
+        xp = array_namespace(self._matrix, v)
+        return xp.matmul(self._matrix, v)
+
+    def rmatvec(self, v):
+        xp = array_namespace(self._matrix, v)
+        return xp.matmul(transpose(xp, self._matrix), v)
+
+    def matmat(self, V):
+        xp = array_namespace(self._matrix, V)
+        return xp.matmul(self._matrix, V)
+
+
+def test_inequality_border_dense_falls_back_to_matmat_probe(namespace, tol):
+    """A Jacobian without ``dense_matrix`` (e.g. scaling's ``_RowScaled``) must
+    still materialize via a matmat identity probe, not silently fail."""
+    jac_dense = array(namespace, [[1.0, 2.0], [-1.0, 0.5]])
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    op = build_condensed_operator(
+        Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        Diagonal(array(namespace, [0.25, 0.75])),
+        sigma_s,
+        _MatmatOnlyJacobian(jac_dense),
+        RegularizationState(),
+    )
+
+    border = op.inequality_border_dense()
+    assert border is not None
+    jac, neg_inv_sigma_s = border
+    assert_allclose(namespace, jac, jac_dense, **tol)
+    assert_allclose(namespace, neg_inv_sigma_s, array(namespace, [-0.5, -2.0]), **tol)
+
+
+def test_condensed_augmented_dense_matrix_raises_for_low_rank_hessian(namespace):
+    """L-BFGS (PD by Powell damping already) has nothing to gain: falls back."""
+    W = _lbfgs_operator(namespace)
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    empty_sigma_s, empty_jac = (
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype)),
+    )
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+    with pytest.raises(NotImplementedError):
+        op.augmented_dense_matrix()
+
+
+def test_saddle_augmented_dense_matrix_matches_bordered_formula(namespace, tol):
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    jac_dense = array(namespace, [[1.0, 2.0], [-1.0, 0.5]])
+    condensed = build_condensed_operator(
+        Dense(W_dense),
+        sigma_x,
+        sigma_s,
+        Dense(jac_dense),
+        RegularizationState(delta_w=1e-6),
+    )
+    eq_dense = array(namespace, [[1.0, 1.0]])
+    saddle = build_saddle_operator(condensed, Dense(eq_dense), delta_c=1e-4)
+
+    actual = saddle.augmented_dense_matrix()
+
+    primal = (
+        W_dense
+        + namespace.asarray([[0.25, 0.0], [0.0, 0.75]], dtype=W_dense.dtype)
+        + 1e-6 * namespace.eye(2, dtype=W_dense.dtype)
+    )
+    # Layout: [primal (n=2) | equality dual (m_eq=1) | inequality border (m_ineq=2)].
+    dtype = W_dense.dtype
+    core_top = namespace.concat((primal, transpose(namespace, eq_dense)), axis=1)
+    core_bottom = namespace.concat(
+        (eq_dense, -1e-4 * namespace.eye(1, dtype=dtype)), axis=1
+    )
+    core = namespace.concat((core_top, core_bottom), axis=0)  # (3, 3)
+
+    conn = namespace.concat(
+        (jac_dense, namespace.zeros((2, 1), dtype=dtype)), axis=1
+    )  # (2, 3): touches only the primal columns
+    e_block = namespace.asarray([[-0.5, 0.0], [0.0, -2.0]], dtype=dtype)
+    top = namespace.concat((core, transpose(namespace, conn)), axis=1)
+    bottom = namespace.concat((conn, e_block), axis=1)
+    expected = namespace.concat((top, bottom), axis=0)
+
+    assert actual.shape == (5, 5)
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_saddle_augmented_dense_matrix_without_inequalities_matches_dense_matrix(
+    namespace, tol
+):
+    condensed = _diagonal_condensed(namespace)
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, 1.0]])), 1e-4
+    )
+    assert_allclose(
+        namespace, saddle.augmented_dense_matrix(), saddle.dense_matrix(), **tol
+    )
+
+
+def test_saddle_augmented_dense_matrix_raises_when_condensed_lacks_support(namespace):
+    """A condensed block without ``logical_dense_block`` (e.g. plain Dense) falls back."""
+    saddle = build_saddle_operator(
+        Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        Dense(array(namespace, [[1.0, 1.0]])),
+        1e-8,
+    )
+    with pytest.raises(NotImplementedError):
+        saddle.augmented_dense_matrix()
 
 
 def test_saddle_block_preconditioner_without_equalities(namespace, tol):

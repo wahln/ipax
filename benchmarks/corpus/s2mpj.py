@@ -16,10 +16,12 @@ performance work (use the synthetic RT generator / TROTS surrogate there).
 
 S2MPJ's generic ``evalgrsum`` evaluation loop is interpretive (per-element
 ``eval()`` dispatch, ``lil_matrix`` row assembly) and dominates sweep wall-time,
-so the bridge routes ``fx/fgx/cx/cJx`` through the **precompiled evaluator** in
-:mod:`benchmarks.corpus._s2mpj_fast` whenever it verifies against the original
-methods at build time (else it falls back to the originals — see that module's
-docstring for the mechanism and measured speedups).
+so the bridge routes ``fx/fgx/cx/cJx`` — and the exact-Hessian ``LgHxy`` —
+through the **precompiled evaluator** in :mod:`benchmarks.corpus._s2mpj_fast`
+whenever it verifies against the original methods at build time (else it falls
+back to the originals; the Hessian is gated by its own verification, so it can
+fall back alone — see that module's docstring for the mechanism and measured
+speedups).
 
 S2MPJ has no license file, so its files are **not vendored**. Point
 ``IPAX_S2MPJ_DIR`` (or the ``directory`` argument) at a local checkout; the loader
@@ -146,6 +148,12 @@ class _S2MPJProblem(Problem):
         self._cx_val: Any = None
         self._cJx_key: bytes | None = None
         self._cJx_val: Any = None
+        # Same-point memo for (f, ∇f): the driver requests the gradient right
+        # after accepting a point whose objective the line search just computed
+        # (and fgx returns both), so one evaluation serves both calls.
+        self._fgx_key: bytes | None = None
+        self._fgx_f: float = 0.0
+        self._fgx_g: Any = None
 
         # ``clower``/``cupper`` exist only when the problem has constraints.
         clower_attr = getattr(instance, "clower", None)
@@ -167,6 +175,26 @@ class _S2MPJProblem(Problem):
             empty_f = np.zeros((0,), dtype=float)
             self._eq_idx = self._lo_idx = self._up_idx = empty_i
             self._eq_rhs = self._lo_rhs = self._up_rhs = empty_f
+
+        # Signed row selectors, built once: ``P @ J`` replaces per-call fancy
+        # row-slicing + vstack when splitting the bundled Jacobian into the
+        # eq/ineq blocks (lower rows carry −1: their lowering is ``clower − c``).
+        import scipy.sparse as sp
+
+        n_eq, n_lo, n_up = len(self._eq_idx), len(self._lo_idx), len(self._up_idx)
+        self._P_eq = sp.csr_matrix(
+            (np.ones(n_eq), (np.arange(n_eq), self._eq_idx)), shape=(n_eq, m)
+        )
+        self._P_ineq = sp.csr_matrix(
+            (
+                np.concatenate((-np.ones(n_lo), np.ones(n_up))),
+                (
+                    np.arange(n_lo + n_up),
+                    np.concatenate((self._lo_idx, self._up_idx)),
+                ),
+            ),
+            shape=(n_lo + n_up, m),
+        )
 
         lower_attr = getattr(instance, "xlower", None)
         upper_attr = getattr(instance, "xupper", None)
@@ -201,6 +229,13 @@ class _S2MPJProblem(Problem):
     def _eval_cJx(self, x_np: Any) -> Any:
         return (self._fast or self._inst).cJx(x_np)
 
+    def _eval_lghxy(self, x_col: Any, y_col: Any) -> Any:
+        # The Hessian fast path is gated by its own verification flag: a
+        # Hessian-only mismatch keeps the fast fx/cx while LgHxy falls back.
+        if self._fast is not None and self._fast.lghxy_ok:
+            return self._fast.LgHxy(x_col, y_col)
+        return self._inst.LgHxy(x_col, y_col)
+
     def objective(self, x: Array) -> Scalar:
         import numpy as np
 
@@ -212,8 +247,11 @@ class _S2MPJProblem(Problem):
         # the trial rather than crashing. Also return an xp float64 0-d (not a
         # Python float) so the value keeps the backend dtype — a Python float
         # re-cast via ``xp.asarray`` would silently drop to float32 on Torch.
+        x_np = _to_numpy(x)
+        if self._fgx_key is not None and x_np.tobytes() == self._fgx_key:
+            return _from_numpy(self.xp, np.asarray(self._fgx_f))
         try:
-            val = np.asarray(self._eval_fx(_to_numpy(x)))
+            val = np.asarray(self._eval_fx(x_np))
         except (OverflowError, FloatingPointError):
             val = np.asarray(np.inf)
         return _from_numpy(self.xp, val)
@@ -223,12 +261,17 @@ class _S2MPJProblem(Problem):
 
         if self._no_objective:  # constant objective ⇒ zero gradient
             return _from_numpy(self.xp, np.zeros((self._n,)))
-        try:
-            _f, g = self._eval_fgx(_to_numpy(x))
-            g = np.reshape(g, (-1,))
-        except (OverflowError, FloatingPointError):
-            g = np.full((self._n,), np.inf)
-        return _from_numpy(self.xp, g)
+        x_np = _to_numpy(x)
+        key = x_np.tobytes()
+        if key != self._fgx_key:
+            try:
+                f, g = self._eval_fgx(x_np)
+            except (OverflowError, FloatingPointError):
+                return _from_numpy(self.xp, np.full((self._n,), np.inf))
+            self._fgx_key = key
+            self._fgx_f = float(np.asarray(f).reshape(-1)[0])
+            self._fgx_g = np.reshape(np.asarray(g, dtype=float), (-1,))
+        return _from_numpy(self.xp, self._fgx_g)
 
     # -- shared per-point constraint value / Jacobian (memoized) -----------
     def _cx(self, x_np: Any) -> Any:
@@ -269,9 +312,10 @@ class _S2MPJProblem(Problem):
         if self._eq_idx.shape[0] == 0:
             raise NotImplementedError
         _c, jac = self._cJx(_to_numpy(x))
+        rows = self._P_eq @ jac.tocsr()
         if self._sparse:
-            return self._sparse_op(jac.tocsr()[self._eq_idx, :])
-        return _from_numpy(self.xp, jac.toarray()[self._eq_idx, :])
+            return self._sparse_op(rows)
+        return _from_numpy(self.xp, rows.toarray())
 
     # -- inequalities (lowered finite sides of the two-sided ranges) -------
     def ineq_constraints(self, x: Array) -> Array:
@@ -287,22 +331,13 @@ class _S2MPJProblem(Problem):
     def ineq_jacobian(self, x: Array) -> Array | LinearOperator:
         if self._lo_idx.shape[0] == 0 and self._up_idx.shape[0] == 0:
             raise NotImplementedError
-        import numpy as np
-
         _c, jac = self._cJx(_to_numpy(x))
         # Lower side ``clower − c`` contributes ``−∇c``; upper side ``c − cupper``
-        # contributes ``+∇c`` (matches the constraint-value lowering above).
+        # contributes ``+∇c`` — both encoded in the signed selector.
+        rows = self._P_ineq @ jac.tocsr()
         if self._sparse:
-            import scipy.sparse as sp
-
-            jcsr = jac.tocsr()
-            rows = sp.vstack((-jcsr[self._lo_idx, :], jcsr[self._up_idx, :]))
             return self._sparse_op(rows)
-        dense = jac.toarray()
-        rows_d = np.concatenate(
-            (-dense[self._lo_idx, :], dense[self._up_idx, :]), axis=0
-        )
-        return _from_numpy(self.xp, rows_d)
+        return _from_numpy(self.xp, rows.toarray())
 
     # -- shared Hessian helpers (used by the exact subclass) ---------------
     def _sparse_op(self, matrix: Any) -> LinearOperator:
@@ -346,9 +381,9 @@ class _S2MPJProblem(Problem):
         common ``σ > 0`` case (gradient-based scaling passes ``σ = s_f`` through
         the scaling wrapper) the identity ``σ∇²f + Σ Y∇²c = σ·(∇²f + Σ(Y/σ)∇²c)``
         folds the objective scaling into the multipliers, so one ``LgHxy`` call
-        suffices — ``LgHxy`` costs a full interpretive Hessian assembly, so the
-        old two-call ``(σ−1)∇²f`` correction doubled the exact-Hessian bridge
-        cost. ``σ ≤ 0`` keeps the general two-call form.
+        suffices — ``LgHxy`` costs a full Hessian assembly (fast or original),
+        so the old two-call ``(σ−1)∇²f`` correction doubled the exact-Hessian
+        bridge cost. ``σ ≤ 0`` keeps the general two-call form.
         """
         import numpy as np
 
@@ -356,13 +391,13 @@ class _S2MPJProblem(Problem):
         xcol = np.reshape(_to_numpy(x), (-1, 1))
         Y = self._s2mpj_multipliers(y_eq, y_ineq)
         if s == 1.0:
-            _lval, _grad, hess = self._inst.LgHxy(xcol, np.reshape(Y, (-1, 1)))
+            _lval, _grad, hess = self._eval_lghxy(xcol, np.reshape(Y, (-1, 1)))
         elif s > 0.0:
-            _lval, _grad, hess = self._inst.LgHxy(xcol, np.reshape(Y / s, (-1, 1)))
+            _lval, _grad, hess = self._eval_lghxy(xcol, np.reshape(Y / s, (-1, 1)))
             hess = s * hess
         else:
-            _lval, _grad, hess = self._inst.LgHxy(xcol, np.reshape(Y, (-1, 1)))
-            _l0, _g0, hess_f = self._inst.LgHxy(xcol, np.zeros((self._m, 1)))
+            _lval, _grad, hess = self._eval_lghxy(xcol, np.reshape(Y, (-1, 1)))
+            _l0, _g0, hess_f = self._eval_lghxy(xcol, np.zeros((self._m, 1)))
             hess = hess + (s - 1.0) * hess_f
         return hess
 

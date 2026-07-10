@@ -11,7 +11,7 @@ from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
 from ipax.linalg.dense import DenseSolver
 from ipax.linalg.regularize import RegularizationState
 from ipax.linalg.solver import LinearSolveError
-from ipax.options import LBFGSOptions
+from ipax.options import DenseOptions, LBFGSOptions
 from tests._helpers import array, assert_allclose
 
 
@@ -325,3 +325,357 @@ def test_dense_solver_wraps_matmat_probe_failure(namespace):
     solver.factor(_MatmatBoom())
     with pytest.raises(LinearSolveError, match="materialization failed"):
         solver.solve(array(namespace, [1.0, 2.0]))
+
+
+# --- augmented dense route (DenseOptions(kkt_route="augmented")) -----------
+
+
+def _condensed_with_inequalities(namespace, *, delta_w=1e-6):
+    W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    jac = Dense(array(namespace, [[1.0, 2.0], [-1.0, 0.5]]))
+    return build_condensed_operator(
+        Dense(W_dense), sigma_x, sigma_s, jac, RegularizationState(delta_w=delta_w)
+    )
+
+
+def test_dense_solver_augmented_route_matches_condensed_solution(namespace, tol):
+    op = _condensed_with_inequalities(namespace)
+    rhs = array(namespace, [1.0, -2.0])
+
+    augmented_solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    augmented_solver.factor(op)
+    actual = augmented_solver.solve(rhs)
+
+    condensed_solver = DenseSolver()
+    condensed_solver.factor(op)
+    expected = condensed_solver.solve(rhs)
+
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_dense_solver_augmented_route_reports_inertia_matching_expected(namespace):
+    op = _condensed_with_inequalities(namespace)
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    solver.factor(op)
+    solver.solve(array(namespace, [1.0, -2.0]))
+
+    assert solver.inertia_or_none() == op.expected_inertia()
+
+
+def test_dense_solver_augmented_route_reuses_factorization_across_solves(namespace):
+    op = _condensed_with_inequalities(namespace)
+
+    calls = {"n": 0}
+    original = type(op).augmented_dense_matrix
+
+    def counting(self, like=None):
+        calls["n"] += 1
+        return original(self, like)
+
+    op.augmented_dense_matrix = counting.__get__(op, type(op))
+
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    solver.factor(op)
+    solver.solve(array(namespace, [1.0, -2.0]))
+    solver.solve(array(namespace, [0.5, 1.5]))
+
+    assert calls["n"] == 1
+
+
+def test_dense_solver_augmented_route_falls_back_for_lbfgs(namespace, tol):
+    # An L-BFGS condensed block's augmented_dense_matrix() raises
+    # NotImplementedError, so the solver falls back to the condensed route
+    # silently and still solves correctly.
+    W = LBFGSOperator(2, LBFGSOptions(memory=5))
+    W.update(array(namespace, [1.0, 0.5]), array(namespace, [2.0, 1.0]))
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    jac = Dense(array(namespace, [[1.0, 2.0], [-1.0, 0.5]]))
+    op = build_condensed_operator(
+        W, sigma_x, sigma_s, jac, RegularizationState(delta_w=1e-6)
+    )
+    rhs = array(namespace, [1.0, -2.0])
+
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    solver.factor(op)
+    actual = solver.solve(rhs)
+
+    expected = namespace.linalg.solve(op.matmat(namespace.eye(2, dtype=rhs.dtype)), rhs)
+    assert_allclose(namespace, actual, expected, **tol)
+    assert solver.inertia_or_none() is None
+
+
+def test_dense_solver_augmented_route_falls_back_for_plain_operator(namespace, tol):
+    # A plain Dense operator has no augmented_dense_matrix at all.
+    op = Dense(array(namespace, [[2.0, 0.0], [0.0, 3.0]]))
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    solver.factor(op)
+
+    actual = solver.solve(array(namespace, [2.0, 3.0]))
+
+    assert_allclose(namespace, actual, array(namespace, [1.0, 1.0]), **tol)
+    assert solver.inertia_or_none() is None
+
+
+def test_dense_solver_augmented_route_uses_eigh_fallback_without_backend_adapter(
+    namespace, tol, monkeypatch
+):
+    import ipax.backend.dense as dense_backend
+
+    monkeypatch.setattr(
+        dense_backend, "get_dense_symmetric_indefinite_adapter", lambda xp: None
+    )
+    op = _condensed_with_inequalities(namespace)
+    rhs = array(namespace, [1.0, -2.0])
+
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    solver.factor(op)
+    actual = solver.solve(rhs)
+
+    condensed_solver = DenseSolver()
+    condensed_solver.factor(op)
+    expected = condensed_solver.solve(rhs)
+
+    assert_allclose(namespace, actual, expected, **tol)
+    assert solver.inertia_or_none() == op.expected_inertia()
+
+
+def test_dense_solver_augmented_route_reuses_adapter_across_factor_calls(
+    namespace, monkeypatch
+):
+    # A GPU adapter (e.g. a persistent cuSOLVER handle) must not be re-created
+    # every Newton iteration: the lookup happens once per DenseSolver instance
+    # and the adapter object itself is reused across factor() calls.
+    import ipax.backend.dense as dense_backend
+
+    calls = {"n": 0}
+    original_lookup = dense_backend.get_dense_symmetric_indefinite_adapter
+
+    def counting_lookup(xp):
+        calls["n"] += 1
+        return original_lookup(xp)
+
+    monkeypatch.setattr(
+        dense_backend, "get_dense_symmetric_indefinite_adapter", counting_lookup
+    )
+
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    for _ in range(3):
+        op = _condensed_with_inequalities(namespace)
+        solver.factor(op)
+        solver.solve(array(namespace, [1.0, -2.0]))
+
+    assert calls["n"] == 1
+
+
+def test_dense_solver_describe_reflects_augmented_route(namespace):
+    op = _condensed_with_inequalities(namespace)
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    solver.factor(op)
+    solver.solve(array(namespace, [1.0, -2.0]))
+    assert "augmented" in solver.describe()
+
+    plain_solver = DenseSolver()
+    plain_solver.factor(op)
+    plain_solver.solve(array(namespace, [1.0, -2.0]))
+    assert "augmented" not in plain_solver.describe()
+
+
+def test_dense_solver_default_kkt_route_matches_no_arg_construction(namespace, tol):
+    op = _condensed_with_inequalities(namespace)
+    rhs = array(namespace, [1.0, -2.0])
+
+    default_options_solver = DenseSolver(DenseOptions())
+    default_options_solver.factor(op)
+    actual = default_options_solver.solve(rhs)
+
+    no_arg_solver = DenseSolver()
+    no_arg_solver.factor(op)
+    expected = no_arg_solver.solve(rhs)
+
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_dense_solver_augmented_route_guards_oversized_border(namespace, tol):
+    # With m inequality rows the augmented matrix is (n + m)². When that exceeds
+    # DenseOptions.augmented_max_size the solver must fall back to the condensed
+    # route *without materializing the bordered matrix* (m ≫ n would otherwise
+    # allocate gigabytes), so inertia stays unavailable and the solution matches.
+    op = _condensed_with_inequalities(namespace)  # n=2, m_ineq=2 → assembled 4
+
+    calls = {"n": 0}
+    original = type(op).augmented_dense_matrix
+
+    def counting(self, like=None):
+        calls["n"] += 1
+        return original(self, like)
+
+    op.augmented_dense_matrix = counting.__get__(op, type(op))
+
+    solver = DenseSolver(DenseOptions(kkt_route="augmented", augmented_max_size=3))
+    solver.factor(op)
+    rhs = array(namespace, [1.0, -2.0])
+    actual = solver.solve(rhs)
+
+    condensed_solver = DenseSolver()
+    condensed_solver.factor(op)
+    expected = condensed_solver.solve(rhs)
+
+    assert calls["n"] == 0
+    assert solver.inertia_or_none() is None
+    assert_allclose(namespace, actual, expected, **tol)
+
+
+def test_condensed_and_saddle_expose_augmented_assembled_size(namespace):
+    op = _condensed_with_inequalities(namespace)
+    assert op.augmented_assembled_size() == 4  # n=2 + m_ineq=2
+
+    eq_jac = Dense(array(namespace, [[1.0, 1.0]]))
+    saddle = build_saddle_operator(op, eq_jac, 1e-8)
+    assert saddle.augmented_assembled_size() == 5  # n=2 + m_eq=1 + m_ineq=2
+
+
+# --- argument validation and factorization-state errors ---------------------
+
+
+def test_dense_solver_rejects_non_square_operator(namespace):
+    dtype = array(namespace, [0.0]).dtype
+    with pytest.raises(ValueError, match="square"):
+        DenseSolver().factor(Dense(namespace.zeros((3, 2), dtype=dtype)))
+
+
+def test_dense_solver_requires_factor_before_solve(namespace):
+    with pytest.raises(RuntimeError, match="factor"):
+        DenseSolver().solve(array(namespace, [1.0, 2.0]))
+
+
+def test_dense_solver_rejects_rhs_length_mismatch(namespace):
+    solver = DenseSolver()
+    solver.factor(Dense(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
+    with pytest.raises(ValueError, match="does not match"):
+        solver.solve(array(namespace, [1.0, 2.0, 3.0]))
+
+
+def test_eigenvalue_inertia_of_empty_spectrum_is_all_zero(namespace):
+    from ipax.linalg.dense import _eigenvalue_inertia
+
+    dtype = array(namespace, [0.0]).dtype
+    assert _eigenvalue_inertia(namespace.zeros((0,), dtype=dtype), namespace) == (
+        0,
+        0,
+        0,
+    )
+
+
+# --- augmented-route failure classification ---------------------------------
+
+
+def test_dense_solver_augmented_route_wraps_materialization_failure(namespace):
+    class _AugmentedBoom(Dense):
+        def augmented_dense_matrix(self, like=None):
+            raise RuntimeError("assembly blew up")
+
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    solver.factor(_AugmentedBoom(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
+    with pytest.raises(LinearSolveError, match="materialization failed"):
+        solver.solve(array(namespace, [1.0, 2.0]))
+
+
+def test_dense_solver_augmented_route_falls_to_eigh_when_adapter_lacks_inertia(
+    namespace, tol, monkeypatch
+):
+    # An adapter that factors but reports no inertia must not be trusted for the
+    # augmented solve: the solver stays honest and uses the eigh path instead.
+    import ipax.backend.dense as dense_backend
+
+    class _NoInertiaAdapter:
+        def factor(self, matrix):
+            del matrix
+
+        def inertia_or_none(self):
+            return None
+
+        def solve(self, rhs):  # pragma: no cover - must not be reached
+            raise AssertionError("inertia-less adapter must not be used to solve")
+
+    monkeypatch.setattr(
+        dense_backend,
+        "get_dense_symmetric_indefinite_adapter",
+        lambda xp: _NoInertiaAdapter(),
+    )
+    op = _condensed_with_inequalities(namespace)
+    rhs = array(namespace, [1.0, -2.0])
+
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    solver.factor(op)
+    actual = solver.solve(rhs)
+
+    condensed_solver = DenseSolver()
+    condensed_solver.factor(op)
+    assert_allclose(namespace, actual, condensed_solver.solve(rhs), **tol)
+    assert solver.inertia_or_none() == op.expected_inertia()
+
+
+def test_dense_solver_augmented_route_wraps_adapter_solve_failure(
+    namespace, monkeypatch
+):
+    import ipax.backend.dense as dense_backend
+
+    class _SolveBoomAdapter:
+        def factor(self, matrix):
+            self._n = int(matrix.shape[0])
+
+        def inertia_or_none(self):
+            return (2, 2, 0)
+
+        def solve(self, rhs):
+            raise RuntimeError("backend blew up")
+
+    monkeypatch.setattr(
+        dense_backend,
+        "get_dense_symmetric_indefinite_adapter",
+        lambda xp: _SolveBoomAdapter(),
+    )
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    solver.factor(_condensed_with_inequalities(namespace))
+    with pytest.raises(LinearSolveError, match="LDL"):
+        solver.solve(array(namespace, [1.0, -2.0]))
+
+
+def test_dense_solver_augmented_route_rejects_singular_block(namespace, monkeypatch):
+    # W = −Σ_x with δ_w = 0 and no inequality border makes the augmented matrix
+    # exactly zero; the eigh path must classify it instead of dividing by 0.
+    import ipax.backend.dense as dense_backend
+
+    monkeypatch.setattr(
+        dense_backend, "get_dense_symmetric_indefinite_adapter", lambda xp: None
+    )
+    op = _condensed(namespace, array(namespace, [[0.0, 0.0], [0.0, 0.0]]))
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    solver.factor(op)
+    with pytest.raises(LinearSolveError, match="singular"):
+        solver.solve(array(namespace, [1.0, 2.0]))
+
+
+def test_dense_solver_augmented_eigh_route_accepts_matrix_rhs(
+    namespace, tol, monkeypatch
+):
+    # A matrix right-hand side exercises the 2-D border padding and the
+    # column-wise eigenvalue division of the eigh fallback.
+    import ipax.backend.dense as dense_backend
+
+    monkeypatch.setattr(
+        dense_backend, "get_dense_symmetric_indefinite_adapter", lambda xp: None
+    )
+    op = _condensed_with_inequalities(namespace)
+    rhs = array(namespace, [[1.0, 0.5], [-2.0, 1.5]])
+
+    solver = DenseSolver(DenseOptions(kkt_route="augmented"))
+    solver.factor(op)
+    actual = solver.solve(rhs)
+
+    condensed_solver = DenseSolver()
+    condensed_solver.factor(op)
+    assert_allclose(namespace, actual, condensed_solver.solve(rhs), **tol)

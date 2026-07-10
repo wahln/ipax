@@ -15,7 +15,7 @@ knobs you are most likely to touch. Every field is documented in the
 
 ## Termination
 
-Four independent sources stop the solve, checked in priority order. The first
+Six independent sources stop the solve, checked in priority order. The first
 two share the same five conditions; `None` disables a condition.
 
 | Condition | Meaning |
@@ -42,9 +42,13 @@ ipax.Options(
 **Acceptable** ([`AcceptableStoppingOptions`](../reference.md#ipax.options.AcceptableStoppingOptions))
 mirrors the same conditions but requires them to hold for `n_iter` *consecutive*
 iterations, and reports [`Status.ACCEPTABLE`](results.md#status) (also a
-success). It is **off by default** and is the right tool when a
-dual-infeasibility-dominated residual plateaus while the objective and primal
-feasibility have already settled:
+success). It follows the **IPOPT convention and is on by default**
+(`dual_inf_tol = constr_viol_tol = compl_inf_tol = 1e-6` — 1e2× the optimality
+default — held for `n_iter = 15`), so a problem whose achievable KKT floor sits
+between the acceptable and optimal tolerances (a degenerate optimum, an
+ill-conditioned least-squares fit) reports `ACCEPTABLE` instead of grinding on
+to `max_iter`/`max_time`. Loosen a tolerance further when a
+dual-infeasibility-dominated residual plateaus early:
 
 ```python
 ipax.Options(
@@ -57,9 +61,38 @@ ipax.Options(
 )
 ```
 
+Set every tolerance to `None` to disable the mechanism entirely and always run
+to `max_iter`/`max_time` on a stagnant residual.
+
 **Limits.** `max_iter` (default `3000`) reports `Status.MAX_ITER`; `max_time`
 in seconds (default `None`, disabled) reports `Status.MAX_TIME`. Both are
 checked at iteration boundaries.
+
+**Unbounded detection.** `diverging_iterates_tol` (default `1e20`) stops the
+solve with [`Status.UNBOUNDED`](results.md#status) once `‖x‖∞` exceeds it while
+the point stays feasible — an IPOPT-style diverging-iterates test that catches
+an objective running away to `-∞` and reports it honestly instead of letting
+the runaway iterate eventually overflow to a misleading `NUMERICAL_ERROR`. Set
+to `None` to disable.
+
+**Stall detection.** `max_stall_iter` (default `25`) stops the solve after that
+many *consecutive* frozen iterations — no accepted step (α = 0) and a
+bit-for-bit unchanged KKT error — reporting `Status.STALLED`, or
+`Status.ACCEPTABLE` when the frozen iterate already sits within the relaxed
+KKT tolerance. A frozen iterate cannot recover by repetition (identical state
+reproduces the identical rejected direction), so this converts a
+whole-budget burn into a fast, honest verdict. Genuine limit cycles — where
+restoration keeps *moving* the iterate — change the KKT error and reset the
+counter, so they still run to the ordinary budgets. Set to `None` to disable.
+
+**Failure results carry the best iterate.** On a failure status (`STALLED`,
+`MAX_ITER`, `MAX_TIME`, `INFEASIBLE`, `NUMERICAL_ERROR`), the result returns
+the accepted iterate with the lowest scaled KKT error — not whatever state a
+diverging final phase left behind — and the message names the iteration it
+came from. Relatedly, a "locally infeasible" verdict is vetoed (reported as
+`STALLED`) whenever an accepted iterate already reached the feasibility level
+the verdict itself uses: a run that has visited feasibility cannot honestly
+call the problem locally infeasible.
 
 ## Hessian
 
@@ -148,12 +181,66 @@ bounds, so they never hurt there. Tune Gondzio via
 - `"breedveld"` — a lighter Markov-filter + ratio-control step controller tuned
   for convex/RT-like problems ([`BreedveldOptions`](../reference.md#ipax.options.BreedveldOptions)).
 
-The barrier μ schedule (`mu_schedule`), the filter constants
-([`LineSearchOptions`](../reference.md#ipax.options.LineSearchOptions)), and the
+The filter constants
+([`LineSearchOptions`](../reference.md#ipax.options.LineSearchOptions)) and the
 regularization escalation
 ([`RegularizationOptions`](../reference.md#ipax.options.RegularizationOptions))
 are rarely-touched advanced knobs; the defaults follow Wächter & Biegler (2006)
 and Friedlander & Orban (2012).
+
+## Barrier μ schedule
+
+`mu_schedule` selects the μ oracle — how the barrier parameter is driven:
+
+- `"monotone"` *(default)* — Fiacco–McCormick: hold μ fixed until the barrier
+  subproblem is solved to `κ_ε·μ`, then reduce it
+  (Wächter & Biegler 2006, eq. (7)). The default was decided empirically: in
+  the S2MPJ v10 paired A/B it beat probing on every solver/Hessian config
+  (3837 vs 3770 correct overall) — an aggressive oracle can crash μ faster
+  than the duals converge, stalling just above tolerance.
+- `"probing"` — Mehrotra σ-rule: an affine (predictor) probe sets
+  σ = (μ_aff/μ)³ (Mehrotra 1992; NWW 2009, eqs. (3.2)–(3.5)). Without a
+  corrector this costs one extra KKT solve per iteration; with corrections
+  active the affine solve is shared. Rescues 12–18 problems per config that
+  monotone misses — worth trying when monotone stalls.
+- `"adaptive"` — LOQO centrality rule: μ = σ·(average complementarity), where σ
+  grows with the deviation of the smallest complementarity product from the
+  average (Nocedal, Wächter & Waltz 2009, eq. (3.6)). Re-targeted every
+  iteration; μ may increase but never above 0.8× the current complementarity.
+- `"breedveld"` — duality-gap update μ = σ(α)·(average complementarity) with
+  σ = ((α−1)/(α+10))² built from the last accepted steplength
+  (Breedveld et al. 2017, eqs. (10)–(12)): full steps drive μ superlinearly to
+  zero, blocked steps re-center. Pairs naturally with
+  `globalization="breedveld"` on convex/RT-like problems.
+
+```python
+ipax.Options(mu_schedule="adaptive")
+```
+
+The oracle is orthogonal to [`corrections`](#higher-order-corrections): the
+corrector improves the *step* toward whatever μ the oracle picked (Nocedal,
+Wächter & Waltz 2009 — "the corrector is not part of the selection of the
+barrier parameter"), so e.g. the LOQO oracle can steer Gondzio corrections.
+
+The non-monotone oracles run in *free mode*, safeguarded twice:
+
+- **KKT-error fallback** (NWW 2009 §5.1, Algorithm A): if the scaled KKT error
+  fails to drop below `fallback_kappa` × (max of the last `fallback_window`+1
+  free-mode values), the oracle is suspended and μ is handled monotonically —
+  re-initialized at `fallback_mu_factor` × (average complementarity) — until
+  the error recovers. Defaults follow the paper (κ = 0.9999, l_max = 5,
+  factor 0.8); set `BarrierOptions(fallback="never")` for pure free mode.
+  Iterates are never rolled back — the filter line search already globalizes
+  each step, so the safeguard gates only the μ rule (matching IPOPT's
+  `adaptive_mu_globalization="kkt-error"`).
+- **Centrality floor**: μ never drops below
+  `kappa_centrality` × max(dual, primal infeasibility) (default `1e-2`).
+  El-Bakry et al. (1996)'s convergence theory requires the complementarity gap
+  not to vanish faster than the KKT residual; without the floor an aggressive
+  oracle can crush μ near a saddle while the iterate is far from stationary,
+  pinning it to the boundary with no barrier left to re-center. The
+  complementarity component is excluded from the floor, so superlinear μ
+  decrease near a solution is unimpeded. `kappa_centrality=0.0` disables it.
 
 ## Verbosity
 

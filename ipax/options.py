@@ -27,9 +27,12 @@ from typing import Literal
 HessianMode = Literal["auto", "lbfgs", "exact", "autodiff-hvp"]
 LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
 Globalization = Literal["filter", "breedveld"]
-MuSchedule = Literal["monotone", "adaptive", "breedveld"]
+MuSchedule = Literal["monotone", "adaptive", "breedveld", "probing"]
+MuFallback = Literal["kkt-error", "never"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
+DenseKKTRoute = Literal["condensed", "augmented"]
+SparseKKTRoute = Literal["augmented", "normal_equations"]
 ScalingMethod = Literal["none", "gradient-based"]
 CorrectionsMethod = Literal["none", "mehrotra", "gondzio"]
 
@@ -55,6 +58,37 @@ class BarrierOptions:
     kappa_mu: float = 0.2  # μ ← max(ε/10, κ_μ μ^θ_μ)
     theta_mu: float = 1.5
     tau_min: float = 0.99  # fraction-to-boundary floor
+    # Free-mode safeguard (Nocedal, Wächter & Waltz 2009, §5.1, Algorithm A):
+    # under a non-monotone μ oracle the scaled KKT error must stay below
+    # κ·max(last l_max+1 free-mode errors); otherwise the oracle is suspended
+    # and μ is handled monotonically — re-initialized at
+    # ``fallback_mu_factor``·(average complementarity) — until the error drops
+    # back below that threshold. ``"never"`` disables the safeguard (pure free
+    # mode). Inert for the monotone schedule itself.
+    fallback: MuFallback = "kkt-error"
+    fallback_kappa: float = 0.9999  # κ ∈ (0, 1)
+    fallback_window: int = 5  # l_max ≥ 0
+    fallback_mu_factor: float = 0.8  # monotone re-entry μ factor
+    # Centrality floor for the free-mode oracles: μ ≥ κ_cent·max(dual, primal
+    # infeasibility). El-Bakry et al. (1996)'s convergence theory requires the
+    # complementarity gap not to vanish faster than the KKT residual; without
+    # this floor an aggressive oracle can crush μ near a saddle while the dual
+    # infeasibility is still O(1), pinning the iterate to the boundary with no
+    # barrier left to re-center (and leaving the KKT-error fallback's
+    # complementarity-based re-entry μ powerless). The complementarity
+    # component is deliberately excluded so superlinear μ decrease near a
+    # solution is unimpeded. ``0.0`` disables the floor.
+    kappa_centrality: float = 1e-2
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.fallback_kappa < 1.0:
+            raise ValueError("fallback_kappa must lie in (0, 1)")
+        if self.fallback_window < 0:
+            raise ValueError("fallback_window must be non-negative")
+        if self.fallback_mu_factor <= 0.0:
+            raise ValueError("fallback_mu_factor must be positive")
+        if not math.isfinite(self.kappa_centrality) or self.kappa_centrality < 0.0:
+            raise ValueError("kappa_centrality must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +197,74 @@ class KrylovOptions:
         # must not be below the floor or above 1.
         if not self.rtol <= self.adaptive_rtol_max <= 1.0:
             raise ValueError("adaptive_rtol_max must lie in [rtol, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class DenseOptions:
+    """Dense-route KKT materialization: condensed vs. augmented.
+
+    ``"condensed"`` (default) forms the normal-equations block ``N`` by
+    condensing the inequality Gram term ``∇gᵀ Σ_s ∇g`` into an explicit
+    matmul, then Cholesky-probes it for positive definiteness
+    (``ipax.linalg.dense``). ``"augmented"`` instead keeps ``∇g``/``−Σ_s⁻¹``
+    as an explicit symmetric border — the dense analogue of the sparse-direct
+    indefinite-augmented route (Friedlander & Orban 2012) — and factors it
+    with a pivoted Bunch-Kaufman LDLᵀ where a backend adapter is available
+    (NumPy/SciPy, Torch), falling back to a symmetric eigendecomposition
+    (``xp.linalg.eigh``) otherwise. Either way it exposes real inertia, so
+    the IPOPT inertia-guided δ_w correction (Wächter & Biegler 2006 §3.1)
+    engages for the dense route too — closing a gap the plain Cholesky
+    pass/fail check cannot. Falls back to ``"condensed"`` behavior
+    automatically whenever the operator can't expose the unformed bordered
+    matrix (e.g. an L-BFGS Hessian, already PD by Powell damping — there is
+    nothing to gain there).
+
+    ``augmented_max_size`` guards the augmented route against tall problems:
+    the bordered matrix is ``(n + m_eq + m_ineq)²`` dense, so with ``m ≫ n``
+    (e.g. radiotherapy-scale inequality counts) materializing it would allocate
+    gigabytes for a system whose condensed form is only ``n × n``. When the
+    assembled size would exceed this bound the solver silently falls back to
+    the condensed route (losing only the inertia diagnostic, not correctness).
+    """
+
+    kkt_route: DenseKKTRoute = "condensed"
+    augmented_max_size: int = 20_000
+
+    def __post_init__(self) -> None:
+        if self.kkt_route not in ("condensed", "augmented"):
+            raise ValueError("dense kkt_route must be 'condensed' or 'augmented'")
+        if self.augmented_max_size < 1:
+            raise ValueError("augmented_max_size must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class SparseOptions:
+    """Sparse-direct KKT assembly: augmented vs. sparse normal equations.
+
+    ``"augmented"`` (default) factors the bordered indefinite system — the
+    inequality Jacobian ``∇g`` stays an explicit border with the ``−Σ_s⁻¹``
+    slack block, so the factor is as sparse as ``∇g`` regardless of its
+    column overlap (Friedlander & Orban 2012; Wächter & Biegler 2006 §3.1).
+    ``"normal_equations"`` instead condenses the Gram term ``∇gᵀ Σ_s ∇g``
+    *sparsely* into the logical ``n×n`` block via the Jacobian's ``gram_coo``
+    (Breedveld 2017 §2: the condensed system is ``n×n`` however large ``m``
+    grows) — the right choice for tall (``m ≫ n``) problems whose Jacobian
+    rows are **localized** (banded/block dose-influence structure), where the
+    Gram stays sparse and one small factorization per iteration replaces a
+    ``(n+m)`` bordered factor. Deliberately **opt-in**: with non-localized
+    rows the Gram fills in toward dense ``n²`` and no cheap structural probe
+    can see that in advance. Requires a ``gram_coo``-capable inequality
+    Jacobian (a sparse-operator Jacobian on a sparse-adapter backend),
+    diagonal slack scaling, and no equality constraints.
+    """
+
+    kkt_route: SparseKKTRoute = "augmented"
+
+    def __post_init__(self) -> None:
+        if self.kkt_route not in ("augmented", "normal_equations"):
+            raise ValueError(
+                "sparse kkt_route must be 'augmented' or 'normal_equations'"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,7 +471,7 @@ class Options:
     the analytic operator (errors otherwise), ``"autodiff-hvp"`` uses backend
     autodiff Hessian-vector products.
 
-    Termination has five sources, checked in priority order:
+    Termination has six sources, checked in priority order:
 
     * ``optimality`` (:class:`OptimalityConditionOptions`) — single-iteration
       test reporting :attr:`Status.OPTIMAL`.
@@ -377,8 +479,15 @@ class Options:
       reporting :attr:`Status.ACCEPTABLE`; enabled by default (IPOPT convention:
       tolerances of ``1e-6`` held for 15 consecutive iterations). Set all its
       tolerances to ``None`` to disable.
-    * ``diverging_iterates_tol`` — ‖x‖_∞ exceeding the threshold reports
+    * ``diverging_iterates_tol`` — ‖x‖_∞ exceeding the threshold *while the
+      objective has diverged below its negation* reports
       :attr:`Status.UNBOUNDED` (``None`` disables it).
+    * ``max_stall_iter`` — after this many *consecutive* frozen iterations (no
+      accepted step, KKT error unchanged) the run stops honestly with
+      :attr:`Status.STALLED` — or :attr:`Status.ACCEPTABLE` when the iterate is
+      within the relaxed KKT tolerance — instead of burning the whole
+      iteration budget re-deriving the same rejected direction
+      (``None`` disables it).
     * ``max_iter`` — iteration cap, reports :attr:`Status.MAX_ITER`.
     * ``max_time`` — wall-clock cap in seconds, reports :attr:`Status.MAX_TIME`
       (``None`` disables it).
@@ -391,14 +500,34 @@ class Options:
         default_factory=AcceptableStoppingOptions
     )
     max_iter: int = 3000
+    max_stall_iter: int | None = 25
     max_time: float | None = None
-    # IPOPT ``diverging_iterates_tol``: if ‖x‖_∞ exceeds this the iterates are
-    # declared diverging and the solve stops with :attr:`Status.UNBOUNDED` (the
-    # problem is likely unbounded below). ``None`` disables the test.
+    # IPOPT ``diverging_iterates_tol``: if ‖x‖_∞ exceeds this WHILE the
+    # objective sits below its negation, the solve stops with
+    # :attr:`Status.UNBOUNDED` (unbounded below means f → −∞; the iterate norm
+    # alone false-positives on convergent problems whose iterates wander
+    # astronomically first — S2MPJ KOEBHELB — or whose optimum is legitimately
+    # that large). ``None`` disables the test; slowly-diverging objectives
+    # (e.g. −log x) then end at the iteration/time budget instead.
     diverging_iterates_tol: float | None = 1e20
     hessian: HessianMode = "auto"
     linsolve: LinSolveMode = "auto"
     globalization: Globalization = "filter"
+    # The μ oracle. ``"monotone"`` (default) holds μ until the barrier KKT test
+    # passes, then reduces it (Wächter & Biegler 2006, eq. (7)) — the default
+    # was decided by the S2MPJ v10 paired A/B (2026-07): monotone beat probing
+    # on every solver/Hessian config, 3837 vs 3770 correct in total, because an
+    # aggressive oracle can crash μ faster than the duals converge (tail stalls
+    # just above tolerance). ``"probing"`` uses the Mehrotra σ-rule from an
+    # affine probe (NWW 2009, eqs. (3.2)–(3.5); one extra KKT solve per
+    # iteration without a corrector) and uniquely rescues 12–18 problems per
+    # config; ``"adaptive"`` re-targets μ every iteration by the LOQO
+    # centrality rule (NWW 2009, eq. (3.6)); ``"breedveld"`` scales the duality
+    # gap by the last accepted steplength (Breedveld et al. 2017,
+    # eqs. (10)–(12)). The oracle is orthogonal to ``corrections``: an active
+    # corrector aims at the oracle's μ. The non-monotone oracles are
+    # safeguarded by the KKT-error fallback (``BarrierOptions.fallback``;
+    # NWW 2009, §5.1) and the centrality floor.
     mu_schedule: MuSchedule = "monotone"
 
     barrier: BarrierOptions = field(default_factory=BarrierOptions)
@@ -407,6 +536,8 @@ class Options:
     breedveld: BreedveldOptions = field(default_factory=BreedveldOptions)
     lbfgs: LBFGSOptions = field(default_factory=LBFGSOptions)
     krylov: KrylovOptions = field(default_factory=KrylovOptions)
+    dense: DenseOptions = field(default_factory=DenseOptions)
+    sparse: SparseOptions = field(default_factory=SparseOptions)
     scaling: ScalingOptions | ScalingMethod = field(default_factory=ScalingOptions)
     corrections: CorrectionsOptions | CorrectionsMethod = field(
         default_factory=CorrectionsOptions
@@ -428,6 +559,8 @@ class Options:
         )
         if self.max_iter < 1:
             raise ValueError("max_iter must be a positive integer")
+        if self.max_stall_iter is not None and self.max_stall_iter < 1:
+            raise ValueError("max_stall_iter must be a positive integer or None")
         if isinstance(self.scaling, str):
             object.__setattr__(self, "scaling", ScalingOptions(method=self.scaling))
         if isinstance(self.corrections, str):
@@ -442,6 +575,8 @@ __all__ = [
     "BreedveldOptions",
     "CorrectionsMethod",
     "CorrectionsOptions",
+    "DenseKKTRoute",
+    "DenseOptions",
     "Globalization",
     "HessianMode",
     "KrylovMethod",
@@ -450,10 +585,13 @@ __all__ = [
     "LBFGSOptions",
     "LinSolveMode",
     "LineSearchOptions",
+    "MuFallback",
     "MuSchedule",
     "OptimalityConditionOptions",
     "Options",
     "RegularizationOptions",
     "ScalingMethod",
     "ScalingOptions",
+    "SparseKKTRoute",
+    "SparseOptions",
 ]

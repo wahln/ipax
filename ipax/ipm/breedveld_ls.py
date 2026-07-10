@@ -70,26 +70,29 @@ class BreedveldController:
         dphi: float,
         eval_point: Callable[[float], tuple[float, float]],
         iteration: int,
-    ) -> tuple[float, bool]:
-        """Return ``(alpha, restoration_needed)`` (Breedveld 2017 §2)."""
+    ) -> tuple[float, bool, int]:
+        """Return ``(alpha, restoration_needed, n_trials)`` (Breedveld 2017 §2)."""
         o = self._o
         alpha = alpha_max
+        trials = 0
 
         # Ratio control: in early iterations of (near-)convex problems accept the
         # aggressive fraction-to-boundary step when the barrier objective does not
         # inflate beyond the ratio bound (eq. 36).
         if iteration < _RATIO_CONTROL_ITERS:
+            trials += 1
             theta_t, phi_t = eval_point(alpha)
             inflate = abs(phi_t) <= o.ratio_limit * max(abs(phi0), 1.0)
             if inflate and (theta_t <= theta0 or phi_t <= phi0):
-                return alpha, False
+                return alpha, False, trials
 
         for _ in range(o.max_backtrack):
+            trials += 1
             theta_t, phi_t = eval_point(alpha)
             if self.markov_accept(theta_t, phi_t, theta0, phi0, dphi, alpha):
-                return alpha, False
+                return alpha, False, trials
             alpha *= o.backtrack
-        return alpha, True
+        return alpha, True, trials
 
 
 __all__ = ["BreedveldController"]

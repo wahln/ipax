@@ -7,8 +7,10 @@ Each :class:`BenchmarkProblem` is backend-parametric: ``build(xp)`` returns the
 NumPy, PyTorch, etc. The analytic oracles are shared with ``ipax.testing`` — the
 benchmark layer only adds starting points, metadata, and the corpus listing.
 
-CUTEst/Maros–Mészáros (``pycutest``) and TROTS are deferred to a later phase
-(download-gated); this module is the always-available QC core.
+CUTEst/Maros–Mészáros (``pycutest``) are deferred to a later phase; the S2MPJ
+(:mod:`benchmarks.corpus.s2mpj`) and TROTS (:mod:`benchmarks.corpus.trots`) loaders
+are download-gated (they return ``[]`` without a local dataset). This module is the
+always-available QC core.
 """
 
 from __future__ import annotations
@@ -180,13 +182,13 @@ def default_corpus() -> list[BenchmarkProblem]:
             tags=("eq", "ineq", "bounds", "nonlinear"),
             build=lambda xp: (HS71(xp), _arr(xp, [1.0, 5.0, 5.0, 1.0])),
             optimum=_known,
-            # The Mehrotra/Gondzio correctors sit at HS71's convergence edge on this
-            # nonconvex problem and stall on some backends/platforms (e.g. CI's
-            # Torch build) while converging on others — a known corrector-robustness
-            # gap, not a per-PR regression. Exclude those configs here so the gate is
-            # deterministic; HS71 is still swept on every stable route, and covered
-            # under the default solve by the integration tests.
-            exclude_configs=("exact/dense+mehrotra", "exact/dense+gondzio"),
+            # The corrector configs were excluded here while the Mehrotra
+            # corrector accepted its corrected direction unconditionally and
+            # sat at HS71's convergence knife-edge (stalled on CI's Torch
+            # build, converged locally). The corrector now degrades to the
+            # plain centered step whenever the correction collapses the
+            # boundary step length (_MEHROTRA_KEEP_FRACTION in
+            # ipax/ipm/corrections.py), so the configs are swept again.
         ),
         _rt_case(),
     ]

@@ -8,7 +8,7 @@ from ipax.backend.namespace import Capabilities
 from ipax.linalg.dense import DenseSolver
 from ipax.linalg.krylov import KrylovSolver
 from ipax.linalg.solver import select_solver
-from ipax.options import Options
+from ipax.options import DenseOptions, Options
 from tests._helpers import implemented
 
 
@@ -68,6 +68,21 @@ def test_select_solver_prefers_sparse_when_requested_and_available():
     assert solver.__class__.__name__.lower().startswith("sparse")
 
 
+@pytest.mark.parametrize("mode", ["dense", "auto"])
+def test_select_solver_threads_dense_options_through(mode):
+    solver = select_solver(
+        n_vars=100,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(
+            linsolve=mode,
+            dense=DenseOptions(kkt_route="augmented"),  # type: ignore[arg-type]
+        ),
+    )
+    assert isinstance(solver, DenseSolver)
+    assert solver._options.kkt_route == "augmented"
+
+
 def test_select_solver_rejects_unavailable_sparse_backend():
     try:
         select_solver(
@@ -82,3 +97,111 @@ def test_select_solver_rejects_unavailable_sparse_backend():
         assert "sparse" in str(exc).lower()
     else:
         pytest.fail("expected a RuntimeError when sparse solving is unavailable")
+
+
+# --- n ≪ m (tall, Gram-capable) auto-selection ------------------------------
+
+
+def test_select_solver_auto_tall_gram_capable_prefers_dense():
+    # Above the plain dense cutoff, but with m ≫ n and a Gram-capable inequality
+    # Jacobian the condensed normal-equations (dense) route factors an n×n block
+    # instead of Krylov matvecs through the huge m×n Jacobian.
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=300_000,
+        ineq_gram_capable=lambda: True,
+    )
+    assert isinstance(solver, DenseSolver)
+
+
+def test_select_solver_auto_tall_without_gram_stays_krylov():
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=300_000,
+        ineq_gram_capable=lambda: False,
+    )
+    assert isinstance(solver, KrylovSolver)
+
+
+def test_select_solver_auto_tall_needs_row_excess():
+    # m comparable to n: no normal-equations advantage, keep Krylov.
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=30_000,
+        ineq_gram_capable=lambda: True,
+    )
+    assert isinstance(solver, KrylovSolver)
+
+
+def test_select_solver_auto_tall_sparse_jacobian_stays_krylov():
+    # 2026-07 tall-crossover measurement: at ~1% density the condensed dense
+    # route loses to Krylov above the plain dense cutoff (n=10k: 75.5 vs
+    # 46.5 s/iter) — the tall-dense win comes from the adapter's dense-GEMM
+    # Gram, which only engages at >= ~5% density. A sparse tall Jacobian must
+    # therefore stay on Krylov.
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=300_000,
+        ineq_gram_capable=lambda: True,
+        ineq_density=lambda: 0.01,
+    )
+    assert isinstance(solver, KrylovSolver)
+
+
+def test_select_solver_auto_tall_dense_jacobian_prefers_dense():
+    # Dense-ish rows (TROTS dose matrices: 11-53%) keep the dense-GEMM Gram
+    # fast path — the measured 13-19x TROTS per-iteration wins.
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=300_000,
+        ineq_gram_capable=lambda: True,
+        ineq_density=lambda: 0.2,
+    )
+    assert isinstance(solver, DenseSolver)
+
+
+def test_select_solver_auto_tall_unknown_density_prefers_dense():
+    # A Gram-capable operator without COO structure (matrix-free with a
+    # structured Gram) reports no density; keep the previous behavior.
+    solver = select_solver(
+        n_vars=15_000,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=300_000,
+        ineq_gram_capable=lambda: True,
+        ineq_density=lambda: None,
+    )
+    assert isinstance(solver, DenseSolver)
+
+
+def test_select_solver_small_problems_skip_gram_probe():
+    # The capability probe may evaluate the Jacobian at x0 — it must only run
+    # when the decision actually depends on it.
+    def probe() -> bool:
+        raise AssertionError("gram probe must not run for small problems")
+
+    solver = select_solver(
+        n_vars=100,
+        has_equalities=False,
+        capabilities=_caps(),
+        options=Options(linsolve="auto"),
+        m_ineq=10_000,
+        ineq_gram_capable=probe,
+    )
+    assert isinstance(solver, DenseSolver)

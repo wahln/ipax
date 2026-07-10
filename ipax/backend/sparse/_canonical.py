@@ -123,8 +123,12 @@ def compile_lower_triangle(
     xp: Any, indptr: Array, indices: Array, n: int
 ) -> CompiledLowerTriangle:
     """Compile the full-CSR → lower-triangle map for a canonical CSR pattern."""
-    counts = xp.diff(indptr)
-    rows = xp.repeat(xp.arange(n), counts)  # row owning each stored entry
+    # Row owning each stored entry: the indptr bucket containing it. CuPy only
+    # accepts array-valued ``repeat`` counts from v14, so the ownership map is
+    # built with searchsorted (as in the adapters' Gram nnz→row maps) instead of
+    # ``repeat(arange(n), diff(indptr))``.
+    nnz_full = int(indices.shape[0])
+    rows = xp.searchsorted(indptr, xp.arange(nnz_full), side="right") - 1
     mask = indices <= rows  # col ≤ row ⇒ lower triangle (incl. diagonal)
     lower_indices = indices[mask]
     lower_rows = rows[mask]

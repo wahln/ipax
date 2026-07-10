@@ -217,7 +217,14 @@ filterwarnings = ["error::DeprecationWarning"]
 [tool.coverage.run]
 branch = true
 source = ["ipax"]
-omit = ["ipax/problem/autodiff/*", "ipax/backend/sparse/*"]
+omit = [
+    "ipax/problem/autodiff/*",
+    "ipax/backend/sparse/*",
+    # GPU-only dense adapter (cuSOLVER via nvmath): unmeasurable until GPU CI
+    # exists, same policy as the sparse adapters above. The SciPy/Torch dense
+    # adapters stay measured — CI exercises them.
+    "ipax/backend/dense/cupy.py",
+]
 
 [tool.coverage.report]
 fail_under = 90

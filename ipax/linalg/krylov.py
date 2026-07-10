@@ -374,6 +374,16 @@ class KrylovSolver:
         z = precond(r)
         p = z
         rz = _inner(xp, r, z)
+        # For an SPD preconditioner ⟨r, M⁻¹r⟩ > 0 whenever r ≠ 0; an exact zero
+        # (underflow on an ill-scaled problem — MGH09LS reached 0/0 in the β
+        # update under pc=auto — or an annihilating approximate M⁻¹), a negative
+        # value or a non-finite one is a breakdown of the preconditioned inner
+        # product: surface it as non-convergence so the driver escalates δ_w
+        # instead of crashing with ZeroDivisionError.
+        if not (rz > 0.0 and math.isfinite(rz)):
+            raise KrylovConvergenceError(
+                f"CG breakdown: preconditioned inner product {rz:.3e} at entry"
+            )
         tol = rtol * b_norm
         r_norm = b_norm
 
@@ -392,6 +402,11 @@ class KrylovSolver:
                 return x
             z = precond(r)
             rz_next = _inner(xp, r, z)
+            if not (rz_next > 0.0 and math.isfinite(rz_next)):
+                raise KrylovConvergenceError(
+                    f"CG breakdown: preconditioned inner product {rz_next:.3e} "
+                    f"at iteration {it} (residual {r_norm:.3e})"
+                )
             beta = rz_next / rz
             p = z + beta * p
             rz = rz_next

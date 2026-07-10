@@ -53,14 +53,28 @@ from ipax.backend.operators import (
     VStack,
     as_operator,
 )
-from ipax.ipm.barrier import fraction_to_boundary, update_mu
+from ipax.ipm.barrier import (
+    FreeModeMonitor,
+    adaptive_mu,
+    breedveld_mu,
+    complementarity_measures,
+    fallback_mu,
+    fraction_to_boundary,
+    update_mu,
+)
 from ipax.ipm.breedveld_ls import BreedveldController
-from ipax.ipm.corrections import CorrectionContext, select_corrector
+from ipax.ipm.corrections import (
+    CenteringOnly,
+    CorrectionContext,
+    HigherOrderCorrection,
+    probing_mu,
+    select_corrector,
+)
 from ipax.ipm.filter_ls import Filter, FilterLineSearch
 from ipax.ipm.hessian import LBFGSOperator
 from ipax.ipm.init import apply_warm_start, initialize
 from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
-from ipax.ipm.restoration import restore
+from ipax.ipm.restoration import RestorationExit, restore
 from ipax.ipm.step import NewtonStep, recover_eliminated
 from ipax.ipm.termination import ConditionChecker
 from ipax.linalg.regularize import (
@@ -81,7 +95,7 @@ from ipax.result import (
 
 if TYPE_CHECKING:
     from ipax.linalg.solver import LinearSolver
-    from ipax.options import OptimalityConditionOptions, Options
+    from ipax.options import MuSchedule, OptimalityConditionOptions, Options
     from ipax.problem.base import Problem
     from ipax.result import IterationCallback, WarmStart
     from ipax.typing import Array, Namespace
@@ -93,6 +107,26 @@ T = TypeVar("T")
 # IPOPT (Wächter & Biegler 2006) constants kept out of the loop body.
 _S_MAX = 100.0  # eq. (5): cap on the dual/complementarity scaling factors
 _KAPPA_EPSILON = 10.0  # eq. (7): barrier sub-problem tolerance factor κ_ε
+# Relative tolerance for the stall detector's "KKT error unchanged" test.
+_STALL_REL_TOL = 1e-12
+# Failure statuses that return the best accepted iterate instead of the last.
+_FAILURE_RETURNS_BEST = frozenset(
+    {
+        Status.INFEASIBLE,
+        Status.STALLED,
+        Status.MAX_ITER,
+        Status.MAX_TIME,
+        Status.NUMERICAL_ERROR,
+        Status.RESTORATION_FAILED,
+    }
+)
+# δ_w escalation attempts for the feasible-point descent enforcement.
+_MAX_DESCENT_ATTEMPTS = 25
+# dφ must exceed this fraction of the barrier objective's scale to count as a
+# *meaningful* ascent direction: near convergence dφ is float noise around
+# zero (and the near-zero step passes Armijo anyway), so escalating δ_w there
+# would only distort an already-converged step with futile re-solves.
+_DESCENT_NOISE_FACTOR = 1e-12
 _MAX_REG_ATTEMPTS = 40
 _MAX_MU_REDUCTIONS = 64
 # A step solve that fails at a point already within this multiple of the
@@ -114,6 +148,12 @@ _THETA_MAX_FACTOR = 1e4
 # The multiple is generous but far below any genuinely-infeasible stationary
 # point (whose violation is bounded away from zero, ≫ tol).
 _RESTORATION_INFEASIBLE_FACTOR = 1e3
+# An *uncertified* restoration stall (window/budget exit, no stationarity
+# certificate) resumes the main loop only while restoration keeps reducing the
+# violation by at least this factor between stalls; otherwise the run ends as
+# RESTORATION_FAILED. Bounds the resume loop: θ must shrink geometrically, so
+# at most ~log(θ0/tol)/log(1/factor) resumes can occur.
+_RESTORATION_PROGRESS_FACTOR = 0.9
 
 
 def _norm_inf(xp: Namespace, v: Array) -> float:
@@ -148,6 +188,19 @@ def _within_relaxed_tol(
     return bool(enabled) and all(value <= factor * tol for tol, value in enabled)
 
 
+def _feasible_evidence_tol(optimality: OptimalityConditionOptions) -> float:
+    """The θ level below which an iterate counts as evidence of feasibility.
+
+    The same threshold the local-infeasibility verdict uses: a restored point
+    is believed infeasible only above it, so an *accepted* iterate below it
+    directly contradicts any later infeasibility claim.
+    """
+    tol = optimality.constr_viol_tol
+    return _RESTORATION_INFEASIBLE_FACTOR * (
+        tol if tol is not None else optimality.kkt_tol
+    )
+
+
 def _restoration_reports_infeasible(
     theta_restored: float, optimality: OptimalityConditionOptions
 ) -> bool:
@@ -165,11 +218,7 @@ def _restoration_reports_infeasible(
     that it is feasible (S2MPJ Task 1). A genuinely infeasible stationary point
     has a violation bounded well away from zero, far above this threshold.
     """
-    tol = optimality.constr_viol_tol
-    feasible_tol = _RESTORATION_INFEASIBLE_FACTOR * (
-        tol if tol is not None else optimality.kkt_tol
-    )
-    return theta_restored > feasible_tol
+    return theta_restored > _feasible_evidence_tol(optimality)
 
 
 def _classify_step_failure(
@@ -227,7 +276,13 @@ class IPMDriver:
         # (``active`` is False), so the predictor direction is used unchanged.
         corrections = options.corrections
         assert not isinstance(corrections, str)  # normalized by Options.__post_init__
-        self._corrector = select_corrector(corrections)
+        self._corrector: HigherOrderCorrection = select_corrector(corrections)
+        # Standalone "probing" (no corrector requested) runs the corrector path
+        # with a plain centered re-solve, since the probing oracle needs the
+        # affine direction anyway (Nocedal, Wächter & Waltz 2009, §3).
+        self._mu_schedule: MuSchedule = options.mu_schedule
+        if self._mu_schedule == "probing" and not self._corrector.active:
+            self._corrector = CenteringOnly()
         self._problem_time_total = 0.0
         self._linear_eq_data = self._normalize_linear_eq(problem.linear_eq())
         self._n = int(problem.n_vars)
@@ -537,6 +592,29 @@ class IPMDriver:
         history: list[IterationRecord] = []
         alpha_p = 1.0
         alpha_d = 1.0
+        # Last *accepted* combined steplength (Breedveld 2017, eq. (11)); the
+        # steplength-driven μ schedule must not consume the α = 1 sentinel
+        # above before a first step has actually been taken.
+        last_alpha: float | None = None
+        # Free-mode safeguard (NWW 2009, §5.1): suspends a non-monotone μ
+        # oracle while the KKT error fails to make sufficient progress. Inert
+        # for the monotone schedule (its μ handling is already monotone).
+        mu_monitor = FreeModeMonitor(opts.barrier)
+        free_mode = True
+        # Stall detector: consecutive iterations with no accepted step and a
+        # bit-frozen KKT error mean the loop is re-deriving the same rejected
+        # direction — terminate honestly instead of burning the budget.
+        stalled_iters = 0
+        prev_e0: float | None = None
+        # Best-iterate bookkeeping: the accepted iterate with the lowest scaled
+        # KKT error, returned instead of the final wreckage when the run ends
+        # in a failure status, plus the feasibility evidence for the
+        # local-infeasibility veto (an accepted iterate below the verdict's own
+        # believe-threshold contradicts any later "infeasible" claim).
+        theta_best = float("inf")
+        best_state: (
+            tuple[IterationRecord, Array, Array, Array, Array, Array, Array] | None
+        ) = None
         reg_applied = 0.0
         status = Status.MAX_ITER
         message = "maximum iterations reached"
@@ -547,6 +625,17 @@ class IPMDriver:
         line_search = FilterLineSearch(opts.line_search)
         # eq. (18): θ_max guard, fixed from the initial constraint violation.
         theta_max = _THETA_MAX_FACTOR * max(1.0, self._theta_l1(x, s, m, m_eq))
+        # Second-chance restoration anchor (S2MPJ 2026-07 audit): restoration
+        # from a wandered-off iterate often converges to a nonzero LOCAL
+        # minimizer of the infeasibility even though feasibility is directly
+        # reachable from the user's starting point (28 of the 52 falsely
+        # INFEASIBLE problems). A local-infeasibility claim therefore gets one
+        # extra probe anchored here before it is believed.
+        x_restore_anchor = x
+        second_chance_used = False
+        # θ at the last *uncertified* restoration stall: resuming is only
+        # justified while restoration keeps making progress between stalls.
+        uncertified_stall_theta = float("inf")
         breedveld = BreedveldController(opts.breedveld)
         use_breedveld = opts.globalization == "breedveld"
 
@@ -565,6 +654,13 @@ class IPMDriver:
         prev_eq_jac: LinearOperator | None = None
         problem_time_mark = self._problem_time_total
         last_step_solve_time = 0.0
+        # Line-search backtracking count and restoration marker, both computed
+        # at the tail of an iteration (once the search/restoration outcome is
+        # known) and surfaced on the *next* row — mirroring how
+        # ``last_step_solve_time`` reports the cost of the step that produced
+        # that row.
+        last_line_search_iters = 0
+        pending_restored = False
 
         def bound_gaps(x: Array) -> tuple[Array, Array]:
             x_minus_l = xp.where(mask_l, x - lower_safe, ones)
@@ -623,6 +719,31 @@ class IPMDriver:
             # iterative route can drive an inexact-Newton forcing sequence (loose
             # early, tight near convergence); direct solvers ignore it.
             self._solver.set_outer_residual(e0)
+            if self._mu_schedule != "monotone":
+                free_mode, entered_monotone = mu_monitor.observe(e0)
+                if entered_monotone and m + n_bounds > 0:
+                    # NWW 2009, §5.1: restart the monotone strategy from a
+                    # fraction of the current complementarity.
+                    avg_compl, _ = complementarity_measures(
+                        s=s,
+                        y_ineq=y_ineq,
+                        z_lower=z_lower,
+                        z_upper=z_upper,
+                        x_minus_l=x_minus_l,
+                        u_minus_x=u_minus_x,
+                        mask_l=mask_l,
+                        mask_u=mask_u,
+                        m=m,
+                        n_bounds=n_bounds,
+                    )
+                    mu = fallback_mu(avg_compl, opts.barrier, opts.optimality.kkt_tol)
+                    logger.debug(
+                        "iter %d: free-mode safeguard tripped (e0=%.3e); "
+                        "monotone mode from mu=%.3e",
+                        it,
+                        e0,
+                        mu,
+                    )
             theta = self._theta(
                 x, g, s, c, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
             )
@@ -642,11 +763,17 @@ class IPMDriver:
                 complementarity=residuals.complementarity,
                 problem_time=record_problem_time,
                 step_solve_time=last_step_solve_time,
+                line_search_iters=last_line_search_iters,
+                restored=pending_restored,
             )
+            pending_restored = False
             if self._record_transform is not None:
                 record = self._record_transform(record)
             problem_time_mark = self._problem_time_total
             history.append(record)
+            theta_best = min(theta_best, theta)
+            if best_state is None or e0 < best_state[0].kkt_error:
+                best_state = (record, x, s, y_eq, y_ineq, z_lower, z_upper)
             if logger.isEnabledFor(ITERATION):
                 if rows_logged % HEADER_REPEAT_INTERVAL == 0:
                     logger.log(ITERATION, format_header())
@@ -667,16 +794,26 @@ class IPMDriver:
                 status = decision.status
                 message = decision.message
                 break
-            # IPOPT-style diverging-iterates test: an unbounded-below problem drives
-            # ‖x‖ off to infinity while the KKT residual never falls (e.g. INDEF).
-            # Report it honestly as UNBOUNDED rather than waiting for the runaway
+            # IPOPT-style diverging-iterates test: an unbounded-below problem
+            # drives ‖x‖ off to infinity while the objective diverges below
+            # (e.g. INDEF: f → −1e155). BOTH signals are required — the
+            # iterate norm alone false-positives on problems whose iterates
+            # wander astronomically far before converging (S2MPJ KOEBHELB:
+            # ‖x‖ grows monotonically past 1e22 across ~30 iterations, then
+            # returns and converges to f = 112 — a *bounded-below* objective
+            # throughout, which is exactly what "unbounded" must not claim).
+            # Report honest UNBOUNDED rather than waiting for the runaway
             # iterate to overflow into a NUMERICAL_ERROR.
             if (
                 opts.diverging_iterates_tol is not None
                 and float(xp.max(xp.abs(x))) > opts.diverging_iterates_tol
+                and float(objective) <= -opts.diverging_iterates_tol
             ):
                 status = Status.UNBOUNDED
-                message = "iterates diverging; the problem may be unbounded below"
+                message = (
+                    "iterates and objective diverging; the problem appears "
+                    "unbounded below"
+                )
                 break
             if (
                 opts.max_time is not None
@@ -688,6 +825,32 @@ class IPMDriver:
             if stop_requested:
                 status = Status.STOPPED
                 message = "stopped: iteration callback requested termination"
+                break
+            # A frozen iterate (zero accepted steplength + unchanged KKT error)
+            # cannot recover by repetition: with identical state every derived
+            # quantity — and thus the rejected direction — is identical too.
+            # Genuine limit cycles (restoration jumps that keep *moving* the
+            # iterate) change e0 and reset the counter, so they still run to
+            # the ordinary budgets rather than being misreported here.
+            frozen = (
+                prev_e0 is not None
+                and alpha_p == 0.0
+                and abs(e0 - prev_e0) <= _STALL_REL_TOL * max(1.0, abs(prev_e0))
+            )
+            stalled_iters = stalled_iters + 1 if frozen else 0
+            prev_e0 = e0
+            if opts.max_stall_iter is not None and stalled_iters >= opts.max_stall_iter:
+                if _within_relaxed_tol(opts.optimality, record):
+                    status = Status.ACCEPTABLE
+                    message = (
+                        "acceptable: iteration stalled within the relaxed KKT tolerance"
+                    )
+                else:
+                    status = Status.STALLED
+                    message = (
+                        f"stalled: no accepted step and no KKT-error progress "
+                        f"for {stalled_iters} consecutive iterations"
+                    )
                 break
             if it == opts.max_iter:
                 break
@@ -710,11 +873,21 @@ class IPMDriver:
                 m_eq: int,
                 r_y: Array,
                 delta_c: float,
+                delta_w_floor: float = 0.0,
             ) -> tuple[Array, Array, float, bool]:
                 problem_before = self._problem_time_total
                 start = perf_counter()
                 result = self._solve_step(
-                    w, sigma_x, sigma_s, ineq_jac, rhs_x, eq_jac, m_eq, r_y, delta_c
+                    w,
+                    sigma_x,
+                    sigma_s,
+                    ineq_jac,
+                    rhs_x,
+                    eq_jac,
+                    m_eq,
+                    r_y,
+                    delta_c,
+                    delta_w_floor,
                 )
                 elapsed = perf_counter() - start
                 problem_elapsed = self._problem_time_total - problem_before
@@ -755,7 +928,7 @@ class IPMDriver:
             }
 
             if self._corrector.active:
-                # Mehrotra/Gondzio: the affine and correction directions
+                # Mehrotra/Gondzio/probing: the affine and correction directions
                 # share one KKT operator. Sparse-direct reuses its factorization;
                 # dense/Krylov perform another solve against that operator.
                 corrected = self._corrected_step(
@@ -770,6 +943,13 @@ class IPMDriver:
                     solve_step_timed=solve_step_timed,
                     rhs_kwargs=rhs_kwargs,
                     recover_kwargs=recover_kwargs,
+                    mu=mu,
+                    last_alpha=last_alpha,
+                    free_mode=free_mode,
+                    infeasibility=max(
+                        residuals.dual_infeasibility, residuals.primal_infeasibility
+                    ),
+                    err_kwargs=err_kwargs,
                 )
                 if corrected is None:
                     status, message = _classify_step_failure(
@@ -777,8 +957,39 @@ class IPMDriver:
                     )
                     break
                 mu, step, reg_applied = corrected
+                # A step must have descent properties for the barrier problem
+                # at the current μ (NWW 2009, §5). A corrected direction built
+                # on a low-quality (quasi-Newton) affine probe can lose them —
+                # the complementarity-target perturbation is amplified through
+                # the near-singular condensed operator — leaving the line
+                # search only rejectable ascent trials. The corrector is a
+                # step-quality mechanism, not part of the μ selection, so fall
+                # back to the plain centered step toward the same μ.
+                if (
+                    self._dphi(
+                        x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
+                    )
+                    >= 0.0
+                ):
+                    rhs = self._condensed_rhs(mu, mu, mu, **rhs_kwargs)
+                    dx, dy_eq, reg_fallback, ok = solve_step_timed(
+                        w, sigma_x, sigma_s, ineq_jac, rhs, eq_jac, m_eq, -c, delta_c
+                    )
+                    if ok:
+                        step = recover_eliminated(
+                            dx, mu=mu, dy_eq=dy_eq, **recover_kwargs
+                        )
+                        reg_applied = max(reg_applied, reg_fallback)
             else:
-                mu = self._reduce_mu(mu, **err_kwargs)
+                mu = self._next_mu(
+                    mu,
+                    last_alpha=last_alpha,
+                    free_mode=free_mode,
+                    infeasibility=max(
+                        residuals.dual_infeasibility, residuals.primal_infeasibility
+                    ),
+                    **err_kwargs,
+                )
                 rhs = self._condensed_rhs(mu, mu, mu, **rhs_kwargs)
                 dx, dy_eq, reg_applied, ok = solve_step_timed(
                     w, sigma_x, sigma_s, ineq_jac, rhs, eq_jac, m_eq, -c, delta_c
@@ -789,6 +1000,61 @@ class IPMDriver:
                     )
                     break
                 step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
+
+            # Descent enforcement at feasible iterates. At θ = 0 only
+            # f-type (Armijo) acceptance exists (W&B 2006, §2.3), which no
+            # ascent trial can pass — and an *iterative* KKT solve can return
+            # a non-descent direction without failing (CG on an indefinite
+            # condensed operator "succeeds" with garbage; success is not a
+            # descent certificate, unlike the dense route's Cholesky PD-probe).
+            # Left alone, the rejected step changes nothing and the identical
+            # direction is recomputed forever (S2MPJ POWELLBSLS burned the
+            # whole 10k budget this way). Escalating δ_w until the direction
+            # is descent is the same inertia-correction response W&B 2006 §3.1
+            # prescribe when the (1,1) block is not positive definite.
+            theta0 = self._theta_l1(x, s, m, m_eq)
+            phi0 = self._phi(x, s, mu, m, mask_l, mask_u, lower_safe, upper_safe)
+            if theta0 == 0.0:
+                ascent_noise = _DESCENT_NOISE_FACTOR * max(1.0, abs(phi0))
+                descent_floor = reg_applied
+                for _ in range(_MAX_DESCENT_ATTEMPTS):
+                    dphi_probe = self._dphi(
+                        x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
+                    )
+                    if dphi_probe <= ascent_noise:
+                        break
+                    descent_floor = (
+                        opts.regularization.delta_w_init
+                        if descent_floor <= 0.0
+                        else descent_floor * opts.regularization.delta_w_factor
+                    )
+                    if descent_floor > opts.regularization.delta_w_max:
+                        break
+                    logger.debug(
+                        "iter %d: non-descent direction at feasible iterate "
+                        "(dphi=%.3e); re-solving with delta_w >= %.2e",
+                        it,
+                        dphi_probe,
+                        descent_floor,
+                    )
+                    rhs = self._condensed_rhs(mu, mu, mu, **rhs_kwargs)
+                    dx, dy_eq, reg_descent, ok = solve_step_timed(
+                        w,
+                        sigma_x,
+                        sigma_s,
+                        ineq_jac,
+                        rhs,
+                        eq_jac,
+                        m_eq,
+                        -c,
+                        delta_c,
+                        delta_w_floor=descent_floor,
+                    )
+                    if not ok:
+                        break
+                    step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
+                    reg_applied = max(reg_applied, reg_descent)
+                    descent_floor = max(descent_floor, reg_descent)
 
             if use_breedveld:
                 tau = opts.breedveld.tau
@@ -930,15 +1196,15 @@ class IPMDriver:
                     ),
                 )
 
-            theta0 = self._theta_l1(x, s, m, m_eq)
-            phi0 = self._phi(x, s, mu, m, mask_l, mask_u, lower_safe, upper_safe)
+            # θ0/φ0 were computed above for the descent enforcement; x, s and
+            # μ are unchanged since.
             dphi = self._dphi(
                 x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
             )
 
             used_soc = False
             if use_breedveld:
-                alpha_p, restoration = breedveld.search(
+                alpha_p, restoration, last_line_search_iters = breedveld.search(
                     alpha_max=alpha_p_max,
                     theta0=theta0,
                     phi0=phi0,
@@ -961,6 +1227,7 @@ class IPMDriver:
                 alpha_p = result.alpha
                 restoration = result.restoration
                 used_soc = result.used_soc
+                last_line_search_iters = result.n_trials
                 if result.accepted and result.augment:
                     filt.augment(theta0, phi0)
 
@@ -977,21 +1244,114 @@ class IPMDriver:
                     break
                 logger.debug("iter %d: entering feasibility restoration", it)
                 filt.augment(theta0, phi0)
-                x, s, infeasible = self._restore(
+                x, s, rest_exit = self._restore(
                     x, s, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
                 )
-                # Only believe an "infeasible" verdict when the returned iterate
-                # is genuinely infeasible by the driver's own θ. Restoration's raw
-                # ℓ∞ measure can stall marginally above its (differently scaled)
-                # tolerance at a point that is feasible here — declaring it locally
-                # infeasible would be a false claim (S2MPJ Task 1). A feasible
-                # restored point means restoration stalled on *optimality*, not
-                # feasibility, so resume the main iteration from it (a genuine
-                # limit cycle then terminates at the iteration/time budget rather
-                # than as a false "infeasible").
-                if infeasible and _restoration_reports_infeasible(
-                    self._theta_l1(x, s, m, m_eq), self._options.optimality
-                ):
+                theta_restored = self._theta_l1(x, s, m, m_eq)
+                still_infeasible = _restoration_reports_infeasible(
+                    theta_restored, self._options.optimality
+                )
+                # A local-infeasibility *claim* needs both the driver's own θ to
+                # be genuinely large (restoration's raw ℓ∞ measure can stall
+                # marginally above its differently scaled tolerance at a point
+                # that is feasible here — S2MPJ Task 1) AND a stationarity-type
+                # exit. An *uncertified* stall (window/budget exit) is not
+                # evidence of infeasibility (S2MPJ restfix audit: LAKES/NASH/
+                # SWOPF were honest out-of-budget failures relabeled
+                # "infeasible" by the early window exit): it resumes the main
+                # loop while restoration keeps reducing θ between stalls, and a
+                # repeat without progress terminates below — after the one-shot
+                # x0 probe had its say — as RESTORATION_FAILED, never as
+                # INFEASIBLE.
+                claim_certified = still_infeasible and rest_exit.certifies_infeasibility
+                uncertified_stall = (
+                    still_infeasible and not rest_exit.certifies_infeasibility
+                )
+                stall_progressed = (
+                    theta_restored
+                    <= _RESTORATION_PROGRESS_FACTOR * uncertified_stall_theta
+                )
+                if uncertified_stall and stall_progressed:
+                    uncertified_stall_theta = theta_restored
+                if claim_certified or (uncertified_stall and not stall_progressed):
+                    # Second chance: restoration is a LOCAL method, so from a
+                    # wandered-off iterate it can converge to a nonzero local
+                    # minimizer of the infeasibility on a perfectly feasible
+                    # problem (S2MPJ 2026-07 audit: 28 of 52 falsely INFEASIBLE
+                    # problems are restorable directly from x0). Probe once from
+                    # the starting point before terminating on either a
+                    # certified claim or an exhausted uncertified stall; a
+                    # believable feasible outcome resumes the main loop there.
+                    if not second_chance_used:
+                        second_chance_used = True
+                        logger.debug(
+                            "iter %d: probing the infeasibility claim with a "
+                            "restoration anchored at the starting point",
+                            it,
+                        )
+                        x_r, s_r, exit_r = self._restore(
+                            x_restore_anchor,
+                            s,
+                            m,
+                            m_eq,
+                            mask_l,
+                            mask_u,
+                            lower_safe,
+                            upper_safe,
+                        )
+                        theta_probe = self._theta_l1(x_r, s_r, m, m_eq)
+                        if not (
+                            exit_r.certifies_infeasibility
+                            and _restoration_reports_infeasible(
+                                theta_probe, self._options.optimality
+                            )
+                        ):
+                            x, s = x_r, s_r
+                            # A probe that stayed infeasible is itself the next
+                            # stall baseline; a believably feasible rescue is a
+                            # fresh basin, so the stall streak restarts.
+                            uncertified_stall_theta = (
+                                theta_probe
+                                if _restoration_reports_infeasible(
+                                    theta_probe, self._options.optimality
+                                )
+                                else float("inf")
+                            )
+                            alpha_p = 0.0
+                            last_alpha = 0.0
+                            prev_x = None
+                            last_step_solve_time = self._step_solve_seconds
+                            pending_restored = True
+                            continue
+                        # The anchored probe itself reached a stationary point
+                        # of the infeasibility: a certificate even when the
+                        # triggering stall carried none.
+                        claim_certified = True
+                    if not claim_certified:
+                        status = Status.RESTORATION_FAILED
+                        message = (
+                            "restoration failed: the infeasibility minimization "
+                            "stalled without a stationarity certificate and "
+                            "without reducing the constraint violation "
+                            f"(theta={theta_restored:.3e})"
+                        )
+                        break
+                    # Veto: a local-infeasibility claim is contradicted by the
+                    # run's own history whenever an *accepted* iterate already
+                    # reached the verdict's believe-threshold — a diverged
+                    # endgame (degenerate duals, tiny μ) is a stall at a
+                    # feasible problem, not evidence of infeasibility
+                    # (S2MPJ v10: DEGENLPA reached θ = 1.7e-7 before the
+                    # collapse that used to be reported as INFEASIBLE).
+                    if theta_best <= _feasible_evidence_tol(opts.optimality):
+                        status = Status.STALLED
+                        message = (
+                            "stalled: restoration could not re-reduce the "
+                            "constraint violation, but an accepted iterate "
+                            f"already reached theta={theta_best:.3e} — the "
+                            "problem is not locally infeasible"
+                        )
+                        break
                     status = Status.INFEASIBLE
                     message = (
                         "locally infeasible: restoration could not reduce the "
@@ -999,10 +1359,14 @@ class IPMDriver:
                     )
                     break
                 alpha_p = 0.0
+                # A restoration jump is a blocked Newton step for the schedule:
+                # σ(0) = 0.01 re-centers on the next iteration (eq. (12)).
+                last_alpha = 0.0
                 # The restoration jump is not a Newton step, so the next
                 # curvature pair would be meaningless — drop the history anchor.
                 prev_x = None
                 last_step_solve_time = self._step_solve_seconds
+                pending_restored = True
                 continue
 
             if used_soc and soc_primal is not None:
@@ -1024,16 +1388,60 @@ class IPMDriver:
             z_upper = xp.where(
                 mask_u, z_upper + alpha_d * step.dz_upper, xp.zeros_like(x)
             )
+            # NOTE: the W&B 2006 eq. (16) κ_Σ dual clip was prototyped here and
+            # measured on the S2MPJ false-infeasible subset (2026-07): it fixed
+            # nothing (the DEGENLPA-class divergence lives in the *equality*
+            # multipliers, which eq. (16) does not touch) and broke CRESC4
+            # exact/krylov (optimal@59 → max_iter). Deliberately not shipped.
+            # Combined steplength over all blocks (Breedveld 2017, eq. (11)),
+            # feeding the σ(α) duality-gap reduction on the next iteration.
+            last_alpha = min(alpha_p, alpha_d)
             last_step_solve_time = self._step_solve_seconds
 
+        final_record = history[-1]
+        # On a failure status, return the best accepted iterate instead of
+        # whatever state the failing tail left behind (e.g. DEGENLPA's
+        # diverged endgame after an essentially optimal iterate). Success
+        # statuses keep the terminating iterate; UNBOUNDED keeps the diverging
+        # one (it *is* the diagnosis), and a user STOP returns the current
+        # point (least surprise).
+        # ``<=`` matters: a restoration jump reassigns x *after* the final
+        # record was written, so on a tie the snapshot restores a state
+        # consistent with that record instead of the jumped-to point.
+        if (
+            best_state is not None
+            and status in _FAILURE_RETURNS_BEST
+            and best_state[0].kkt_error <= final_record.kkt_error
+        ):
+            final_record, x, s, y_eq, y_ineq, z_lower, z_upper = best_state
+            message = (
+                f"{message}; returning the best accepted iterate "
+                f"(KKT {final_record.kkt_error:.3e} at iteration "
+                f"{final_record.iteration})"
+            )
+        # Budget exhaustion at an essentially optimal returned iterate reports
+        # ACCEPTABLE, mirroring the stall/step-failure salvage paths: a stall
+        # at KKT 6e-7 already reports ACCEPTABLE through the relaxed
+        # tolerance, so running out of iterations or clock at the same quality
+        # must not read as a harsher failure (S2MPJ budget-cluster audit:
+        # DIAMON2DLS oscillates at the acceptable level without holding it for
+        # the acceptable-iter window, then reported MAX_TIME from a 6.7e-7
+        # best iterate).
+        if status in (Status.MAX_ITER, Status.MAX_TIME) and _within_relaxed_tol(
+            self._options.optimality, final_record
+        ):
+            status = Status.ACCEPTABLE
+            message = (
+                "acceptable: the iteration/time budget ran out at an iterate "
+                f"within the relaxed KKT tolerance ({message})"
+            )
         x_minus_l, u_minus_x = bound_gaps(x)
         g = self._ineq(x)
         c = self._eq(x)
         final_theta = self._theta(
             x, g, s, c, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
         )
-        final_kkt = history[-1].kkt_error
-        final_record = history[-1]
+        final_kkt = final_record.kkt_error
 
         # The human-readable result/timing summary is emitted by ``solve`` once
         # the solution has been unscaled; the driver only assembles the Result.
@@ -1124,6 +1532,62 @@ class IPMDriver:
             _norm_inf(xp, xp.maximum(xp.where(mask_u, x - upper_safe, zero), zero)),
         )
         return viol
+
+    def _next_mu(
+        self,
+        mu: float,
+        *,
+        last_alpha: float | None,
+        free_mode: bool = True,
+        infeasibility: float = 0.0,
+        **err_kwargs: Any,
+    ) -> float:
+        """Advance μ by the configured schedule (``Options.mu_schedule``).
+
+        ``"monotone"`` runs the guarded Fiacco–McCormick reduction loop below;
+        the free-mode schedules instead re-target μ from the current
+        complementarity on every iteration: ``"adaptive"`` via the LOQO
+        centrality rule (Nocedal, Wächter & Waltz 2009, eqs. (3.1)/(3.6)),
+        ``"breedveld"`` via the steplength-driven duality-gap reduction
+        (Breedveld 2017, eqs. (10)–(12)). ``"probing"`` never reaches this
+        method — it needs the affine direction, so it is applied on the
+        corrector path (see ``_corrected_step``). Problems without
+        complementarity pairs — and, for the steplength rule, iterations before
+        the first accepted step — fall back to keeping/reducing μ monotonically.
+        With ``free_mode`` ``False`` (the NWW §5.1 safeguard tripped) every
+        oracle is suspended in favor of the monotone reduction.
+        """
+        opts = self._options
+        schedule = self._mu_schedule
+        m = int(err_kwargs["m"])
+        n_bounds = int(err_kwargs["n_bounds"])
+        if not free_mode or schedule == "monotone" or m + n_bounds == 0:
+            return self._reduce_mu(mu, **err_kwargs)
+        if schedule == "breedveld" and last_alpha is None:
+            # σ(α) needs an accepted steplength; keep μ_init for the first solve.
+            return mu
+        avg_compl, min_compl = complementarity_measures(
+            s=err_kwargs["s"],
+            y_ineq=err_kwargs["y_ineq"],
+            z_lower=err_kwargs["z_lower"],
+            z_upper=err_kwargs["z_upper"],
+            x_minus_l=err_kwargs["x_minus_l"],
+            u_minus_x=err_kwargs["u_minus_x"],
+            mask_l=err_kwargs["mask_l"],
+            mask_u=err_kwargs["mask_u"],
+            m=m,
+            n_bounds=n_bounds,
+        )
+        tol = opts.optimality.kkt_tol
+        if schedule == "adaptive":
+            mu_next = adaptive_mu(avg_compl, min_compl, opts.barrier, tol)
+        else:
+            assert last_alpha is not None  # narrowed above
+            mu_next = breedveld_mu(avg_compl, last_alpha, opts.barrier, tol)
+        # Centrality floor (El-Bakry et al. 1996): μ must not vanish faster
+        # than the primal/dual infeasibility, or the barrier decenters at a
+        # still-unsolved iterate (see BarrierOptions.kappa_centrality).
+        return max(mu_next, opts.barrier.kappa_centrality * infeasibility)
 
     def _reduce_mu(self, mu: float, **err_kwargs: object) -> float:
         opts = self._options
@@ -1233,12 +1697,21 @@ class IPMDriver:
         solve_step_timed: Callable[..., tuple[Array, Array, float, bool]],
         rhs_kwargs: dict[str, Any],
         recover_kwargs: dict[str, Any],
+        mu: float,
+        last_alpha: float | None,
+        free_mode: bool,
+        infeasibility: float,
+        err_kwargs: dict[str, Any],
     ) -> tuple[float, NewtonStep, float] | None:
-        """Affine predictor + higher-order corrector.
+        """Affine predictor + μ oracle + higher-order corrector.
 
-        Returns ``(μ, step, δ_w)`` where ``μ`` is the barrier target the
-        corrected ``step`` aims at (adopted by the line search), or ``None`` if
-        the affine operator setup/solve failed despite regularization.
+        The affine direction doubles as the probe for the ``"probing"`` oracle;
+        any other ``mu_schedule`` picks the target via ``_next_mu`` and the
+        corrector merely aims at it (Nocedal, Wächter & Waltz 2009: the
+        corrector is not part of the barrier-parameter selection). Returns
+        ``(μ, step, δ_w)`` where ``μ`` is the barrier target the corrected
+        ``step`` aims at (adopted by the line search), or ``None`` if the
+        affine operator setup/solve failed despite regularization.
         """
         affine_rhs = self._condensed_rhs(0.0, 0.0, 0.0, **rhs_kwargs)
         dx_aff, dy_aff, reg_applied, ok = solve_step_timed(
@@ -1289,7 +1762,21 @@ class IPMDriver:
                 self._options.barrier.mu_min, self._options.optimality.kkt_tol / 10.0
             ),
         )
-        result = self._corrector.correct(context)
+        if free_mode and self._mu_schedule == "probing":
+            # Centrality floor (El-Bakry et al. 1996) — see BarrierOptions.
+            mu_target = max(
+                probing_mu(context),
+                self._options.barrier.kappa_centrality * infeasibility,
+            )
+        else:
+            mu_target = self._next_mu(
+                mu,
+                last_alpha=last_alpha,
+                free_mode=free_mode,
+                infeasibility=infeasibility,
+                **err_kwargs,
+            )
+        result = self._corrector.correct(context, mu_target)
         return result.mu, result.step, reg_applied
 
     def _inertia_acceptable(self, operator: LinearOperator) -> bool:
@@ -1324,16 +1811,19 @@ class IPMDriver:
         m_eq: int,
         r_y: Array,
         delta_c: float,
+        delta_w_floor: float = 0.0,
     ) -> tuple[Array, Array, float, bool]:
         """Factor/solve the condensed (or bordered saddle) step (§2.3, §4.4).
 
         Returns ``(Δx, Δy_eq, δ_w, ok)``. With equalities present the condensed
         block is bordered into the quasidefinite saddle (Friedlander–Orban) and
         solved through the same injected ``LinearSolver``; Breedveld δ_w
-        escalation handles a failed factorization.
+        escalation handles a failed factorization. ``delta_w_floor`` starts the
+        ladder above zero — the descent-enforcement re-solve uses it to demand
+        a more strongly regularized (more convex) system than the last attempt.
         """
         xp = self._xp
-        reg = RegularizationState()
+        reg = RegularizationState(delta_w=delta_w_floor)
         sigma_x_op = Diagonal(sigma_x)
         sigma_s_op = Diagonal(sigma_s)
         empty = xp.zeros((0,), dtype=rhs_x.dtype)
@@ -1528,7 +2018,7 @@ class IPMDriver:
         mask_u: Array,
         lower_safe: Array,
         upper_safe: Array,
-    ) -> tuple[Array, Array, bool]:
+    ) -> tuple[Array, Array, RestorationExit]:
         """Run the Gauss-Newton restoration phase (delegates to ``restore``)."""
         return restore(
             xp=self._xp,

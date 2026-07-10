@@ -31,6 +31,7 @@ user-managed CUDA dependencies.
 from __future__ import annotations
 
 import ctypes
+import warnings
 from typing import TYPE_CHECKING, Any, cast
 
 # Allowed import boundary (invariants #1, #4): backend/sparse/ adapters only.
@@ -65,6 +66,22 @@ _CUDSS_R_64I = 24
 # Cached nvmath cuDSS bindings module (``nvmath.bindings.cudss``).
 _CUDSS_BINDINGS: Any | None = None
 
+# ``cudssStatus_t`` codes that, on a *matrix creation* call, mean the runtime is
+# unusable rather than the system numerically hard — the canonical cause is a
+# cuDSS library whose ABI does not match the installed nvmath-python bindings
+# (nvmath's own high-level API refuses such a pairing up front; the raw
+# bindings do not check). Creation takes no matrix values, so no amount of
+# regularization can repair it — degrade to spsolve instead.
+_CUDSS_STATUS_INVALID_VALUE = 3
+_CUDSS_STATUS_NOT_SUPPORTED = 4
+
+# Density crossover / chunk cap for the weighted-Gram dense-GEMM strategy —
+# mirrors ``ipax.backend.sparse.numpy_scipy`` (kept local to avoid importing
+# the SciPy adapter into GPU-only environments); see that module for the flop
+# model and TROTS measurements behind the values.
+_GRAM_DENSE_MIN_DENSITY = 0.05
+_GRAM_DENSE_CHUNK_ELEMENTS = 50_000_000
+
 
 class _CuDSSUnavailableError(ImportError):
     """The nvmath binding or user-managed cuDSS runtime cannot be loaded."""
@@ -87,7 +104,9 @@ def _to_index(arr: Array) -> Any:
 
 def _scatter_add(out: Any, idx: Any, vals: Any) -> None:
     """Device unbuffered scatter-add (sums duplicate targets) for canonical maps."""
-    cupyx.scatter_add(out, idx, vals)
+    # ``cupyx.scatter_add`` delegates to the deprecated ``ndarray.scatter_add``
+    # (warns as of CuPy 14); ``cupy.add.at`` is its documented replacement.
+    cupy.add.at(out, idx, vals)
 
 
 def _to_float(value: Any) -> float:
@@ -197,6 +216,19 @@ class SparseOperator(LinearOperator):
         # Structural symmetry hint from the assembler (None ⇒ test numerically).
         self._symmetric_hint = symmetric
         self._pattern_signature = pattern_signature
+        # Gram-path caches — mirror of the SciPy adapter (see its ``gram``):
+        # a last-weights memo plus one-time Aᵀ CSR / scaled-buffer / row-map
+        # symbolic work, leaving only value work + the SpGEMM on a miss.
+        self._gram_transpose: Any = None  # Aᵀ as CSR
+        self._gram_scaled: Any = None  # diag(w)A same-pattern buffer
+        self._gram_row_index: Any = None  # nnz → row map for w expansion
+        self._gram_weights: Any = None  # memo key (last weights, device)
+        self._gram_value: Any = None  # memoized dense n×n result (device)
+        self._gram_compute_count = 0  # observability/testing: actual SpGEMM runs
+        self._squared: Any = None  # A∘A (shared by the Gram diagonals)
+        # Sparse-Gram (COO) memo for the sparse normal-equations route.
+        self._gram_coo_weights: Any = None
+        self._gram_coo_value: Any = None
         self._symmetric: bool | None = None
 
     @property
@@ -245,16 +277,127 @@ class SparseOperator(LinearOperator):
         del like
         return cast("Array", to_xp_array(self._matrix.diagonal(), self._xp))
 
+    @property
+    def _squared_csr(self) -> Any:
+        """The elementwise square ``A∘A``, built once (shared by both Gram
+        diagonals, which are recomputed every IPM iteration)."""
+        if self._squared is None:
+            self._squared = self._matrix.multiply(self._matrix).tocsr()
+        return self._squared
+
     def gram_diagonal(self, weights: Array) -> Array:
         # diag(Aᵀ diag(w) A)_k = Σ_i w_i A_ik² = (A∘A)ᵀ w (column energies).
-        squared = self._matrix.multiply(self._matrix)
-        out = squared.T @ _to_cupy(weights)
+        out = self._squared_csr.T @ _to_cupy(weights)
         return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
+
+    def gram(self, weights: Array) -> Array:
+        # Aᵀ diag(w) A as a dense n×n matrix via sparse arithmetic (row-scale then
+        # sparse Gram), densifying only the small n×n result — mirror of the SciPy
+        # adapter's cached ``gram`` (see its comment for the caching rationale).
+        # The memo compare costs one device reduction + host sync per call; the
+        # SpGEMM it skips is orders of magnitude more work at n ≪ m scale.
+        w = _to_cupy(weights).reshape(-1)
+        if self._gram_value is not None and bool(
+            cupy.array_equal(w, self._gram_weights)
+        ):
+            return cast("Array", to_xp_array(self._gram_value, self._xp))
+
+        a = self._matrix
+        m, n = a.shape
+        size = int(m) * int(n)
+        if size > 0 and a.nnz / size >= _GRAM_DENSE_MIN_DENSITY:
+            # Dense-ish rows: chunked dense GEMM (cuBLAS) beats SpGEMM — the
+            # CPU-calibrated crossover of the SciPy adapter, if anything more
+            # pronounced on GPU tensor pipelines.
+            gram = self._gram_dense_accumulate(a, w)
+        else:
+            if self._gram_transpose is None:
+                self._gram_transpose = a.T.tocsr()
+                self._gram_scaled = a.copy()
+                # nnz→row map, device-native: row of stored element k is the
+                # indptr bucket containing k (no host round-trip of an O(m)
+                # row-count vector, which cupy.repeat's list repeats would need).
+                self._gram_row_index = (
+                    cupy.searchsorted(a.indptr, cupy.arange(int(a.nnz)), side="right")
+                    - 1
+                )
+            scaled = self._gram_scaled
+            scaled.data = a.data * w[self._gram_row_index]
+            gram = cupy.asarray((self._gram_transpose @ scaled).toarray())
+        self._gram_weights = w.copy()
+        self._gram_value = gram
+        self._gram_compute_count += 1
+        return cast("Array", to_xp_array(gram, self._xp))
+
+    def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
+        # ``Aᵀ diag(w) A`` kept SPARSE for the sparse normal-equations route —
+        # mirror of the SciPy adapter's ``gram_coo`` (see its comment for the
+        # pattern-stability contract), on the device via cuSPARSE SpGEMM.
+        w = _to_cupy(weights).reshape(-1)
+        if self._gram_coo_value is not None and bool(
+            cupy.array_equal(w, self._gram_coo_weights)
+        ):
+            product = self._gram_coo_value
+        else:
+            a = self._matrix
+            if self._gram_transpose is None:
+                self._gram_transpose = a.T.tocsr()
+                self._gram_scaled = a.copy()
+                self._gram_row_index = (
+                    cupy.searchsorted(a.indptr, cupy.arange(int(a.nnz)), side="right")
+                    - 1
+                )
+            scaled = self._gram_scaled
+            scaled.data = a.data * w[self._gram_row_index]
+            product = (self._gram_transpose @ scaled).tocoo()
+            self._gram_coo_weights = w.copy()
+            self._gram_coo_value = product
+            self._gram_compute_count += 1
+        n = int(self.shape[1])
+        return (
+            cast("Array", to_xp_array(product.row, self._xp)),
+            cast("Array", to_xp_array(product.col, self._xp)),
+            cast("Array", to_xp_array(product.data, self._xp)),
+            (n, n),
+        )
+
+    def gram_coo_capable(self) -> bool:
+        return True
+
+    @staticmethod
+    def _gram_dense_accumulate(a: Any, w: Any) -> Any:
+        """``Aᵀ diag(w) A`` by cuBLAS over zero-copy row windows of ``a``.
+
+        Mirror of the SciPy adapter's dense-accumulation strategy: densify
+        ``m_chunk × n`` row windows (bounded by ``_GRAM_DENSE_CHUNK_ELEMENTS``)
+        and accumulate ``blockᵀ @ (w_chunk ∘ block)``.
+        """
+        from cupyx.scipy import sparse as cupyx_sparse
+
+        m, n = a.shape
+        chunk = max(1, _GRAM_DENSE_CHUNK_ELEMENTS // max(int(n), 1))
+        # One consolidated host transfer of the chunk-boundary offsets instead
+        # of two 0-d syncs per chunk inside the loop.
+        starts = [*range(0, m, chunk), m]
+        bounds = [int(v) for v in cupy.asnumpy(a.indptr[cupy.asarray(starts)])]
+        out: Any = None
+        for i, start in enumerate(starts[:-1]):
+            end = starts[i + 1]
+            lo, hi = bounds[i], bounds[i + 1]
+            window = cupyx_sparse.csr_matrix(
+                (a.data[lo:hi], a.indices[lo:hi], a.indptr[start : end + 1] - lo),
+                shape=(end - start, n),
+            )
+            block = window.toarray()
+            piece = block.T @ (w[start:end, None] * block)
+            out = piece if out is None else out + piece
+        if out is None:
+            out = cupy.zeros((n, n), dtype=cupy.result_type(a.dtype, w.dtype))
+        return out
 
     def row_gram_diagonal(self, weights: Array) -> Array:
         # diag(A diag(w) Aᵀ)_j = Σ_k w_k A_jk² = (A∘A) w (row energies).
-        squared = self._matrix.multiply(self._matrix)
-        out = squared @ _to_cupy(weights)
+        out = self._squared_csr @ _to_cupy(weights)
         return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
 
     def row_inf_norms(self, like: Array | None = None) -> Array:
@@ -391,6 +534,12 @@ class CuDSSSparseSolver:
         self._xp: Namespace | None = None
         self._dtype: Any | None = None
         self._inertia: tuple[int, int, int] | None = None
+        # Lazy best-effort inertia state: whether the current factor is a
+        # symmetric LDLᵀ (inertia defined), its size, and whether the read was
+        # already attempted (so ``inertia_or_none`` syncs the host at most once).
+        self._symmetric_factor = False
+        self._n_factored = 0
+        self._inertia_read = False
         self._device_id: int | None = None
 
     def describe(self) -> str:
@@ -434,6 +583,8 @@ class CuDSSSparseSolver:
             self._xp = None
             self._dtype = None
             self._inertia = None
+            self._symmetric_factor = False
+            self._inertia_read = False
 
     def factor(self, K: LinearOperator) -> None:
         matrix, xp = _require_csr(K)
@@ -465,10 +616,14 @@ class CuDSSSparseSolver:
                 matrix_view,
                 pattern_signature=pattern_signature,
             )
+            # Under ``require_inertia`` read eagerly (implausible inertia must
+            # fail the factor); otherwise defer to ``inertia_or_none`` so
+            # callers that never consult it pay no per-factor host sync.
+            self._symmetric_factor = symmetric
+            self._n_factored = int(matrix.shape[0])
+            self._inertia_read = self._require_inertia
             self._inertia = (
-                self._read_inertia(int(matrix.shape[0]))
-                if self._require_inertia
-                else None
+                self._read_inertia(self._n_factored) if self._require_inertia else None
             )
 
     def solve(self, rhs: Array) -> Array:
@@ -525,7 +680,30 @@ class CuDSSSparseSolver:
         return self._inertia
 
     def inertia_or_none(self) -> tuple[int, int, int] | None:
-        """Best-effort inertia; only populated under ``require_inertia``."""
+        """Best-effort LDLᵀ inertia of the current symmetric factor.
+
+        Parity with the Feral CPU adapter: inertia is a free by-product of the
+        symmetric factorization and the IPM's inertia-guided δ_w correction
+        depends on it, so it is reported even without ``require_inertia``. The
+        ``data_get`` is a host sync, so it runs lazily and at most once per
+        factor; a GENERAL (non-symmetric) factor has no defined inertia and
+        reports ``None``.
+        """
+        if self._inertia is not None:
+            return self._inertia
+        if (
+            self._inertia_read
+            or not self._symmetric_factor
+            or self._data is None
+            or self._device_id is None
+        ):
+            return None
+        self._inertia_read = True
+        with cupy.cuda.Device(self._device_id):
+            try:
+                self._inertia = self._read_inertia(self._n_factored)
+            except LinearSolveError:
+                self._inertia = None
         return self._inertia
 
     def _guard(self, fn: Any, *args: Any) -> Any:
@@ -534,6 +712,45 @@ class CuDSSSparseSolver:
         try:
             return fn(*args)
         except self._cudss.cuDSSError as exc:
+            raise LinearSolveError(f"cuDSS {fn.__name__} failed: {exc}") from exc
+
+    def _runtime_version(self) -> str:
+        """Best-effort ``major.minor.patch`` of the loaded cuDSS runtime."""
+        get_property = getattr(self._cudss, "get_property", None)
+        if get_property is None:
+            return "unknown"
+        try:
+            # libraryPropertyType: MAJOR_VERSION=0, MINOR_VERSION=1, PATCH_LEVEL=2.
+            return ".".join(str(int(get_property(i))) for i in (0, 1, 2))
+        except Exception:
+            return "unknown"
+
+    def _guard_create(self, fn: Any, *args: Any) -> Any:
+        """Like :meth:`_guard`, but for *matrix creation* calls.
+
+        Creation rejections (INVALID_VALUE / NOT_SUPPORTED) carry no numerical
+        content — the classic cause is a cuDSS runtime that does not match the
+        nvmath-python bindings (observed: cuDSS 0.8 under nvmath 0.9, which was
+        built against 0.7). They are raised as :class:`_CuDSSUnavailableError`
+        so the dispatching solver degrades to spsolve instead of feeding an
+        unfixable failure into the driver's regularization ladder.
+        """
+        assert self._cudss is not None
+        try:
+            return fn(*args)
+        except self._cudss.cuDSSError as exc:
+            status = getattr(exc, "status", None)
+            if status is not None and int(status) in (
+                _CUDSS_STATUS_INVALID_VALUE,
+                _CUDSS_STATUS_NOT_SUPPORTED,
+            ):
+                raise _CuDSSUnavailableError(
+                    f"cuDSS {fn.__name__} rejected its arguments ({exc}); the "
+                    f"loaded cuDSS runtime (version {self._runtime_version()}) "
+                    "likely does not match the version this nvmath-python "
+                    "release was built against — install the matching "
+                    "nvidia-cudss wheel"
+                ) from exc
             raise LinearSolveError(f"cuDSS {fn.__name__} failed: {exc}") from exc
 
     def _ensure_context(self, device_id: int) -> None:
@@ -690,8 +907,10 @@ class CuDSSSparseSolver:
         if self._dn_shape == (n, ncols) and self._rhs_matrix is not None:
             return
         self._destroy_dense()
-        self._b_buf = cupy.zeros((n, ncols), dtype=self._dtype)
-        self._x_buf = cupy.zeros((n, ncols), dtype=self._dtype)
+        # Fortran order to match the COL_MAJOR descriptors (cuDSS supports only
+        # column-major dense matrices; ROW_MAJOR returns NOT_SUPPORTED).
+        self._b_buf = cupy.zeros((n, ncols), dtype=self._dtype, order="F")
+        self._x_buf = cupy.zeros((n, ncols), dtype=self._dtype, order="F")
         self._rhs_matrix = self._create_dense_matrix(n, ncols, self._b_buf)
         self._sol_matrix = self._create_dense_matrix(n, ncols, self._x_buf)
         self._dn_shape = (n, ncols)
@@ -725,7 +944,7 @@ class CuDSSSparseSolver:
         # fits a signed 32-bit int, else int64).
         return cast(
             int,
-            self._guard(
+            self._guard_create(
                 cudss.matrix_create_csr,
                 int(matrix.shape[0]),
                 int(matrix.shape[1]),
@@ -746,16 +965,19 @@ class CuDSSSparseSolver:
         cudss = self._cudss
         if cudss is None:
             raise RuntimeError("cuDSS context was not initialized")
+        # cuDSS supports only column-major dense matrices (cudssMatrixCreateDn
+        # returns NOT_SUPPORTED for ROW_MAJOR), so ld is the row count and the
+        # backing buffers are allocated Fortran-order in _ensure_dense.
         return cast(
             int,
-            self._guard(
+            self._guard_create(
                 cudss.matrix_create_dn,
                 int(nrows),
                 int(ncols),
-                int(ncols),
+                int(nrows),
                 _ptr(values),
                 _value_type(values.dtype),
-                int(cudss.Layout.ROW_MAJOR),
+                int(cudss.Layout.COL_MAJOR),
             ),
         )
 
@@ -763,23 +985,35 @@ class CuDSSSparseSolver:
         cudss = self._cudss
         if cudss is None or self._handle is None or self._data is None:
             raise RuntimeError("cuDSS context was not initialized")
-        counts = (ctypes.c_int64 * 2)()
-        written = ctypes.c_size_t()
-        self._guard(
-            cudss.data_get,
-            self._handle,
-            self._data,
-            int(cudss.DataParam.INERTIA),
-            ctypes.addressof(counts),
-            ctypes.sizeof(counts),
-            ctypes.addressof(written),
-        )
-        pos = int(counts[0])
-        neg = int(counts[1])
-        zero = n - pos - neg
-        if pos < 0 or neg < 0 or zero < 0:
-            raise LinearSolveError("cuDSS returned an implausible inertia")
-        return pos, neg, zero
+        # cuDSS validates the output-buffer size exactly and (observed on 0.7)
+        # fills INERTIA as int32[2], rejecting an int64[2] buffer with
+        # INVALID_VALUE — so try the known layout first, then the widened one
+        # for runtimes that grow it.
+        last_error: LinearSolveError | None = None
+        for count_type in (ctypes.c_int32, ctypes.c_int64):
+            counts = (count_type * 2)()
+            written = ctypes.c_size_t()
+            try:
+                self._guard(
+                    cudss.data_get,
+                    self._handle,
+                    self._data,
+                    int(cudss.DataParam.INERTIA),
+                    ctypes.addressof(counts),
+                    ctypes.sizeof(counts),
+                    ctypes.addressof(written),
+                )
+            except LinearSolveError as exc:
+                last_error = exc
+                continue
+            pos = int(counts[0])
+            neg = int(counts[1])
+            zero = n - pos - neg
+            if pos < 0 or neg < 0 or zero < 0:
+                raise LinearSolveError("cuDSS returned an implausible inertia")
+            return pos, neg, zero
+        assert last_error is not None
+        raise last_error
 
     def _destroy_matrix(self) -> None:
         if self._cudss is not None and self._matrix is not None:
@@ -820,6 +1054,16 @@ class CuPySparseSolver:
                         "GPU sparse inertia requires a user-managed NVIDIA cuDSS "
                         "runtime compatible with the installed CUDA toolkit"
                     ) from exc
+                # Loud on purpose: spsolve re-factorizes from scratch on every
+                # solve (no symbolic reuse), typically orders of magnitude
+                # slower per IPM iteration — a silent downgrade here has cost
+                # real users long, unexplained runs.
+                warnings.warn(
+                    f"cuDSS is unavailable ({exc}); falling back to CuPy "
+                    "spsolve, which re-factorizes on every solve",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             else:
                 return
 

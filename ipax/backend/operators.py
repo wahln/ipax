@@ -155,6 +155,58 @@ class LinearOperator(ABC):
         """
         raise NotImplementedError("operator does not expose a cheap Gram diagonal")
 
+    def gram(self, weights: Array) -> Array:
+        """Return the full weighted Gram matrix ``Aᵀ diag(weights) A`` (dense ``n×n``).
+
+        The matrix analogue of :meth:`gram_diagonal`: the condensed inequality term
+        ``∇gᵀ Σ_s ∇g`` of the Newton system (Breedveld 2017, eq. 18). For a sparse
+        ``A`` this is formed by sparse arithmetic — scale rows by ``weights`` then a
+        sparse Gram product — yielding the small dense ``n×n`` result *without*
+        densifying ``A`` to ``m×n`` first. That is the whole point at radiotherapy
+        scale, where ``m ≫ n``: the dense condensed route would otherwise materialize
+        a ``m×n`` Jacobian (gigabytes) to form an ``n×n`` matrix. Optional, like
+        :meth:`gram_diagonal`; the dense KKT route falls back to densifying ``A`` when
+        it is unavailable.
+        """
+        raise NotImplementedError("operator does not expose a full weighted Gram")
+
+    def gram_capable(self) -> bool:
+        """Whether :meth:`gram` is expected to succeed (no densify fallback).
+
+        A cheap *structural* probe — no Gram is formed — used by solver
+        auto-selection to prefer the condensed normal-equations route for tall
+        (``n ≪ m``) inequality Jacobians. Wrapper operators that forward
+        :meth:`gram` to an inner operator must override this to forward the
+        probe as well. Conservative: the default only reports the override.
+        """
+        return type(self).gram is not LinearOperator.gram
+
+    def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
+        """``Aᵀ diag(weights) A`` as *sparse* COO triplets (invariant #4).
+
+        The sparse sibling of :meth:`gram`, for the sparse condensed
+        normal-equations route: when ``A`` has localized (banded/block) rows,
+        the Gram stays sparse and an ``n×n`` sparse factorization of the
+        condensed matrix beats both the dense route (O(n²) memory) and
+        matrix-free Krylov. Contract: for a fixed operator, the returned
+        *pattern* (rows/cols, canonical order) is identical across calls with
+        different ``weights`` — only the values move — so sparse-direct
+        callers may cache structure and symbolic analyses. Duplicate entries,
+        if any, are summed by the consumer. Optional; on non-localized
+        sparsity the result may be near-dense, which is why route selection
+        treats this as opt-in rather than probing it.
+        """
+        del weights
+        raise NotImplementedError("operator does not expose a sparse COO Gram")
+
+    def gram_coo_capable(self) -> bool:
+        """Whether :meth:`gram_coo` is expected to succeed.
+
+        Structural probe like :meth:`gram_capable`; wrappers forwarding
+        :meth:`gram_coo` must forward this too.
+        """
+        return type(self).gram_coo is not LinearOperator.gram_coo
+
     def row_gram_diagonal(self, weights: Array) -> Array:
         """Return ``diag(A diag(weights) Aᵀ)`` — the weighted *row* energies.
 
@@ -663,6 +715,52 @@ class VStack(LinearOperator):
         xp = array_namespace(result)
         return xp.asarray(result)
 
+    def gram(self, weights: Array) -> Array:
+        # Jᵀ diag(w) J for J = [J1; …; Jk] is Σ_b Jbᵀ diag(w_b) Jb — the vertical
+        # stack sums each block's Gram over its own row (weight) range. Propagates
+        # NotImplementedError if any block cannot form its Gram.
+        result = None
+        offset = 0
+        for op, rows in zip(self._ops, self._rows, strict=True):
+            piece = op.gram(weights[offset : offset + rows])
+            result = piece if result is None else result + piece
+            offset += rows
+        assert result is not None
+        xp = array_namespace(result)
+        return xp.asarray(result)
+
+    def gram_capable(self) -> bool:
+        # The stacked Gram succeeds only when every block's does.
+        return all(op.gram_capable() for op in self._ops)
+
+    def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
+        # Σ_b Jbᵀ diag(w_b) Jb as concatenated n×n triplets: overlapping
+        # entries across blocks are duplicates the consumer sums. Per-block
+        # patterns are stable, so the concatenation is too.
+        rows_parts: list[Array] = []
+        cols_parts: list[Array] = []
+        vals_parts: list[Array] = []
+        offset = 0
+        xp = None
+        for op, n_rows in zip(self._ops, self._rows, strict=True):
+            r, c, v, _ = op.gram_coo(weights[offset : offset + n_rows])
+            if xp is None:
+                xp = array_namespace(v)
+            rows_parts.append(r)
+            cols_parts.append(c)
+            vals_parts.append(v)
+            offset += n_rows
+        assert xp is not None
+        return (
+            xp.concat(tuple(rows_parts)),
+            xp.concat(tuple(cols_parts)),
+            xp.concat(tuple(vals_parts)),
+            (self._n, self._n),
+        )
+
+    def gram_coo_capable(self) -> bool:
+        return all(op.gram_coo_capable() for op in self._ops)
+
     def row_inf_norms(self, like: Array | None = None) -> Array:
         # Stacked rows ⇒ concatenate each block's row norms (used by scaling).
         xp = None
@@ -831,6 +929,27 @@ class _SparseStructured(LinearOperator):
 
     def gram_diagonal(self, weights: Array) -> Array:
         return self._adapter_op().gram_diagonal(weights)
+
+    def gram(self, weights: Array) -> Array:
+        return self._adapter_op().gram(weights)
+
+    def gram_capable(self) -> bool:
+        # Capability lives in the backend adapter operator (e.g. scipy/cupy
+        # implement ``gram``; torch/jax sparse do not yet). No adapter ⇒ the
+        # matvec family itself would fail, so report incapable rather than raise.
+        try:
+            return self._adapter_op().gram_capable()
+        except NotImplementedError:
+            return False
+
+    def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
+        return self._adapter_op().gram_coo(weights)
+
+    def gram_coo_capable(self) -> bool:
+        try:
+            return self._adapter_op().gram_coo_capable()
+        except NotImplementedError:
+            return False
 
     def row_gram_diagonal(self, weights: Array) -> Array:
         return self._adapter_op().row_gram_diagonal(weights)

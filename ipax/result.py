@@ -34,6 +34,7 @@ class Status(Enum):
     INFEASIBLE = "infeasible"
     UNBOUNDED = "unbounded"
     MAX_ITER = "max_iter"
+    STALLED = "stalled"  # frozen iterates: no accepted step, KKT error constant
     RESTORATION_FAILED = "restoration_failed"
     NUMERICAL_ERROR = "numerical_error"
     STOPPED = "stopped"  # user iteration callback requested termination
@@ -91,6 +92,8 @@ class IterationRecord:
     dual_infeasibility: float = float("inf")
     primal_infeasibility: float = float("inf")
     complementarity: float = float("inf")
+    line_search_iters: int = 0  # backtracking trials in the search reaching this row
+    restored: bool = False  # this iterate is the result of a restoration jump
 
 
 @dataclass(frozen=True, slots=True)

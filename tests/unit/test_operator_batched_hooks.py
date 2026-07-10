@@ -77,3 +77,34 @@ def test_vstack_pattern_signature_none_when_any_block_unstructured(namespace):
     top = Dense(array(namespace, [[1.0, 2.0]]))
     bottom = MatrixFreeJacobian((1, 2), matvec=lambda v: v[:1])
     assert VStack((top, bottom)).coo_pattern_signature() is None
+
+
+def test_vstack_gram_sums_block_grams(namespace, tol):
+    # For J = [J1; J2], Jᵀ diag(w) J = J1ᵀ diag(w1) J1 + J2ᵀ diag(w2) J2 — the
+    # block-wise Gram used by the condensed dense route on a stacked Jacobian.
+    import pytest
+
+    from ipax.backend.operators import COOOperator
+    from ipax.backend.sparse import get_sparse_adapter
+
+    if get_sparse_adapter(namespace) is None:
+        pytest.skip(f"no sparse adapter for backend {namespace.__name__!r}")
+
+    top = COOOperator(
+        namespace.asarray([0, 0, 1]),
+        namespace.asarray([0, 1, 2]),
+        array(namespace, [2.0, -1.0, 3.0]),
+        (2, 3),
+    )
+    bottom = COOOperator(
+        namespace.asarray([0, 1]),
+        namespace.asarray([1, 2]),
+        array(namespace, [4.0, 5.0]),
+        (2, 3),
+    )
+    stacked = VStack((top, bottom))
+    weights = array(namespace, [2.0, 0.5, 1.0, 1.5])
+    dense = stacked.dense_matrix()
+    scaled = namespace.expand_dims(weights, axis=1) * dense
+    expected = namespace.matmul(transpose(namespace, dense), scaled)
+    assert_allclose(namespace, stacked.gram(weights), expected, **tol)

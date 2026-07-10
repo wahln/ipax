@@ -167,6 +167,11 @@ def test_objective_stagnation_is_guarded_and_skips_the_initial_record(namespace)
             array(namespace, [1.0]),
             options=Options(
                 linsolve="dense",
+                # Monotone μ keeps this degenerate problem un-converged for a
+                # few iterations so the acceptable-stagnation checker (the
+                # subject of this test) actually fires; the probing default
+                # solves it to full optimality straight away.
+                mu_schedule="monotone",
                 acceptable=AcceptableStoppingOptions(
                     f_rel_change_tol=0.0,
                     dual_inf_tol=1.0,
@@ -223,7 +228,12 @@ def test_verbose_emits_iteration_log_to_ipax_logger(namespace, caplog):
         if rec.levelno == ITERATION and rec.getMessage().lstrip().startswith("iter")
     ]
     assert headers
-    assert "prob_s" in headers[0] and "step_s" in headers[0]
+    assert "prob_s" in headers[0] and "step_s" in headers[0] and "ls" in headers[0]
+    # condensed problem-setup headline (tier 1), before the result summary
+    assert any(
+        rec.levelno == RESULT and rec.getMessage().startswith("ipax solving:")
+        for rec in records
+    )
     # final result summary (tier 1) and the timing split (tier 2)
     assert any(
         rec.levelno == RESULT and rec.getMessage().startswith("result:")
@@ -301,6 +311,58 @@ def test_iterates_meeting_acceptable_criteria_are_marked(namespace, caplog):
     ]
     assert rows
     assert any(row.rstrip().endswith("*") for row in rows)
+
+
+def test_restoration_jump_marks_the_resulting_iteration(namespace, monkeypatch, caplog):
+    # A restoration jump replaces (x, s) outside the Newton step; the record for
+    # the resulting iterate — and its logged row — must say so, both so users can
+    # see restorations in the table and so IterationRecord.restored is reliable
+    # for programmatic inspection.
+    from ipax._logging import ITERATION
+    from ipax.ipm.driver import IPMDriver
+    from ipax.ipm.filter_ls import FilterLineSearch, LineSearchResult
+    from ipax.ipm.restoration import RestorationExit
+    from ipax.testing.problems import HS7
+
+    xp = namespace
+    problem = HS7(xp)
+    x0 = array(xp, [2.0, 2.0])
+
+    calls = {"n": 0}
+    original = FilterLineSearch.search
+
+    def flaky(self, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return original(self, **kwargs)
+        return LineSearchResult(self._o.alpha_min_frac, False, False, True)
+
+    monkeypatch.setattr(FilterLineSearch, "search", flaky)
+
+    feasible = array(xp, [0.0, 1.7320508075688772])  # exactly satisfies HS7's c(x)=0
+
+    def stub_restore(self, x, s, m, m_eq, mask_l, mask_u, lower_safe, upper_safe):
+        return feasible, s, RestorationExit.FEASIBLE
+
+    monkeypatch.setattr(IPMDriver, "_restore", stub_restore)
+
+    with caplog.at_level(ITERATION, logger="ipax"):
+        result = solve(
+            problem,
+            x0,
+            options=Options(hessian="exact", linsolve="dense", verbose=2, max_iter=15),
+        )
+
+    assert any(record.restored for record in result.history)
+
+    rows = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "ipax"
+        and rec.levelno == ITERATION
+        and rec.getMessage().lstrip()[:1].isdigit()
+    ]
+    assert any(row.rstrip().endswith("R") for row in rows)
 
 
 def test_verbosity_tiers_are_emitted_at_their_levels(namespace, caplog):

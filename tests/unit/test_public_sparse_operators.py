@@ -198,6 +198,28 @@ def test_row_gram_diagonal_matches_dense(namespace, tol):
     assert_allclose(namespace, op.row_gram_diagonal(weights), expected, **tol)
 
 
+def test_gram_matches_dense(namespace, tol):
+    # Full weighted Gram Aᵀ diag(w) A as a dense n×n matrix (the condensed
+    # inequality term ∇gᵀ Σ_s ∇g, formed without densifying A to m×n).
+    _require_adapter(namespace)
+    op = _coo_AB(namespace)
+    dense = array(namespace, [[2.0, -1.0, 0.5], [0.0, 3.0, 4.0]])
+    weights = array(namespace, [2.0, 0.5])
+    scaled = namespace.expand_dims(weights, axis=1) * dense
+    expected = namespace.matmul(transpose(namespace, dense), scaled)
+    assert_allclose(namespace, op.gram(weights), expected, **tol)
+
+
+def test_gram_diagonal_is_gram_diagonal(namespace, tol):
+    # The full Gram's diagonal must agree with the cheap gram_diagonal hook.
+    _require_adapter(namespace)
+    op = _coo_AB(namespace)
+    weights = array(namespace, [1.3, 0.7])
+    gram = op.gram(weights)
+    diag = namespace.asarray([gram[k, k] for k in range(int(gram.shape[0]))])
+    assert_allclose(namespace, diag, op.gram_diagonal(weights), **tol)
+
+
 def test_rmatmat_matches_dense(namespace, tol):
     _require_adapter(namespace)
     op = _coo_AB(namespace)

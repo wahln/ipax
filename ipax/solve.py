@@ -31,6 +31,7 @@ from ipax._logging import (
     format_options,
     format_problem,
     format_result,
+    format_setup,
     format_solver,
     format_timing,
     logger,
@@ -52,6 +53,7 @@ from ipax.result import (
 )
 
 if TYPE_CHECKING:
+    from ipax.backend.operators import LinearOperator
     from ipax.problem.base import Problem
     from ipax.result import IterationCallback
     from ipax.typing import Array, Namespace
@@ -65,12 +67,13 @@ def _has_nonlinear_equalities(problem: Problem, x: Array) -> bool:
     return int(values.shape[0]) > 0
 
 
-def _has_inequalities(problem: Problem, x: Array) -> bool:
+def _count_inequalities(problem: Problem, x: Array) -> int:
+    """Total inequality rows at ``x`` (nonlinear + lowered linear), 0 if none."""
     try:
         values = problem.ineq_constraints(x)
     except NotImplementedError:
-        return False
-    return int(values.shape[0]) > 0
+        return 0
+    return int(values.shape[0])
 
 
 def _bound_violation(
@@ -172,7 +175,8 @@ def solve(
     # no-op when the problem declares no ``linear_ineq``.
     resolved = lower_linear_inequalities(resolved, x0, xp)
 
-    has_ineq = _has_inequalities(resolved, x0)
+    m_ineq = _count_inequalities(resolved, x0)
+    has_ineq = m_ineq > 0
     has_eq = _has_nonlinear_equalities(resolved, x0)
     has_equalities = has_eq or resolved.linear_eq() is not None
 
@@ -195,11 +199,49 @@ def solve(
     if warm_start is not None and problem_scaling is not None:
         effective_warm = _scale_warm_start(warm_start, problem_scaling)
 
+    # Lazy structural probes for the tall n ≪ m selection heuristic: they
+    # evaluate the (scaled) inequality Jacobian once at ``x0`` — only when
+    # ``select_solver`` actually reaches the tall-problem branch — and share
+    # the evaluated operator so the Jacobian is built at most once.
+    _probe_cache: list[LinearOperator | None] = []
+
+    def _ineq_jac_probe() -> LinearOperator | None:
+        if not _probe_cache:
+            from ipax.backend.operators import as_operator
+
+            try:
+                _probe_cache.append(as_operator(model.ineq_jacobian(x0)))
+            except NotImplementedError:
+                _probe_cache.append(None)
+        return _probe_cache[0]
+
+    def _ineq_gram_capable() -> bool:
+        """Whether ∇g can form ``∇gᵀ diag(w) ∇g`` without densifying to m×n."""
+        op = _ineq_jac_probe()
+        return op is not None and op.gram_capable()
+
+    def _ineq_density() -> float | None:
+        """``nnz/(m·n)`` of ∇g, or ``None`` without explicit COO structure."""
+        op = _ineq_jac_probe()
+        if op is None:
+            return None
+        rows, cols = op.shape
+        if rows == 0 or cols == 0:
+            return None
+        try:
+            values = op.to_coo()[2]
+        except NotImplementedError:
+            return None
+        return int(values.shape[0]) / (int(rows) * int(cols))
+
     solver = select_solver(
         n_vars=int(resolved.n_vars),
         has_equalities=has_equalities,
         capabilities=capabilities(xp),
         options=opts,
+        m_ineq=m_ineq,
+        ineq_gram_capable=_ineq_gram_capable if has_ineq else None,
+        ineq_density=_ineq_density if has_ineq else None,
     )
 
     # Pre-solve diagnostics (verbosity tiers 3–5; gated by the logger threshold
@@ -258,8 +300,14 @@ def _log_setup(
     has_ineq: bool,
     has_eq: bool,
 ) -> None:
-    """Emit the problem/solver/options diagnostics (verbosity tiers 3–5)."""
-    if logger.isEnabledFor(PROBLEM):
+    """Emit the problem/solver/options diagnostics (verbosity tiers 1, 3–5).
+
+    ``RESULT`` (tier 1, ``verbose >= 1``) is the least restrictive tier that
+    needs the problem counts, so they are only evaluated (an extra constraint
+    callback each) when at least that tier is enabled — a silent/``verbose=0``
+    solve pays nothing extra.
+    """
+    if logger.isEnabledFor(RESULT):
         n_ineq = int(resolved.ineq_constraints(x0).shape[0]) if has_ineq else 0
         n_eq_nl = int(resolved.eq_constraints(x0).shape[0]) if has_eq else 0
         linear = resolved.linear_eq()
@@ -267,20 +315,45 @@ def _log_setup(
         n_lower = _count_finite(xp, lower)
         n_upper = _count_finite(xp, upper)
         logger.log(
-            PROBLEM,
-            format_problem(
+            RESULT,
+            format_setup(
                 n_vars=int(resolved.n_vars),
-                n_ineq=n_ineq,
-                n_eq_nonlinear=n_eq_nl,
-                n_eq_linear=n_eq_lin,
                 n_lower=n_lower,
                 n_upper=n_upper,
+                n_eq=n_eq_nl + n_eq_lin,
+                n_ineq=n_ineq,
+                linear_solver=_describe_solver(solver),
+                hessian=_hessian_source(resolved),
             ),
         )
+        if logger.isEnabledFor(PROBLEM):
+            logger.log(
+                PROBLEM,
+                format_problem(
+                    n_vars=int(resolved.n_vars),
+                    n_ineq=n_ineq,
+                    n_eq_nonlinear=n_eq_nl,
+                    n_eq_linear=n_eq_lin,
+                    n_lower=n_lower,
+                    n_upper=n_upper,
+                ),
+            )
     if logger.isEnabledFor(SOLVER):
         logger.log(SOLVER, format_solver(opts, type(solver).__name__))
     if logger.isEnabledFor(OPTIONS):
         logger.log(OPTIONS, format_options(opts))
+
+
+def _hessian_source(resolved: Problem) -> str:
+    """The resolved Hessian source (``"analytic"``/``"autodiff-hvp"``/``"lbfgs"``).
+
+    ``resolve()`` always attaches ``sources`` to the returned
+    :class:`~ipax.problem.derivatives.ResolvedProblem`, but the static type here
+    is the ``Problem`` ABC (which doesn't declare it) — mirrors the ``getattr``
+    fallback the driver uses for the same attribute.
+    """
+    sources = getattr(resolved, "sources", None)
+    return "unknown" if sources is None else str(sources.hessian)
 
 
 def _describe_solver(solver: object) -> str:

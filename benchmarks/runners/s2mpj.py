@@ -87,6 +87,7 @@ def default_configs(
     krylov_max_vars: int = _KRYLOV_MAX_VARS,
     sparse_max_vars: int = _SPARSE_MAX_VARS,
     krylov_preconditioner: str | None = None,
+    mu_schedule: str | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -107,6 +108,10 @@ def default_configs(
         "max_time": max_time,
         "scaling": scaling,
     }
+    if mu_schedule is not None:
+        # μ-oracle A/B lever (e.g. probing-default vs monotone); None keeps
+        # the solver default so ordinary sweeps track it automatically.
+        common["mu_schedule"] = mu_schedule
     krylov_common = dict(common)
     if krylov_preconditioner is not None:
         krylov_common["krylov"] = KrylovOptions(preconditioner=krylov_preconditioner)  # type: ignore[arg-type]
@@ -388,6 +393,13 @@ def main(argv: list[str] | None = None) -> int:
         "Only affects the Krylov configs — the lever for an auto-vs-jacobi A/B.",
     )
     parser.add_argument(
+        "--mu-schedule",
+        default=None,
+        choices=["monotone", "adaptive", "breedveld", "probing"],
+        help="override the barrier μ oracle on every config (default: the solver "
+        "default) — the lever for a schedule A/B such as probing vs monotone.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -443,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
         krylov_max_vars=args.krylov_max_vars,
         sparse_max_vars=args.sparse_max_vars,
         krylov_preconditioner=args.preconditioner,
+        mu_schedule=args.mu_schedule,
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}

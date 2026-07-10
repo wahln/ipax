@@ -21,27 +21,55 @@ This is a **damped Gauss-Newton / Levenberg–Marquardt** minimization of the
     F(x) = ½‖c(x)‖² + ½‖max(g(x), 0)‖²
 
 (the slacks are recovered as ``s = max(-g(x), floor)`` afterwards, which is the
-minimizer of ``‖g+s‖`` over ``s ≥ 0``). It returns a point with reduced
-violation, or declares local infeasibility when the infeasibility minimization
-stalls at a stationary point with ``θ`` above tolerance.
+minimizer of ``‖g+s‖`` over ``s ≥ 0``). It returns the reached point together
+with a :class:`RestorationExit` reason; only a stationarity-type exit with
+``θ`` above tolerance is evidence of *local infeasibility* — a stall or an
+exhausted budget merely says the minimization gave up.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ipax.backend.operators import LinearOperator
     from ipax.typing import Array, Namespace
 
-_MAX_ITER = 80
+_MAX_ITER = 200  # outer (Jacobian-rebuild) iterations; stalls exit via the window
+_STALL_WINDOW = 12  # exit when f fails to improve by _STALL_RTOL over this window
+_STALL_RTOL = 1e-3
 _LM_INIT = 1e-8  # Levenberg–Marquardt damping seed
 _LM_GROW = 10.0
 _LM_SHRINK = 0.1
 _LM_MAX = 1e16  # ceiling on the damping before declaring no further progress
 _GRAD_TOL = 1e-10  # stationarity test for the infeasibility objective
 _SLACK_FLOOR = 1e-12
+
+
+class RestorationExit(Enum):
+    """How the infeasibility minimization ended.
+
+    Only :attr:`STATIONARY` and :attr:`NO_DESCENT` are certificates of local
+    infeasibility (a first-order stationary point of the bound-constrained
+    infeasibility with ``θ > 0``; Wächter & Biegler 2006, §3.3). A window or
+    budget exit is a mere stall: the S2MPJ restfix audit (2026-07) showed the
+    trailing-window guard exiting *early* on slow problems (LAKES/NASH/SWOPF),
+    and treating that as an infeasibility verdict relabels an honest
+    out-of-budget failure as a false claim about the problem.
+    """
+
+    FEASIBLE = "feasible"  # θ_∞ reached the feasibility tolerance
+    STATIONARY = "stationary"  # projected-gradient stationary point of F
+    NO_DESCENT = "no_descent"  # no LM damping in [init, max] yields descent
+    STALL_WINDOW = "stall_window"  # trailing-window plateau (uncertified)
+    BUDGET = "budget"  # iteration budget exhausted (uncertified)
+
+    @property
+    def certifies_infeasibility(self) -> bool:
+        """Whether this exit is first-order evidence of local infeasibility."""
+        return self in (RestorationExit.STATIONARY, RestorationExit.NO_DESCENT)
 
 
 def _dense(op: LinearOperator, xp: Namespace, dtype: object) -> Array:
@@ -64,20 +92,21 @@ def restore(
     lower_safe: Array,
     upper_safe: Array,
     tol: float,
-) -> tuple[Array, Array, bool]:
-    """Minimize the constraint infeasibility; return ``(x, s, infeasible)``."""
+) -> tuple[Array, Array, RestorationExit]:
+    """Minimize the constraint infeasibility; return ``(x, s, exit_reason)``."""
     dtype = x.dtype
     n = int(x.shape[0])
     identity = xp.eye(n, dtype=dtype)
     feasible_tol = max(tol, 1e-8)
 
+    margin = feasible_tol
+    both = xp.logical_and(mask_l, mask_u)
+    narrow = xp.logical_and(both, upper_safe - lower_safe <= 2.0 * margin)
+    midpoint = 0.5 * (lower_safe + upper_safe)
+    lower_target = xp.where(narrow, midpoint, lower_safe + margin)
+    upper_target = xp.where(narrow, midpoint, upper_safe - margin)
+
     def project(x: Array) -> Array:
-        margin = feasible_tol
-        both = xp.logical_and(mask_l, mask_u)
-        narrow = xp.logical_and(both, upper_safe - lower_safe <= 2.0 * margin)
-        midpoint = 0.5 * (lower_safe + upper_safe)
-        lower_target = xp.where(narrow, midpoint, lower_safe + margin)
-        upper_target = xp.where(narrow, midpoint, upper_safe - margin)
         x = xp.where(mask_l, xp.maximum(x, lower_target), x)
         return xp.where(mask_u, xp.minimum(x, upper_target), x)
 
@@ -102,8 +131,29 @@ def restore(
 
     x = project(x)
     lam = _LM_INIT
+    f_window: list[float] = []
+    exit_reason = RestorationExit.BUDGET
     for _ in range(_MAX_ITER):
         f, c, g, gpos = infeasibility(x)
+
+        theta = float(xp.max(xp.abs(c))) if m_eq > 0 else 0.0
+        if m > 0:
+            theta = max(theta, float(xp.max(xp.abs(gpos))))
+        if theta <= feasible_tol:
+            exit_reason = RestorationExit.FEASIBLE
+            break
+
+        # Trailing-window progress guard: a plateau (an LM accept/reject limit
+        # cycle near a nonzero local minimizer of F) exits here instead of
+        # consuming the full budget, which is what pays for the larger
+        # _MAX_ITER that genuinely converging runs (CORE1-class) need.
+        f_window.append(f)
+        if len(f_window) > _STALL_WINDOW:
+            del f_window[0]
+            if f > (1.0 - _STALL_RTOL) * f_window[0]:
+                exit_reason = RestorationExit.STALL_WINDOW
+                break
+
         hessian = xp.zeros((n, n), dtype=dtype)
         grad = xp.zeros((n,), dtype=dtype)
         if m_eq > 0:
@@ -118,51 +168,86 @@ def restore(
             hessian = hessian + xp.matmul(xp.permute_dims(jg, (1, 0)), jg_w)
             grad = grad + xp.matmul(xp.permute_dims(jg, (1, 0)), gpos)
 
-        theta = float(xp.max(xp.abs(c))) if m_eq > 0 else 0.0
-        if m > 0:
-            theta = max(theta, float(xp.max(xp.abs(gpos))))
-        grad_norm = float(xp.max(xp.abs(grad))) if n > 0 else 0.0
-
-        if theta <= feasible_tol:
-            break
+        # First-order stationarity for the BOUND-CONSTRAINED infeasibility
+        # problem: a component whose descent direction points out of the box is
+        # blocked and carries no reducibility information (projected-gradient
+        # optimality; Bertsekas 1999, prop. 2.1.2). Testing the raw gradient
+        # here misses active-bound stalls (MANNE, S2MPJ 2026-07 audit) and
+        # grinds the damping to its ceiling with one Jacobian rebuild per
+        # projection-swallowed trial.
+        blocked_lo = xp.logical_and(
+            mask_l, xp.logical_and(x <= lower_target, grad > 0.0)
+        )
+        blocked_hi = xp.logical_and(
+            mask_u, xp.logical_and(x >= upper_target, grad < 0.0)
+        )
+        blocked = xp.logical_or(blocked_lo, blocked_hi)
+        pg = xp.where(blocked, xp.zeros_like(grad), grad)
+        grad_norm = float(xp.max(xp.abs(pg))) if n > 0 else 0.0
         if grad_norm <= _GRAD_TOL:
-            # Stationary point of the infeasibility with θ > 0 ⇒ infeasible.
+            # Stationary point of the infeasibility with θ > 0 ⇒ a local-
+            # infeasibility certificate.
             s_out = recover_slack(g)
-            return x, s_out, True
+            return x, s_out, RestorationExit.STATIONARY
 
-        # Damped Gauss-Newton step. A rank-deficient or extreme-scale normal
-        # matrix (e.g. the (1+x1²)² Jacobian of HS7 reaching ~1e201 at a bad
-        # iterate) can make the backend's solve raise or return a non-finite
-        # step; both are a failed LM step ⇒ grow λ and retry, exactly as a
-        # rejected step. The exception type is backend-specific (numpy
-        # ``LinAlgError``, torch ``_LinAlgError``, …) and cannot be named without
-        # importing a concrete library (invariant #1), so it is caught broadly.
-        try:
-            dx = xp.linalg.solve(hessian + lam * identity, -grad)
-            step_ok = bool(xp.all(xp.isfinite(dx)))
-        except MemoryError:  # a genuine resource failure must propagate, not retry
-            raise
-        except Exception:  # backend-specific singular-solve error (see comment)
-            step_ok = False
-        if not step_ok:
-            lam = lam * _LM_GROW
-            if lam > _LM_MAX:
-                break
-            continue
+        # Bound-blocked variables are fixed for this step: zero their rows and
+        # columns of the normal matrix (unit diagonal, zero rhs) so the free
+        # block solves the *reduced* Gauss-Newton system — projected Newton on
+        # the binding set (Bertsekas 1999, §2.3). On strongly coupled
+        # Jacobians the full-space step is dominated by the blocked
+        # components; projection swallows it and the LM loop degrades into a
+        # microscopic gradient crawl (S2MPJ DRUGDIS: θ 0.19 → 0.16 in a full
+        # 200-iteration budget, vs 8e-4 with the reduction).
+        blocked_f = xp.astype(blocked, dtype)
+        free_f = 1.0 - blocked_f
+        hessian = (
+            hessian * (xp.expand_dims(free_f, axis=1) * xp.expand_dims(free_f, axis=0))
+            + identity * blocked_f
+        )
+        grad = pg
 
-        x_trial = project(x + dx)
-        f_trial, _, _, _ = infeasibility(x_trial)
-        if f_trial < f:
-            x = x_trial
-            lam = max(_LM_INIT, lam * _LM_SHRINK)
-        else:
+        # Damped Gauss-Newton step with an INNER damping loop: the normal
+        # matrix, gradient and residuals belong to the unchanged iterate, so a
+        # rejected trial retries with a larger λ without rebuilding them
+        # (Levenberg–Marquardt damping control; Nocedal & Wright 2006, §10.3).
+        # A rank-deficient or extreme-scale normal matrix (e.g. the (1+x1²)²
+        # Jacobian of HS7 reaching ~1e201 at a bad iterate) can make the
+        # backend's solve raise or return a non-finite step; both count as a
+        # rejected trial. The exception type is backend-specific (numpy
+        # ``LinAlgError``, torch ``_LinAlgError``, …) and cannot be named
+        # without importing a concrete library (invariant #1), so it is caught
+        # broadly.
+        accepted = False
+        while lam <= _LM_MAX:
+            try:
+                dx = xp.linalg.solve(hessian + lam * identity, -grad)
+                step_ok = bool(xp.all(xp.isfinite(dx)))
+            except MemoryError:  # a genuine resource failure must propagate
+                raise
+            except Exception:  # backend-specific singular-solve error
+                step_ok = False
+            if step_ok:
+                x_trial = project(x + dx)
+                f_trial, _, _, _ = infeasibility(x_trial)
+                if f_trial < f:
+                    x = x_trial
+                    lam = max(_LM_INIT, lam * _LM_SHRINK)
+                    accepted = True
+                    break
             lam = lam * _LM_GROW
-            if lam > _LM_MAX:
-                break
+        if not accepted:
+            # No damping in [_LM_INIT, _LM_MAX] yields descent: numerically
+            # stationary, which certifies like the gradient test above.
+            exit_reason = RestorationExit.NO_DESCENT
+            break
 
     _, c, g, _ = infeasibility(x)
     s_out = recover_slack(g)
-    return x, s_out, filter_theta(c, g, s_out) > feasible_tol
+    if filter_theta(c, g, s_out) <= feasible_tol:
+        # The final point is feasible by the driver's own (ℓ1 filter) measure,
+        # whatever ended the loop — never report a stall from a feasible point.
+        exit_reason = RestorationExit.FEASIBLE
+    return x, s_out, exit_reason
 
 
-__all__ = ["restore"]
+__all__ = ["RestorationExit", "restore"]

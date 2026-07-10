@@ -19,10 +19,32 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ipax.backend.namespace import Capabilities
     from ipax.backend.operators import LinearOperator
     from ipax.options import Options
     from ipax.typing import Array
+
+# Auto-selection thresholds. Below ``_DENSE_AUTO_MAX_VARS`` the dense route is
+# the reference choice regardless of constraint shape. Between that and
+# ``_TALL_DENSE_MAX_VARS`` the dense condensed (normal-equations) route is still
+# preferred *when the problem is tall*: with ``m ≥ _TALL_ROW_EXCESS · n``
+# inequality rows and a Gram-capable Jacobian, one n×n Cholesky per iteration
+# beats Krylov's repeated O(nnz(∇g)) matvecs through the huge Jacobian
+# (Breedveld 2017 §2: the condensed system is n×n however large m grows).
+# The tall extension is additionally gated on Jacobian *density*: the dense
+# win in this zone comes from the adapters' dense-GEMM Gram (engages at
+# ≥ ~5% density; the measured 13–19× TROTS per-iteration wins), while at ~1%
+# density the SpGEMM Gram + O(n³) Cholesky LOSE to Krylov (tall-crossover
+# measurement 2026-07: n=10k, m=10n — dense 75.5 s/iter vs Krylov 46.5).
+_DENSE_AUTO_MAX_VARS = 10_000
+_TALL_DENSE_MAX_VARS = 20_000
+_TALL_ROW_EXCESS = 10
+# Mirrors the adapters' dense-GEMM Gram crossover (``_GRAM_DENSE_MIN_DENSITY``
+# in ``backend/sparse/numpy_scipy.py`` — kept as a separate constant so the
+# core does not import an adapter).
+_TALL_DENSE_MIN_DENSITY = 0.05
 
 
 class LinearSolveError(RuntimeError):
@@ -64,8 +86,19 @@ def select_solver(
     has_equalities: bool,
     capabilities: Capabilities,
     options: Options,
+    m_ineq: int = 0,
+    ineq_gram_capable: Callable[[], bool] | None = None,
+    ineq_density: Callable[[], float | None] | None = None,
 ) -> LinearSolver:
-    """Pick a concrete linear solver from user preference and backend features."""
+    """Pick a concrete linear solver from user preference and backend features.
+
+    ``m_ineq`` (total inequality rows), ``ineq_gram_capable`` and
+    ``ineq_density`` (both *lazy* structural probes of the inequality Jacobian
+    — they may evaluate it at ``x0``, so they are only called when the
+    tall-problem heuristic actually needs them) extend auto-selection to tall
+    ``n ≪ m`` problems. ``ineq_density`` returns ``nnz/(m·n)`` or ``None``
+    when the operator exposes no COO structure.
+    """
     from ipax.linalg.dense import DenseSolver
     from ipax.linalg.krylov import KrylovSolver
 
@@ -76,7 +109,7 @@ def select_solver(
     if mode == "dense":
         if not has_dense_solve():
             raise RuntimeError("dense linear solving requires xp.linalg.solve")
-        return DenseSolver()
+        return DenseSolver(options.dense)
 
     if mode == "krylov":
         return KrylovSolver(options.krylov)
@@ -86,14 +119,30 @@ def select_solver(
             raise RuntimeError("sparse linear solving is unavailable for this backend")
         from ipax.linalg.sparse import SparseDirectSolver
 
-        return SparseDirectSolver()
+        return SparseDirectSolver(form=options.sparse.kkt_route)
 
+    dense_viable = has_dense_solve() and (
+        not has_equalities or "cholesky" in capabilities.linalg_functions
+    )
+    if n_vars < _DENSE_AUTO_MAX_VARS and dense_viable:
+        return DenseSolver(options.dense)
+
+    # Tall n ≪ m: the condensed block stays n×n however many inequality rows
+    # exist, and a Gram-capable Jacobian forms it without densifying m×n —
+    # prefer the direct dense route over Krylov through the huge Jacobian,
+    # but only when the rows are dense enough for the dense-GEMM Gram (see
+    # the threshold comments above; sparse tall Jacobians measure faster on
+    # Krylov in this zone).
     if (
-        n_vars < 10_000
-        and has_dense_solve()
-        and (not has_equalities or "cholesky" in capabilities.linalg_functions)
+        n_vars < _TALL_DENSE_MAX_VARS
+        and dense_viable
+        and m_ineq >= _TALL_ROW_EXCESS * n_vars
+        and ineq_gram_capable is not None
+        and ineq_gram_capable()
     ):
-        return DenseSolver()
+        density = ineq_density() if ineq_density is not None else None
+        if density is None or density >= _TALL_DENSE_MIN_DENSITY:
+            return DenseSolver(options.dense)
 
     return KrylovSolver(options.krylov)
 

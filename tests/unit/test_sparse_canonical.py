@@ -100,6 +100,86 @@ def test_compiled_lower_triangle_keep_filters_upper_entries():
     np.testing.assert_allclose(built.toarray(), reference.toarray())
 
 
+class _CupyLikeNamespace:
+    """NumPy-backed namespace that mimics real CuPy's ``repeat`` restriction.
+
+    ``cupy.repeat`` rejects array-valued ``repeats`` (NumPy accepts them), so a
+    plain-NumPy test cannot catch code that relies on that NumPy-only feature.
+    Everything else delegates to NumPy.
+    """
+
+    def __getattr__(self, name: str):
+        return getattr(np, name)
+
+    @staticmethod
+    def repeat(a, repeats, axis=None):
+        if isinstance(repeats, np.ndarray):
+            raise ValueError("cupy.ndaray cannot be specified as `repeats` argument.")
+        return np.repeat(a, repeats, axis)
+
+
+def _symmetric_full_csr():
+    """A canonical symmetric full CSR pattern shared by the tril tests."""
+    rows = np.asarray([0, 0, 1, 1, 2, 2])
+    cols = np.asarray([0, 1, 0, 1, 1, 2])
+    shape = (3, 3)
+    full = scipy_sparse.coo_matrix(
+        (np.ones(rows.shape[0]), (rows, cols)), shape=shape
+    ).tocsr()
+    full.sum_duplicates()
+    full.sort_indices()
+    return full, shape
+
+
+def test_compile_lower_triangle_avoids_array_valued_repeat():
+    # Regression (cuDSS symmetric route on device): the nnz→row ownership map
+    # was built with ``xp.repeat(arange, counts)``, which NumPy accepts but real
+    # CuPy raises on — crashing the first symmetric factor. Compiling under a
+    # CuPy-semantics namespace must succeed and match scipy's tril.
+    full, shape = _symmetric_full_csr()
+
+    lower = compile_lower_triangle(_CupyLikeNamespace(), full.indptr, full.indices, 3)
+
+    data = np.arange(1.0, full.nnz + 1.0)
+    built = scipy_sparse.csr_matrix(
+        (lower.data(data), lower.indices, lower.indptr), shape=shape
+    )
+    reference = scipy_sparse.tril(
+        scipy_sparse.csr_matrix((data, full.indices, full.indptr), shape=shape)
+    ).tocsr()
+    np.testing.assert_allclose(built.toarray(), reference.toarray())
+
+
+@pytest.mark.gpu
+def test_compile_lower_triangle_on_real_cupy():
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("no CUDA device available")
+    except Exception:
+        pytest.skip("CUDA is not available")
+
+    full, shape = _symmetric_full_csr()
+
+    lower = compile_lower_triangle(
+        cupy, cupy.asarray(full.indptr), cupy.asarray(full.indices), 3
+    )
+
+    data = np.arange(1.0, full.nnz + 1.0)
+    built = scipy_sparse.csr_matrix(
+        (
+            cupy.asnumpy(lower.data(cupy.asarray(data))),
+            cupy.asnumpy(lower.indices),
+            cupy.asnumpy(lower.indptr),
+        ),
+        shape=shape,
+    )
+    reference = scipy_sparse.tril(
+        scipy_sparse.csr_matrix((data, full.indices, full.indptr), shape=shape)
+    ).tocsr()
+    np.testing.assert_allclose(built.toarray(), reference.toarray())
+
+
 def test_compiled_lower_triangle_matches_scipy_tril():
     # Build a canonical symmetric full CSR, then check the compiled lower-triangle
     # gather reproduces scipy's tril(...).tocsr() for two value vectors.

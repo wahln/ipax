@@ -21,6 +21,7 @@ BANNED_TOP_LEVEL = {"numpy", "torch", "cupy", "cupyx", "jax", "jaxlib", "scipy"}
 # Directories (relative to the ipax package) where adapter imports are allowed.
 ALLOWED_PREFIXES = (
     "backend/sparse/",
+    "backend/dense/",
     "problem/autodiff/",
 )
 

@@ -347,3 +347,24 @@ def test_s2mpj_bridge_derivatives_match_finite_differences(bridge_namespace):
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+def test_second_chance_restoration_rescues_catenary(bridge_namespace, backend_name):
+    # S2MPJ 2026-07 audit: CATENARY (exact/dense) walks into a bad basin, its
+    # restoration converges to a nonzero LOCAL minimizer of the infeasibility,
+    # and the run was falsely declared INFEASIBLE on all six configs — even
+    # though feasibility (and the optimum) is directly reachable from x0. The
+    # x0-anchored second-chance restoration must rescue it.
+    if backend_name != "numpy":
+        pytest.skip("driver-behavior regression; one backend suffices")
+    xp = bridge_namespace
+    (case,) = s2mpj.s2mpj_problems(("CATENARY",), hessian="exact", backends=("numpy",))
+    problem, x0 = case.build(xp)
+    result = solve(
+        problem,
+        x0,
+        options=Options(hessian="exact", linsolve="dense", scaling="gradient-based"),
+    )
+
+    assert result.status is not Status.INFEASIBLE
+    assert result.constraint_violation <= 1e-6

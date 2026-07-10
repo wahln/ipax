@@ -78,6 +78,7 @@ class LineSearchResult:
     augment: bool  # θ-type accepted steps augment the filter
     restoration: bool
     used_soc: bool = False
+    n_trials: int = 1  # number of backtracking trial step sizes evaluated
 
 
 class FilterLineSearch:
@@ -136,7 +137,9 @@ class FilterLineSearch:
         alpha = alpha_max
         alpha_min = o.alpha_min_frac
         first = True
+        trials = 0
         while alpha >= alpha_min:
+            trials += 1
             theta_t, phi_t = eval_point(alpha)
 
             # SOC on the first (full-ish) trial that worsens feasibility.
@@ -151,16 +154,20 @@ class FilterLineSearch:
                         # finiteness is checked inside ``soc`` (which returns None
                         # to reject a non-finite-derivative corrected trial).
                         switching = self._switching(dphi, alpha, theta0)
-                        return LineSearchResult(alpha, True, not switching, False, True)
+                        return LineSearchResult(
+                            alpha, True, not switching, False, True, trials
+                        )
             first = False
 
             if self._accept(
                 theta_t, phi_t, theta0, phi0, dphi, alpha, theta_max, entries
             ) and (grad_finite is None or grad_finite(alpha)):
                 switching = self._switching(dphi, alpha, theta0)
-                return LineSearchResult(alpha, True, not switching, False)
+                return LineSearchResult(
+                    alpha, True, not switching, False, n_trials=trials
+                )
             alpha *= 0.5
-        return LineSearchResult(alpha_min, False, False, True)
+        return LineSearchResult(alpha_min, False, False, True, n_trials=trials)
 
     def _switching(self, dphi: float, alpha: float, theta0: float) -> bool:
         o = self._o
@@ -200,11 +207,13 @@ class FilterLineSearch:
         if self._switching(dphi, alpha, theta0):
             # f-type step: require Armijo decrease on the barrier objective.
             return phi_t <= phi0 + o.eta_phi * alpha * dphi
-        # θ-type step: sufficient decrease in θ or φ vs the current point.
-        return (
-            theta_t <= (1.0 - o.gamma_theta) * theta0
-            or phi_t <= phi0 - o.gamma_phi * theta0
-        )
+        # θ-type step: sufficient decrease in θ or φ vs the current point
+        # (W&B eq. 20). At a feasible iterate (θ0 = 0) no θ-progress step
+        # exists — the branch would degenerate to "0 ≤ 0" and accept an
+        # arbitrary ascent direction (W&B §2.3: only f-type/φ-decrease
+        # acceptance applies there), so it requires θ0 > 0.
+        theta_progress = theta0 > 0.0 and theta_t <= (1.0 - o.gamma_theta) * theta0
+        return theta_progress or phi_t <= phi0 - o.gamma_phi * theta0
 
 
 __all__ = ["Filter", "FilterLineSearch", "LineSearchResult"]

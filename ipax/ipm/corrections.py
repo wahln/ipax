@@ -20,14 +20,22 @@ unchanged KKT operator:
 
 - **Mehrotra predictor–corrector** (Mehrotra 1992, *SIAM J. Optim.* 2(4)). An
   *affine* (predictor) solve with complementarity target ``0`` gives the maximal
-  un-centered step; its boundary step lengths set the adaptive centering
-  parameter ``σ = (μ_aff/μ)³`` and a second-order complementarity correction
-  ``−ΔΔ``. A single corrector solve then targets ``σμ − ΔΔ`` per component.
+  un-centered step and a second-order complementarity correction ``−ΔΔ``. A
+  single corrector solve then targets ``μ − ΔΔ`` per component.
 - **Gondzio multiple centrality corrections** (Gondzio 1996, *Comput. Optim.
   Appl.* 6(2)). Starting from the Mehrotra step, up to ``K`` further corrections
   project the *trial* complementarity products (taken at slightly enlarged step
   lengths) into a target box ``[γ μ, μ/γ]`` and re-solve; each correction
   is kept only while it enlarges the step lengths.
+
+Correctors *consume* the barrier target ``μ`` — they never choose it (Nocedal,
+Wächter & Waltz 2009: "the corrector is not part of the selection of the
+barrier parameter"). The driver's μ oracle (``Options.mu_schedule``) picks the
+target; :func:`probing_mu` is the Mehrotra σ-rule oracle
+(``σ = (μ_aff/μ)³``, NWW 2009 eqs. (3.2)–(3.5)), which lives here because it
+probes the affine direction. :class:`CenteringOnly` backs the standalone
+``mu_schedule="probing"`` mode: the affine solve is only a probe and the
+returned direction is the plain centered Newton step.
 
 Both use :attr:`CorrectionContext.solve` so the injected-linear-algebra
 invariant (#3) holds — a corrector never sees the solver, only a callback that
@@ -63,6 +71,16 @@ _ENLARGE = 0.1
 _ACCEPT = 0.1
 # Fraction-to-boundary used for the predictor/trial *maximal* step lengths.
 _TAU_BOUNDARY = 1.0
+# The Mehrotra corrected direction is accepted only while it retains this
+# fraction of the predictor's combined boundary step length. The −ΔΔ term
+# presumes a Newton predictor whose full step reduces complementarity; on
+# nonconvex or quasi-Newton curvature it can instead collapse the maximal
+# step, and an unconditionally accepted corrector then sits at a convergence
+# knife-edge (S2MPJ HS71 × exact/dense+mehrotra: converges in ~10 iterations
+# or stalls at kkt ≈ 36 depending on last-bit arithmetic). Below the
+# threshold the corrector degrades to the plain centered Newton step at the
+# same μ target — the direction ``corrections="none"`` would compute.
+_MEHROTRA_KEEP_FRACTION = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,8 +145,8 @@ class HigherOrderCorrection(Protocol):
         """Whether this corrector runs (``False`` skips all corrector work)."""
         ...
 
-    def correct(self, context: CorrectionContext) -> CorrectionResult:
-        """Return the corrected direction and its barrier target."""
+    def correct(self, context: CorrectionContext, mu_target: float) -> CorrectionResult:
+        """Return the corrected direction aiming at the oracle's ``mu_target``."""
         ...
 
 
@@ -203,23 +221,57 @@ def _second_order_targets(
     return comp_s, comp_l, comp_u
 
 
-def _mehrotra_step(
-    ctx: CorrectionContext, xp: Namespace, count: int
-) -> _CorrectionState:
-    """The Mehrotra predictor–corrector direction (shared by both correctors)."""
+def probing_mu(ctx: CorrectionContext) -> float:
+    """Mehrotra σ-rule μ oracle from an affine probe of the current iterate.
+
+    ``σ = (μ_aff/μ)³`` where ``μ_aff`` is the average complementarity after the
+    maximal (τ = 1) boundary step along the affine direction (Mehrotra 1992;
+    Nocedal, Wächter & Waltz 2009, eqs. (3.2)–(3.5)). Floored at
+    ``ctx.mu_min``; ``0.0`` when there are no complementarity pairs.
+    """
+    xp = array_namespace(ctx.affine.dx)
+    count = _counts(ctx, xp)
+    if count == 0:
+        return 0.0
     mu = _average(*_products(ctx, xp, None, 0.0, 0.0), count, xp)
     alpha_p = ctx.alpha_primal(ctx.affine, tau=_TAU_BOUNDARY)
     alpha_d = ctx.alpha_dual(ctx.affine, tau=_TAU_BOUNDARY)
     mu_aff = _average(*_products(ctx, xp, ctx.affine, alpha_p, alpha_d), count, xp)
     # Adaptive centering (Mehrotra 1992, eq. for σ); guard μ > 0 (count > 0).
-    sigma = (mu_aff / mu) ** 3 if mu > 0.0 else 0.0
-    mu_target = max(sigma * mu, ctx.mu_min)
+    # σ is clipped at 1: Mehrotra's rule presumes a true Newton predictor whose
+    # full step *reduces* complementarity, but a quasi-Newton (L-BFGS) probe
+    # can inflate the dual products instead (μ_aff ≫ μ), and an unguarded
+    # σ = (μ_aff/μ)³ then explodes μ within a few iterations (regression:
+    # tests/regression/test_mu_oracle_inflation.py). Probing may hold μ at the
+    # current gap, never raise it.
+    sigma = min((mu_aff / mu) ** 3, 1.0) if mu > 0.0 else 0.0
+    return max(sigma * mu, ctx.mu_min)
 
+
+def _mehrotra_step(
+    ctx: CorrectionContext, xp: Namespace, mu_target: float, gamma: float
+) -> _CorrectionState:
+    """The Mehrotra corrector direction toward ``mu_target`` (shared by both).
+
+    The second-order targets ``μ − ΔΔ`` are clipped into the symmetric
+    neighbourhood ``[γμ, μ/γ]`` (Colombo & Gondzio 2008): with a *quasi-Newton*
+    affine direction the ``−ΔΔ`` term is not a second-order complementarity
+    residual and can be arbitrarily large, and unclipped targets inflated the
+    dual state by orders of magnitude in one accepted step (regression:
+    tests/regression/test_mu_oracle_inflation.py).
+    """
     ones_s = xp.ones_like(ctx.s)
     ones_x = xp.ones_like(ctx.x_minus_l)
     comp_s, comp_l, comp_u = _second_order_targets(
         ctx, xp, ctx.affine, mu_target * ones_s, mu_target * ones_x, mu_target * ones_x
     )
+    if mu_target > 0.0:
+        lo, hi = gamma * mu_target, mu_target / gamma
+        zero_l = xp.zeros_like(ctx.x_minus_l)
+        zero_u = xp.zeros_like(ctx.u_minus_x)
+        comp_s = xp.clip(comp_s, lo, hi)
+        comp_l = xp.where(ctx.mask_l, xp.clip(comp_l, lo, hi), zero_l)
+        comp_u = xp.where(ctx.mask_u, xp.clip(comp_u, lo, hi), zero_u)
     step = ctx.solve(comp_s, comp_l, comp_u)
     if step is None:
         # The affine direction was solved with zero complementarity targets;
@@ -229,6 +281,33 @@ def _mehrotra_step(
         return _CorrectionState(
             CorrectionResult(ctx.affine, 0.0), zero_s, zero_x, zero_x
         )
+
+    # Step-length acceptance (see _MEHROTRA_KEEP_FRACTION): a corrected
+    # direction that collapses the predictor's boundary step is worse than no
+    # correction — re-solve for the plain centered step at the same μ target,
+    # and only fall back to the affine direction if even that solve fails.
+    alpha_affine = ctx.alpha_primal(ctx.affine, tau=_TAU_BOUNDARY) + ctx.alpha_dual(
+        ctx.affine, tau=_TAU_BOUNDARY
+    )
+    alpha_corrected = ctx.alpha_primal(step, tau=_TAU_BOUNDARY) + ctx.alpha_dual(
+        step, tau=_TAU_BOUNDARY
+    )
+    if mu_target > 0.0 and alpha_corrected < _MEHROTRA_KEEP_FRACTION * alpha_affine:
+        zero_l = xp.zeros_like(ctx.x_minus_l)
+        zero_u = xp.zeros_like(ctx.u_minus_x)
+        centered_s = mu_target * xp.ones_like(ctx.s)
+        centered_l = xp.where(ctx.mask_l, mu_target * xp.ones_like(zero_l), zero_l)
+        centered_u = xp.where(ctx.mask_u, mu_target * xp.ones_like(zero_u), zero_u)
+        centered = ctx.solve(centered_s, centered_l, centered_u)
+        if centered is None:
+            zero_s = xp.zeros_like(ctx.s)
+            zero_x = xp.zeros_like(ctx.x_minus_l)
+            return _CorrectionState(
+                CorrectionResult(ctx.affine, 0.0), zero_s, zero_x, zero_x
+            )
+        return _CorrectionState(
+            CorrectionResult(centered, mu_target), centered_s, centered_l, centered_u
+        )
     return _CorrectionState(CorrectionResult(step, mu_target), comp_s, comp_l, comp_u)
 
 
@@ -237,24 +316,51 @@ class NoCorrection:
 
     active = False
 
-    def correct(self, context: CorrectionContext) -> CorrectionResult:
-        return CorrectionResult(context.affine, 0.0)
+    def correct(self, context: CorrectionContext, mu_target: float) -> CorrectionResult:
+        return CorrectionResult(context.affine, mu_target)
+
+
+class CenteringOnly:
+    """Plain centered re-solve at the oracle's μ target — no higher-order terms.
+
+    Backs the standalone ``mu_schedule="probing"`` strategy (Nocedal, Wächter &
+    Waltz 2009, §3): the affine solve is only a σ probe, and the returned
+    direction is the ordinary centered Newton step targeting ``μ e``.
+    """
+
+    active = True
+
+    def correct(self, context: CorrectionContext, mu_target: float) -> CorrectionResult:
+        xp = array_namespace(context.affine.dx)
+        if _counts(context, xp) == 0:
+            return CorrectionResult(context.affine, mu_target)
+        step = context.solve(
+            mu_target * xp.ones_like(context.s),
+            mu_target * xp.ones_like(context.x_minus_l),
+            mu_target * xp.ones_like(context.u_minus_x),
+        )
+        if step is None:
+            # Fall back to the affine direction, whose targets were zero.
+            return CorrectionResult(context.affine, 0.0)
+        return CorrectionResult(step, mu_target)
 
 
 class MehrotraCorrector:
-    """Mehrotra (1992) predictor–corrector with adaptive centering."""
+    """Mehrotra (1992) predictor–corrector toward the oracle's μ target."""
 
     active = True
 
     def __init__(self, options: CorrectionsOptions) -> None:
         self._options = options
 
-    def correct(self, context: CorrectionContext) -> CorrectionResult:
+    def correct(self, context: CorrectionContext, mu_target: float) -> CorrectionResult:
         xp = array_namespace(context.affine.dx)
-        count = _counts(context, xp)
-        if count == 0:  # nothing to centre — affine is the full Newton step
-            return CorrectionResult(context.affine, 0.0)
-        return _mehrotra_step(context, xp, count).result
+        if _counts(context, xp) == 0:
+            # nothing to centre — affine is the full Newton step
+            return CorrectionResult(context.affine, mu_target)
+        return _mehrotra_step(
+            context, xp, mu_target, self._options.gondzio_gamma
+        ).result
 
 
 class GondzioCorrector:
@@ -265,13 +371,12 @@ class GondzioCorrector:
     def __init__(self, options: CorrectionsOptions) -> None:
         self._options = options
 
-    def correct(self, context: CorrectionContext) -> CorrectionResult:
+    def correct(self, context: CorrectionContext, mu_target: float) -> CorrectionResult:
         xp = array_namespace(context.affine.dx)
-        count = _counts(context, xp)
-        if count == 0:
-            return CorrectionResult(context.affine, 0.0)
+        if _counts(context, xp) == 0:
+            return CorrectionResult(context.affine, mu_target)
 
-        state = _mehrotra_step(context, xp, count)
+        state = _mehrotra_step(context, xp, mu_target, self._options.gondzio_gamma)
         base = state.result
         step, mu_target = base.step, base.mu
         if mu_target <= 0.0:
@@ -328,11 +433,13 @@ def select_corrector(options: CorrectionsOptions) -> HigherOrderCorrection:
 
 
 __all__ = [
+    "CenteringOnly",
     "CorrectionContext",
     "CorrectionResult",
     "GondzioCorrector",
     "HigherOrderCorrection",
     "MehrotraCorrector",
     "NoCorrection",
+    "probing_mu",
     "select_corrector",
 ]

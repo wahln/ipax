@@ -304,3 +304,16 @@ Steps:
 - Friedlander, M. P. & Orban, D. (2012). "A primal–dual regularized interior-point
   method for convex quadratic programs." *Mathematical Programming Computation* 4(1),
   71–107. <https://doi.org/10.1007/s12532-012-0035-2>
+- Nocedal, J., Wächter, A. & Waltz, R. A. (2009). "Adaptive barrier update
+  strategies for nonlinear interior methods." *SIAM Journal on Optimization* 19(4),
+  1674–1693. <https://doi.org/10.1137/060649513> (LOQO centrality rule, eq. (3.6);
+  Mehrotra probing, eqs. (3.2)–(3.5); KKT-error globalization, §5.1)
+- El-Bakry, A. S., Tapia, R. A., Tsuchiya, T. & Zhang, Y. (1996). "On the
+  formulation and theory of the Newton interior-point method for nonlinear
+  programming." *Journal of Optimization Theory and Applications* 89(3), 507–541.
+  <https://doi.org/10.1007/BF02275347> (centrality condition behind the
+  free-mode μ floor)
+- Colombo, M. & Gondzio, J. (2008). "Further development of multiple centrality
+  correctors for interior point methods." *Computational Optimization and
+  Applications* 41(3), 277–305. <https://doi.org/10.1007/s10589-007-9106-0>
+  (symmetric-neighbourhood clipping of corrector targets)

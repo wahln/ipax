@@ -8,6 +8,7 @@ import pytest
 
 from ipax.options import (
     AcceptableStoppingOptions,
+    DenseOptions,
     KrylovOptions,
     OptimalityConditionOptions,
     Options,
@@ -171,3 +172,25 @@ def test_krylov_options_adaptive_defaults_on():
     opts = KrylovOptions()
     assert opts.adaptive_tol is True
     assert 0.0 < opts.adaptive_eta and opts.rtol < opts.adaptive_rtol_max <= 1.0
+
+
+def test_dense_options_default_is_condensed():
+    assert DenseOptions().kkt_route == "condensed"
+    assert Options().dense.kkt_route == "condensed"
+
+
+def test_dense_options_accepts_augmented():
+    assert DenseOptions(kkt_route="augmented").kkt_route == "augmented"
+
+
+@pytest.mark.parametrize("route", ["sparse", "bordered", ""])
+def test_dense_options_rejects_unsupported_kkt_route(route):
+    with pytest.raises(ValueError, match="kkt_route"):
+        DenseOptions(kkt_route=route)  # type: ignore[arg-type]
+
+
+def test_dense_options_augmented_max_size_default_and_validation():
+    assert DenseOptions().augmented_max_size > 0
+    assert DenseOptions(augmented_max_size=5).augmented_max_size == 5
+    with pytest.raises(ValueError, match="augmented_max_size"):
+        DenseOptions(augmented_max_size=0)

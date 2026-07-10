@@ -86,7 +86,7 @@ HEADER_REPEAT_INTERVAL = 10
 
 _HEADER = (
     f"{'iter':>4} {'objective':>15} {'infeas':>10} {'kkt':>10} "
-    f"{'mu':>10} {'alpha_pr':>9} {'alpha_du':>9} {'reg':>9} "
+    f"{'mu':>10} {'alpha_pr':>9} {'alpha_du':>9} {'reg':>9} {'ls':>3} "
     f"{'prob_s':>9} {'step_s':>9}"
 )
 
@@ -154,19 +154,49 @@ def format_header() -> str:
 def format_record(record: IterationRecord, *, acceptable: bool = False) -> str:
     """One iteration-table row matching :func:`format_header`.
 
-    When ``acceptable`` is true the row is tagged with a trailing ``*`` to mark
-    an iterate that already satisfies every enabled acceptable-stopping
-    criterion, even though the required consecutive-iteration count has not yet
-    been reached.
+    ``ls`` is the number of backtracking trial step sizes the line search (or
+    Breedveld controller) evaluated to reach this row. A trailing ``R`` marks
+    an iterate produced by a feasibility-restoration jump, and a trailing ``*``
+    marks one that already satisfies every enabled acceptable-stopping
+    criterion even though the required consecutive-iteration count has not yet
+    been reached; both tags may appear together.
     """
     row = (
         f"{record.iteration:>4d} {record.objective:>15.7e} "
         f"{record.theta:>10.3e} {record.kkt_error:>10.3e} {record.mu:>10.3e} "
         f"{record.alpha_primal:>9.2e} {record.alpha_dual:>9.2e} "
-        f"{record.regularization:>9.2e} "
+        f"{record.regularization:>9.2e} {record.line_search_iters:>3d} "
         f"{record.problem_time:>9.2e} {record.step_solve_time:>9.2e}"
     )
-    return f"{row} *" if acceptable else row
+    tags = []
+    if record.restored:
+        tags.append("R")
+    if acceptable:
+        tags.append("*")
+    return f"{row} {' '.join(tags)}" if tags else row
+
+
+def format_setup(
+    *,
+    n_vars: int,
+    n_lower: int,
+    n_upper: int,
+    n_eq: int,
+    n_ineq: int,
+    linear_solver: str,
+    hessian: str,
+) -> str:
+    """One-line problem/solver headline, printed at verbosity tier 1 (info).
+
+    Condenses what :func:`format_problem`/:func:`format_solver` report in full
+    at tiers 3–4 into a single line so a default ``verbose=1`` run states what
+    is being solved before the result summary.
+    """
+    return (
+        f"ipax solving: {n_vars} variables (bounds: {n_lower} lower, "
+        f"{n_upper} upper), {n_eq} equalities, {n_ineq} inequalities "
+        f"| linear solver = {linear_solver} | hessian = {hessian}"
+    )
 
 
 def format_problem(
@@ -265,6 +295,7 @@ __all__ = [
     "format_problem",
     "format_record",
     "format_result",
+    "format_setup",
     "format_solver",
     "format_timing",
     "logger",
