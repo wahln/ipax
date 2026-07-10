@@ -5,8 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from ipax.backend.dense.numpy_scipy import ScipyLDLFactorization
 from ipax.linalg.solver import LinearSolveError
+
+pytest.importorskip("scipy")  # the NumPy adapter wraps scipy.linalg.ldl
+
+from ipax.backend.dense.numpy_scipy import ScipyLDLFactorization
 
 
 def test_factor_solve_matches_reference_on_indefinite_matrix():

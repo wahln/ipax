@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import pytest
+
 from ipax.backend.dense import get_dense_symmetric_indefinite_adapter
 from ipax.testing.backends import import_namespace
 
 
 def test_get_dense_symmetric_indefinite_adapter_numpy_returns_scipy_adapter():
+    pytest.importorskip("scipy")  # the NumPy adapter wraps scipy.linalg.ldl
     numpy = import_namespace("numpy")
     adapter = get_dense_symmetric_indefinite_adapter(numpy)
     assert adapter is not None
@@ -14,10 +17,8 @@ def test_get_dense_symmetric_indefinite_adapter_numpy_returns_scipy_adapter():
 
 
 def test_get_dense_symmetric_indefinite_adapter_torch_returns_torch_adapter():
-    try:
-        torch = import_namespace("torch")
-    except ImportError:
-        return
+    pytest.importorskip("torch")
+    torch = import_namespace("torch")
     adapter = get_dense_symmetric_indefinite_adapter(torch)
     assert adapter is not None
     assert adapter.__class__.__name__ == "TorchLDLFactorization"
@@ -29,10 +30,10 @@ def test_get_dense_symmetric_indefinite_adapter_returns_none_for_unregistered_na
 
 
 def test_get_dense_symmetric_indefinite_adapter_cupy_returns_cupy_adapter():
-    try:
-        cupy = import_namespace("cupy")
-    except ImportError:
-        return
+    # nvmath/cuSOLVER is loaded lazily at factor time, so an importable CuPy is
+    # sufficient for dispatch to return the adapter object itself.
+    pytest.importorskip("cupy")
+    cupy = import_namespace("cupy")
     adapter = get_dense_symmetric_indefinite_adapter(cupy)
     assert adapter is not None
     assert adapter.__class__.__name__ == "CuPyLDLFactorization"
