@@ -142,6 +142,47 @@ def test_row_scaled_wrapper_forwards_estimate(namespace):
     assert _RowScaled(op, d).gram_fill_estimate() == op.gram_fill_estimate()
 
 
+def test_estimate_handles_columns_with_many_rows(namespace):
+    # A column shared by thousands of rows triggers the per-column row
+    # subsampling cap; the estimate must stay a valid density and still
+    # report the (saturated) fill that such a hub column produces.
+    _require_sparse(namespace)
+    m, n = 2000, 16
+    rows_l, cols_l, vals_l = [], [], []
+    for i in range(m):
+        for j in (0, 1 + (i % (n - 1))):  # column 0 is in every row
+            rows_l.append(i)
+            cols_l.append(j)
+            vals_l.append(1.0)
+    op = COOOperator(
+        namespace.asarray(rows_l),
+        namespace.asarray(cols_l),
+        array(namespace, vals_l),
+        (m, n),
+        pattern_key="hub",
+    )
+
+    estimate = op.gram_fill_estimate()
+
+    assert estimate is not None
+    assert 0.0 < estimate <= 1.0
+    # The subsampled union must still track the exact fill (the hub column
+    # densifies exactly Gram row/column 0 plus the diagonal).
+    exact = _exact_gram_fill(op, namespace, m, n)
+    assert 0.5 * exact <= estimate <= 2.0 * exact
+
+
+def test_estimate_is_unknown_without_a_sparse_adapter(namespace):
+    # On adapter-less backends (array-api-strict) the structured operator has
+    # no estimator to delegate to — the probe reports unknown, never raises.
+    if get_sparse_adapter(namespace) is not None:
+        pytest.skip("backend has a sparse adapter; the fallback is unreachable")
+    m, n = 32, 8
+    rows, cols, vals = _banded_coo(namespace, m, n)
+    op = COOOperator(rows, cols, vals, (m, n), pattern_key="b")
+    assert op.gram_fill_estimate() is None
+
+
 def test_empty_operator_reports_zero_fill(namespace):
     _require_sparse(namespace)
     dtype = array(namespace, [0.0]).dtype
