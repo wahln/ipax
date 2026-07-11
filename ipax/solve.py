@@ -234,10 +234,37 @@ def solve(
             return None
         return int(values.shape[0]) / (int(rows) * int(cols))
 
+    def _eq_jac_coo_capable() -> bool:
+        """Whether the combined equality Jacobian can emit COO triplets.
+
+        The sparse normal-equations saddle keeps ``∇c`` as an explicit border
+        in the factored matrix, so a matrix-free equality Jacobian must veto
+        the route here rather than crash at the first factorization.
+        """
+        from ipax.backend.operators import as_operator
+
+        ops: list[LinearOperator] = []
+        if has_eq:
+            try:
+                ops.append(as_operator(model.eq_jacobian(x0)))
+            except NotImplementedError:
+                return False
+        linear = model.linear_eq()
+        if linear is not None:
+            ops.append(as_operator(linear[0]))
+        for op in ops:
+            try:
+                op.to_coo()
+            except NotImplementedError:
+                return False
+        return True
+
     def _ineq_gram_fill() -> float | None:
         """Estimated Gram-pattern density of ∇g (sampled column overlap)."""
         op = _ineq_jac_probe()
         if op is None or not op.gram_coo_capable():
+            return None
+        if has_equalities and not _eq_jac_coo_capable():
             return None
         return op.gram_fill_estimate()
 

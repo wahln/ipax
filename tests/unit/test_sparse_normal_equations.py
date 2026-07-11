@@ -17,10 +17,11 @@ import pytest
 
 from ipax.backend.operators import COOOperator, Dense, Diagonal, VStack
 from ipax.backend.sparse import get_sparse_adapter
-from ipax.ipm.kkt import build_condensed_operator
+from ipax.ipm.hessian import LBFGSOperator
+from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
 from ipax.linalg.regularize import RegularizationState
 from ipax.linalg.sparse import SparseDirectSolver
-from ipax.options import Options, SparseOptions
+from ipax.options import LBFGSOptions, Options, SparseOptions
 from tests._helpers import array, assert_allclose
 
 pytestmark = pytest.mark.sparse
@@ -168,3 +169,96 @@ def test_sparse_options_validate_the_route():
     assert Options(sparse=SparseOptions(kkt_route="normal_equations"))
     with pytest.raises(ValueError, match="kkt_route"):
         SparseOptions(kkt_route="bogus")  # type: ignore[arg-type]
+
+
+# --- equality saddle through the normal-equations form -----------------------
+
+
+def _eq_jacobian(namespace, n):
+    eq_rows = namespace.asarray([0, 0, 1, 1])
+    eq_cols = namespace.asarray([0, 2, 1, 3])
+    eq_vals = array(namespace, [1.0, -1.0, 2.0, 0.5])
+    return COOOperator(eq_rows, eq_cols, eq_vals, (2, n), pattern_key="C")
+
+
+def _saddle_sparse_system(namespace, *, delta_c=1e-6):
+    """Equality saddle over the NE-capable condensed system (n=4, m_I=8, m_E=2)."""
+    op, _, _ = _condensed_sparse_system(namespace)
+    saddle = build_saddle_operator(op, _eq_jacobian(namespace, 4), delta_c)
+    x_exact = array(namespace, [1.0, -2.0, 0.5, 3.0, -1.0, 2.0])
+    rhs = saddle.matvec(x_exact)
+    return saddle, rhs, x_exact
+
+
+def test_normal_equations_solver_solves_the_equality_saddle(namespace):
+    # The Schur/equality border: the inequality Gram condenses into the n×n
+    # block while ∇c stays an explicit border — the NE form must now accept
+    # equality-constrained systems.
+    _require_sparse(namespace)
+    saddle, rhs, x_exact = _saddle_sparse_system(namespace)
+    solver = SparseDirectSolver(form="normal_equations")
+    solver.factor(saddle)
+    assert_allclose(namespace, solver.solve(rhs), x_exact, atol=1e-8)
+    # Refactor with the same pattern — the cached-structure/values-only path.
+    solver.factor(saddle)
+    assert_allclose(namespace, solver.solve(rhs), x_exact, atol=1e-8)
+
+
+def test_saddle_normal_equations_matches_augmented_form(namespace):
+    _require_sparse(namespace)
+    saddle, rhs, _ = _saddle_sparse_system(namespace)
+
+    ne = SparseDirectSolver(form="normal_equations")
+    ne.factor(saddle)
+    augmented = SparseDirectSolver(form="augmented")
+    augmented.factor(saddle)
+
+    assert_allclose(namespace, ne.solve(rhs), augmented.solve(rhs), atol=1e-8)
+
+
+def test_saddle_normal_equations_reports_bordered_inertia(namespace):
+    # The Haynsworth offset must survive the equality border: the factored
+    # matrix is (n + m_E)-sized, but the reported inertia is in bordered terms
+    # (+m_I negatives for the eliminated −Σ_s⁻¹ block), matching the target.
+    _require_sparse(namespace)
+    saddle, rhs, _ = _saddle_sparse_system(namespace)
+    solver = SparseDirectSolver(form="normal_equations")
+    solver.factor(saddle)
+    solver.solve(rhs)
+
+    actual = solver.inertia_or_none()
+    if actual is None:
+        pytest.skip("backend factorization reports no inertia")
+    assert actual == saddle.expected_inertia() == (4, 2 + 8, 0)
+
+
+def test_saddle_normal_equations_with_lbfgs_border(namespace):
+    # An L-BFGS Hessian keeps its low-rank border; the equality rows must sit
+    # in the logical block *before* the border so the driver's [Δx | Δy]
+    # slice stays intact.
+    _require_sparse(namespace)
+    n, m = 4, 8
+    W = LBFGSOperator(n, LBFGSOptions(memory=5))
+    W.update(
+        array(namespace, [1.0, 0.5, -0.2, 0.3]),
+        array(namespace, [2.0, 1.0, 0.4, 0.6]),
+    )
+    rows, cols, vals = _banded_coo(namespace, m, n)
+    jac = COOOperator(rows, cols, vals, (m, n), pattern_key="G")
+    condensed = build_condensed_operator(
+        W,
+        Diagonal(array(namespace, [0.25, 0.75, 0.5, 1.0])),
+        Diagonal(array(namespace, [float(1 + (i % 4)) for i in range(m)])),
+        jac,
+        RegularizationState(delta_w=1e-6),
+    )
+    saddle = build_saddle_operator(condensed, _eq_jacobian(namespace, n), 1e-6)
+    rhs = array(namespace, [1.0, -2.0, 0.5, 3.0, -1.0, 2.0])
+
+    solver = SparseDirectSolver(form="normal_equations")
+    solver.factor(saddle)
+    actual = solver.solve(rhs)
+
+    dense = saddle.matmat(namespace.eye(n + 2, dtype=rhs.dtype))
+    expected = namespace.linalg.solve(dense, rhs)
+    assert_allclose(namespace, actual, expected, atol=1e-8)

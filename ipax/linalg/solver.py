@@ -156,14 +156,11 @@ def select_solver(
         # sparse factorization of the condensed n×n block per iteration
         # beats Krylov, whose iteration counts blow up on the
         # ill-conditioned late-IPM Σ (Breedveld 2017 §2; banded validation
-        # n=20k: NE optimal in 62 s vs Krylov 50+ min unconverged). The
-        # sparse normal-equations form cannot fold an equality border, so
-        # equalities keep Krylov.
-        if (
-            not has_equalities
-            and capabilities.has_sparse_adapter
-            and ineq_gram_fill is not None
-        ):
+        # n=20k: NE optimal in 62 s vs Krylov 50+ min unconverged).
+        # Equalities border into the factored saddle explicitly; whether ∇c
+        # can emit that border is the caller's probe's concern (it withholds
+        # ``ineq_gram_fill`` when it cannot).
+        if capabilities.has_sparse_adapter and ineq_gram_fill is not None:
             fill = ineq_gram_fill()
             if fill is not None and fill <= _TALL_SPARSE_NE_MAX_FILL:
                 from ipax.linalg.sparse import SparseDirectSolver

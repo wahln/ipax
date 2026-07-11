@@ -250,11 +250,16 @@ def test_select_solver_auto_tall_unknown_gram_fill_stays_krylov():
     assert isinstance(solver, KrylovSolver)
 
 
-def test_select_solver_auto_tall_ne_requires_no_equalities():
-    # The sparse NE form cannot fold an equality border yet (see
-    # linalg/sparse.py); with equalities the auto route must not select it.
+def test_select_solver_auto_tall_ne_allows_equalities():
+    # The NE form keeps ∇c as an explicit border next to the condensed block,
+    # so equalities no longer veto the route here. (Whether the equality
+    # Jacobian can emit COO structure is the solve()-side probe's concern —
+    # it withholds ineq_gram_fill when it cannot.)
+    from ipax.linalg.sparse import SparseDirectSolver
+
     solver = select_solver(**_tall_sparse_kwargs(has_equalities=True))
-    assert isinstance(solver, KrylovSolver)
+    assert isinstance(solver, SparseDirectSolver)
+    assert solver.form == "normal_equations"
 
 
 def test_select_solver_auto_tall_ne_requires_sparse_adapter():

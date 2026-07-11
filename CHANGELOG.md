@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **The sparse normal-equations route now takes equality constraints.** The
+  NE form previously rejected any problem with equalities; the equality
+  Jacobian now borders in as a Schur/equality block — the inequality Gram
+  still condenses sparsely into the `n×n` block while `∇c` stays explicit,
+  so the factored matrix is the `(n+m_E)` quasidefinite saddle over the
+  condensed-Gram block (Friedlander–Orban 2012), with any L-BFGS low-rank
+  border carried through at the tail and full structure/symbolic reuse. The
+  Haynsworth inertia offset is unchanged (the eliminated `−Σ_s⁻¹` block's
+  `m_I` negatives; the `−δ_c` block stays *in* the factor), so the
+  inertia-guided δ_w correction works for the bordered form too.
+  Auto-selection no longer vetoes equality problems: the tall sparse-Gram
+  gate now also verifies the equality Jacobian can emit COO structure
+  (a matrix-free `∇c` keeps Krylov rather than crashing at the first
+  factorization).
 - **A one-time warning when the inertia safety net cannot engage.** The
   IPM's inertia-guided δ_w correction runs only when the KKT operator knows
   its target inertia *and* the backend factorization reports the factor's
@@ -37,8 +51,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   sparsity saturates toward 1) selects the sparse-NE route — the regime where
   it measured 3–4.6× faster per iteration than the bordered augmented factor
   and solved n=20k in 62 s while Krylov ran 50+ min unconverged — restricted
-  to inequality-only problems on the L-BFGS Hessian route (the forms the NE
-  fold supports). Everything else keeps the previous selection unchanged.
+  to the L-BFGS Hessian route (the fold the NE form supports; see the
+  equality-border entry above for the constraint mixes). Everything else
+  keeps the previous selection unchanged.
   `SparseDirectSolver` also gained a public `form` property, and its
   `describe()` now reports `sparse-NE [...]` for the normal-equations form.
 

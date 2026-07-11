@@ -132,11 +132,12 @@ class SparseDirectSolver:
             signature_fn = getattr(K, "normal_equations_pattern_signature", None)
             if to_coo is None or values is None or signature_fn is None:
                 raise RuntimeError(
-                    "the sparse normal-equations form requires a condensed KKT "
-                    "operator that can fold the inequality Gram sparsely "
-                    "(no equality constraints; a gram_coo-capable sparse "
-                    "inequality Jacobian); use the default 'augmented' form "
-                    "or another linsolve mode instead"
+                    "the sparse normal-equations form requires a KKT operator "
+                    "that can fold the inequality Gram sparsely (a "
+                    "gram_coo-capable sparse inequality Jacobian; equality "
+                    "Jacobians border in and must emit COO structure); use "
+                    "the default 'augmented' form or another linsolve mode "
+                    "instead"
                 )
             return signature_fn, to_coo, values
         return K.coo_pattern_signature, K.to_coo, K.coo_values

@@ -79,9 +79,12 @@ a backend-specific sparse object.
   `Σ` — with one small sparse Cholesky-sized factorization per iteration.
   Measured on banded tall QPs (`m = 10n`): 3–4.6× faster per iteration than
   the bordered factor at `n` = 10k–30k, and optimal in 62 s at `n` = 20k where
-  matrix-free Krylov ran 50+ minutes unconverged. Requires an
-  inequality-only problem and a Hessian the fold supports (L-BFGS keeps its
-  low-rank border; a COO-emittable analytic Hessian folds directly).
+  matrix-free Krylov ran 50+ minutes unconverged. Equality constraints
+  border in as a Schur/equality block — `∇c` stays explicit next to the
+  condensed-Gram block in the factored quasidefinite saddle — so all
+  constraint mixes are supported; the Hessian must be one the fold supports
+  (L-BFGS keeps its low-rank border; a COO-emittable analytic Hessian folds
+  directly).
 
 The trap in the normal-equations form is *Gram fill-in*: scattered rows of the
 same nnz fill `∇gᵀ∇g` almost completely, and a sparse factorization of a

@@ -937,7 +937,7 @@ class _SaddleOperator(LinearOperator):
         """The equality saddle is symmetric indefinite, so MINRES is the route."""
         return "minres"
 
-    def assemble(self) -> _Assembly:
+    def assemble(self, *, condense_inequalities: bool = False) -> _Assembly:
         """Assemble the bordered quasidefinite saddle in ``[Δx | Δy]`` order.
 
         Extends the condensed block's logical assembly (size ``n``) with the
@@ -947,8 +947,23 @@ class _SaddleOperator(LinearOperator):
         through unchanged — their connections live in the primal range ``[0, n)``,
         which the equality rows sit *after*, so they still border the full saddle
         correctly.
+
+        With ``condense_inequalities=True`` (the sparse normal-equations route)
+        the inequality Gram is folded sparsely into the condensed ``n×n`` block
+        while ``∇c`` stays this explicit Schur/equality border — the factored
+        matrix is the ``(n + m)`` quasidefinite saddle over the condensed-Gram
+        block (plus any L-BFGS low-rank border at the tail).
         """
-        inner = _logical_assembly(self._condensed)
+        if condense_inequalities:
+            assemble_fn = getattr(self._condensed, "assemble", None)
+            if assemble_fn is None:
+                raise NotImplementedError(
+                    "the sparse normal-equations form requires a condensed KKT "
+                    "block that can fold the inequality Gram sparsely"
+                )
+            inner = assemble_fn(condense_inequalities=True)
+        else:
+            inner = _logical_assembly(self._condensed)
         xp = array_namespace(inner.values)
         n, m = self._n, self._m
         er, ec, ev, _ = self._eq_jac.to_coo()
@@ -985,9 +1000,17 @@ class _SaddleOperator(LinearOperator):
         :func:`_border` without rebuilding any index vector.
         """
         del like
+        return self._assembled_values(condense_inequalities=False)
+
+    def _assembled_values(self, *, condense_inequalities: bool) -> Array:
         value_parts = getattr(self._condensed, "_value_parts", None)
         if value_parts is not None:
-            logical, borders = value_parts()
+            logical, borders = value_parts(condense_inequalities=condense_inequalities)
+        elif condense_inequalities:  # generic block: no NE structure/value split
+            raise NotImplementedError(
+                "the sparse normal-equations form requires a condensed KKT "
+                "block that can fold the inequality Gram sparsely"
+            )
         else:  # generic condensed block: no structure/value split available
             logical, borders = [self._condensed.coo_values()], []
         xp = array_namespace(logical[0])
@@ -999,6 +1022,35 @@ class _SaddleOperator(LinearOperator):
             parts.append(xp.full((self._m,), -self._delta_c, dtype=logical[0].dtype))
         parts.extend(borders)
         return xp.concat(tuple(parts))
+
+    def normal_equations_coo(
+        self,
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        """COO of the equality saddle over the condensed-Gram block (see
+        :meth:`assemble` with ``condense_inequalities=True``)."""
+        return _border(self.assemble(condense_inequalities=True))
+
+    def normal_equations_values(self, like: Array | None = None) -> Array:
+        del like
+        return self._assembled_values(condense_inequalities=True)
+
+    def normal_equations_pattern_signature(self) -> object | None:
+        """Stable pattern key for the condensed-Gram saddle (see the condensed
+        analogue: same structural ingredients, distinct tag)."""
+        base = self.coo_pattern_signature()
+        if base is None:
+            return None
+        return ("normal_equations", base)
+
+    def normal_equations_inertia_offset(self) -> tuple[int, int, int]:
+        """Inertia delta between the bordered and the condensed-Gram assembly.
+
+        The equality ``−δ_c`` block stays *in* the factored saddle either way,
+        so the offset is exactly the condensed block's (the eliminated
+        ``−Σ_s⁻¹`` slack block's ``m_I`` negatives, Haynsworth additivity).
+        """
+        fn = getattr(self._condensed, "normal_equations_inertia_offset", None)
+        return fn() if fn is not None else (0, 0, 0)
 
     def symmetry_hint(self) -> bool:
         """The saddle is symmetric: ``∇c``/``∇cᵀ`` mirror one value array, the

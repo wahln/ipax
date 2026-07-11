@@ -168,3 +168,72 @@ def test_tall_analytic_hessian_keeps_krylov(ne_zone):
     _run(_TinyTallQPWithHessian(import_namespace("numpy"), jacobian="coo"))
     assert len(ne_zone) == 1
     assert isinstance(ne_zone[0], KrylovSolver)
+
+
+class _TinyTallQPWithEquality(_TinyTallQP):
+    """The tiny tall QP plus one equality row, COO or matrix-free."""
+
+    def __init__(self, xp, *, jacobian: str, eq_jacobian: str) -> None:
+        super().__init__(xp, jacobian=jacobian)
+        assert eq_jacobian in ("coo", "matrix-free")
+        self._eq_jacobian_kind = eq_jacobian
+
+    def eq_constraints(self, x):
+        return self._xp.sum(x, keepdims=True) - 0.45 * _N
+
+    def eq_jacobian(self, x):
+        del x
+        xp = self._xp
+        if self._eq_jacobian_kind == "coo":
+            return COOOperator(
+                xp.zeros((_N,), dtype=xp.int64),
+                xp.arange(_N),
+                xp.ones((_N,), dtype=xp.float64),
+                (1, _N),
+                pattern_key="C",
+            )
+
+        from ipax.backend.operators import LinearOperator
+
+        class _MatvecOnly(LinearOperator):
+            shape = (1, _N)
+
+            def matvec(self, v):
+                return xp.sum(v, keepdims=True)
+
+            def rmatvec(self, v):
+                return xp.ones((_N,), dtype=xp.float64) * v[0]
+
+            def matmat(self, V):
+                return xp.sum(V, axis=0, keepdims=True)
+
+        return _MatvecOnly()
+
+
+def test_tall_equality_with_coo_jacobian_selects_normal_equations(ne_zone):
+    # Equalities no longer veto the NE route when ∇c can emit COO structure:
+    # the saddle borders it explicitly.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    pytest.importorskip("scipy")
+    _run(
+        _TinyTallQPWithEquality(
+            import_namespace("numpy"), jacobian="coo", eq_jacobian="coo"
+        )
+    )
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], SparseDirectSolver)
+    assert ne_zone[0].form == "normal_equations"
+
+
+def test_tall_equality_with_matrix_free_jacobian_keeps_krylov(ne_zone):
+    # A matrix-free ∇c cannot be bordered into the sparse factor; the probe
+    # must veto the NE route rather than crash at the first factorization.
+    pytest.importorskip("scipy")
+    _run(
+        _TinyTallQPWithEquality(
+            import_namespace("numpy"), jacobian="coo", eq_jacobian="matrix-free"
+        )
+    )
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], KrylovSolver)
