@@ -237,3 +237,48 @@ def test_tall_equality_with_matrix_free_jacobian_keeps_krylov(ne_zone):
     )
     assert len(ne_zone) == 1
     assert isinstance(ne_zone[0], KrylovSolver)
+
+
+def test_tall_linear_equality_selects_normal_equations(ne_zone):
+    # Declared *linear* equalities join the probe through linear_eq(): a
+    # COO-able constant A keeps the NE route available.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    pytest.importorskip("scipy")
+    xp = import_namespace("numpy")
+
+    class _WithLinearEq(_TinyTallQP):
+        def linear_eq(self):
+            a = xp.ones((1, _N), dtype=xp.float64)
+            b = xp.asarray([0.45 * _N])
+            return a, b
+
+    _run(_WithLinearEq(xp, jacobian="coo"))
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], SparseDirectSolver)
+    assert ne_zone[0].form == "normal_equations"
+
+
+def test_tall_equality_jacobian_failing_at_probe_keeps_krylov(ne_zone):
+    # An equality Jacobian that cannot be evaluated at the probe point (x0)
+    # must veto the NE route; the solve itself continues on Krylov. Scaling is
+    # disabled so the selection probe's evaluation is the *first* call (the
+    # gradient-based default would otherwise evaluate ∇c before selection).
+    pytest.importorskip("scipy")
+    xp = import_namespace("numpy")
+
+    class _ProbeShyEq(_TinyTallQPWithEquality):
+        def __init__(self):
+            super().__init__(xp, jacobian="coo", eq_jacobian="coo")
+            self._eq_jac_calls = 0
+
+        def eq_jacobian(self, x):
+            self._eq_jac_calls += 1
+            if self._eq_jac_calls == 1:  # the selection probe's evaluation
+                raise NotImplementedError("unavailable at the probe point")
+            return super().eq_jacobian(x)
+
+    x0 = xp.full((_N,), 0.4)
+    solve(_ProbeShyEq(), x0, options=Options(max_iter=3, scaling="none"))
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], KrylovSolver)

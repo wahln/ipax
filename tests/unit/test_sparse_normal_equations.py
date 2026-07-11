@@ -232,6 +232,27 @@ def test_saddle_normal_equations_reports_bordered_inertia(namespace):
     assert actual == saddle.expected_inertia() == (4, 2 + 8, 0)
 
 
+def test_saddle_normal_equations_signature_is_none_without_pattern_keys(namespace):
+    # Operators without pattern keys have no stable structure signature, so
+    # the NE saddle must report None (no symbolic caching) instead of a bogus
+    # stable key.
+    n, m = 4, 8
+    w_idx = namespace.asarray([0, 1, 2, 3])
+    W = COOOperator(
+        w_idx, w_idx, array(namespace, [4.0, 3.0, 2.5, 2.0]), (n, n), symmetric=True
+    )
+    rows, cols, vals = _banded_coo(namespace, m, n)
+    condensed = build_condensed_operator(
+        W,
+        Diagonal(array(namespace, [0.25, 0.75, 0.5, 1.0])),
+        Diagonal(array(namespace, [1.0] * m)),
+        COOOperator(rows, cols, vals, (m, n)),
+        RegularizationState(delta_w=1e-6),
+    )
+    saddle = build_saddle_operator(condensed, _eq_jacobian(namespace, n), 1e-6)
+    assert saddle.normal_equations_pattern_signature() is None
+
+
 def test_saddle_normal_equations_with_lbfgs_border(namespace):
     # An L-BFGS Hessian keeps its low-rank border; the equality rows must sit
     # in the logical block *before* the border so the driver's [Δx | Δy]
