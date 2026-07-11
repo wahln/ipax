@@ -72,9 +72,9 @@ from ipax.ipm.corrections import (
 )
 from ipax.ipm.filter_ls import Filter, FilterLineSearch
 from ipax.ipm.hessian import LBFGSOperator
-from ipax.ipm.init import apply_warm_start, initialize
+from ipax.ipm.init import apply_warm_start, initialize, recenter_slacks_duals
 from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
-from ipax.ipm.restoration import RestorationExit, restore
+from ipax.ipm.restoration import RestorationExit, feasible_theta_tol, restore
 from ipax.ipm.step import NewtonStep, recover_eliminated
 from ipax.ipm.termination import ConditionChecker
 from ipax.linalg.regularize import (
@@ -1242,6 +1242,34 @@ class IPMDriver:
                         "relaxed KKT tolerance"
                     )
                     break
+                # Restoration entered at an already-feasible point cannot move
+                # it: ``restore()`` exits immediately at the same ``x``, and
+                # resuming with the stale barrier state re-derives the same
+                # rejected direction forever (S2MPJ v11, HS101 exact routes:
+                # boundary-floor slacks against multipliers grown to ~1e6 give
+                # Σ_s ~ 1e18, δ_w escalates to ~1e5 every iteration, and the
+                # fraction-to-boundary rule caps every step at ~1e-11 — a
+                # limit cycle the stall detector ends at an *infeasible* best
+                # iterate). Repair the barrier state instead: re-floor the
+                # slacks on the current μ and clip the multipliers to the
+                # central band (Wächter & Biegler 2006, §3.3 / eq. (16)).
+                if m > 0 and theta0 <= feasible_theta_tol(opts.optimality.kkt_tol):
+                    logger.debug(
+                        "iter %d: line search failed at a feasible point; "
+                        "re-centering slacks/duals instead of restoration",
+                        it,
+                    )
+                    filt.augment(theta0, phi0)
+                    # ``g`` is the inequality residual at this iterate, computed
+                    # at the top of the loop; the line search's failure did not
+                    # move ``x``, so it is still current here.
+                    s, y_ineq = recenter_slacks_duals(xp, g, y_ineq, mu)
+                    alpha_p = 0.0
+                    last_alpha = 0.0
+                    prev_x = None
+                    last_step_solve_time = self._step_solve_seconds
+                    pending_restored = True
+                    continue
                 logger.debug("iter %d: entering feasibility restoration", it)
                 filt.augment(theta0, phi0)
                 x, s, rest_exit = self._restore(

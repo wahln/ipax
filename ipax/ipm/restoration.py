@@ -72,6 +72,17 @@ class RestorationExit(Enum):
         return self in (RestorationExit.STATIONARY, RestorationExit.NO_DESCENT)
 
 
+def feasible_theta_tol(tol: float) -> float:
+    """The θ threshold below which restoration considers a point feasible.
+
+    Shared with the driver's feasible-entry guard: a line-search failure at a
+    point already below this threshold must not enter restoration at all
+    (``restore()`` would exit immediately at the same ``x``), it re-centers
+    the barrier state instead.
+    """
+    return max(tol, 1e-8)
+
+
 def _dense(op: LinearOperator, xp: Namespace, dtype: object) -> Array:
     return op.matmat(xp.eye(op.shape[1], dtype=dtype))
 
@@ -97,7 +108,7 @@ def restore(
     dtype = x.dtype
     n = int(x.shape[0])
     identity = xp.eye(n, dtype=dtype)
-    feasible_tol = max(tol, 1e-8)
+    feasible_tol = feasible_theta_tol(tol)
 
     margin = feasible_tol
     both = xp.logical_and(mask_l, mask_u)
@@ -250,4 +261,4 @@ def restore(
     return x, s_out, exit_reason
 
 
-__all__ = ["RestorationExit", "restore"]
+__all__ = ["RestorationExit", "feasible_theta_tol", "restore"]

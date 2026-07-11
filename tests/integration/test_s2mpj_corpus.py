@@ -151,6 +151,34 @@ def test_nonconvex_equality_exact_sparse_converges(bridge_namespace, name):
     assert result.kkt_error <= 1e-6
 
 
+def test_hs101_exact_krylov_escapes_the_feasible_point_limit_cycle(
+    bridge_namespace,
+):
+    # Regression (v11 sweep, v0.7.0 item 1): HS101 on the exact routes walked
+    # into a feasible point with stale multipliers (λ ~ 1e6 on the active set
+    # against restoration's 1e-12 slack floor → Σ_s ~ 1e18); the line search
+    # failed forever and restoration — re-entered at the already-feasible
+    # point ~25× — could not move it, so the run stalled at kkt ~ 33 and
+    # returned an *infeasible* iterate. The feasible-entry re-centering
+    # (slack re-floor on μ + central-band multiplier clip) must break the
+    # cycle and reach the known optimum f* = 1809.76476.
+    xp = bridge_namespace
+    if "HS101" not in s2mpj.list_s2mpj_problems():
+        pytest.skip("HS101 not in this S2MPJ checkout")
+    backend = xp.__name__.split(".")[-1]
+    (case,) = s2mpj.s2mpj_problems(("HS101",), backends=(backend,), hessian="exact")
+    problem, x0 = case.build(xp)
+    result = solve(
+        problem,
+        x0,
+        options=Options(hessian="exact", linsolve="krylov", max_iter=500),
+    )
+
+    assert result.status is Status.OPTIMAL, f"HS101: {result.status}"
+    assert result.kkt_error <= 1e-6
+    assert abs(float(result.objective) - 1809.76476) <= 1e-2
+
+
 @pytest.mark.parametrize("name", ("HS61",))
 def test_exploded_multiplier_curvature_recovers_via_pure_delta_w(
     bridge_namespace, name

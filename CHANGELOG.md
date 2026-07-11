@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+- **A line-search failure at an already-feasible point re-centers the barrier
+  state instead of looping through restoration.** When the filter line search
+  could not find an acceptable step at a feasible iterate (`θ ≤` the
+  feasibility tolerance), the driver handed off to feasibility restoration —
+  but restoration cannot move an already-feasible point, so it exited at the
+  same `x` and the loop re-derived the same rejected direction until the stall
+  detector returned an *infeasible* best iterate. In the S2MPJ v11 sweep this
+  was the HS101 exact-route limit cycle: boundary-floor slacks against
+  inequality multipliers grown to ~1e6 gave `Σ_s = λ/s ~ 1e18`, forcing
+  `δ_w ~ 1e5` every iteration and capping every step at ~1e-11 through the
+  fraction-to-boundary rule. The driver now repairs the barrier state at such
+  a point — re-flooring the slacks on the current `μ` and clipping the
+  inequality multipliers into the central band `[μ/(κ·s), κ·μ/s]` (Wächter &
+  Biegler 2006, §3.3 / eq. (16)) — and resumes the main loop. HS101 now
+  reaches its optimum (`f* = 1809.76476`) on all three exact routes.
+
 ## [0.6.0] - 2026-07-11
 
 ### Added
