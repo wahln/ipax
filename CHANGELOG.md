@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- **Sparse normal-equations auto-selection.** The 0.5.0 sparse-NE route
+  (`SparseOptions(kkt_route="normal_equations")`) was opt-in because nothing
+  could predict whether the Gram `∇gᵀ Σ_s ∇g` stays sparse. A new
+  `LinearOperator.gram_fill_estimate` capability answers that without forming
+  the Gram: the pattern of Gram column `j` is exactly the union of the column
+  patterns of the rows touching `j`, so sampling evenly spaced columns and
+  averaging the union sizes estimates `nnz(∇gᵀ∇g)/n²` (SciPy + CuPy adapters;
+  forwarded through `VStack` and the scaling wrapper; measured within 1% of
+  the exact fill at n=10k–20k for ~25–60 ms, once, at selection time).
+  `select_solver(linsolve="auto")` now consults it for tall (`m ≥ 10n`)
+  problems whose sparse Jacobian is below the dense-GEMM Gram crossover:
+  estimated fill ≤ 1% (banded validation case sits at ~0.2–0.5%, scattered
+  sparsity saturates toward 1) selects the sparse-NE route — the regime where
+  it measured 3–4.6× faster per iteration than the bordered augmented factor
+  and solved n=20k in 62 s while Krylov ran 50+ min unconverged — restricted
+  to inequality-only problems on the L-BFGS Hessian route (the forms the NE
+  fold supports). Everything else keeps the previous selection unchanged.
+  `SparseDirectSolver` also gained a public `form` property, and its
+  `describe()` now reports `sparse-NE [...]` for the normal-equations form.
+
 ### Changed
 - **Dense route: the PD-probe Cholesky factor is now reused for the solve.**
   `DenseSolver` already Cholesky-probes the condensed block `N` to reject

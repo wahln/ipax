@@ -68,6 +68,54 @@ _GRAM_DENSE_MIN_DENSITY = 0.05
 # buffers ≈ 800 MB at this cap, independent of m.
 _GRAM_DENSE_CHUNK_ELEMENTS = 50_000_000
 
+# Sampling caps for the Gram fill-in estimate (``gram_fill_estimate``): the
+# per-column union size is exact, so a modest evenly spaced column sample
+# already tracks structured (banded/block) patterns closely, and the per-column
+# row cap only truncates columns whose Gram fill is far past any sparse-route
+# threshold anyway (a few hundred scattered rows saturate the union).
+_GRAM_FILL_SAMPLE_COLUMNS = 128
+_GRAM_FILL_SAMPLE_ROWS = 512
+
+
+def _estimate_gram_fill(
+    csr_indptr: np.ndarray,
+    csr_indices: np.ndarray,
+    csc_indptr: np.ndarray,
+    csc_indices: np.ndarray,
+    n_cols: int,
+) -> float:
+    """Estimated density of the Gram pattern ``nnz(AᵀA)/n²`` in ``[0, 1]``.
+
+    Exact-per-sample column overlap: Gram entry ``(j, k)`` is structurally
+    nonzero iff columns ``j`` and ``k`` share a row, so the pattern of Gram
+    column ``j`` is exactly the union of the CSR column patterns of the rows
+    listed in CSC column ``j``. Averaging that union size over an evenly
+    spaced column sample estimates the mean Gram-column fill at
+    O(sample · nnz-per-column) cost — no SpGEMM, no Gram allocation. This is
+    the cheap probe the sparse normal-equations route selection needs
+    (scattered rows of low nnz-density still saturate the union, which is
+    precisely what the estimate must reveal).
+    """
+    if n_cols == 0:
+        return 0.0
+    sample = min(n_cols, _GRAM_FILL_SAMPLE_COLUMNS)
+    columns = np.unique(np.linspace(0, n_cols - 1, sample).astype(np.int64))
+    total = 0
+    for j in columns:
+        rows = csc_indices[csc_indptr[j] : csc_indptr[j + 1]]
+        if rows.shape[0] == 0:
+            continue
+        if rows.shape[0] > _GRAM_FILL_SAMPLE_ROWS:
+            step = np.linspace(0, rows.shape[0] - 1, _GRAM_FILL_SAMPLE_ROWS)
+            rows = rows[np.unique(step.astype(np.int64))]
+        union = np.unique(
+            np.concatenate(
+                [csr_indices[csr_indptr[i] : csr_indptr[i + 1]] for i in rows]
+            )
+        )
+        total += int(union.shape[0])
+    return total / (int(columns.shape[0]) * n_cols)
+
 
 def _to_numpy(arr: Array) -> np.ndarray:
     """Bring an Array-API array onto the host as a NumPy ndarray.
@@ -351,6 +399,17 @@ class SparseOperator(LinearOperator):
 
     def gram_coo_capable(self) -> bool:
         return True
+
+    def gram_fill_estimate(self) -> float | None:
+        """Estimated Gram-pattern density (sampled column overlap; see
+        :func:`_estimate_gram_fill`). One-time selection probe, never on the
+        per-iteration path."""
+        m, n = self.shape
+        if m == 0 or n == 0:
+            return 0.0
+        csr = self._csr_matrix
+        csc = self.csc_matrix
+        return _estimate_gram_fill(csr.indptr, csr.indices, csc.indptr, csc.indices, n)
 
     @staticmethod
     def _gram_dense_accumulate(a: scipy.sparse.csr_matrix, w: np.ndarray) -> np.ndarray:

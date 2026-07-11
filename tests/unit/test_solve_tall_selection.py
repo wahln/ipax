@@ -125,3 +125,46 @@ def test_tall_gram_incapable_dense_jacobian_keeps_krylov(selected_solvers):
     _run(_TinyTallQP(import_namespace("numpy"), jacobian="dense"))
     assert len(selected_solvers) == 1
     assert isinstance(selected_solvers[0], KrylovSolver)
+
+
+# --- sparse normal-equations auto-selection wiring ---------------------------
+
+
+class _TinyTallQPWithHessian(_TinyTallQP):
+    """The same QP with an analytic (identity) Lagrangian Hessian."""
+
+    def lagrangian_hessian(self, x, y_eq, y_ineq, sigma=1.0):
+        del y_eq, y_ineq
+        return sigma * self._xp.eye(_N, dtype=self._xp.float64)
+
+
+@pytest.fixture
+def ne_zone(selected_solvers, monkeypatch):
+    """Push the tiny banded QP into the sparse-NE selection zone: its density
+    (0.25) is above the real dense-GEMM crossover and its Gram fill (~0.4 at
+    n=8) above the real NE threshold, so both measurement-derived cutoffs are
+    widened; the *wiring* (probes → select_solver → SparseDirectSolver) is
+    what runs for real here."""
+    monkeypatch.setattr(solver_mod, "_TALL_DENSE_MIN_DENSITY", 0.5)
+    monkeypatch.setattr(solver_mod, "_TALL_SPARSE_NE_MAX_FILL", 0.9)
+    return selected_solvers
+
+
+def test_tall_sparse_gram_selects_normal_equations(ne_zone):
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    pytest.importorskip("scipy")
+    _run(_TinyTallQP(import_namespace("numpy"), jacobian="coo"))
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], SparseDirectSolver)
+    assert ne_zone[0].form == "normal_equations"
+
+
+def test_tall_analytic_hessian_keeps_krylov(ne_zone):
+    # The NE form folds the Gram into the condensed block only for an L-BFGS
+    # (diagonal + low-rank) Hessian; with an analytic Hessian the auto route
+    # must not gamble on the operator being COO-emittable.
+    pytest.importorskip("scipy")
+    _run(_TinyTallQPWithHessian(import_namespace("numpy"), jacobian="coo"))
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], KrylovSolver)

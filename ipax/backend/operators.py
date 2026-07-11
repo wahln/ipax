@@ -193,8 +193,8 @@ class LinearOperator(ABC):
         different ``weights`` — only the values move — so sparse-direct
         callers may cache structure and symbolic analyses. Duplicate entries,
         if any, are summed by the consumer. Optional; on non-localized
-        sparsity the result may be near-dense, which is why route selection
-        treats this as opt-in rather than probing it.
+        sparsity the result may be near-dense — route selection consults
+        :meth:`gram_fill_estimate` before committing to this form.
         """
         del weights
         raise NotImplementedError("operator does not expose a sparse COO Gram")
@@ -206,6 +206,20 @@ class LinearOperator(ABC):
         :meth:`gram_coo` must forward this too.
         """
         return type(self).gram_coo is not LinearOperator.gram_coo
+
+    def gram_fill_estimate(self) -> float | None:
+        """Estimated density of the Gram *pattern* ``nnz(AᵀA)/n²``, or ``None``.
+
+        The cheap structural probe behind sparse normal-equations
+        auto-selection: the route wins only when ``AᵀA`` stays sparse
+        (localized/banded rows), and whether it does cannot be read off
+        ``nnz(A)`` — scattered rows of the same density fill the Gram
+        completely. Adapters estimate it from sampled column overlap without
+        forming the Gram; ``None`` means unknown (no explicit sparse
+        structure), which selection treats as a veto. Wrappers forwarding
+        :meth:`gram_coo` must forward this too.
+        """
+        return None
 
     def row_gram_diagonal(self, weights: Array) -> Array:
         """Return ``diag(A diag(weights) Aᵀ)`` — the weighted *row* energies.
@@ -761,6 +775,18 @@ class VStack(LinearOperator):
     def gram_coo_capable(self) -> bool:
         return all(op.gram_coo_capable() for op in self._ops)
 
+    def gram_fill_estimate(self) -> float | None:
+        # The stacked Gram pattern is the union of the blocks' patterns, so
+        # the fill is bounded by the (capped) sum of the block fills — a safe
+        # over-estimate for the sparse-NE gate. Unknown anywhere ⇒ unknown.
+        total = 0.0
+        for op in self._ops:
+            estimate = op.gram_fill_estimate()
+            if estimate is None:
+                return None
+            total += estimate
+        return min(1.0, total)
+
     def row_inf_norms(self, like: Array | None = None) -> Array:
         # Stacked rows ⇒ concatenate each block's row norms (used by scaling).
         xp = None
@@ -950,6 +976,12 @@ class _SparseStructured(LinearOperator):
             return self._adapter_op().gram_coo_capable()
         except NotImplementedError:
             return False
+
+    def gram_fill_estimate(self) -> float | None:
+        try:
+            return self._adapter_op().gram_fill_estimate()
+        except NotImplementedError:
+            return None
 
     def row_gram_diagonal(self, weights: Array) -> Array:
         return self._adapter_op().row_gram_diagonal(weights)

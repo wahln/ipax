@@ -205,3 +205,70 @@ def test_select_solver_small_problems_skip_gram_probe():
         ineq_gram_capable=probe,
     )
     assert isinstance(solver, DenseSolver)
+
+
+# --- tall + sparse Gram: normal-equations auto-selection ---------------------
+
+
+def _tall_sparse_kwargs(**overrides):
+    """Tall, sparse-Jacobian selection scenario (density below the dense-GEMM
+    crossover, so the dense tall branch declines and the NE gate decides)."""
+    kwargs = {
+        "n_vars": 15_000,
+        "has_equalities": False,
+        "capabilities": _caps(sparse=True),
+        "options": Options(linsolve="auto"),
+        "m_ineq": 300_000,
+        "ineq_gram_capable": lambda: True,
+        "ineq_density": lambda: 0.01,
+        "ineq_gram_fill": lambda: 0.002,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_select_solver_auto_tall_sparse_gram_selects_normal_equations():
+    # n=20k banded validation (2026-07): sparse NE solved in 62 s where Krylov
+    # ran 50+ min unconverged — when the fill probe certifies a sparse Gram,
+    # the auto route must take it.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    solver = select_solver(**_tall_sparse_kwargs())
+    assert isinstance(solver, SparseDirectSolver)
+    assert solver.form == "normal_equations"
+
+
+def test_select_solver_auto_tall_filled_gram_stays_krylov():
+    # Scattered sparsity: the Gram fills in (the reason the route was opt-in) —
+    # the probe reports it and the selection keeps Krylov.
+    solver = select_solver(**_tall_sparse_kwargs(ineq_gram_fill=lambda: 0.5))
+    assert isinstance(solver, KrylovSolver)
+
+
+def test_select_solver_auto_tall_unknown_gram_fill_stays_krylov():
+    solver = select_solver(**_tall_sparse_kwargs(ineq_gram_fill=lambda: None))
+    assert isinstance(solver, KrylovSolver)
+
+
+def test_select_solver_auto_tall_ne_requires_no_equalities():
+    # The sparse NE form cannot fold an equality border yet (see
+    # linalg/sparse.py); with equalities the auto route must not select it.
+    solver = select_solver(**_tall_sparse_kwargs(has_equalities=True))
+    assert isinstance(solver, KrylovSolver)
+
+
+def test_select_solver_auto_tall_ne_requires_sparse_adapter():
+    solver = select_solver(**_tall_sparse_kwargs(capabilities=_caps(sparse=False)))
+    assert isinstance(solver, KrylovSolver)
+
+
+def test_select_solver_auto_tall_dense_win_skips_fill_probe():
+    # Dense-ish rows take the dense tall route before the (Jacobian-evaluating)
+    # fill probe is ever consulted.
+    def probe() -> float:
+        raise AssertionError("fill probe must not run when the dense route wins")
+
+    solver = select_solver(
+        **_tall_sparse_kwargs(ineq_density=lambda: 0.2, ineq_gram_fill=probe)
+    )
+    assert isinstance(solver, DenseSolver)

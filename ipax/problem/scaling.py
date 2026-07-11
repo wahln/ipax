@@ -101,6 +101,11 @@ class _RowScaled(LinearOperator):
     def gram_coo_capable(self) -> bool:
         return self._jac.gram_coo_capable()
 
+    def gram_fill_estimate(self) -> float | None:
+        # Row scaling never changes the sparsity pattern (the factors are
+        # strictly positive), so the Gram fill is exactly the wrapped one's.
+        return self._jac.gram_fill_estimate()
+
     def row_gram_diagonal(self, weights: Array) -> Array:
         # diag((DJ) W (DJ)ᵀ)_j = d_j² Σ_k W_k J_jk² = d²·J.row_gram_diagonal(W).
         return self._d * self._d * self._jac.row_gram_diagonal(weights)

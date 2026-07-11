@@ -63,8 +63,10 @@ class SparseDirectSolver:
     ``"normal_equations"`` condenses the inequality Gram term sparsely into the
     logical ``n×n`` block (``normal_equations_coo``), for tall problems whose
     Jacobian rows are localized enough that ``∇gᵀ Σ_s ∇g`` stays sparse.
-    Opt-in: on non-localized sparsity the Gram fills in, and no cheap
-    structural probe can detect that in advance.
+    On non-localized sparsity the Gram fills in catastrophically, so the form
+    is selectable explicitly (``SparseOptions(kkt_route=...)``) and picked by
+    ``select_solver`` only when the ``gram_fill_estimate`` probe (sampled
+    column overlap of ``∇g``) certifies a sparse Gram pattern.
     """
 
     def __init__(
@@ -93,6 +95,11 @@ class SparseDirectSolver:
         self._struct_signature: object | None = None
         self._struct: tuple[Array, Array, tuple[int, int]] | None = None
 
+    @property
+    def form(self) -> str:
+        """The assembled KKT form: ``"augmented"`` or ``"normal_equations"``."""
+        return self._form
+
     def describe(self) -> str:
         """Human-readable label, delegating to the dispatched backend solver."""
         if self._inner is None:
@@ -101,7 +108,8 @@ class SparseDirectSolver:
         detail = (
             inner_describe() if callable(inner_describe) else type(self._inner).__name__
         )
-        return f"sparse [{detail}]"
+        prefix = "sparse-NE" if self._form == "normal_equations" else "sparse"
+        return f"{prefix} [{detail}]"
 
     def set_outer_residual(self, residual: float) -> None:
         """No-op: a direct factorization has no inner tolerance to adapt."""

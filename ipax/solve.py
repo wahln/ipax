@@ -234,6 +234,20 @@ def solve(
             return None
         return int(values.shape[0]) / (int(rows) * int(cols))
 
+    def _ineq_gram_fill() -> float | None:
+        """Estimated Gram-pattern density of ∇g (sampled column overlap)."""
+        op = _ineq_jac_probe()
+        if op is None or not op.gram_coo_capable():
+            return None
+        return op.gram_fill_estimate()
+
+    # The sparse normal-equations form folds the Hessian into its n×n block
+    # only for a diagonal+low-rank W (the L-BFGS route); with an analytic or
+    # HVP Hessian the auto heuristic must not gamble on the operator being
+    # COO-emittable, so the fill probe is withheld and the form stays
+    # explicitly selectable via SparseOptions(kkt_route="normal_equations").
+    ne_foldable = has_ineq and _hessian_source(resolved) == "lbfgs"
+
     solver = select_solver(
         n_vars=int(resolved.n_vars),
         has_equalities=has_equalities,
@@ -242,6 +256,7 @@ def solve(
         m_ineq=m_ineq,
         ineq_gram_capable=_ineq_gram_capable if has_ineq else None,
         ineq_density=_ineq_density if has_ineq else None,
+        ineq_gram_fill=_ineq_gram_fill if ne_foldable else None,
     )
 
     # Pre-solve diagnostics (verbosity tiers 3–5; gated by the logger threshold
