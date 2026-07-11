@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ipax._logging import logger
 from ipax.backend.namespace import _namespace_name, array_namespace
 
 if TYPE_CHECKING:
@@ -94,6 +95,12 @@ class SparseDirectSolver:
         # value vector is recomputed (``coo_values``) instead of the full triplet.
         self._struct_signature: object | None = None
         self._struct: tuple[Array, Array, tuple[int, int]] | None = None
+        # One warning per solver lifetime when the inertia safety net cannot
+        # engage (see the end of ``factor``). Latched after the FIRST
+        # evaluation either way: factor() runs every iteration, and both the
+        # operator's target kind and the backend's inertia capability are
+        # fixed for a solve.
+        self._inertia_gap_checked = False
 
     @property
     def form(self) -> str:
@@ -211,6 +218,29 @@ class SparseDirectSolver:
             else None
         )
         self._inertia_offset = offset_fn() if offset_fn is not None else (0, 0, 0)
+
+        # Surface the silent gap in the inertia safety net: when the operator
+        # knows its target inertia (an assemblable — possibly nonconvex —
+        # Hessian) but this backend's factorization reports none (e.g. the
+        # SuperLU fallback), the IPM's inertia-guided delta_w correction
+        # silently never engages, and a symmetric-indefinite LDL^T can succeed
+        # with the *wrong* inertia — a non-descent step the failure path never
+        # sees (Waechter & Biegler 2006, sec. 3.1). No warning for an L-BFGS /
+        # low-rank Hessian (no target: PD by Powell damping) or when inertia
+        # is reported (the check runs). Warned once per solver lifetime.
+        if not self._inertia_gap_checked:
+            self._inertia_gap_checked = True
+            target_fn = getattr(K, "expected_inertia", None)
+            target = target_fn() if target_fn is not None else None
+            if target is not None and self.inertia_or_none() is None:
+                logger.warning(
+                    "the sparse backend factorization reports no inertia, so the "
+                    "inertia-guided delta_w correction cannot engage; on "
+                    "nonconvex problems a wrong-inertia factor may pass "
+                    "undetected. Install an inertia-revealing backend "
+                    "(feral-solver via `ipax[sparse-cpu]` on CPU, cuDSS on "
+                    "CUDA) or choose another linsolve mode."
+                )
 
     def solve(self, rhs: Array) -> Array:
         if self._inner is None:

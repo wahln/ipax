@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **A one-time warning when the inertia safety net cannot engage.** The
+  IPM's inertia-guided δ_w correction runs only when the KKT operator knows
+  its target inertia *and* the backend factorization reports the factor's
+  inertia. When the target is known (an assemblable, possibly nonconvex
+  Hessian) but the backend cannot report inertia (e.g. the SuperLU
+  fallback), the check used to no-op silently — a symmetric-indefinite LDLᵀ
+  can then succeed with the wrong inertia and hand back a non-descent step.
+  `SparseDirectSolver` now logs a warning (once per solver lifetime)
+  naming the gap and the fix (`ipax[sparse-cpu]`/Feral on CPU, cuDSS on
+  CUDA). No warning on the L-BFGS route (PD by damping, no target) or on
+  the dense/Krylov routes (each has its own PD mechanism).
+- **The sparse KKT forms are now documented** in `docs/concepts/linalg.md`:
+  the augmented vs normal-equations assembly, the Gram fill-in trap and the
+  `gram_fill_estimate` probe, the auto-selection gate, and inertia as a
+  backend capability.
 - **Sparse normal-equations auto-selection.** The 0.5.0 sparse-NE route
   (`SparseOptions(kkt_route="normal_equations")`) was opt-in because nothing
   could predict whether the Gram `∇gᵀ Σ_s ∇g` stays sparse. A new
