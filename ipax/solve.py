@@ -48,6 +48,7 @@ from ipax.result import (
     IterationInfo,
     IterationRecord,
     Result,
+    Routes,
     Status,
     WarmStart,
 )
@@ -321,6 +322,7 @@ def solve(
         solve_time=perf_counter() - start_time,
         linear_solver=_describe_solver(solver),
         device=_describe_device(result.x),
+        routes=_build_routes(solver, resolved, opts),
     )
 
     # Post-solve summary (tier 1) and the timing split (tier 2).
@@ -408,6 +410,31 @@ def _describe_solver(solver: object) -> str:
     """
     describe = getattr(solver, "describe", None)
     return describe() if callable(describe) else type(solver).__name__
+
+
+def _build_routes(solver: object, resolved: Problem, opts: Options) -> Routes:
+    """Assemble the requested → resolved route record for ``Result.routes``.
+
+    Read *after* the run so runtime resolutions are reflected: the sparse
+    facade's dispatched backend, the dense augmented route's fallback, an
+    ``"auto"`` Krylov preconditioner's promotion — all through the same
+    duck-typed ``describe()``/``kkt_form()`` hooks the solvers expose
+    (invariant #3: no solver-specific knowledge here).
+    """
+    kkt_form_fn = getattr(solver, "kkt_form", None)
+    scaling = opts.scaling
+    corrections = opts.corrections
+    return Routes(
+        linear_solver=_describe_solver(solver),
+        linsolve_requested=str(opts.linsolve),
+        kkt_form=kkt_form_fn() if callable(kkt_form_fn) else "unknown",
+        hessian=_hessian_source(resolved),
+        hessian_requested=str(opts.hessian),
+        globalization=str(opts.globalization),
+        mu_schedule=str(opts.mu_schedule),
+        scaling=str(getattr(scaling, "method", scaling)),
+        corrections=str(getattr(corrections, "method", corrections)),
+    )
 
 
 def _describe_device(x: Array) -> str:

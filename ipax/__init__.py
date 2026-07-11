@@ -42,6 +42,7 @@ from ipax.result import (
     IterationRecord,
     KKTResiduals,
     Result,
+    Routes,
     Status,
     WarmStart,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "Problem",
     "QuadraticProblem",
     "Result",
+    "Routes",
     "ScalingOptions",
     "Status",
     "WarmStart",

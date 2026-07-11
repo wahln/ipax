@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **`Result.routes` — the auto-selection decisions, recorded on the result.**
+  The solver resolves several routes at setup (`linsolve="auto"` picks
+  dense/Krylov/sparse-NE, the KKT assembly form, the Hessian source) and
+  runs others as configured; a new frozen `Routes` dataclass records them
+  all in one place: `linear_solver` (resolved, incl. the dispatched
+  backend), `linsolve_requested`, `kkt_form`
+  (`"condensed"`/`"augmented"`/`"normal_equations"`, reflecting runtime
+  fallbacks — read from a new duck-typed `kkt_form()` hook on each solver),
+  `hessian`/`hessian_requested`, `globalization`, `mu_schedule`, `scaling`,
+  and `corrections`. `None` on pre-solver exits (e.g. infeasible bounds).
+  The tier-1 (`verbose >= 1`) result summary prints the same record as a
+  compact `routes = linsolve:auto->… kkt:… hessian:auto->…` line.
+  Complements the existing `Result.derivative_sources` (the derivative half
+  of the story) without changing any existing field.
 - **The sparse normal-equations route now takes equality constraints.** The
   NE form previously rejected any problem with equalities; the equality
   Jacobian now borders in as a Schur/equality block — the inequality Gram

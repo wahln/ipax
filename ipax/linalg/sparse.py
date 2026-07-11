@@ -107,6 +107,10 @@ class SparseDirectSolver:
         """The assembled KKT form: ``"augmented"`` or ``"normal_equations"``."""
         return self._form
 
+    def kkt_form(self) -> str:
+        """The KKT assembly actually factored (``Result.routes.kkt_form``)."""
+        return self._form
+
     def describe(self) -> str:
         """Human-readable label, delegating to the dispatched backend solver."""
         if self._inner is None:

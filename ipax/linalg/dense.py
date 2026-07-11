@@ -120,6 +120,15 @@ class DenseSolver:
         """Human-readable label for diagnostics."""
         return "dense (augmented)" if self._inertia is not None else "dense"
 
+    def kkt_form(self) -> str:
+        """The KKT assembly actually factored (``Result.routes.kkt_form``).
+
+        ``"augmented"`` only when the bordered route engaged; a configured
+        augmented route that fell back (L-BFGS Hessian, oversized border)
+        honestly reports ``"condensed"``.
+        """
+        return "augmented" if self._inertia is not None else "condensed"
+
     def set_outer_residual(self, residual: float) -> None:
         """No-op: a direct factorization has no inner tolerance to adapt."""
         del residual

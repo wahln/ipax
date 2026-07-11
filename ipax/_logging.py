@@ -254,7 +254,7 @@ def format_options(opts: Options) -> str:
 def format_result(result: Result) -> str:
     """Final result summary block (verbosity tier 1)."""
     src = result.derivative_sources
-    return (
+    text = (
         f"result: {result.status.value} - {result.message}\n"
         f"  objective     = {result.objective:.8e}\n"
         f"  iterations    = {result.n_iter}\n"
@@ -269,6 +269,16 @@ def format_result(result: Result) -> str:
         f"  derivatives   = grad:{src.gradient} eq_jac:{src.eq_jacobian} "
         f"ineq_jac:{src.ineq_jacobian} hess:{src.hessian}"
     )
+    if result.routes is not None:
+        r = result.routes
+        text += (
+            f"\n  routes        = linsolve:{r.linsolve_requested}->"
+            f"{r.linear_solver} kkt:{r.kkt_form} "
+            f"hessian:{r.hessian_requested}->{r.hessian} "
+            f"globalization:{r.globalization} mu:{r.mu_schedule} "
+            f"scaling:{r.scaling} corrections:{r.corrections}"
+        )
+    return text
 
 
 def format_timing(history: tuple[IterationRecord, ...]) -> str:
