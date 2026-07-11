@@ -23,6 +23,22 @@ import torch
 from ipax.linalg.solver import LinearSolveError
 
 
+def cholesky_solve(factor: Any, rhs: Any) -> torch.Tensor:
+    """Solve ``(L Lᵀ) x = rhs`` given the lower Cholesky factor ``L``.
+
+    Gap-filler for the missing Array-API primitive: the ``linalg`` extension
+    has no triangular solve (BLAS ``trsm`` / LAPACK ``potrs``), so a Cholesky
+    factor cannot be back-substituted portably. Wraps ``torch.cholesky_solve``
+    (LAPACK ``potrs`` on CPU, cuSOLVER on CUDA), O(n²) per right-hand side.
+    """
+    ell = torch.as_tensor(factor)
+    b = torch.as_tensor(rhs)
+    vector_rhs = b.ndim == 1
+    b2d = b.unsqueeze(-1) if vector_rhs else b
+    x = torch.cholesky_solve(b2d, ell, upper=False)
+    return x.squeeze(-1) if vector_rhs else x
+
+
 def _ldl_blocks_from_pivots(pivots: torch.Tensor) -> list[tuple[int, int]]:
     """Identify the ``(start, size)`` of each 1x1/2x2 block from LAPACK ``ipiv``.
 
@@ -129,4 +145,4 @@ class TorchLDLFactorization:
         return self._inertia
 
 
-__all__ = ["TorchLDLFactorization"]
+__all__ = ["TorchLDLFactorization", "cholesky_solve"]

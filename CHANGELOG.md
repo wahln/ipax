@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+- **Dense route: the PD-probe Cholesky factor is now reused for the solve.**
+  `DenseSolver` already Cholesky-probes the condensed block `N` to reject
+  indefinite systems (the δ_w escalation guard); that factor was then
+  discarded and the same matrix re-factored with LU by `xp.linalg.solve`.
+  A new backend gap-filler `get_dense_cholesky_solve` (`ipax/backend/dense/`;
+  the Array API `linalg` extension has no triangular solve — BLAS `trsm` /
+  LAPACK `potrs`) back-substitutes the kept factor instead: SciPy `cho_solve`
+  on NumPy, `torch.cholesky_solve` on Torch (CPU/CUDA), two
+  `cupyx.scipy.linalg.solve_triangular` sweeps on CuPy. Every solve against
+  one factorization drops from O(n³) to O(n²), which also makes
+  Mehrotra/Gondzio corrector and SOC back-solves near-free on the dense
+  route. Measured (NumPy, single-threaded BLAS, n=1000–4000, m=n/2):
+  1.2–1.4× per factor+solve, 1.7–1.9× for the factor+3-back-solves pattern.
+  Backends without the primitive (array-api-strict, JAX) and the equality
+  saddle route (indefinite bordered matrix; only its leading `N` block is
+  probed) keep the LU path unchanged.
+
 ## [0.5.0] - 2026-07-10
 
 ### Added

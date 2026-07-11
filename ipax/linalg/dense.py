@@ -25,6 +25,14 @@ escalation — the dense analog of the sparse route's inertia check. Both
 stays pure Array API. Target ≤ ~1e4 variables; the reference implementation every
 other solver is checked against.
 
+When the probed block spans the whole system (the condensed route), the probe's
+Cholesky factor is kept and every solve back-substitutes it through the
+``get_dense_cholesky_solve`` backend gap-filler (the Array-API ``linalg``
+extension has no triangular solve), replacing the redundant O(n³) LU refactor
+with an O(n²) solve — this also makes corrector/SOC back-solves against the
+same factorization cheap. Backends without the gap-filler (array-api-strict,
+JAX) keep the original LU path.
+
 ``DenseOptions(kkt_route="augmented")`` selects an alternative route: instead
 of condensing the inequality Gram term into ``N`` (a normal-equations step),
 it keeps ``∇g``/``−Σ_s⁻¹`` as an explicit border (``operator.
@@ -46,6 +54,8 @@ from ipax.backend.namespace import array_namespace
 from ipax.linalg.solver import LinearSolveError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ipax.backend.operators import LinearOperator
     from ipax.options import DenseOptions
     from ipax.typing import Array
@@ -99,6 +109,12 @@ class DenseSolver:
         self._eigenvalues: Array | None = None
         self._eigenvectors: Array | None = None
         self._inertia: tuple[int, int, int] | None = None
+        # Cholesky factor kept from the PD probe when it spans the whole
+        # system, plus the once-per-instance backend back-substitution lookup
+        # (mirrors _adapter_checked; a solver stays on one backend).
+        self._cholesky_factor: Array | None = None
+        self._cholesky_solve: Callable[[Array, Array], Array] | None = None
+        self._cholesky_solve_checked = False
 
     def describe(self) -> str:
         """Human-readable label for diagnostics."""
@@ -119,6 +135,7 @@ class DenseSolver:
         self._eigenvalues = None
         self._eigenvectors = None
         self._inertia = None
+        self._cholesky_factor = None
 
     def solve(self, rhs: Array) -> Array:
         if self._operator is None:
@@ -160,10 +177,32 @@ class DenseSolver:
 
         matrix = self._matrix
         assert matrix is not None
+        if self._cholesky_factor is not None:
+            solve_cholesky = self._lookup_cholesky_solve(xp)
+            if solve_cholesky is not None:
+                try:
+                    return solve_cholesky(self._cholesky_factor, rhs)
+                except Exception:
+                    # The reuse is purely an optimization: the materialized
+                    # matrix is still in hand, so an unexpected trsm/potrs
+                    # failure falls back to LU instead of escalating delta_w
+                    # (the factor is dropped so later solves skip the retry).
+                    self._cholesky_factor = None
+        return self._solve_lu(matrix, rhs, xp)
+
+    def _solve_lu(self, matrix: Array, rhs: Array, xp: Any) -> Array:
         try:
             return xp.linalg.solve(matrix, rhs)
         except Exception as exc:
             raise LinearSolveError("dense linear solve failed") from exc
+
+    def _lookup_cholesky_solve(self, xp: Any) -> Callable[[Array, Array], Array] | None:
+        if not self._cholesky_solve_checked:
+            from ipax.backend.dense import get_dense_cholesky_solve
+
+            self._cholesky_solve = get_dense_cholesky_solve(xp)
+            self._cholesky_solve_checked = True
+        return self._cholesky_solve
 
     def _try_factor_augmented(self, xp: Any) -> None:
         """Attempt the augmented route; no-op (silent fallback) if unsupported."""
@@ -309,6 +348,12 @@ class DenseSolver:
         when ``N`` is not positive definite. Skips the probe when the operator
         exposes no condensed block (e.g. an L-BFGS low-rank Hessian, PD by
         damping) or when the backend lacks ``cholesky``.
+
+        When the probed block spans the whole system (the condensed route),
+        the factor is kept so ``solve`` back-substitutes it instead of paying
+        a second O(n³) LU factorization of the same matrix. An equality
+        saddle's probe covers only the leading ``N`` block of the indefinite
+        bordered matrix, so nothing is kept there.
         """
         primal_block = getattr(self._operator, "primal_block", None)
         block = primal_block() if primal_block is not None else None
@@ -322,9 +367,13 @@ class DenseSolver:
         # ``N``; equality saddles store ``N`` in the leading primal block.
         primal = matrix if n == matrix.shape[0] else matrix[:n, :n]
         try:
-            cholesky(primal)
+            factor = cholesky(primal)
         except Exception as exc:
             raise LinearSolveError("condensed block is not positive definite") from exc
+        # Keep the factor only where a backend back-substitution exists;
+        # otherwise it would be dead n×n memory next to the LU path.
+        if primal is matrix and self._lookup_cholesky_solve(xp) is not None:
+            self._cholesky_factor = factor
 
 
 __all__ = ["DenseSolver"]

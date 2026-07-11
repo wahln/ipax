@@ -34,7 +34,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ipax.typing import Namespace
+    from collections.abc import Callable
+
+    from ipax.typing import Array, Namespace
 
 
 def get_dense_symmetric_indefinite_adapter(xp: Namespace) -> object | None:
@@ -82,4 +84,57 @@ def get_dense_symmetric_indefinite_adapter(xp: Namespace) -> object | None:
     return None
 
 
-__all__ = ["get_dense_symmetric_indefinite_adapter"]
+def get_dense_cholesky_solve(xp: Namespace) -> Callable[[Array, Array], Array] | None:
+    """Return ``(L, rhs) -> x`` solving ``(L Lᵀ) x = rhs``, or ``None``.
+
+    Gap-filler for a missing Array-API primitive: the ``linalg`` extension has
+    **no triangular solve** (BLAS ``trsm`` / LAPACK ``potrs``), so the Cholesky
+    factor that ``DenseSolver``'s PD guard already computed cannot be
+    back-substituted portably — a pure-standard caller would have to refactor
+    the matrix with ``xp.linalg.solve`` (LU), paying O(n³) twice per KKT
+    factorization (and once more per extra back-solve). Per-backend adapters
+    provide the O(n²) back-substitution instead:
+
+    ===========  ================================================
+    backend      primitive
+    ===========  ================================================
+    numpy        ``scipy.linalg.cho_solve`` (LAPACK ``?potrs``)
+    torch        ``torch.cholesky_solve`` (CPU + CUDA)
+    cupy         ``cupyx.scipy.linalg.solve_triangular`` ×2 (CUDA)
+    ===========  ================================================
+
+    ``None`` for any other backend (JAX, array-api-strict) or when the
+    concrete library import fails: the caller falls back to the LU solve,
+    losing only the reuse speedup, never correctness.
+    """
+    from ipax.backend.namespace import _namespace_name
+
+    name = _namespace_name(xp)
+    if name == "numpy":
+        try:
+            from ipax.backend.dense.numpy_scipy import (
+                cholesky_solve as _numpy_cholesky_solve,
+            )
+        except ImportError:
+            return None
+        return _numpy_cholesky_solve
+    if name == "torch":
+        try:
+            from ipax.backend.dense.torch import (
+                cholesky_solve as _torch_cholesky_solve,
+            )
+        except ImportError:
+            return None
+        return _torch_cholesky_solve
+    if name == "cupy":
+        try:
+            from ipax.backend.dense.cupy import (
+                cholesky_solve as _cupy_cholesky_solve,
+            )
+        except ImportError:
+            return None
+        return _cupy_cholesky_solve
+    return None
+
+
+__all__ = ["get_dense_cholesky_solve", "get_dense_symmetric_indefinite_adapter"]
