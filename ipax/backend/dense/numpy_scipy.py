@@ -19,10 +19,26 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+from scipy.linalg import cho_solve as _scipy_cho_solve
 from scipy.linalg import ldl as _scipy_ldl
 from scipy.linalg import solve_triangular
 
 from ipax.linalg.solver import LinearSolveError
+
+
+def cholesky_solve(factor: Any, rhs: Any) -> np.ndarray:
+    """Solve ``(L Lᵀ) x = rhs`` given the lower Cholesky factor ``L``.
+
+    Gap-filler for the missing Array-API primitive: the ``linalg`` extension
+    has no triangular solve (BLAS ``trsm`` / LAPACK ``potrs``), so a Cholesky
+    factor cannot be back-substituted portably. Wraps ``scipy.linalg.cho_solve``
+    (LAPACK ``?potrs``), O(n²) per right-hand side. ``check_finite=False``:
+    the factor came from a ``cholesky`` that already succeeded on this data.
+    """
+    result: np.ndarray = _scipy_cho_solve(
+        (np.asarray(factor), True), np.asarray(rhs), check_finite=False
+    )
+    return result
 
 
 def _ldl_blocks(d: np.ndarray) -> list[tuple[int, int]]:
@@ -146,4 +162,4 @@ class ScipyLDLFactorization:
         return self._inertia
 
 
-__all__ = ["ScipyLDLFactorization"]
+__all__ = ["ScipyLDLFactorization", "cholesky_solve"]

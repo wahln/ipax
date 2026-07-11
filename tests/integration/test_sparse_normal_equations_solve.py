@@ -22,11 +22,16 @@ _M = 5 * _N
 
 
 class _BandedTallQP(Problem):
-    """min ½‖x − 1.5‖² s.t. banded A x ≤ b, x ≥ 0 (rows hit adjacent columns)."""
+    """min ½‖x − 1.5‖² s.t. banded A x ≤ b, x ≥ 0 (rows hit adjacent columns).
 
-    def __init__(self, namespace, *, with_hessian: bool) -> None:
+    With ``with_equality=True`` a sparse two-row equality block is added, so
+    the NE route factors the Schur/equality-bordered saddle.
+    """
+
+    def __init__(self, namespace, *, with_hessian: bool, with_equality=False) -> None:
         self._xp = namespace
         self._with_hessian = with_hessian
+        self._with_equality = with_equality
         rows_l, cols_l, vals_l = [], [], []
         for i in range(_M):
             center = (i * _N) // _M
@@ -85,6 +90,27 @@ class _BandedTallQP(Problem):
     def bounds(self):
         return self._xp.zeros((_N,), dtype=self._vals.dtype), None
 
+    def _eq_operator(self):
+        xp = self._xp
+        rows = xp.asarray([0, 0, 1, 1])
+        cols = xp.asarray([0, 2, 1, _N - 1])
+        vals = array(xp, [1.0, 1.0, 1.0, -1.0])
+        return COOOperator(rows, cols, vals, (2, _N), pattern_key="C")
+
+    def eq_constraints(self, x):
+        if not self._with_equality:
+            raise NotImplementedError
+        # x0 + x2 = 0.9 and x1 = x_{N-1}: satisfied strictly inside the
+        # inequality margins at the feasible seed x = 0.5.
+        rhs = array(self._xp, [0.9, 0.0])
+        return self._eq_operator().matvec(x) - rhs
+
+    def eq_jacobian(self, x):
+        if not self._with_equality:
+            raise NotImplementedError
+        del x
+        return self._eq_operator()
+
 
 def _require_sparse(namespace):
     if get_sparse_adapter(namespace) is None:
@@ -114,7 +140,38 @@ def test_sparse_normal_equations_reaches_the_dense_optimum(namespace, hessian):
     assert abs(float(result.objective) - float(reference.objective)) <= 1e-6
 
 
-def test_normal_equations_route_rejects_equality_problems(namespace):
+@pytest.mark.parametrize("hessian", ["exact", "lbfgs"])
+def test_sparse_normal_equations_solves_equality_constrained_problems(
+    namespace, hessian
+):
+    # The Schur/equality border: ∇c stays explicit next to the sparsely
+    # condensed n×n block, so equality-constrained problems now go through
+    # the NE route instead of being rejected.
+    _require_sparse(namespace)
+    problem = _BandedTallQP(
+        namespace, with_hessian=(hessian == "exact"), with_equality=True
+    )
+    x0 = namespace.full((_N,), 0.4)
+
+    reference = solve(problem, x0, options=Options(linsolve="dense", hessian=hessian))
+    assert reference.status.is_success
+
+    result = solve(
+        problem,
+        x0,
+        options=Options(
+            linsolve="sparse",
+            sparse=SparseOptions(kkt_route="normal_equations"),
+            hessian=hessian,
+        ),
+    )
+    assert result.status.is_success
+    assert result.kkt_error <= 1e-6
+    assert abs(float(result.objective) - float(reference.objective)) <= 1e-6
+
+
+def test_normal_equations_route_solves_a_pure_equality_problem(namespace):
+    # No inequalities at all: the NE form degenerates to the equality saddle.
     _require_sparse(namespace)
 
     class _EqQP(Problem):
@@ -145,13 +202,16 @@ def test_normal_equations_route_rejects_equality_problems(namespace):
                 pattern_key="H",
             )
 
-    with pytest.raises(RuntimeError, match=r"normal.equations"):
-        solve(
-            _EqQP(),
-            array(namespace, [0.3, 0.4]),
-            options=Options(
-                linsolve="sparse",
-                sparse=SparseOptions(kkt_route="normal_equations"),
-                hessian="exact",
-            ),
-        )
+    result = solve(
+        _EqQP(),
+        array(namespace, [0.3, 0.4]),
+        options=Options(
+            linsolve="sparse",
+            sparse=SparseOptions(kkt_route="normal_equations"),
+            hessian="exact",
+        ),
+    )
+    assert result.status.is_success
+    # Analytic optimum of min ‖x‖² s.t. x0 + x1 = 1 is x = (0.5, 0.5).
+    assert abs(float(result.x[0]) - 0.5) <= 1e-6
+    assert abs(float(result.x[1]) - 0.5) <= 1e-6

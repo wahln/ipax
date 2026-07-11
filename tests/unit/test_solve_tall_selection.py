@@ -125,3 +125,160 @@ def test_tall_gram_incapable_dense_jacobian_keeps_krylov(selected_solvers):
     _run(_TinyTallQP(import_namespace("numpy"), jacobian="dense"))
     assert len(selected_solvers) == 1
     assert isinstance(selected_solvers[0], KrylovSolver)
+
+
+# --- sparse normal-equations auto-selection wiring ---------------------------
+
+
+class _TinyTallQPWithHessian(_TinyTallQP):
+    """The same QP with an analytic (identity) Lagrangian Hessian."""
+
+    def lagrangian_hessian(self, x, y_eq, y_ineq, sigma=1.0):
+        del y_eq, y_ineq
+        return sigma * self._xp.eye(_N, dtype=self._xp.float64)
+
+
+@pytest.fixture
+def ne_zone(selected_solvers, monkeypatch):
+    """Push the tiny banded QP into the sparse-NE selection zone: its density
+    (0.25) is above the real dense-GEMM crossover and its Gram fill (~0.4 at
+    n=8) above the real NE threshold, so both measurement-derived cutoffs are
+    widened; the *wiring* (probes → select_solver → SparseDirectSolver) is
+    what runs for real here."""
+    monkeypatch.setattr(solver_mod, "_TALL_DENSE_MIN_DENSITY", 0.5)
+    monkeypatch.setattr(solver_mod, "_TALL_SPARSE_NE_MAX_FILL", 0.9)
+    return selected_solvers
+
+
+def test_tall_sparse_gram_selects_normal_equations(ne_zone):
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    pytest.importorskip("scipy")
+    _run(_TinyTallQP(import_namespace("numpy"), jacobian="coo"))
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], SparseDirectSolver)
+    assert ne_zone[0].form == "normal_equations"
+
+
+def test_tall_analytic_hessian_keeps_krylov(ne_zone):
+    # The NE form folds the Gram into the condensed block only for an L-BFGS
+    # (diagonal + low-rank) Hessian; with an analytic Hessian the auto route
+    # must not gamble on the operator being COO-emittable.
+    pytest.importorskip("scipy")
+    _run(_TinyTallQPWithHessian(import_namespace("numpy"), jacobian="coo"))
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], KrylovSolver)
+
+
+class _TinyTallQPWithEquality(_TinyTallQP):
+    """The tiny tall QP plus one equality row, COO or matrix-free."""
+
+    def __init__(self, xp, *, jacobian: str, eq_jacobian: str) -> None:
+        super().__init__(xp, jacobian=jacobian)
+        assert eq_jacobian in ("coo", "matrix-free")
+        self._eq_jacobian_kind = eq_jacobian
+
+    def eq_constraints(self, x):
+        return self._xp.sum(x, keepdims=True) - 0.45 * _N
+
+    def eq_jacobian(self, x):
+        del x
+        xp = self._xp
+        if self._eq_jacobian_kind == "coo":
+            return COOOperator(
+                xp.zeros((_N,), dtype=xp.int64),
+                xp.arange(_N),
+                xp.ones((_N,), dtype=xp.float64),
+                (1, _N),
+                pattern_key="C",
+            )
+
+        from ipax.backend.operators import LinearOperator
+
+        class _MatvecOnly(LinearOperator):
+            shape = (1, _N)
+
+            def matvec(self, v):
+                return xp.sum(v, keepdims=True)
+
+            def rmatvec(self, v):
+                return xp.ones((_N,), dtype=xp.float64) * v[0]
+
+            def matmat(self, V):
+                return xp.sum(V, axis=0, keepdims=True)
+
+        return _MatvecOnly()
+
+
+def test_tall_equality_with_coo_jacobian_selects_normal_equations(ne_zone):
+    # Equalities no longer veto the NE route when ∇c can emit COO structure:
+    # the saddle borders it explicitly.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    pytest.importorskip("scipy")
+    _run(
+        _TinyTallQPWithEquality(
+            import_namespace("numpy"), jacobian="coo", eq_jacobian="coo"
+        )
+    )
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], SparseDirectSolver)
+    assert ne_zone[0].form == "normal_equations"
+
+
+def test_tall_equality_with_matrix_free_jacobian_keeps_krylov(ne_zone):
+    # A matrix-free ∇c cannot be bordered into the sparse factor; the probe
+    # must veto the NE route rather than crash at the first factorization.
+    pytest.importorskip("scipy")
+    _run(
+        _TinyTallQPWithEquality(
+            import_namespace("numpy"), jacobian="coo", eq_jacobian="matrix-free"
+        )
+    )
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], KrylovSolver)
+
+
+def test_tall_linear_equality_selects_normal_equations(ne_zone):
+    # Declared *linear* equalities join the probe through linear_eq(): a
+    # COO-able constant A keeps the NE route available.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    pytest.importorskip("scipy")
+    xp = import_namespace("numpy")
+
+    class _WithLinearEq(_TinyTallQP):
+        def linear_eq(self):
+            a = xp.ones((1, _N), dtype=xp.float64)
+            b = xp.asarray([0.45 * _N])
+            return a, b
+
+    _run(_WithLinearEq(xp, jacobian="coo"))
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], SparseDirectSolver)
+    assert ne_zone[0].form == "normal_equations"
+
+
+def test_tall_equality_jacobian_failing_at_probe_keeps_krylov(ne_zone):
+    # An equality Jacobian that cannot be evaluated at the probe point (x0)
+    # must veto the NE route; the solve itself continues on Krylov. Scaling is
+    # disabled so the selection probe's evaluation is the *first* call (the
+    # gradient-based default would otherwise evaluate ∇c before selection).
+    pytest.importorskip("scipy")
+    xp = import_namespace("numpy")
+
+    class _ProbeShyEq(_TinyTallQPWithEquality):
+        def __init__(self):
+            super().__init__(xp, jacobian="coo", eq_jacobian="coo")
+            self._eq_jac_calls = 0
+
+        def eq_jacobian(self, x):
+            self._eq_jac_calls += 1
+            if self._eq_jac_calls == 1:  # the selection probe's evaluation
+                raise NotImplementedError("unavailable at the probe point")
+            return super().eq_jacobian(x)
+
+    x0 = xp.full((_N,), 0.4)
+    solve(_ProbeShyEq(), x0, options=Options(max_iter=3, scaling="none"))
+    assert len(ne_zone) == 1
+    assert isinstance(ne_zone[0], KrylovSolver)

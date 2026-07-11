@@ -333,4 +333,22 @@ class CuPyLDLFactorization:
         return self._inertia
 
 
-__all__ = ["CuPyLDLFactorization"]
+def cholesky_solve(factor: Any, rhs: Any) -> Any:
+    """Solve ``(L Lᵀ) x = rhs`` given the lower Cholesky factor ``L``.
+
+    Gap-filler for the missing Array-API primitive: the ``linalg`` extension
+    has no triangular solve (BLAS ``trsm`` / LAPACK ``potrs``), so a Cholesky
+    factor cannot be back-substituted portably. Two cuSOLVER ``trsm``
+    triangular solves via ``cupyx.scipy.linalg.solve_triangular`` (CuPy has no
+    ``cho_solve``), O(n²) per right-hand side.
+    """
+    from cupyx.scipy.linalg import solve_triangular as _solve_triangular
+
+    ell = _to_cupy(factor)
+    b = _to_cupy(rhs)
+    y = _solve_triangular(ell, b, lower=True)
+    x = _solve_triangular(ell, y, lower=True, trans="T")
+    return x
+
+
+__all__ = ["CuPyLDLFactorization", "cholesky_solve"]

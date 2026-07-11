@@ -364,6 +364,33 @@ class SparseOperator(LinearOperator):
     def gram_coo_capable(self) -> bool:
         return True
 
+    def gram_fill_estimate(self) -> float | None:
+        """Estimated Gram-pattern density — the SciPy adapter's sampled
+        column-overlap estimate on the host-transferred index structure.
+
+        A one-time route-selection probe, so the two index-array transfers
+        (a few MB) are irrelevant; running the 128-column union loop on the
+        GPU would instead cost hundreds of tiny kernel launches and syncs.
+        Reuses :func:`ipax.backend.sparse.numpy_scipy._estimate_gram_fill`
+        (a CuPy stack without SciPy skips the probe rather than raising).
+        """
+        try:
+            from ipax.backend.sparse.numpy_scipy import _estimate_gram_fill
+        except ImportError:
+            return None
+        m, n = self.shape
+        if m == 0 or n == 0:
+            return 0.0
+        csr = self._matrix.tocsr()
+        csc = self._matrix.tocsc()
+        return _estimate_gram_fill(
+            cupy.asnumpy(csr.indptr),
+            cupy.asnumpy(csr.indices),
+            cupy.asnumpy(csc.indptr),
+            cupy.asnumpy(csc.indices),
+            n,
+        )
+
     @staticmethod
     def _gram_dense_accumulate(a: Any, w: Any) -> Any:
         """``Aᵀ diag(w) A`` by cuBLAS over zero-copy row windows of ``a``.

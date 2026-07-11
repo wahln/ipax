@@ -6,6 +6,91 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-11
+
+### Added
+- **`Result.routes` — the auto-selection decisions, recorded on the result.**
+  The solver resolves several routes at setup (`linsolve="auto"` picks
+  dense/Krylov/sparse-NE, the KKT assembly form, the Hessian source) and
+  runs others as configured; a new frozen `Routes` dataclass records them
+  all in one place: `linear_solver` (resolved, incl. the dispatched
+  backend), `linsolve_requested`, `kkt_form`
+  (`"condensed"`/`"augmented"`/`"normal_equations"`, reflecting runtime
+  fallbacks — read from a new duck-typed `kkt_form()` hook on each solver),
+  `hessian`/`hessian_requested`, `globalization`, `mu_schedule`, `scaling`,
+  and `corrections`. `None` on pre-solver exits (e.g. infeasible bounds).
+  The tier-1 (`verbose >= 1`) result summary prints the same record as a
+  compact `routes = linsolve:auto->… kkt:… hessian:auto->…` line.
+  Complements the existing `Result.derivative_sources` (the derivative half
+  of the story) without changing any existing field.
+- **The sparse normal-equations route now takes equality constraints.** The
+  NE form previously rejected any problem with equalities; the equality
+  Jacobian now borders in as a Schur/equality block — the inequality Gram
+  still condenses sparsely into the `n×n` block while `∇c` stays explicit,
+  so the factored matrix is the `(n+m_E)` quasidefinite saddle over the
+  condensed-Gram block (Friedlander–Orban 2012), with any L-BFGS low-rank
+  border carried through at the tail and full structure/symbolic reuse. The
+  Haynsworth inertia offset is unchanged (the eliminated `−Σ_s⁻¹` block's
+  `m_I` negatives; the `−δ_c` block stays *in* the factor), so the
+  inertia-guided δ_w correction works for the bordered form too.
+  Auto-selection no longer vetoes equality problems: the tall sparse-Gram
+  gate now also verifies the equality Jacobian can emit COO structure
+  (a matrix-free `∇c` keeps Krylov rather than crashing at the first
+  factorization).
+- **A one-time warning when the inertia safety net cannot engage.** The
+  IPM's inertia-guided δ_w correction runs only when the KKT operator knows
+  its target inertia *and* the backend factorization reports the factor's
+  inertia. When the target is known (an assemblable, possibly nonconvex
+  Hessian) but the backend cannot report inertia (e.g. the SuperLU
+  fallback), the check used to no-op silently — a symmetric-indefinite LDLᵀ
+  can then succeed with the wrong inertia and hand back a non-descent step.
+  `SparseDirectSolver` now logs a warning (once per solver lifetime)
+  naming the gap and the fix (`ipax[sparse-cpu]`/Feral on CPU, cuDSS on
+  CUDA). No warning on the L-BFGS route (PD by damping, no target) or on
+  the dense/Krylov routes (each has its own PD mechanism).
+- **The sparse KKT forms are now documented** in `docs/concepts/linalg.md`:
+  the augmented vs normal-equations assembly, the Gram fill-in trap and the
+  `gram_fill_estimate` probe, the auto-selection gate, and inertia as a
+  backend capability.
+- **Sparse normal-equations auto-selection.** The 0.5.0 sparse-NE route
+  (`SparseOptions(kkt_route="normal_equations")`) was opt-in because nothing
+  could predict whether the Gram `∇gᵀ Σ_s ∇g` stays sparse. A new
+  `LinearOperator.gram_fill_estimate` capability answers that without forming
+  the Gram: the pattern of Gram column `j` is exactly the union of the column
+  patterns of the rows touching `j`, so sampling evenly spaced columns and
+  averaging the union sizes estimates `nnz(∇gᵀ∇g)/n²` (SciPy + CuPy adapters;
+  forwarded through `VStack` and the scaling wrapper; measured within 1% of
+  the exact fill at n=10k–20k for ~25–60 ms, once, at selection time).
+  `select_solver(linsolve="auto")` now consults it for tall (`m ≥ 10n`)
+  problems whose sparse Jacobian is below the dense-GEMM Gram crossover:
+  estimated fill ≤ 1% (banded validation case sits at ~0.2–0.5%, scattered
+  sparsity saturates toward 1) selects the sparse-NE route — the regime where
+  it measured 3–4.6× faster per iteration than the bordered augmented factor
+  and solved n=20k in 62 s while Krylov ran 50+ min unconverged — restricted
+  to the L-BFGS Hessian route (the fold the NE form supports; see the
+  equality-border entry above for the constraint mixes). Everything else
+  keeps the previous selection unchanged.
+  `SparseDirectSolver` also gained a public `form` property, and its
+  `describe()` now reports `sparse-NE [...]` for the normal-equations form.
+
+### Changed
+- **Dense route: the PD-probe Cholesky factor is now reused for the solve.**
+  `DenseSolver` already Cholesky-probes the condensed block `N` to reject
+  indefinite systems (the δ_w escalation guard); that factor was then
+  discarded and the same matrix re-factored with LU by `xp.linalg.solve`.
+  A new backend gap-filler `get_dense_cholesky_solve` (`ipax/backend/dense/`;
+  the Array API `linalg` extension has no triangular solve — BLAS `trsm` /
+  LAPACK `potrs`) back-substitutes the kept factor instead: SciPy `cho_solve`
+  on NumPy, `torch.cholesky_solve` on Torch (CPU/CUDA), two
+  `cupyx.scipy.linalg.solve_triangular` sweeps on CuPy. Every solve against
+  one factorization drops from O(n³) to O(n²), which also makes
+  Mehrotra/Gondzio corrector and SOC back-solves near-free on the dense
+  route. Measured (NumPy, single-threaded BLAS, n=1000–4000, m=n/2):
+  1.2–1.4× per factor+solve, 1.7–1.9× for the factor+3-back-solves pattern.
+  Backends without the primitive (array-api-strict, JAX) and the equality
+  saddle route (indefinite bordered matrix; only its leading `N` block is
+  probed) keep the LU path unchanged.
+
 ## [0.5.0] - 2026-07-10
 
 ### Added
@@ -886,7 +971,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/wahln/ipax/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/wahln/ipax/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/wahln/ipax/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/wahln/ipax/compare/v0.2.0...v0.3.0

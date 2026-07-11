@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ipax._logging import logger
 from ipax.backend.namespace import _namespace_name, array_namespace
 
 if TYPE_CHECKING:
@@ -63,8 +64,10 @@ class SparseDirectSolver:
     ``"normal_equations"`` condenses the inequality Gram term sparsely into the
     logical ``n×n`` block (``normal_equations_coo``), for tall problems whose
     Jacobian rows are localized enough that ``∇gᵀ Σ_s ∇g`` stays sparse.
-    Opt-in: on non-localized sparsity the Gram fills in, and no cheap
-    structural probe can detect that in advance.
+    On non-localized sparsity the Gram fills in catastrophically, so the form
+    is selectable explicitly (``SparseOptions(kkt_route=...)``) and picked by
+    ``select_solver`` only when the ``gram_fill_estimate`` probe (sampled
+    column overlap of ``∇g``) certifies a sparse Gram pattern.
     """
 
     def __init__(
@@ -92,6 +95,21 @@ class SparseDirectSolver:
         # value vector is recomputed (``coo_values``) instead of the full triplet.
         self._struct_signature: object | None = None
         self._struct: tuple[Array, Array, tuple[int, int]] | None = None
+        # One warning per solver lifetime when the inertia safety net cannot
+        # engage (see the end of ``factor``). Latched after the FIRST
+        # evaluation either way: factor() runs every iteration, and both the
+        # operator's target kind and the backend's inertia capability are
+        # fixed for a solve.
+        self._inertia_gap_checked = False
+
+    @property
+    def form(self) -> str:
+        """The assembled KKT form: ``"augmented"`` or ``"normal_equations"``."""
+        return self._form
+
+    def kkt_form(self) -> str:
+        """The KKT assembly actually factored (``Result.routes.kkt_form``)."""
+        return self._form
 
     def describe(self) -> str:
         """Human-readable label, delegating to the dispatched backend solver."""
@@ -101,7 +119,8 @@ class SparseDirectSolver:
         detail = (
             inner_describe() if callable(inner_describe) else type(self._inner).__name__
         )
-        return f"sparse [{detail}]"
+        prefix = "sparse-NE" if self._form == "normal_equations" else "sparse"
+        return f"{prefix} [{detail}]"
 
     def set_outer_residual(self, residual: float) -> None:
         """No-op: a direct factorization has no inner tolerance to adapt."""
@@ -117,11 +136,12 @@ class SparseDirectSolver:
             signature_fn = getattr(K, "normal_equations_pattern_signature", None)
             if to_coo is None or values is None or signature_fn is None:
                 raise RuntimeError(
-                    "the sparse normal-equations form requires a condensed KKT "
-                    "operator that can fold the inequality Gram sparsely "
-                    "(no equality constraints; a gram_coo-capable sparse "
-                    "inequality Jacobian); use the default 'augmented' form "
-                    "or another linsolve mode instead"
+                    "the sparse normal-equations form requires a KKT operator "
+                    "that can fold the inequality Gram sparsely (a "
+                    "gram_coo-capable sparse inequality Jacobian; equality "
+                    "Jacobians border in and must emit COO structure); use "
+                    "the default 'augmented' form or another linsolve mode "
+                    "instead"
                 )
             return signature_fn, to_coo, values
         return K.coo_pattern_signature, K.to_coo, K.coo_values
@@ -203,6 +223,29 @@ class SparseDirectSolver:
             else None
         )
         self._inertia_offset = offset_fn() if offset_fn is not None else (0, 0, 0)
+
+        # Surface the silent gap in the inertia safety net: when the operator
+        # knows its target inertia (an assemblable — possibly nonconvex —
+        # Hessian) but this backend's factorization reports none (e.g. the
+        # SuperLU fallback), the IPM's inertia-guided delta_w correction
+        # silently never engages, and a symmetric-indefinite LDL^T can succeed
+        # with the *wrong* inertia — a non-descent step the failure path never
+        # sees (Waechter & Biegler 2006, sec. 3.1). No warning for an L-BFGS /
+        # low-rank Hessian (no target: PD by Powell damping) or when inertia
+        # is reported (the check runs). Warned once per solver lifetime.
+        if not self._inertia_gap_checked:
+            self._inertia_gap_checked = True
+            target_fn = getattr(K, "expected_inertia", None)
+            target = target_fn() if target_fn is not None else None
+            if target is not None and self.inertia_or_none() is None:
+                logger.warning(
+                    "the sparse backend factorization reports no inertia, so the "
+                    "inertia-guided delta_w correction cannot engage; on "
+                    "nonconvex problems a wrong-inertia factor may pass "
+                    "undetected. Install an inertia-revealing backend "
+                    "(feral-solver via `ipax[sparse-cpu]` on CPU, cuDSS on "
+                    "CUDA) or choose another linsolve mode."
+                )
 
     def solve(self, rhs: Array) -> Array:
         if self._inner is None:

@@ -48,6 +48,7 @@ from ipax.result import (
     IterationInfo,
     IterationRecord,
     Result,
+    Routes,
     Status,
     WarmStart,
 )
@@ -234,6 +235,47 @@ def solve(
             return None
         return int(values.shape[0]) / (int(rows) * int(cols))
 
+    def _eq_jac_coo_capable() -> bool:
+        """Whether the combined equality Jacobian can emit COO triplets.
+
+        The sparse normal-equations saddle keeps ``∇c`` as an explicit border
+        in the factored matrix, so a matrix-free equality Jacobian must veto
+        the route here rather than crash at the first factorization.
+        """
+        from ipax.backend.operators import as_operator
+
+        ops: list[LinearOperator] = []
+        if has_eq:
+            try:
+                ops.append(as_operator(model.eq_jacobian(x0)))
+            except NotImplementedError:
+                return False
+        linear = model.linear_eq()
+        if linear is not None:
+            ops.append(as_operator(linear[0]))
+        for op in ops:
+            try:
+                op.to_coo()
+            except NotImplementedError:
+                return False
+        return True
+
+    def _ineq_gram_fill() -> float | None:
+        """Estimated Gram-pattern density of ∇g (sampled column overlap)."""
+        op = _ineq_jac_probe()
+        if op is None or not op.gram_coo_capable():
+            return None
+        if has_equalities and not _eq_jac_coo_capable():
+            return None
+        return op.gram_fill_estimate()
+
+    # The sparse normal-equations form folds the Hessian into its n×n block
+    # only for a diagonal+low-rank W (the L-BFGS route); with an analytic or
+    # HVP Hessian the auto heuristic must not gamble on the operator being
+    # COO-emittable, so the fill probe is withheld and the form stays
+    # explicitly selectable via SparseOptions(kkt_route="normal_equations").
+    ne_foldable = has_ineq and _hessian_source(resolved) == "lbfgs"
+
     solver = select_solver(
         n_vars=int(resolved.n_vars),
         has_equalities=has_equalities,
@@ -242,6 +284,7 @@ def solve(
         m_ineq=m_ineq,
         ineq_gram_capable=_ineq_gram_capable if has_ineq else None,
         ineq_density=_ineq_density if has_ineq else None,
+        ineq_gram_fill=_ineq_gram_fill if ne_foldable else None,
     )
 
     # Pre-solve diagnostics (verbosity tiers 3–5; gated by the logger threshold
@@ -279,6 +322,7 @@ def solve(
         solve_time=perf_counter() - start_time,
         linear_solver=_describe_solver(solver),
         device=_describe_device(result.x),
+        routes=_build_routes(solver, resolved, opts),
     )
 
     # Post-solve summary (tier 1) and the timing split (tier 2).
@@ -366,6 +410,31 @@ def _describe_solver(solver: object) -> str:
     """
     describe = getattr(solver, "describe", None)
     return describe() if callable(describe) else type(solver).__name__
+
+
+def _build_routes(solver: object, resolved: Problem, opts: Options) -> Routes:
+    """Assemble the requested → resolved route record for ``Result.routes``.
+
+    Read *after* the run so runtime resolutions are reflected: the sparse
+    facade's dispatched backend, the dense augmented route's fallback, an
+    ``"auto"`` Krylov preconditioner's promotion — all through the same
+    duck-typed ``describe()``/``kkt_form()`` hooks the solvers expose
+    (invariant #3: no solver-specific knowledge here).
+    """
+    kkt_form_fn = getattr(solver, "kkt_form", None)
+    scaling = opts.scaling
+    corrections = opts.corrections
+    return Routes(
+        linear_solver=_describe_solver(solver),
+        linsolve_requested=str(opts.linsolve),
+        kkt_form=kkt_form_fn() if callable(kkt_form_fn) else "unknown",
+        hessian=_hessian_source(resolved),
+        hessian_requested=str(opts.hessian),
+        globalization=str(opts.globalization),
+        mu_schedule=str(opts.mu_schedule),
+        scaling=str(getattr(scaling, "method", scaling)),
+        corrections=str(getattr(corrections, "method", corrections)),
+    )
 
 
 def _describe_device(x: Array) -> str:

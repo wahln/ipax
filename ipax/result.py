@@ -132,7 +132,40 @@ class DerivativeSources:
     gradient: str = "unknown"  # analytic | autodiff | finite-diff
     eq_jacobian: str = "n/a"
     ineq_jacobian: str = "n/a"
-    hessian: str = "lbfgs"  # analytic | autodiff-hvp | lbfgs
+    hessian: str = "lbfgs"  # exact | autodiff-hvp | lbfgs
+
+
+@dataclass(frozen=True, slots=True)
+class Routes:
+    """Which route each auto-selectable mechanism actually took.
+
+    The solver resolves several choices at setup ("auto" linear-solver
+    selection, the KKT assembly form, the Hessian source) and simply *runs*
+    others as configured; this records them all in one place so a finished
+    :class:`Result` explains itself. The ``*_requested`` fields echo the
+    option as configured (``"auto"`` means the solver chose); the plain
+    fields record what actually ran. Complements :class:`DerivativeSources`,
+    which logs the gradient/Jacobian resolution in detail — ``hessian`` is
+    mirrored here because it doubles as the solver-route gate (e.g. the
+    sparse normal-equations fold).
+    """
+
+    # Resolved linear solver, including the dispatched backend — the same
+    # string as ``Result.linear_solver`` (e.g. "sparse-NE [Feral LDL^T (CPU)]").
+    linear_solver: str = ""
+    linsolve_requested: str = ""  # Options.linsolve as configured
+    # KKT assembly actually factored/iterated: "condensed" (normal-equations
+    # block, dense or matrix-free; equality saddles included), "augmented"
+    # (indefinite bordered form), or "normal_equations" (sparsely condensed
+    # Gram). Reflects runtime fallbacks (e.g. the dense augmented route
+    # falling back to condensed).
+    kkt_form: str = ""
+    hessian: str = ""  # resolved source: exact | autodiff-hvp | lbfgs
+    hessian_requested: str = ""  # Options.hessian as configured
+    globalization: str = ""  # filter | breedveld
+    mu_schedule: str = ""  # the μ oracle as configured
+    scaling: str = ""  # none | gradient-based
+    corrections: str = ""  # none | mehrotra | gondzio
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +200,10 @@ class Result:
     dual_infeasibility: float = float("inf")
     primal_infeasibility: float = float("inf")
     complementarity: float = float("inf")
+    # The resolved auto-selection routes, or ``None`` when the solve exited
+    # before any machinery was selected (e.g. infeasible bounds at x0).
+    # Appended last so positional construction of older Results stays valid.
+    routes: Routes | None = None
 
     @property
     def success(self) -> bool:
@@ -217,6 +254,7 @@ __all__ = [
     "IterationRecord",
     "KKTResiduals",
     "Result",
+    "Routes",
     "Status",
     "WarmStart",
 ]

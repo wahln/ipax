@@ -45,6 +45,14 @@ _TALL_ROW_EXCESS = 10
 # in ``backend/sparse/numpy_scipy.py`` — kept as a separate constant so the
 # core does not import an adapter).
 _TALL_DENSE_MIN_DENSITY = 0.05
+# Estimated Gram-pattern density (``gram_fill_estimate``) at or below which a
+# tall sparse-Jacobian problem takes the sparse normal-equations route instead
+# of Krylov. The regimes are far apart, so the exact value is uncritical:
+# the banded NE validation case (n=20k, m=10n, 20 nnz/row) has Gram fill
+# ≈ 2e-3 and solved in 62 s where Krylov ran 50+ min unconverged, while
+# scattered sparsity of the same nnz saturates the Gram (fill → 1), where a
+# sparse factorization of the near-dense n×n block would be hopeless.
+_TALL_SPARSE_NE_MAX_FILL = 0.01
 
 
 class LinearSolveError(RuntimeError):
@@ -89,15 +97,19 @@ def select_solver(
     m_ineq: int = 0,
     ineq_gram_capable: Callable[[], bool] | None = None,
     ineq_density: Callable[[], float | None] | None = None,
+    ineq_gram_fill: Callable[[], float | None] | None = None,
 ) -> LinearSolver:
     """Pick a concrete linear solver from user preference and backend features.
 
-    ``m_ineq`` (total inequality rows), ``ineq_gram_capable`` and
-    ``ineq_density`` (both *lazy* structural probes of the inequality Jacobian
-    — they may evaluate it at ``x0``, so they are only called when the
+    ``m_ineq`` (total inequality rows), ``ineq_gram_capable``, ``ineq_density``
+    and ``ineq_gram_fill`` (all *lazy* structural probes of the inequality
+    Jacobian — they may evaluate it at ``x0``, so they are only called when the
     tall-problem heuristic actually needs them) extend auto-selection to tall
     ``n ≪ m`` problems. ``ineq_density`` returns ``nnz/(m·n)`` or ``None``
-    when the operator exposes no COO structure.
+    when the operator exposes no COO structure; ``ineq_gram_fill`` returns the
+    estimated Gram-pattern density ``nnz(∇gᵀ∇g)/n²`` or ``None`` when it
+    cannot be estimated (or when the caller knows the sparse normal-equations
+    form is unusable for the problem, e.g. a non-L-BFGS Hessian).
     """
     from ipax.linalg.dense import DenseSolver
     from ipax.linalg.krylov import KrylovSolver
@@ -133,16 +145,27 @@ def select_solver(
     # but only when the rows are dense enough for the dense-GEMM Gram (see
     # the threshold comments above; sparse tall Jacobians measure faster on
     # Krylov in this zone).
-    if (
-        n_vars < _TALL_DENSE_MAX_VARS
-        and dense_viable
-        and m_ineq >= _TALL_ROW_EXCESS * n_vars
-        and ineq_gram_capable is not None
-        and ineq_gram_capable()
-    ):
-        density = ineq_density() if ineq_density is not None else None
-        if density is None or density >= _TALL_DENSE_MIN_DENSITY:
-            return DenseSolver(options.dense)
+    if n_vars < _TALL_DENSE_MAX_VARS and m_ineq >= _TALL_ROW_EXCESS * n_vars:
+        if dense_viable and ineq_gram_capable is not None and ineq_gram_capable():
+            density = ineq_density() if ineq_density is not None else None
+            if density is None or density >= _TALL_DENSE_MIN_DENSITY:
+                return DenseSolver(options.dense)
+        # Sparse tall rows lose the dense-GEMM Gram, but when the Gram
+        # *pattern* provably stays sparse (localized/banded rows — the
+        # ``gram_fill_estimate`` sampled-column-overlap probe) one small
+        # sparse factorization of the condensed n×n block per iteration
+        # beats Krylov, whose iteration counts blow up on the
+        # ill-conditioned late-IPM Σ (Breedveld 2017 §2; banded validation
+        # n=20k: NE optimal in 62 s vs Krylov 50+ min unconverged).
+        # Equalities border into the factored saddle explicitly; whether ∇c
+        # can emit that border is the caller's probe's concern (it withholds
+        # ``ineq_gram_fill`` when it cannot).
+        if capabilities.has_sparse_adapter and ineq_gram_fill is not None:
+            fill = ineq_gram_fill()
+            if fill is not None and fill <= _TALL_SPARSE_NE_MAX_FILL:
+                from ipax.linalg.sparse import SparseDirectSolver
+
+                return SparseDirectSolver(form="normal_equations")
 
     return KrylovSolver(options.krylov)
 

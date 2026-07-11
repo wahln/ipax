@@ -157,6 +157,12 @@ class KrylovSolver:
             pc = f"auto:{self._effective_preconditioner()}"
         return f"krylov ({self._options.method}, pc={pc})"
 
+    def kkt_form(self) -> str:
+        """The KKT assembly iterated on (``Result.routes.kkt_form``): the
+        condensed normal-equations block (bordered into the equality saddle
+        where needed), applied matrix-free."""
+        return "condensed"
+
     def _effective_preconditioner(self) -> str:
         """Resolve the preconditioner actually in force this solve.
 
