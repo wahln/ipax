@@ -147,8 +147,25 @@ _THETA_MAX_FACTOR = 1e4
 # scaled) tolerance at a point the solver considers feasible; declaring such a
 # point "locally infeasible" is a contradiction (S2MPJ Task 1: HS13/HS56/HS72).
 # The multiple is generous but far below any genuinely-infeasible stationary
-# point (whose violation is bounded away from zero, ≫ tol).
+# point (whose violation is bounded away from zero, ≫ tol). It gates BOTH the
+# "resume vs believe the claim" decision and the x0-anchored second-chance
+# probe, so it must stay tight enough to keep triggering the rescue path that
+# recovers problems like HS111/OET7 (a looser value here reroutes them into a
+# worse basin — S2MPJ v12 regression). The *terminal* near-feasible downgrade
+# is a separate, looser threshold below (`_NEAR_FEASIBLE_FACTOR`).
 _RESTORATION_INFEASIBLE_FACTOR = 1e3
+# Terminal near-feasibility band (IPOPT `constr_viol_tol` level, 1e-4 at the
+# default): a restored point that *would* be declared locally infeasible but is
+# itself feasible to this band is reported STALLED instead — a point feasible to
+# ~1e-4 is not distinguishable from a degenerate near-feasible optimum, so
+# "locally infeasible" is the wrong verdict (S2MPJ v11 item 3: LEWISPOL — 9
+# nonlinear eqs with a multiplicity-3 degenerate root — and the
+# ARGAUSS/LANCZOS/MISRA1B NLS cluster floor at θ ~ 1e-5, the float64 limit).
+# Applied only at the terminal INFEASIBLE emission (NOT the resume/second-chance
+# decision above), so it never reroutes a rescuable problem. Genuinely
+# infeasible problems keep their verdict (violation ≫ 1e-4: BURKEHAN 1.0,
+# PDE1 2.5).
+_NEAR_FEASIBLE_FACTOR = 1e4
 # An *uncertified* restoration stall (window/budget exit, no stationarity
 # certificate) resumes the main loop only while restoration keeps reducing the
 # violation by at least this factor between stalls; otherwise the run ends as
@@ -200,6 +217,15 @@ def _feasible_evidence_tol(optimality: OptimalityConditionOptions) -> float:
     return _RESTORATION_INFEASIBLE_FACTOR * (
         tol if tol is not None else optimality.kkt_tol
     )
+
+
+def _near_feasible_tol(optimality: OptimalityConditionOptions) -> float:
+    """The θ band (IPOPT ``constr_viol_tol`` level) below which a restored point
+    is treated as near-feasible: it is reported STALLED rather than declared
+    locally infeasible, since a point feasible to ~1e-4 is not distinguishable
+    from a degenerate near-feasible optimum (S2MPJ item 3: LEWISPOL cluster)."""
+    tol = optimality.constr_viol_tol
+    return _NEAR_FEASIBLE_FACTOR * (tol if tol is not None else optimality.kkt_tol)
 
 
 def _restoration_reports_infeasible(
@@ -2170,11 +2196,15 @@ class IPMDriver:
                 )
             # Veto: a local-infeasibility claim is contradicted by the run's own
             # history whenever an *accepted* iterate already reached the
-            # verdict's believe-threshold — a diverged endgame (degenerate duals,
-            # tiny μ) is a stall at a feasible problem, not evidence of
-            # infeasibility (S2MPJ v10: DEGENLPA reached θ = 1.7e-7 before the
-            # collapse that used to be reported as INFEASIBLE).
-            if theta_best <= _feasible_evidence_tol(opts.optimality):
+            # near-feasible band — a diverged endgame (degenerate duals, tiny μ)
+            # is a stall at a feasible problem, not evidence of infeasibility
+            # (S2MPJ v10: DEGENLPA reached θ = 1.7e-7 before the collapse that
+            # used to be reported as INFEASIBLE; v11 item 3: the ARGAUSS/LANCZOS/
+            # MISRA1B NLS cluster reaches an accepted θ ~ 5e-5 before restoration
+            # floors just above it). Uses the ~1e-4 near-feasible band, not the
+            # tighter believe-threshold: it fires only after the resume/second-
+            # chance path, so a rescuable problem (HS111) never reaches it.
+            if theta_best <= _near_feasible_tol(opts.optimality):
                 return _RestorationOutcome(
                     resume=False,
                     status=Status.STALLED,
@@ -2183,6 +2213,25 @@ class IPMDriver:
                         f"violation, but an accepted iterate already reached "
                         f"theta={theta_best:.3e} — the problem is not locally "
                         "infeasible"
+                    ),
+                )
+            # Terminal near-feasible downgrade: a certified "infeasible" point
+            # that is itself feasible to IPOPT's constr_viol_tol band (~1e-4) is
+            # not distinguishable from a degenerate near-feasible optimum, so
+            # report the honest STALLED instead of a wrong "locally infeasible"
+            # (S2MPJ item 3: LEWISPOL floors at θ ~ 1e-5, the float64 limit).
+            # This is checked only here, after the resume/second-chance path has
+            # already run at the tighter threshold, so it never reroutes a
+            # rescuable problem — it only softens the final verdict.
+            if theta_restored <= _near_feasible_tol(opts.optimality):
+                return _RestorationOutcome(
+                    resume=False,
+                    status=Status.STALLED,
+                    message=(
+                        "stalled: restoration floored at a near-feasible point "
+                        f"(theta={theta_restored:.3e}, within the ~1e-4 "
+                        "feasibility band) it could not improve — the problem is "
+                        "not locally infeasible"
                     ),
                 )
             return _RestorationOutcome(

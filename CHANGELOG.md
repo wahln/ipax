@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Fixed
+- **A near-feasible restoration stall is no longer reported as `infeasible`.**
+  A *terminal* near-feasibility band at IPOPT's `constr_viol_tol` level
+  (`1e-4` at the default) now downgrades restoration's local-infeasibility
+  verdict to `stalled` when the restored point — or an accepted iterate — is
+  itself feasible to that band: a point feasible to ~`1e-4` cannot be
+  distinguished from a degenerate near-feasible optimum, so "locally
+  infeasible" is the wrong verdict (the honest one is "stalled: could not
+  improve"). This corrects LEWISPOL (9 nonlinear equalities / 6 variables with
+  a multiplicity-3 degenerate root, which floors at a violation of ~`1e-5`, the
+  float64 limit) and the ARGAUSS / LANCZOS / MISRA1B nonlinear-least-squares
+  cluster. The downgrade is applied **only at the terminal verdict**, leaving
+  the tighter threshold that gates restoration's resume / second-chance rescue
+  path untouched — so genuinely rescuable problems keep their basin — and
+  genuinely infeasible problems, whose violation is bounded well away from zero
+  (BURKEHAN `1.0`, PDE1 `2.5`), are unaffected.
 - **A step-solve failure hands to feasibility restoration instead of reporting
   `numerical_error`.** When the condensed/saddle factorization could not be
   completed even after the full δ_w regularization ladder, the driver reported

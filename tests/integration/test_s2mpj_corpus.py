@@ -295,6 +295,30 @@ def test_objective_free_step_failure_reports_honestly_not_numerical_error(
     )
 
 
+def test_lewispol_near_feasible_floor_is_not_reported_infeasible(bridge_namespace):
+    # Regression (v11 mining, v0.7.0 item 3): LEWISPOL (9 nonlinear equalities /
+    # 6 vars with a multiplicity-3 degenerate root) floors at a constraint
+    # violation of ~1e-5 — the float64 precision limit near the degenerate root
+    # — and was declared *locally infeasible*. The problem is feasible (it has
+    # solutions), so that verdict is wrong: a point feasible to IPOPT's ~1e-4
+    # band is honestly STALLED (cannot improve), never INFEASIBLE.
+    xp = bridge_namespace
+    if "LEWISPOL" not in s2mpj.list_s2mpj_problems():
+        pytest.skip("LEWISPOL not in this S2MPJ checkout")
+    backend = xp.__name__.split(".")[-1]
+    (case,) = s2mpj.s2mpj_problems(
+        ("LEWISPOL",), backends=(backend,), hessian="exact", feasibility=True
+    )
+    problem, x0 = case.build(xp)
+    result = solve(
+        problem,
+        x0,
+        options=Options(hessian="exact", linsolve="dense", max_iter=5000),
+    )
+    assert result.status is not Status.INFEASIBLE, result.message
+    assert result.constraint_violation <= 1e-4
+
+
 def test_sized_instantiation_scales_and_falls_back(bridge_namespace):
     # ``size`` requests a scalable problem's dimension (the scaling-sweep lever); a
     # fixed-size problem ignores it and keeps its SIF default.
