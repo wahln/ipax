@@ -42,6 +42,16 @@ _SLACK_FLOOR = 1e-2
 # Floor for warm-started slacks/duals: just strictly interior, so supplied
 # near-active values are preserved rather than pushed back toward μ-scale.
 _WARM_FLOOR = 1e-8
+# Re-centering for a line search that fails at an already-feasible point
+# (Wächter & Biegler 2006, §3.3: the multipliers belong to the abandoned
+# iterate and are re-initialized after a restoration jump). The slack floor is
+# μ-scaled so the repair is a small perturbation near convergence, and the
+# multiplier clip mirrors the Σ safeguard of W&B eq. (16) with a much tighter
+# band (κ_Σ = 1e10 there): this is a one-shot repair of a provably stuck
+# state, not an every-iteration guard, so it may be aggressive — a component
+# already consistent with the central path (sλ ≈ μ) always passes untouched.
+_RECENTER_SLACK_FRACTION = 0.1
+_RECENTER_KAPPA = 1e2
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +165,30 @@ def initialize(
     )
 
 
+def recenter_slacks_duals(
+    xp: Namespace, g: Array, y_ineq: Array, mu: float
+) -> tuple[Array, Array]:
+    """Re-center slacks and inequality multipliers on the current barrier problem.
+
+    Used when the filter line search fails at an **already-feasible** iterate:
+    restoration cannot move such a point (it exits immediately at the same
+    ``x``), and resuming with the stale state re-derives the same rejected
+    direction forever (S2MPJ v11: the HS101 limit cycle, where boundary-floor
+    slacks against multipliers grown to ~1e6 gave ``Σ_s = λ/s ~ 1e18``).
+
+    Slacks are re-floored at a fraction of the current ``μ`` (interior again,
+    a vanishing perturbation near convergence) and the multipliers are clipped
+    into the central band ``[μ/(κ·s), κ·μ/s]`` — the analogue of the ``κ_Σ``
+    dual safeguard (Wächter & Biegler 2006, eq. (16)) applied once, at the
+    repair point, with a tight band. Components already consistent with the
+    central path (``s·λ ≈ μ``) pass through unchanged.
+    """
+    floor = xp.full(g.shape, _RECENTER_SLACK_FRACTION * mu, dtype=g.dtype)
+    s = xp.maximum(-g, floor)
+    y = xp.clip(y_ineq, mu / (_RECENTER_KAPPA * s), _RECENTER_KAPPA * mu / s)
+    return s, y
+
+
 def _floor_positive(xp: Namespace, arr: Array) -> Array:
     """Push ``arr`` up to the warm-start interiority floor where it falls below."""
     return xp.maximum(arr, xp.full_like(arr, _WARM_FLOOR))
@@ -214,5 +248,6 @@ __all__ = [
     "apply_warm_start",
     "initialize",
     "project_interior",
+    "recenter_slacks_duals",
     "relax_fixed_bounds",
 ]

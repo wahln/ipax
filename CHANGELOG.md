@@ -6,6 +6,59 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-13
+
+### Fixed
+- **A near-feasible restoration stall is no longer reported as `infeasible`.**
+  A *terminal* near-feasibility band at IPOPT's `constr_viol_tol` level
+  (`1e-4` at the default) now downgrades restoration's local-infeasibility
+  verdict to `stalled` when the restored point — or an accepted iterate — is
+  itself feasible to that band: a point feasible to ~`1e-4` cannot be
+  distinguished from a degenerate near-feasible optimum, so "locally
+  infeasible" is the wrong verdict (the honest one is "stalled: could not
+  improve"). This corrects LEWISPOL (9 nonlinear equalities / 6 variables with
+  a multiplicity-3 degenerate root, which floors at a violation of ~`1e-5`, the
+  float64 limit) and the ARGAUSS / LANCZOS / MISRA1B nonlinear-least-squares
+  cluster. The downgrade is applied **only at the terminal verdict**, leaving
+  the tighter threshold that gates restoration's resume / second-chance rescue
+  path untouched — so genuinely rescuable problems keep their basin — and
+  genuinely infeasible problems, whose violation is bounded well away from zero
+  (BURKEHAN `1.0`, PDE1 `2.5`), are unaffected.
+- **A step-solve failure hands to feasibility restoration instead of reporting
+  `numerical_error`.** When the condensed/saddle factorization could not be
+  completed even after the full δ_w regularization ladder, the driver reported
+  `numerical_error` outright. Wächter & Biegler 2006 (§3.1 inertia correction,
+  which reverts to the §3.3 *feasibility restoration* phase once δ_w exceeds
+  its ceiling) treats an uncompletable inertia-corrected step as a restoration
+  trigger — the same globalization fallback a filter line-search failure
+  already took. The driver now routes such a step-solve failure through
+  the shared restoration handler: it either recovers (restoration reaches a
+  feasible point and the main loop resumes) or terminates with an honest
+  `infeasible` / `restoration_failed` / `stalled` verdict. This upgrades the
+  diagnostics on the objective-free nonlinear-equation / NLS cluster (S2MPJ v11
+  exact-route `*NE` problems, ~44 rows: `min 0 s.t. r(x)=0` where the equality
+  multipliers diverge and no δ_w regularizes the runaway Hessian `Σ yᵢ ∇²cᵢ`),
+  which now report the same honest infeasibility the L-BFGS routes already did
+  instead of a crash-like `numerical_error`. The near-optimal step-failure
+  salvage (report `acceptable`) is unchanged. Internally the restoration branch
+  is extracted into a single `_handle_restoration` method shared by both entry
+  points.
+- **A line-search failure at an already-feasible point re-centers the barrier
+  state instead of looping through restoration.** When the filter line search
+  could not find an acceptable step at a feasible iterate (`θ ≤` the
+  feasibility tolerance), the driver handed off to feasibility restoration —
+  but restoration cannot move an already-feasible point, so it exited at the
+  same `x` and the loop re-derived the same rejected direction until the stall
+  detector returned an *infeasible* best iterate. In the S2MPJ v11 sweep this
+  was the HS101 exact-route limit cycle: boundary-floor slacks against
+  inequality multipliers grown to ~1e6 gave `Σ_s = λ/s ~ 1e18`, forcing
+  `δ_w ~ 1e5` every iteration and capping every step at ~1e-11 through the
+  fraction-to-boundary rule. The driver now repairs the barrier state at such
+  a point — re-flooring the slacks on the current `μ` and clipping the
+  inequality multipliers into the central band `[μ/(κ·s), κ·μ/s]` (Wächter &
+  Biegler 2006, §3.3 / eq. (16)) — and resumes the main loop. HS101 now
+  reaches its optimum (`f* = 1809.76476`) on all three exact routes.
+
 ## [0.6.0] - 2026-07-11
 
 ### Added
@@ -971,7 +1024,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/wahln/ipax/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/wahln/ipax/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/wahln/ipax/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/wahln/ipax/compare/v0.3.0...v0.4.0
