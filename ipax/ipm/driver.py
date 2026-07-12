@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
+from dataclasses import dataclass
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -241,6 +242,40 @@ def _classify_step_failure(
         Status.NUMERICAL_ERROR,
         "condensed factorization failed despite regularization",
     )
+
+
+@dataclass
+class _RestorationState:
+    """Loop-persistent state for the feasibility-restoration handler.
+
+    ``second_chance_used`` fires the x0-anchored infeasibility probe at most
+    once; ``uncertified_stall_theta`` tracks the θ at the last uncertified
+    restoration stall so a resume is only justified while restoration keeps
+    reducing the violation between stalls. Held in an explicit object (not
+    module state, invariant #5) and threaded through the loop.
+    """
+
+    second_chance_used: bool = False
+    uncertified_stall_theta: float = float("inf")
+
+
+@dataclass(frozen=True)
+class _RestorationOutcome:
+    """Result of :meth:`IPMDriver._handle_restoration`, applied by the caller.
+
+    ``resume=True`` restarts the main loop from the updated ``(x, s, y_ineq)``;
+    otherwise the run terminates with ``status``/``message``. Keeping the
+    control-flow decision in the return value lets the two entry points — a
+    filter line-search failure and a step-solve failure the δ_w ladder could
+    not repair — share one handler.
+    """
+
+    resume: bool
+    x: Array | None = None
+    s: Array | None = None
+    y_ineq: Array | None = None
+    status: Status | None = None
+    message: str | None = None
 
 
 class IPMDriver:
@@ -632,10 +667,10 @@ class IPMDriver:
         # INFEASIBLE problems). A local-infeasibility claim therefore gets one
         # extra probe anchored here before it is believed.
         x_restore_anchor = x
-        second_chance_used = False
-        # θ at the last *uncertified* restoration stall: resuming is only
-        # justified while restoration keeps making progress between stalls.
-        uncertified_stall_theta = float("inf")
+        # Loop-persistent restoration bookkeeping (one-shot x0 probe + the θ of
+        # the last uncertified stall), shared by the line-search and step-solve
+        # restoration entry points via ``_handle_restoration``.
+        rstate = _RestorationState()
         breedveld = BreedveldController(opts.breedveld)
         use_breedveld = opts.globalization == "breedveld"
 
@@ -927,6 +962,7 @@ class IPMDriver:
                 "mask_u": mask_u,
             }
 
+            step_solve_failed = False
             if self._corrector.active:
                 # Mehrotra/Gondzio/probing: the affine and correction directions
                 # share one KKT operator. Sparse-direct reuses its factorization;
@@ -952,34 +988,49 @@ class IPMDriver:
                     err_kwargs=err_kwargs,
                 )
                 if corrected is None:
-                    status, message = _classify_step_failure(
-                        self._options.optimality, record
-                    )
-                    break
-                mu, step, reg_applied = corrected
-                # A step must have descent properties for the barrier problem
-                # at the current μ (NWW 2009, §5). A corrected direction built
-                # on a low-quality (quasi-Newton) affine probe can lose them —
-                # the complementarity-target perturbation is amplified through
-                # the near-singular condensed operator — leaving the line
-                # search only rejectable ascent trials. The corrector is a
-                # step-quality mechanism, not part of the μ selection, so fall
-                # back to the plain centered step toward the same μ.
-                if (
-                    self._dphi(
-                        x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
-                    )
-                    >= 0.0
-                ):
-                    rhs = self._condensed_rhs(mu, mu, mu, **rhs_kwargs)
-                    dx, dy_eq, reg_fallback, ok = solve_step_timed(
-                        w, sigma_x, sigma_s, ineq_jac, rhs, eq_jac, m_eq, -c, delta_c
-                    )
-                    if ok:
-                        step = recover_eliminated(
-                            dx, mu=mu, dy_eq=dy_eq, **recover_kwargs
+                    step_solve_failed = True
+                else:
+                    mu, step, reg_applied = corrected
+                    # A step must have descent properties for the barrier problem
+                    # at the current μ (NWW 2009, §5). A corrected direction built
+                    # on a low-quality (quasi-Newton) affine probe can lose them —
+                    # the complementarity-target perturbation is amplified through
+                    # the near-singular condensed operator — leaving the line
+                    # search only rejectable ascent trials. The corrector is a
+                    # step-quality mechanism, not part of the μ selection, so fall
+                    # back to the plain centered step toward the same μ.
+                    if (
+                        self._dphi(
+                            x,
+                            s,
+                            step,
+                            grad,
+                            mu,
+                            m,
+                            mask_l,
+                            mask_u,
+                            x_minus_l,
+                            u_minus_x,
                         )
-                        reg_applied = max(reg_applied, reg_fallback)
+                        >= 0.0
+                    ):
+                        rhs = self._condensed_rhs(mu, mu, mu, **rhs_kwargs)
+                        dx, dy_eq, reg_fallback, ok = solve_step_timed(
+                            w,
+                            sigma_x,
+                            sigma_s,
+                            ineq_jac,
+                            rhs,
+                            eq_jac,
+                            m_eq,
+                            -c,
+                            delta_c,
+                        )
+                        if ok:
+                            step = recover_eliminated(
+                                dx, mu=mu, dy_eq=dy_eq, **recover_kwargs
+                            )
+                            reg_applied = max(reg_applied, reg_fallback)
             else:
                 mu = self._next_mu(
                     mu,
@@ -995,11 +1046,65 @@ class IPMDriver:
                     w, sigma_x, sigma_s, ineq_jac, rhs, eq_jac, m_eq, -c, delta_c
                 )
                 if not ok:
-                    status, message = _classify_step_failure(
-                        self._options.optimality, record
-                    )
+                    step_solve_failed = True
+                else:
+                    step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
+
+            if step_solve_failed:
+                # Classify the failure: a solve that fails at an essentially
+                # optimal iterate is salvaged ACCEPTABLE (ill-conditioning near
+                # the solution), exactly as before. Otherwise, a Newton step the
+                # δ_w ladder could not complete (δ_w driven past δ_w^max in the
+                # inertia-correction algorithm, W&B 2006 §3.1) triggers the
+                # feasibility restoration phase (§3.3) rather than an outright
+                # numerical_error — the same globalization fallback a line-search
+                # failure takes, so a diverging-multiplier feasibility system
+                # (S2MPJ v11 exact-route *NE cluster) resolves to an honest
+                # infeasibility verdict or is rescued, instead of crashing.
+                status, message = _classify_step_failure(
+                    self._options.optimality, record
+                )
+                if status is Status.ACCEPTABLE:
                     break
-                step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
+                theta0 = self._theta_l1(x, s, m, m_eq)
+                phi0 = self._phi(x, s, mu, m, mask_l, mask_u, lower_safe, upper_safe)
+                outcome = self._handle_restoration(
+                    x=x,
+                    s=s,
+                    y_ineq=y_ineq,
+                    g=g,
+                    mu=mu,
+                    m=m,
+                    m_eq=m_eq,
+                    mask_l=mask_l,
+                    mask_u=mask_u,
+                    lower_safe=lower_safe,
+                    upper_safe=upper_safe,
+                    theta0=theta0,
+                    phi0=phi0,
+                    record=record,
+                    filt=filt,
+                    theta_best=theta_best,
+                    x_restore_anchor=x_restore_anchor,
+                    rstate=rstate,
+                    it=it,
+                )
+                if not outcome.resume:
+                    assert outcome.status is not None and outcome.message is not None
+                    status, message = outcome.status, outcome.message
+                    break
+                assert (
+                    outcome.x is not None
+                    and outcome.s is not None
+                    and outcome.y_ineq is not None
+                )
+                x, s, y_ineq = outcome.x, outcome.s, outcome.y_ineq
+                alpha_p = 0.0
+                last_alpha = 0.0
+                prev_x = None
+                last_step_solve_time = self._step_solve_seconds
+                pending_restored = True
+                continue
 
             # Descent enforcement at feasible iterates. At θ = 0 only
             # f-type (Armijo) acceptance exists (W&B 2006, §2.3), which no
@@ -1232,166 +1337,43 @@ class IPMDriver:
                     filt.augment(theta0, phi0)
 
             if restoration:
-                # A line search that stalls at an already near-optimal iterate
-                # (ill-conditioning near the solution) should accept it rather
-                # than enter restoration and risk a false "infeasible".
-                if _within_relaxed_tol(self._options.optimality, record):
-                    status = Status.ACCEPTABLE
-                    message = (
-                        "acceptable: line search stalled at a point within the "
-                        "relaxed KKT tolerance"
-                    )
+                outcome = self._handle_restoration(
+                    x=x,
+                    s=s,
+                    y_ineq=y_ineq,
+                    g=g,
+                    mu=mu,
+                    m=m,
+                    m_eq=m_eq,
+                    mask_l=mask_l,
+                    mask_u=mask_u,
+                    lower_safe=lower_safe,
+                    upper_safe=upper_safe,
+                    theta0=theta0,
+                    phi0=phi0,
+                    record=record,
+                    filt=filt,
+                    theta_best=theta_best,
+                    x_restore_anchor=x_restore_anchor,
+                    rstate=rstate,
+                    it=it,
+                )
+                if not outcome.resume:
+                    assert outcome.status is not None and outcome.message is not None
+                    status, message = outcome.status, outcome.message
                     break
-                # Restoration entered at an already-feasible point cannot move
-                # it: ``restore()`` exits immediately at the same ``x``, and
-                # resuming with the stale barrier state re-derives the same
-                # rejected direction forever (S2MPJ v11, HS101 exact routes:
-                # boundary-floor slacks against multipliers grown to ~1e6 give
-                # Σ_s ~ 1e18, δ_w escalates to ~1e5 every iteration, and the
-                # fraction-to-boundary rule caps every step at ~1e-11 — a
-                # limit cycle the stall detector ends at an *infeasible* best
-                # iterate). Repair the barrier state instead: re-floor the
-                # slacks on the current μ and clip the multipliers to the
-                # central band (Wächter & Biegler 2006, §3.3 / eq. (16)).
-                if m > 0 and theta0 <= feasible_theta_tol(opts.optimality.kkt_tol):
-                    logger.debug(
-                        "iter %d: line search failed at a feasible point; "
-                        "re-centering slacks/duals instead of restoration",
-                        it,
-                    )
-                    filt.augment(theta0, phi0)
-                    # ``g`` is the inequality residual at this iterate, computed
-                    # at the top of the loop; the line search's failure did not
-                    # move ``x``, so it is still current here.
-                    s, y_ineq = recenter_slacks_duals(xp, g, y_ineq, mu)
-                    alpha_p = 0.0
-                    last_alpha = 0.0
-                    prev_x = None
-                    last_step_solve_time = self._step_solve_seconds
-                    pending_restored = True
-                    continue
-                logger.debug("iter %d: entering feasibility restoration", it)
-                filt.augment(theta0, phi0)
-                x, s, rest_exit = self._restore(
-                    x, s, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
+                assert (
+                    outcome.x is not None
+                    and outcome.s is not None
+                    and outcome.y_ineq is not None
                 )
-                theta_restored = self._theta_l1(x, s, m, m_eq)
-                still_infeasible = _restoration_reports_infeasible(
-                    theta_restored, self._options.optimality
-                )
-                # A local-infeasibility *claim* needs both the driver's own θ to
-                # be genuinely large (restoration's raw ℓ∞ measure can stall
-                # marginally above its differently scaled tolerance at a point
-                # that is feasible here — S2MPJ Task 1) AND a stationarity-type
-                # exit. An *uncertified* stall (window/budget exit) is not
-                # evidence of infeasibility (S2MPJ restfix audit: LAKES/NASH/
-                # SWOPF were honest out-of-budget failures relabeled
-                # "infeasible" by the early window exit): it resumes the main
-                # loop while restoration keeps reducing θ between stalls, and a
-                # repeat without progress terminates below — after the one-shot
-                # x0 probe had its say — as RESTORATION_FAILED, never as
-                # INFEASIBLE.
-                claim_certified = still_infeasible and rest_exit.certifies_infeasibility
-                uncertified_stall = (
-                    still_infeasible and not rest_exit.certifies_infeasibility
-                )
-                stall_progressed = (
-                    theta_restored
-                    <= _RESTORATION_PROGRESS_FACTOR * uncertified_stall_theta
-                )
-                if uncertified_stall and stall_progressed:
-                    uncertified_stall_theta = theta_restored
-                if claim_certified or (uncertified_stall and not stall_progressed):
-                    # Second chance: restoration is a LOCAL method, so from a
-                    # wandered-off iterate it can converge to a nonzero local
-                    # minimizer of the infeasibility on a perfectly feasible
-                    # problem (S2MPJ 2026-07 audit: 28 of 52 falsely INFEASIBLE
-                    # problems are restorable directly from x0). Probe once from
-                    # the starting point before terminating on either a
-                    # certified claim or an exhausted uncertified stall; a
-                    # believable feasible outcome resumes the main loop there.
-                    if not second_chance_used:
-                        second_chance_used = True
-                        logger.debug(
-                            "iter %d: probing the infeasibility claim with a "
-                            "restoration anchored at the starting point",
-                            it,
-                        )
-                        x_r, s_r, exit_r = self._restore(
-                            x_restore_anchor,
-                            s,
-                            m,
-                            m_eq,
-                            mask_l,
-                            mask_u,
-                            lower_safe,
-                            upper_safe,
-                        )
-                        theta_probe = self._theta_l1(x_r, s_r, m, m_eq)
-                        if not (
-                            exit_r.certifies_infeasibility
-                            and _restoration_reports_infeasible(
-                                theta_probe, self._options.optimality
-                            )
-                        ):
-                            x, s = x_r, s_r
-                            # A probe that stayed infeasible is itself the next
-                            # stall baseline; a believably feasible rescue is a
-                            # fresh basin, so the stall streak restarts.
-                            uncertified_stall_theta = (
-                                theta_probe
-                                if _restoration_reports_infeasible(
-                                    theta_probe, self._options.optimality
-                                )
-                                else float("inf")
-                            )
-                            alpha_p = 0.0
-                            last_alpha = 0.0
-                            prev_x = None
-                            last_step_solve_time = self._step_solve_seconds
-                            pending_restored = True
-                            continue
-                        # The anchored probe itself reached a stationary point
-                        # of the infeasibility: a certificate even when the
-                        # triggering stall carried none.
-                        claim_certified = True
-                    if not claim_certified:
-                        status = Status.RESTORATION_FAILED
-                        message = (
-                            "restoration failed: the infeasibility minimization "
-                            "stalled without a stationarity certificate and "
-                            "without reducing the constraint violation "
-                            f"(theta={theta_restored:.3e})"
-                        )
-                        break
-                    # Veto: a local-infeasibility claim is contradicted by the
-                    # run's own history whenever an *accepted* iterate already
-                    # reached the verdict's believe-threshold — a diverged
-                    # endgame (degenerate duals, tiny μ) is a stall at a
-                    # feasible problem, not evidence of infeasibility
-                    # (S2MPJ v10: DEGENLPA reached θ = 1.7e-7 before the
-                    # collapse that used to be reported as INFEASIBLE).
-                    if theta_best <= _feasible_evidence_tol(opts.optimality):
-                        status = Status.STALLED
-                        message = (
-                            "stalled: restoration could not re-reduce the "
-                            "constraint violation, but an accepted iterate "
-                            f"already reached theta={theta_best:.3e} — the "
-                            "problem is not locally infeasible"
-                        )
-                        break
-                    status = Status.INFEASIBLE
-                    message = (
-                        "locally infeasible: restoration could not reduce the "
-                        "constraint violation"
-                    )
-                    break
+                x, s, y_ineq = outcome.x, outcome.s, outcome.y_ineq
+                # A restoration jump / barrier re-center is a blocked Newton step:
+                # σ(0) = 0.01 re-centers on the next iteration (Breedveld eq. (12)),
+                # and the jump is not a Newton step, so the next curvature pair
+                # would be meaningless — drop the history anchor.
                 alpha_p = 0.0
-                # A restoration jump is a blocked Newton step for the schedule:
-                # σ(0) = 0.01 re-centers on the next iteration (eq. (12)).
                 last_alpha = 0.0
-                # The restoration jump is not a Newton step, so the next
-                # curvature pair would be meaningless — drop the history anchor.
                 prev_x = None
                 last_step_solve_time = self._step_solve_seconds
                 pending_restored = True
@@ -2035,6 +2017,183 @@ class IPMDriver:
             xp.sum(xp.where(mask_u, step.dx / u_minus_x, xp.zeros_like(x)))
         )
         return dd
+
+    def _handle_restoration(
+        self,
+        *,
+        x: Array,
+        s: Array,
+        y_ineq: Array,
+        g: Array,
+        mu: float,
+        m: int,
+        m_eq: int,
+        mask_l: Array,
+        mask_u: Array,
+        lower_safe: Array,
+        upper_safe: Array,
+        theta0: float,
+        phi0: float,
+        record: IterationRecord,
+        filt: Filter,
+        theta_best: float,
+        x_restore_anchor: Array,
+        rstate: _RestorationState,
+        it: int,
+    ) -> _RestorationOutcome:
+        """Recover a globalization failure by re-centering or restoration.
+
+        Shared by the two failures that cannot make progress with the current
+        barrier state: a filter line search that hands off to restoration, and
+        a step solve the inertia correction (δ_w ladder) could not complete
+        (Wächter & Biegler 2006: §3.1 escalates δ_w and reverts to the §3.3
+        restoration phase once it exceeds δ_w^max — a failed regularization is
+        a restoration trigger, not an outright failure). Returns an outcome the
+        caller applies: ``resume`` restarts the main loop from the updated
+        ``(x, s, y_ineq)``; otherwise the run terminates with the returned
+        ``status``/``message``.
+        """
+        xp = self._xp
+        opts = self._options
+        # A stall at an already near-optimal iterate (ill-conditioning near the
+        # solution) is accepted rather than restored, to avoid a false
+        # "infeasible".
+        if _within_relaxed_tol(opts.optimality, record):
+            return _RestorationOutcome(
+                resume=False,
+                status=Status.ACCEPTABLE,
+                message=(
+                    "acceptable: globalization stalled at a point within the "
+                    "relaxed KKT tolerance"
+                ),
+            )
+        # Restoration entered at an already-feasible point cannot move it:
+        # ``restore()`` exits immediately at the same ``x``, and resuming with
+        # the stale barrier state re-derives the same rejected direction forever
+        # (S2MPJ v11, HS101 exact routes: boundary-floor slacks against
+        # multipliers grown to ~1e6 give Σ_s ~ 1e18, δ_w escalates to ~1e5 every
+        # iteration, and the fraction-to-boundary rule caps every step at
+        # ~1e-11 — a limit cycle the stall detector ends at an *infeasible* best
+        # iterate). Repair the barrier state instead: re-floor the slacks on the
+        # current μ and clip the multipliers to the central band (Wächter &
+        # Biegler 2006, §3.3 / eq. (16)).
+        if m > 0 and theta0 <= feasible_theta_tol(opts.optimality.kkt_tol):
+            logger.debug(
+                "iter %d: globalization failed at a feasible point; "
+                "re-centering slacks/duals instead of restoration",
+                it,
+            )
+            filt.augment(theta0, phi0)
+            # ``g`` is the inequality residual at this iterate, computed at the
+            # top of the loop; the failure did not move ``x``, so it is current.
+            s, y_ineq = recenter_slacks_duals(xp, g, y_ineq, mu)
+            return _RestorationOutcome(resume=True, x=x, s=s, y_ineq=y_ineq)
+        logger.debug("iter %d: entering feasibility restoration", it)
+        filt.augment(theta0, phi0)
+        x, s, rest_exit = self._restore(
+            x, s, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
+        )
+        theta_restored = self._theta_l1(x, s, m, m_eq)
+        still_infeasible = _restoration_reports_infeasible(
+            theta_restored, opts.optimality
+        )
+        # A local-infeasibility *claim* needs both the driver's own θ to be
+        # genuinely large (restoration's raw ℓ∞ measure can stall marginally
+        # above its differently scaled tolerance at a point that is feasible
+        # here — S2MPJ Task 1) AND a stationarity-type exit. An *uncertified*
+        # stall (window/budget exit) is not evidence of infeasibility (S2MPJ
+        # restfix audit: LAKES/NASH/SWOPF were honest out-of-budget failures
+        # relabeled "infeasible" by the early window exit): it resumes the main
+        # loop while restoration keeps reducing θ between stalls, and a repeat
+        # without progress terminates below — after the one-shot x0 probe had
+        # its say — as RESTORATION_FAILED, never as INFEASIBLE.
+        claim_certified = still_infeasible and rest_exit.certifies_infeasibility
+        uncertified_stall = still_infeasible and not rest_exit.certifies_infeasibility
+        stall_progressed = (
+            theta_restored
+            <= _RESTORATION_PROGRESS_FACTOR * rstate.uncertified_stall_theta
+        )
+        if uncertified_stall and stall_progressed:
+            rstate.uncertified_stall_theta = theta_restored
+        if claim_certified or (uncertified_stall and not stall_progressed):
+            # Second chance: restoration is a LOCAL method, so from a wandered-off
+            # iterate it can converge to a nonzero local minimizer of the
+            # infeasibility on a perfectly feasible problem (S2MPJ 2026-07 audit:
+            # 28 of 52 falsely INFEASIBLE problems are restorable directly from
+            # x0). Probe once from the starting point before terminating on
+            # either a certified claim or an exhausted uncertified stall; a
+            # believable feasible outcome resumes the main loop there.
+            if not rstate.second_chance_used:
+                rstate.second_chance_used = True
+                logger.debug(
+                    "iter %d: probing the infeasibility claim with a "
+                    "restoration anchored at the starting point",
+                    it,
+                )
+                x_r, s_r, exit_r = self._restore(
+                    x_restore_anchor,
+                    s,
+                    m,
+                    m_eq,
+                    mask_l,
+                    mask_u,
+                    lower_safe,
+                    upper_safe,
+                )
+                theta_probe = self._theta_l1(x_r, s_r, m, m_eq)
+                if not (
+                    exit_r.certifies_infeasibility
+                    and _restoration_reports_infeasible(theta_probe, opts.optimality)
+                ):
+                    # A probe that stayed infeasible is itself the next stall
+                    # baseline; a believably feasible rescue is a fresh basin, so
+                    # the stall streak restarts.
+                    rstate.uncertified_stall_theta = (
+                        theta_probe
+                        if _restoration_reports_infeasible(theta_probe, opts.optimality)
+                        else float("inf")
+                    )
+                    return _RestorationOutcome(resume=True, x=x_r, s=s_r, y_ineq=y_ineq)
+                # The anchored probe itself reached a stationary point of the
+                # infeasibility: a certificate even when the triggering stall
+                # carried none.
+                claim_certified = True
+            if not claim_certified:
+                return _RestorationOutcome(
+                    resume=False,
+                    status=Status.RESTORATION_FAILED,
+                    message=(
+                        "restoration failed: the infeasibility minimization "
+                        "stalled without a stationarity certificate and without "
+                        f"reducing the constraint violation (theta={theta_restored:.3e})"
+                    ),
+                )
+            # Veto: a local-infeasibility claim is contradicted by the run's own
+            # history whenever an *accepted* iterate already reached the
+            # verdict's believe-threshold — a diverged endgame (degenerate duals,
+            # tiny μ) is a stall at a feasible problem, not evidence of
+            # infeasibility (S2MPJ v10: DEGENLPA reached θ = 1.7e-7 before the
+            # collapse that used to be reported as INFEASIBLE).
+            if theta_best <= _feasible_evidence_tol(opts.optimality):
+                return _RestorationOutcome(
+                    resume=False,
+                    status=Status.STALLED,
+                    message=(
+                        "stalled: restoration could not re-reduce the constraint "
+                        f"violation, but an accepted iterate already reached "
+                        f"theta={theta_best:.3e} — the problem is not locally "
+                        "infeasible"
+                    ),
+                )
+            return _RestorationOutcome(
+                resume=False,
+                status=Status.INFEASIBLE,
+                message=(
+                    "locally infeasible: restoration could not reduce the "
+                    "constraint violation"
+                ),
+            )
+        return _RestorationOutcome(resume=True, x=x, s=s, y_ineq=y_ineq)
 
     def _restore(
         self,

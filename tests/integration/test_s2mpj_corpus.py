@@ -259,6 +259,42 @@ def test_objective_free_problem_runs_as_feasibility(bridge_namespace):
     assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE, Status.INFEASIBLE)
 
 
+@pytest.mark.parametrize("name", ("RAT42", "BOXBOD", "FREURONE"))
+def test_objective_free_step_failure_reports_honestly_not_numerical_error(
+    bridge_namespace, name
+):
+    # Regression (v11 mining, v0.7.0 item 2): the exact/dense route reported
+    # crash-like ``numerical_error`` on the objective-free nonlinear-equation /
+    # NLS cluster (min 0 s.t. r(x)=0). For the NIST regression datasets r(x)=0
+    # is genuinely inconsistent (nonzero residuals at the fit), so the honest
+    # verdict is infeasibility — which the L-BFGS routes already reported. A
+    # step-solve failure the δ_w ladder cannot repair now hands to feasibility
+    # restoration (Wächter & Biegler 2006, §3.3) and terminates with an honest
+    # infeasible / restoration_failed / stalled status instead of
+    # numerical_error.
+    xp = bridge_namespace
+    if name not in s2mpj.list_s2mpj_problems():
+        pytest.skip(f"{name} not in this S2MPJ checkout")
+    backend = xp.__name__.split(".")[-1]
+    (case,) = s2mpj.s2mpj_problems(
+        (name,), backends=(backend,), hessian="exact", feasibility=True
+    )
+    problem, x0 = case.build(xp)
+    result = solve(
+        problem,
+        x0,
+        options=Options(hessian="exact", linsolve="dense", max_iter=2000),
+    )
+    assert result.status is not Status.NUMERICAL_ERROR, f"{name}: {result.status}"
+    assert result.status in (
+        Status.INFEASIBLE,
+        Status.RESTORATION_FAILED,
+        Status.STALLED,
+        Status.OPTIMAL,
+        Status.ACCEPTABLE,
+    )
+
+
 def test_sized_instantiation_scales_and_falls_back(bridge_namespace):
     # ``size`` requests a scalable problem's dimension (the scaling-sweep lever); a
     # fixed-size problem ignores it and keeps its SIF default.

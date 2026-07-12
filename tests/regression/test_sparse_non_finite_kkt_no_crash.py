@@ -50,10 +50,15 @@ def test_sparse_non_finite_kkt_returns_result_without_raising(namespace):
     # The solve must not propagate the backend's non-finite ``ValueError``: the
     # non-finite factorization is a recoverable numerical failure, so the driver
     # exhausts δ_w escalation and terminates with a status object in hand.
+    # STALLED is now reachable because a step-solve failure hands to feasibility
+    # restoration (Wächter & Biegler 2006, §3.3): restoration ignores the
+    # (non-finite) objective Hessian and reaches HS6's feasible manifold, so the
+    # run honestly stalls on the dual side instead of reporting numerical_error.
     result = _solve_sparse(namespace)
     assert result.status in (
         Status.NUMERICAL_ERROR,
         Status.ACCEPTABLE,
         Status.MAX_ITER,
         Status.RESTORATION_FAILED,
+        Status.STALLED,
     ), f"unexpected status {result.status}"

@@ -7,6 +7,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Fixed
+- **A step-solve failure hands to feasibility restoration instead of reporting
+  `numerical_error`.** When the condensed/saddle factorization could not be
+  completed even after the full δ_w regularization ladder, the driver reported
+  `numerical_error` outright. Wächter & Biegler 2006 (§3.1 inertia correction,
+  which reverts to the §3.3 *feasibility restoration* phase once δ_w exceeds
+  its ceiling) treats an uncompletable inertia-corrected step as a restoration
+  trigger — the same globalization fallback a filter line-search failure
+  already took. The driver now routes such a step-solve failure through
+  the shared restoration handler: it either recovers (restoration reaches a
+  feasible point and the main loop resumes) or terminates with an honest
+  `infeasible` / `restoration_failed` / `stalled` verdict. This upgrades the
+  diagnostics on the objective-free nonlinear-equation / NLS cluster (S2MPJ v11
+  exact-route `*NE` problems, ~44 rows: `min 0 s.t. r(x)=0` where the equality
+  multipliers diverge and no δ_w regularizes the runaway Hessian `Σ yᵢ ∇²cᵢ`),
+  which now report the same honest infeasibility the L-BFGS routes already did
+  instead of a crash-like `numerical_error`. The near-optimal step-failure
+  salvage (report `acceptable`) is unchanged. Internally the restoration branch
+  is extracted into a single `_handle_restoration` method shared by both entry
+  points.
 - **A line-search failure at an already-feasible point re-centers the barrier
   state instead of looping through restoration.** When the filter line search
   could not find an acceptable step at a feasible iterate (`θ ≤` the
