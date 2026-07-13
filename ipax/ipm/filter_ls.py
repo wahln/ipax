@@ -24,10 +24,13 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+
+from ipax._logging import logger
 
 if TYPE_CHECKING:
     from ipax.options import LineSearchOptions
@@ -138,6 +141,7 @@ class FilterLineSearch:
         alpha_min = o.alpha_min_frac
         first = True
         trials = 0
+        trace = logger.isEnabledFor(logging.DEBUG)
         while alpha >= alpha_min:
             trials += 1
             theta_t, phi_t = eval_point(alpha)
@@ -147,9 +151,19 @@ class FilterLineSearch:
                 corrected = soc(alpha)
                 if corrected is not None:
                     theta_c, phi_c = corrected
-                    if self._accept(
+                    soc_reason = self._reject_reason(
                         theta_c, phi_c, theta0, phi0, dphi, alpha, theta_max, entries
-                    ):
+                    )
+                    if trace:
+                        logger.debug(
+                            "  ls trial %d: alpha=%.3e theta=%.3e phi=%.3e -> soc-%s",
+                            trials,
+                            alpha,
+                            theta_c,
+                            phi_c,
+                            "accept" if soc_reason is None else soc_reason,
+                        )
+                    if soc_reason is None:
                         # The SOC point differs from ``x + α d``; its own gradient
                         # finiteness is checked inside ``soc`` (which returns None
                         # to reject a non-finite-derivative corrected trial).
@@ -159,9 +173,21 @@ class FilterLineSearch:
                         )
             first = False
 
-            if self._accept(
+            reason = self._reject_reason(
                 theta_t, phi_t, theta0, phi0, dphi, alpha, theta_max, entries
-            ) and (grad_finite is None or grad_finite(alpha)):
+            )
+            if reason is None and grad_finite is not None and not grad_finite(alpha):
+                reason = "non-finite-grad"
+            if trace:
+                logger.debug(
+                    "  ls trial %d: alpha=%.3e theta=%.3e phi=%.3e -> %s",
+                    trials,
+                    alpha,
+                    theta_t,
+                    phi_t,
+                    "accept" if reason is None else reason,
+                )
+            if reason is None:
                 switching = self._switching(dphi, alpha, theta0)
                 return LineSearchResult(
                     alpha, True, not switching, False, n_trials=trials
@@ -186,6 +212,30 @@ class FilterLineSearch:
         theta_max: float,
         entries: list[tuple[float, float]],
     ) -> bool:
+        return (
+            self._reject_reason(
+                theta_t, phi_t, theta0, phi0, dphi, alpha, theta_max, entries
+            )
+            is None
+        )
+
+    def _reject_reason(
+        self,
+        theta_t: float,
+        phi_t: float,
+        theta0: float,
+        phi0: float,
+        dphi: float,
+        alpha: float,
+        theta_max: float,
+        entries: list[tuple[float, float]],
+    ) -> str | None:
+        """The first failing acceptance gate, or ``None`` if the trial is accepted.
+
+        Names the gate (``non-finite`` / ``theta-max`` / ``filter`` / ``armijo``
+        / ``no-decrease``) so the per-trial debug trace can report *why* a step
+        size was rejected — the signal for diagnosing heavy backtracking.
+        """
         o = self._o
         # W&B eq. (18): the filter is initialized to the guard region {θ ≥ θ_max}.
         # Reject wildly infeasible (or non-finite) trials outright, before the
@@ -196,24 +246,24 @@ class FilterLineSearch:
         # element function) would otherwise pass the Armijo test — ``φ_t = -∞`` is
         # trivially below any finite bound — instead of backtracking to a finite,
         # usable iterate.
-        if (
-            not math.isfinite(theta_t)
-            or not math.isfinite(phi_t)
-            or theta_t >= theta_max
-        ):
-            return False
+        if not math.isfinite(theta_t) or not math.isfinite(phi_t):
+            return "non-finite"
+        if theta_t >= theta_max:
+            return "theta-max"
         if not self._filter_acceptable(theta_t, phi_t, entries):
-            return False
+            return "filter"
         if self._switching(dphi, alpha, theta0):
             # f-type step: require Armijo decrease on the barrier objective.
-            return phi_t <= phi0 + o.eta_phi * alpha * dphi
+            return None if phi_t <= phi0 + o.eta_phi * alpha * dphi else "armijo"
         # θ-type step: sufficient decrease in θ or φ vs the current point
         # (W&B eq. 20). At a feasible iterate (θ0 = 0) no θ-progress step
         # exists — the branch would degenerate to "0 ≤ 0" and accept an
         # arbitrary ascent direction (W&B §2.3: only f-type/φ-decrease
         # acceptance applies there), so it requires θ0 > 0.
         theta_progress = theta0 > 0.0 and theta_t <= (1.0 - o.gamma_theta) * theta0
-        return theta_progress or phi_t <= phi0 - o.gamma_phi * theta0
+        if theta_progress or phi_t <= phi0 - o.gamma_phi * theta0:
+            return None
+        return "no-decrease"
 
 
 __all__ = ["Filter", "FilterLineSearch", "LineSearchResult"]

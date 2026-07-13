@@ -18,6 +18,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `r × r` block (`r` = the L-BFGS memory window). A singular or oversized `M`
   block returns `None`, deferring to the factorization-failure escalation as
   before. Applies to both the condensed and equality-saddle assemblies.
+- **Per-trial line-search debug trace.** At `verbose >= 6` (DEBUG) the filter
+  line search now logs every backtracking trial with its `alpha`, `theta`, `phi`
+  and the reason it was rejected (`filter` / `armijo` / `no-decrease` /
+  `theta-max` / `non-finite` / `non-finite-grad`, or `accept`), plus `soc-*` for
+  second-order-correction trials — so an iteration with a high `ls` count can be
+  diagnosed straight from the log without a rerun.
+
+### Changed
+- **Iteration table uses IPOPT-style log10 columns.** The `mu` and `reg` columns
+  are now `lg(mu)` and `lg(rg)` (base-10 logs), and a step that needed no
+  regularization prints `lg(rg)` as `-` instead of `0.00e+00`, so a nonzero δ_w
+  stands out. This affects only the human-readable log; `IterationRecord` still
+  carries the raw `mu` / `regularization` values.
 
 ## [0.6.1] - 2026-07-13
 

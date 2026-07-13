@@ -2,9 +2,65 @@
 
 from __future__ import annotations
 
+import logging
+
+from ipax._logging import LOGGER_NAME
 from ipax.ipm.filter_ls import Filter, FilterLineSearch
 from ipax.options import LineSearchOptions
 from tests._helpers import implemented
+
+
+def test_reject_reason_classifies_each_gate():
+    # The rejection classifier names the first failing acceptance gate; ``None``
+    # means the trial is acceptable. This is the label the per-trial debug trace
+    # surfaces so a heavy-backtracking iteration can be diagnosed from the log.
+    ls = FilterLineSearch(LineSearchOptions())
+
+    # non-finite θ/φ (here φ = -inf on an f-type step).
+    assert ls._reject_reason(0.5, float("-inf"), 1.0, 1.0, -1e6, 1.0, 1e10, []) == (
+        "non-finite"
+    )
+    # θ past the eq. (18) guard θ_max.
+    assert ls._reject_reason(1e30, 1.0, 1.0, 1.0, -1e6, 1.0, 1e4, []) == "theta-max"
+    # dominated by a filter entry.
+    assert ls._reject_reason(2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1e10, [(1.0, 1.0)]) == (
+        "filter"
+    )
+    # f-type step (switching holds) failing the Armijo decrease.
+    assert ls._reject_reason(0.5, 5.0, 1.0, 1.0, -1e6, 1.0, 1e10, []) == "armijo"
+    # θ-type step (switching fails) with neither θ- nor φ-progress.
+    assert ls._reject_reason(2.0, 5.0, 1.0, 1.0, 1.0, 1.0, 1e10, []) == "no-decrease"
+    # acceptable ⇒ None.
+    assert ls._reject_reason(0.1, 0.1, 1.0, 1.0, 1.0, 1.0, 1e10, []) is None
+
+
+def test_search_emits_per_trial_debug_trace(caplog):
+    # At DEBUG level the search logs each backtracking trial with its α, θ, φ and
+    # the reason it was rejected (or "accept"), so 10+-trial iterations can be
+    # read directly from the log without a rerun.
+    line_search = FilterLineSearch(LineSearchOptions())
+    # f-type ray: Armijo bound is 1 - 100α; φ = 5 fails until α shrinks enough
+    # that φ drops to -200 and the step is accepted.
+    with caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+        result = line_search.search(
+            alpha_max=1.0,
+            theta0=1.0,
+            phi0=1.0,
+            dphi=-1e6,
+            theta_max=1e10,
+            eval_point=lambda alpha: (0.5, 5.0) if alpha > 0.02 else (0.5, -200.0),
+            entries=[],
+            soc=None,
+        )
+
+    assert result.accepted
+    msgs = [r.getMessage() for r in caplog.records if "ls trial" in r.getMessage()]
+    assert len(msgs) >= 2  # several backtracks were traced
+    assert any("armijo" in m for m in msgs)  # rejected trials are labelled
+    assert any("accept" in m for m in msgs)  # the accepted trial is labelled
+    assert all(
+        "alpha=" in m and "theta=" in m and "phi=" in m for m in msgs
+    )  # each line carries the trial quantities
 
 
 def test_empty_filter_accepts_candidate():

@@ -11,6 +11,7 @@ from ipax._logging import (
     RESULT,
     SOLVER,
     configure_verbosity,
+    format_header,
     format_options,
     format_problem,
     format_record,
@@ -96,6 +97,33 @@ def test_owned_handler_dropped_when_app_attaches_later():
     finally:
         logger.handlers[:] = saved_handlers
         logger.setLevel(saved_level)
+
+
+def test_header_uses_log_scaled_mu_and_reg_columns():
+    # IPOPT-style: the barrier and regularization columns are log10-scaled.
+    header = format_header()
+    assert "lg(mu)" in header
+    assert "lg(rg)" in header
+
+
+def test_format_record_log_scales_mu_and_regularization():
+    # mu = 1e-8 → lg(mu) = -8.0; reg = 1e-6 → lg(rg) = -6.0.
+    record = IterationRecord(3, 1.0, 1e-8, 1e-9, 1e-9, 1.0, 1.0, 1e-6, 0.0, 0.0)
+    row = format_record(record)
+    assert "-8.0" in row
+    assert "-6.0" in row
+    assert "1.00e-06" not in row  # no longer scientific-notation reg
+
+
+def test_format_record_dashes_zero_regularization():
+    # δ_w = 0 is the common case; log10(0) is -inf, so it prints a dash, not a
+    # misleading "0.00e+00" that hides whether any regularization happened.
+    # Nonzero timing fields so the only possible "0.00e+00" would be the reg col.
+    record = IterationRecord(3, 1.0, 1e-8, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.5, 0.25)
+    row = format_record(record)
+    assert "0.00e+00" not in row  # reg column is a dash, not scientific zero
+    assert " - " in f" {row} "  # a standalone dash marks the reg column
+    assert "-8.0" in row  # lg(mu) still numeric
 
 
 def test_format_record_marks_acceptable_iterates():
