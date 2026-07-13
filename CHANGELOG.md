@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- **The sparse-direct inertia check now covers the L-BFGS (default) Hessian
+  route.** `_CondensedOperator.expected_inertia` previously returned `None` for
+  a diagonal-plus-low-rank Hessian, so a genuinely nonconvex problem on the
+  L-BFGS route relied purely on Powell damping and never got the IPOPT
+  inertia-guided δ_w correction (Wächter & Biegler 2006, §3.1). The bordered
+  system `[D U; Uᵀ M]` has, by Haynsworth inertia additivity, `In(K) = In(M) +
+  In(N)`, so the target now folds the compact middle-block signature in:
+  `(n + M₊, M₋ + m_I, 0)`, with `In(M)` from a cheap dense eigensolve of the
+  `r × r` block (`r` = the L-BFGS memory window). A singular or oversized `M`
+  block returns `None`, deferring to the factorization-failure escalation as
+  before. Applies to both the condensed and equality-saddle assemblies.
+
 ## [0.6.1] - 2026-07-13
 
 ### Fixed

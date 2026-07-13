@@ -1820,11 +1820,15 @@ class IPMDriver:
 
         Best-effort and solver-agnostic (invariant #3): it only engages when the
         injected solver reports the factor's inertia (a sparse LDLᵀ backend such
-        as Feral / cuDSS) *and* the KKT operator knows its target inertia. In
-        every other case — dense Cholesky / Krylov (no inertia, but Cholesky
-        already fails on indefiniteness), a non-inertia-revealing factorization,
-        or an L-BFGS low-rank Hessian (PD by Powell damping) — it returns ``True``
-        and leaves correction to the factorization-failure escalation.
+        as Feral / cuDSS) *and* the KKT operator knows its target inertia. For a
+        diagonal-plus-low-rank (L-BFGS) Hessian the target folds the compact
+        ``M``-block signature into the bordered inertia (see
+        :meth:`~ipax.ipm.kkt._CondensedOperator.expected_inertia`), so the check
+        now covers that route too. In every other case — dense Cholesky / Krylov
+        (no inertia, but Cholesky already fails on indefiniteness), a
+        non-inertia-revealing factorization, or a singular/oversized ``M`` block
+        (no reliable target) — it returns ``True`` and leaves correction to the
+        factorization-failure escalation.
         """
         target_fn = getattr(operator, "expected_inertia", None)
         target = target_fn() if target_fn is not None else None

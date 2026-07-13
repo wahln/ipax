@@ -132,6 +132,35 @@ def _inequality_border(ineq_jac: LinearOperator, sigma_s: LinearOperator) -> _Bo
     return _Border(m_ineq, g_rows, g_cols, g_values, diag, diag, inner)
 
 
+# Cap on the low-rank middle-block size we will eigensolve for inertia. The
+# L-BFGS window is a few tens, so this only guards against a pathologically wide
+# matrix-free low-rank border (whose O(r³) eigensolve is not worth it — the
+# inertia check is best-effort and falls back to δ_w escalation).
+_LOWRANK_INERTIA_MAX = 512
+
+
+def _symmetric_signature(matrix: Array) -> tuple[int, int, int] | None:
+    """Inertia ``(n₊, n₋, n₀)`` of a small symmetric matrix, or ``None`` if too big.
+
+    Sylvester's law of inertia on the eigenvalues (Array-API ``linalg``
+    extension, invariant #2). Used for the diagonal-plus-low-rank middle block
+    ``M`` (the compact L-BFGS ``[ξSᵀS L; Lᵀ −D]``, size = the memory window), so
+    the dense eigensolve is cheap. Mirrors the eigvalsh inertia tolerance used by
+    the sparse dense-inertia fallback (``backend/sparse/numpy_scipy.py``).
+    """
+    r = int(matrix.shape[0])
+    if r > _LOWRANK_INERTIA_MAX:
+        return None
+    xp = array_namespace(matrix)
+    sym = 0.5 * (matrix + xp.permute_dims(matrix, (1, 0)))  # symmetrize defensively
+    eig = xp.linalg.eigvalsh(sym)
+    scale = float(xp.max(xp.abs(eig))) if r else 0.0
+    tol = max(1.0, scale) * r * float(xp.finfo(eig.dtype).eps)
+    pos = int(xp.sum(xp.astype(eig > tol, xp.int64)))
+    neg = int(xp.sum(xp.astype(eig < -tol, xp.int64)))
+    return pos, neg, r - pos - neg
+
+
 def _border(a: _Assembly) -> tuple[Array, Array, Array, tuple[int, int]]:
     """Materialize the bordered COO matrix and its (augmented) shape."""
     xp = array_namespace(a.values)
@@ -697,14 +726,43 @@ class _CondensedOperator(LinearOperator):
         A correct LDLᵀ factorization can *succeed* with the wrong inertia (a
         non-descent step), which is exactly what the inertia check catches.
 
-        Returns ``None`` for a diagonal-plus-low-rank Hessian (L-BFGS /
-        matrix-free): its low-rank border carries an inner block whose inertia is
-        not known cheaply, and Powell-damped L-BFGS keeps ``W`` PD anyway, so the
-        factorization-failure escalation suffices there.
+        For a *diagonal-plus-low-rank* Hessian ``W = diag(d) − U M⁻¹ Uᵀ`` (the
+        L-BFGS compact form, or a matrix-free ``diag(h) + C Cᵀ``) the assembled
+        matrix is the border ``[N* U; Uᵀ M]`` with ``N* = D − 0`` on the primal
+        block; its Schur complement onto that block is exactly the condensed
+        ``N = D − U M⁻¹ Uᵀ`` we regularize to PD. By Haynsworth inertia
+        additivity ``In(K) = In(M) + In(N)``, so with ``In(N) = (n, 0, 0)`` the
+        target folds the small ``M``-block signature in:
+        ``(n + M₊, M₋ + m_I, 0)`` (IPOPT §4.3 limited-memory; Byrd–Nocedal–
+        Schnabel 1994). ``In(M)`` comes from a dense symmetric eigensolve of the
+        ``r × r`` middle block (``r`` = the memory window, a few tens).
+
+        Returns ``None`` when ``M`` is singular (its ``(d, u, m)`` factors give
+        no reliable signature) or oversized, deferring to the
+        factorization-failure escalation.
         """
-        if getattr(self._W, "diagonal_low_rank_form", None) is not None:
+        low_rank_form = getattr(self._W, "diagonal_low_rank_form", None)
+        n = self._W.shape[0]
+        m_ineq = int(self._ineq_jac.shape[0])
+        if low_rank_form is None:
+            return (n, m_ineq, 0)
+        try:
+            _, u, m = low_rank_form()
+        except NotImplementedError:
+            # No low-rank part yet (e.g. L-BFGS before the first pair, W = I):
+            # no border is assembled, so the target is the identity-Hessian one.
+            return (n, m_ineq, 0)
+        if u is None or m is None or int(u.shape[1]) == 0:
+            return (n, m_ineq, 0)
+        signature = _symmetric_signature(m)
+        if signature is None:
             return None
-        return (self._W.shape[0], self._ineq_jac.shape[0], 0)
+        m_pos, m_neg, m_zero = signature
+        if m_zero != 0:
+            # A singular middle block makes W = diag(d) − U M⁻¹ Uᵀ ill-defined;
+            # the bordered inertia target is unreliable, so skip the check.
+            return None
+        return (n + m_pos, m_neg + m_ineq, 0)
 
     def primal_block(self) -> LinearOperator | None:
         """The condensed block ``N`` that must be PD, or ``None`` to skip the check.

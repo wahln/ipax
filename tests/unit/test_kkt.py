@@ -406,11 +406,46 @@ def test_saddle_dense_structured_solve_handles_matrix_rhs(namespace, tol):
 
 
 def _empty_ineq(namespace):
+    return _empty_ineq_n(namespace, 2)
+
+
+def _empty_ineq_n(namespace, n):
     dtype = array(namespace, [0.0]).dtype
     return (
         Diagonal(array(namespace, [])),
-        Dense(namespace.zeros((0, 2), dtype=dtype)),
+        Dense(namespace.zeros((0, n), dtype=dtype)),
     )
+
+
+def _lbfgs_with_pairs(namespace, n, pairs):
+    """An :class:`LBFGSOperator` with the given ``(delta, gamma)`` curvature pairs."""
+    op = LBFGSOperator(n, LBFGSOptions(memory=10))
+    for delta, gamma in pairs:
+        op.update(array(namespace, delta), array(namespace, gamma))
+    return op
+
+
+def _coo_to_dense(namespace, op):
+    """Materialize an operator's (bordered) COO triplets to a dense array."""
+    rows, cols, values, shape = op.to_coo()
+    size = int(shape[0])
+    dense = [[0.0] * size for _ in range(size)]
+    for k in range(int(rows.shape[0])):
+        dense[int(rows[k])][int(cols[k])] += float(values[k])
+    return array(namespace, dense)
+
+
+def _inertia_of(namespace, matrix):
+    """Inertia ``(n₊, n₋, n₀)`` of a symmetric matrix via eigvalsh (Sylvester)."""
+    xp = array_namespace(matrix)
+    sym = 0.5 * (matrix + transpose(xp, matrix))
+    eig = xp.linalg.eigvalsh(sym)
+    n = int(eig.shape[0])
+    scale = float(xp.max(xp.abs(eig))) if n else 0.0
+    thresh = max(1.0, scale) * n * 1e-10
+    pos = sum(1 for k in range(n) if float(eig[k]) > thresh)
+    neg = sum(1 for k in range(n) if float(eig[k]) < -thresh)
+    return pos, neg, n - pos - neg
 
 
 def test_condensed_expected_inertia_assemblable(namespace):
@@ -432,14 +467,77 @@ def test_condensed_expected_inertia_assemblable(namespace):
     assert with_ineq.expected_inertia() == (2, 2, 0)
 
 
-def test_condensed_expected_inertia_none_for_low_rank_hessian(namespace):
-    """A diagonal-plus-low-rank (L-BFGS-style) Hessian disables the inertia check."""
+def test_condensed_expected_inertia_low_rank_no_pairs(namespace):
+    """A low-rank Hessian with no low-rank part yet (W = I) targets (n, m_I, 0)."""
 
     class _LowRankW(Dense):
-        def diagonal_low_rank_form(self):  # presence alone is the signal
+        def diagonal_low_rank_form(self):  # raises ⇒ no curvature pairs yet, W = I
             raise NotImplementedError
 
     W = _LowRankW(array(namespace, [[4.0, 0.5], [0.5, 3.0]]))
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    empty_sigma_s, empty_jac = _empty_ineq(namespace)
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState()
+    )
+    # No low-rank border ⇒ same target as an assemblable identity Hessian.
+    assert op.expected_inertia() == (2, 0, 0)
+
+
+def test_condensed_expected_inertia_lbfgs_folds_m_block(namespace):
+    """L-BFGS low-rank Hessian: In(M) folds into the target (n + M₊, M₋ + m_I, 0)."""
+    W = _lbfgs_with_pairs(
+        namespace,
+        3,
+        [
+            ([1.0, 0.0, 0.0], [2.0, 0.1, 0.1]),
+            ([0.0, 1.0, 0.0], [0.1, 3.0, 0.1]),
+        ],
+    )
+    _, u, _ = W.diagonal_low_rank_form()
+    assert int(u.shape[1]) == 4  # k = 2 pairs ⇒ U = [ξS  Y] has 2k columns
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 0.5]))
+
+    empty_sigma_s, empty_jac = _empty_ineq_n(namespace, 3)
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState()
+    )
+    # In(M) = (k, k, 0) = (2, 2, 0); N is PD (Powell damping) ⇒ (3 + 2, 2, 0).
+    assert op.expected_inertia() == (5, 2, 0)
+    # Self-check: the materialized bordered system has exactly that inertia.
+    assert _inertia_of(namespace, _coo_to_dense(namespace, op)) == (5, 2, 0)
+
+
+def test_condensed_expected_inertia_lbfgs_with_inequalities(namespace):
+    """Each inequality adds one −Σ_s⁻¹ negative on top of the folded In(M)."""
+    W = _lbfgs_with_pairs(
+        namespace,
+        3,
+        [
+            ([1.0, 0.0, 0.0], [2.0, 0.1, 0.1]),
+            ([0.0, 1.0, 0.0], [0.1, 3.0, 0.1]),
+        ],
+    )
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 0.5]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    jac = Dense(array(namespace, [[1.0, 2.0, 0.0], [-1.0, 0.5, 1.0]]))
+    op = build_condensed_operator(W, sigma_x, sigma_s, jac, RegularizationState())
+    # (n + k, k + m_I, 0) = (5, 4, 0).
+    assert op.expected_inertia() == (5, 4, 0)
+    assert _inertia_of(namespace, _coo_to_dense(namespace, op)) == (5, 4, 0)
+
+
+def test_condensed_expected_inertia_none_for_singular_m_block(namespace):
+    """A singular low-rank middle block ⇒ target unavailable (skip the check)."""
+
+    class _SingularLowRankW(Dense):
+        def diagonal_low_rank_form(self):
+            d = array(namespace, [1.0, 1.0])
+            u = array(namespace, [[1.0], [0.0]])
+            m = array(namespace, [[0.0]])  # singular M ⇒ inertia target unreliable
+            return d, u, m
+
+    W = _SingularLowRankW(array(namespace, [[4.0, 0.5], [0.5, 3.0]]))
     sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
     empty_sigma_s, empty_jac = _empty_ineq(namespace)
     op = build_condensed_operator(
@@ -463,16 +561,42 @@ def test_saddle_expected_inertia_adds_equalities(namespace):
     assert saddle.expected_inertia() == (2, 3, 0)  # n=2, m_E=1, m_I=2
 
 
-def test_saddle_expected_inertia_none_propagates(namespace):
-    """A low-rank condensed block propagates ``None`` through the saddle."""
+def test_saddle_expected_inertia_lbfgs(namespace):
+    """The equality border adds m_E negatives on top of the folded In(M)."""
+    W = _lbfgs_with_pairs(
+        namespace,
+        3,
+        [
+            ([1.0, 0.0, 0.0], [2.0, 0.1, 0.1]),
+            ([0.0, 1.0, 0.0], [0.1, 3.0, 0.1]),
+        ],
+    )
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 0.5]))
+    sigma_s = Diagonal(array(namespace, [2.0, 0.5]))
+    jac = Dense(array(namespace, [[1.0, 2.0, 0.0], [-1.0, 0.5, 1.0]]))
+    condensed = build_condensed_operator(
+        W, sigma_x, sigma_s, jac, RegularizationState()
+    )
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, 1.0, 0.0]])), 1e-8
+    )
+    # (n + k, k + m_I + m_E, 0) = (3 + 2, 2 + 2 + 1, 0).
+    assert saddle.expected_inertia() == (5, 5, 0)
 
-    class _LowRankW(Dense):
+
+def test_saddle_expected_inertia_none_propagates(namespace):
+    """A condensed block that cannot report a target propagates ``None``."""
+
+    class _SingularLowRankW(Dense):
         def diagonal_low_rank_form(self):
-            raise NotImplementedError
+            d = array(namespace, [1.0, 1.0])
+            u = array(namespace, [[1.0], [0.0]])
+            m = array(namespace, [[0.0]])  # singular M ⇒ no reliable target
+            return d, u, m
 
     empty_sigma_s, empty_jac = _empty_ineq(namespace)
     condensed = build_condensed_operator(
-        _LowRankW(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        _SingularLowRankW(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
         Diagonal(array(namespace, [0.25, 0.75])),
         empty_sigma_s,
         empty_jac,

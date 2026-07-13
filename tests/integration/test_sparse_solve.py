@@ -250,6 +250,27 @@ def test_sparse_route_inertia_correction_escapes_saddle(namespace):
     assert abs(float(result.x[0] * result.x[1]) - (-1.0)) <= 1e-5
 
 
+def test_sparse_lbfgs_route_inertia_covers_saddle(namespace):
+    """L-BFGS route on the saddle QP: the folded ``In(M)`` target extends the
+    inertia guard to the diagonal-plus-low-rank Hessian without regressing it.
+
+    ``expected_inertia`` now returns ``(n + M₊, M₋ + m_I, 0)`` for the L-BFGS
+    compact block instead of ``None`` (inertia-route-status gap 1), so the sparse
+    LDLᵀ inertia check is active on this route too. The solve must still reach a
+    true minimizer (``f = −1``), not stall at the origin saddle.
+    """
+    _require_sparse(namespace)
+    pytest.importorskip("feral")
+    problem, x0 = _saddle_trap_qp(namespace)
+    result = solve(
+        problem, x0, options=Options(linsolve="sparse", hessian="lbfgs", max_iter=500)
+    )
+
+    assert result.status is Status.OPTIMAL
+    assert abs(float(result.objective) - (-1.0)) <= 1e-5
+    assert abs(float(result.x[0] * result.x[1]) - (-1.0)) <= 1e-5
+
+
 def test_sparse_route_unavailable_backend_errors(namespace):
     # The facade resolves the adapter from the operator's namespace at factor
     # time; a backend without a registered adapter must fail clearly rather than
