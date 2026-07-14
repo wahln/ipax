@@ -273,10 +273,12 @@ class FilterLineSearch:
         safety invariants and stay. SOC and the feasible-point KKT rescue are
         rigorous-path mechanisms and are not consulted here.
 
-        The caller owns the free filter: it remembers each free iterate
-        (driver-side ``augment``) before searching, so the current point is an
-        entry — the margins are what keep this from degenerating to a monotone
-        requirement. Acceptance never augments the W&B filter
+        The caller owns the free filter and must remember each free iterate
+        (driver-side ``augment``) *before* searching, so the current point is
+        an entry — the margins are what keep this from degenerating to a
+        monotone requirement. An empty ``entries`` list vacuously accepts any
+        finite trial, so skipping that pre-augment would disable the merit
+        test entirely. Acceptance never augments the W&B filter
         (``LineSearchResult.augment`` is always ``False``); a fully rejected
         ray hands off to restoration exactly like the rigorous search.
         """
