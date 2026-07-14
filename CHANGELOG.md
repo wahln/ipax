@@ -25,6 +25,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   second-order-correction trials — so an iteration with a high `ls` count can be
   diagnosed straight from the log without a rerun.
 
+### Fixed
+- **A repeated feasible-point re-center now raises μ instead of treadmilling
+  at the same barrier.** Observed on an RT fluence case (4882 lower-bounded
+  variables, L-BFGS/sparse): the free-mode μ oracle pinned μ at its ε/10 floor
+  while the iterate sat at exact feasibility, where the W&B eq. (19) switching
+  condition holds for every descent direction — each trial faced the full
+  Armijo test against a barrier made stiff by thousands of near-active bounds
+  (11–27 backtracking trials per iteration), and every line-search failure
+  re-centered slacks/duals at the *same* pinned μ, reproducing the identical
+  stall for hundreds of iterations. The first feasible re-center is unchanged
+  (the 0.6.1 HS101 repair); a repeat now raises μ to the scale of the stall's
+  KKT error (at least 10×, capped at `mu_init` — cf. IPOPT's adaptive oracle
+  raising μ; Nocedal, Wächter & Waltz 2009, §5.1) and suspends the free-mode
+  μ oracle until the KKT error improves, so the raise is not immediately
+  re-targeted away.
+
 ### Changed
 - **Iteration table uses IPOPT-style log10 columns.** The `mu` and `reg` columns
   are now `lg(mu)` and `lg(rg)` (base-10 logs), and a step that needed no

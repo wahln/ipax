@@ -172,6 +172,21 @@ _NEAR_FEASIBLE_FACTOR = 1e4
 # RESTORATION_FAILED. Bounds the resume loop: θ must shrink geometrically, so
 # at most ~log(θ0/tol)/log(1/factor) resumes can occur.
 _RESTORATION_PROGRESS_FACTOR = 0.9
+# Barrier escalation on a *repeated* feasible-point re-center. The first
+# re-center repairs slacks/duals at the current μ (the HS101 fix); when that
+# repeats, the barrier problem itself is what cannot be solved — observed on an
+# RT fluence case where a free-mode μ oracle pinned μ at its floor and every
+# re-center re-derived the same rejected direction for hundreds of iterations
+# (at θ0 = 0 the W&B eq. (19) switching condition holds for every descent
+# direction, so each trial faces the full Armijo test against the stiff
+# barrier). The repeat raises μ to the scale of the stationarity residual the
+# barrier must absorb — the same "iterate outran the barrier" response as
+# IPOPT's adaptive oracle raising μ (cf. Nocedal, Wächter & Waltz 2009, §5.1
+# re-initialization) — by at least this factor (a smaller raise changes
+# nothing against an α-halving line search) and at most back to ``mu_init``
+# (never worse-centered than a cold start).
+_RECENTER_MU_RAISE_FACTOR = 10.0
+_RECENTER_MU_ERROR_FRACTION = 0.1  # μ_new target: fraction of the stall's KKT error
 
 
 def _norm_inf(xp: Namespace, v: Array) -> float:
@@ -277,12 +292,15 @@ class _RestorationState:
     ``second_chance_used`` fires the x0-anchored infeasibility probe at most
     once; ``uncertified_stall_theta`` tracks the θ at the last uncertified
     restoration stall so a resume is only justified while restoration keeps
-    reducing the violation between stalls. Held in an explicit object (not
+    reducing the violation between stalls; ``feasible_recenters`` counts the
+    feasible-point re-centers so a *repeat* escalates the barrier (raises μ)
+    instead of treadmilling at the same one. Held in an explicit object (not
     module state, invariant #5) and threaded through the loop.
     """
 
     second_chance_used: bool = False
     uncertified_stall_theta: float = float("inf")
+    feasible_recenters: int = 0
 
 
 @dataclass(frozen=True)
@@ -293,7 +311,10 @@ class _RestorationOutcome:
     otherwise the run terminates with ``status``/``message``. Keeping the
     control-flow decision in the return value lets the two entry points — a
     filter line-search failure and a step-solve failure the δ_w ladder could
-    not repair — share one handler.
+    not repair — share one handler. A non-``None`` ``mu`` carries a barrier
+    escalation (a repeated feasible-point re-center raised μ); the caller
+    applies it to the loop's μ and suspends any free-mode μ oracle so the
+    raise is not immediately re-targeted away.
     """
 
     resume: bool
@@ -302,6 +323,7 @@ class _RestorationOutcome:
     y_ineq: Array | None = None
     status: Status | None = None
     message: str | None = None
+    mu: float | None = None
 
 
 class IPMDriver:
@@ -1125,6 +1147,12 @@ class IPMDriver:
                     and outcome.y_ineq is not None
                 )
                 x, s, y_ineq = outcome.x, outcome.s, outcome.y_ineq
+                if outcome.mu is not None:
+                    # Barrier escalation from a repeated feasible re-center;
+                    # suspend the free-mode μ oracle or it would re-target μ
+                    # from the stale complementarity on the next iteration.
+                    mu = outcome.mu
+                    mu_monitor.suspend(e0)
                 alpha_p = 0.0
                 last_alpha = 0.0
                 prev_x = None
@@ -1394,6 +1422,12 @@ class IPMDriver:
                     and outcome.y_ineq is not None
                 )
                 x, s, y_ineq = outcome.x, outcome.s, outcome.y_ineq
+                if outcome.mu is not None:
+                    # Barrier escalation from a repeated feasible re-center;
+                    # suspend the free-mode μ oracle or it would re-target μ
+                    # from the stale complementarity on the next iteration.
+                    mu = outcome.mu
+                    mu_monitor.suspend(e0)
                 # A restoration jump / barrier re-center is a blocked Newton step:
                 # σ(0) = 0.01 re-centers on the next iteration (Breedveld eq. (12)),
                 # and the jump is not a Newton step, so the next curvature pair
@@ -2114,10 +2148,40 @@ class IPMDriver:
                 it,
             )
             filt.augment(theta0, phi0)
+            rstate.feasible_recenters += 1
+            # A *repeated* feasible re-center means repairing slacks/duals at
+            # the current μ already failed once — the barrier problem itself is
+            # what cannot be solved. Raise μ to the scale of the stall's KKT
+            # error (capped at mu_init, raised by at least the escalation
+            # factor); the caller applies it and suspends any free-mode μ
+            # oracle. See _RECENTER_MU_RAISE_FACTOR for the full rationale.
+            mu_raised: float | None = None
+            if rstate.feasible_recenters >= 2:
+                target = min(
+                    opts.barrier.mu_init,
+                    max(
+                        _RECENTER_MU_RAISE_FACTOR * mu,
+                        _RECENTER_MU_ERROR_FRACTION * record.kkt_error,
+                    ),
+                )
+                if target > mu:
+                    mu_raised = target
+                    logger.debug(
+                        "iter %d: repeated feasible re-center; raising the "
+                        "barrier mu from %.2e to %.2e",
+                        it,
+                        mu,
+                        mu_raised,
+                    )
             # ``g`` is the inequality residual at this iterate, computed at the
             # top of the loop; the failure did not move ``x``, so it is current.
-            s, y_ineq = recenter_slacks_duals(xp, g, y_ineq, mu)
-            return _RestorationOutcome(resume=True, x=x, s=s, y_ineq=y_ineq)
+            # Re-center on the μ the loop will actually resume with, so the
+            # slack floor and the multiplier central band match that barrier.
+            mu_eff = mu_raised if mu_raised is not None else mu
+            s, y_ineq = recenter_slacks_duals(xp, g, y_ineq, mu_eff)
+            return _RestorationOutcome(
+                resume=True, x=x, s=s, y_ineq=y_ineq, mu=mu_raised
+            )
         logger.debug("iter %d: entering feasibility restoration", it)
         filt.augment(theta0, phi0)
         x, s, rest_exit = self._restore(

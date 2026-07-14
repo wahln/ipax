@@ -159,6 +159,24 @@ class FreeModeMonitor:
             return True, False
         return False, False
 
+    def suspend(self, error: float) -> None:
+        """Force monotone mode from outside the KKT-error test.
+
+        Used when a repeated feasible-point re-center *raised* μ (the barrier
+        escalation): in free mode the oracle re-targets μ from the current
+        complementarity on the very next iteration — exactly the stale,
+        near-floor value the raise is escaping — silently undoing it.
+        Suspension reuses the NWW §5.1 re-entry rule of :meth:`observe`: free
+        mode resumes once the KKT error drops below ``κ`` of the suspension
+        point, i.e. once the raised barrier has produced real progress. When
+        already suspended the tighter switch point wins. A no-op when the
+        fallback safeguard is disabled.
+        """
+        if not self._enabled:
+            return
+        self._m_switch = error if self._free else min(self._m_switch, error)
+        self._free = False
+
 
 def complementarity_measures(
     *,
