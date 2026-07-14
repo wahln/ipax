@@ -117,6 +117,7 @@ class FilterLineSearch:
         entries: list[tuple[float, float]],
         soc: Callable[[float], tuple[float, float] | None] | None = None,
         grad_finite: Callable[[float], bool] | None = None,
+        kkt_progress: Callable[[float], bool] | None = None,
     ) -> LineSearchResult:
         """Return the accepted ``(α, …)`` or signal restoration.
 
@@ -135,6 +136,24 @@ class FilterLineSearch:
         keeps backtracking to a damped step that stays in the finite region,
         reusing the existing α-reduction (and restoration hand-off if the whole
         ray is bad).
+
+        ``kkt_progress(α)``, when supplied, certifies that the trial at ``α``
+        makes sufficient scaled-KKT-error progress. At an exactly feasible
+        iterate (θ0 = 0) the switching condition (W&B eq. 19) holds for every
+        descent direction — its right side is ``δ·θ0^{s_θ} = 0`` — so every
+        trial faces the full Armijo test and there is no θ-type escape. The
+        certifier rescues a *first* trial that fails Armijo: at a feasible
+        iterate, KKT-error decrease is optimality progress even when the
+        barrier objective wiggles up (the KKT-error-globalization philosophy
+        of Nocedal, Wächter & Waltz 2009, §5.1). The caller supplies the
+        certifier only at (numerically) feasible iterates — round-off keeps
+        θ0 at ~1e-16 rather than exactly 0, and the switching condition
+        degenerates there all the same. Consulted on the first trial only
+        (the certificate costs a gradient/Jacobian evaluation), and only
+        against an ``armijo`` rejection — never for an ascent direction
+        (those fail switching and take the θ-branch, so the feasible
+        ascent-stall guard is untouched). Accepted rescues are f-type-like:
+        the filter is not augmented.
         """
         o = self._o
         alpha = alpha_max
@@ -178,6 +197,23 @@ class FilterLineSearch:
             )
             if reason is None and grad_finite is not None and not grad_finite(alpha):
                 reason = "non-finite-grad"
+            if (
+                reason == "armijo"
+                and trials == 1
+                and kkt_progress is not None
+                and kkt_progress(alpha)
+            ):
+                # Feasible-point rescue (see docstring): certified KKT-error
+                # decrease stands in for the unreachable θ-type acceptance.
+                if trace:
+                    logger.debug(
+                        "  ls trial %d: alpha=%.3e theta=%.3e phi=%.3e -> kkt-progress",
+                        trials,
+                        alpha,
+                        theta_t,
+                        phi_t,
+                    )
+                return LineSearchResult(alpha, True, False, False, n_trials=trials)
             if trace:
                 logger.debug(
                     "  ls trial %d: alpha=%.3e theta=%.3e phi=%.3e -> %s",

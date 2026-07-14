@@ -6,6 +6,7 @@ import pytest
 
 from ipax import Options, Status, solve
 from ipax.backend.namespace import capabilities
+from ipax.options import LineSearchOptions
 from ipax.problem.base import Problem
 from ipax.testing.problems import BoundConstrainedQP
 from tests._helpers import array, assert_allclose, implemented
@@ -43,7 +44,16 @@ class _InequalityQP(Problem):
 
 
 def _opts(method: str, linsolve: str = "dense") -> Options:
-    return Options(hessian="exact", linsolve=linsolve, corrections=method)
+    # The feasible-point KKT-progress rescue is an orthogonal accelerator that
+    # can close the base-vs-corrected iteration gap on these tiny QPs (it
+    # accepts first trials the classical Armijo gate would chop); disable it so
+    # the tests isolate the corrector's own effect on the classical gate.
+    return Options(
+        hessian="exact",
+        linsolve=linsolve,
+        corrections=method,
+        line_search=LineSearchOptions(feasible_kkt_progress=None),
+    )
 
 
 @pytest.mark.parametrize("method", ["mehrotra", "gondzio"])

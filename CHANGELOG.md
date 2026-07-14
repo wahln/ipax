@@ -7,6 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Feasible-point KKT-progress acceptance in the filter line search**
+  (`LineSearchOptions.feasible_kkt_progress`, default `0.1`; `None` disables).
+  At a (numerically) feasible iterate the W&B eq. (19) switching condition
+  holds for every descent direction — its right side is `δ·θ0^{s_θ} ≈ 0` — so
+  every trial faces the full Armijo test and the θ-type acceptance branch
+  IPOPT effectively lives on at its θ ≈ 1e-6 iterates is unreachable. On the
+  RT fluence case this ground the solve to 11–27 backtracks per iteration
+  while the objective crawled (IPOPT's productive phase is visibly
+  φ-non-monotone; Armijo rejects those steps). A *first* trial that fails
+  Armijo is now still accepted when the scaled KKT error decreases by the
+  configured fraction — at a feasible iterate, optimality progress *is*
+  progress (the KKT-error-globalization philosophy of NWW 2009, §5.1, applied
+  to step acceptance). Guarded: first trial only (one extra gradient/Jacobian
+  evaluation), armijo-failures only — ascent directions take the θ-branch and
+  stay rejected, so the feasible ascent-stall fix is untouched — and the
+  filter is not augmented (f-type-like).
 - **`mu_schedule="quality"` — the quality-function μ oracle** (Nocedal,
   Wächter & Waltz 2009, §3.3; IPOPT's adaptive default), completing the NWW
   oracle set alongside probing and LOQO. σ is chosen by minimizing a linear

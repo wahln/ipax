@@ -34,6 +34,7 @@ the matrix-free Krylov solver, or the sparse-direct route.
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from time import perf_counter
@@ -1276,6 +1277,57 @@ class IPMDriver:
                 """
                 return bool(xp.all(xp.isfinite(self._gradient(x + alpha * step.dx))))
 
+            def kkt_progress(
+                alpha: float,
+                x: Array = x,
+                s: Array = s,
+                step: NewtonStep = step,
+                alpha_d: float = alpha_d,
+                y_eq: Array = y_eq,
+                y_ineq: Array = y_ineq,
+                z_lower: Array = z_lower,
+                z_upper: Array = z_upper,
+                e0: float = e0,
+            ) -> bool:
+                """Certify scaled-KKT-error decrease at the trial point.
+
+                The feasible-point rescue's acceptance certificate (see
+                ``LineSearchOptions.feasible_kkt_progress``): evaluates the
+                scaled KKT error at ``(x + α Δx, s + α Δs)`` with the duals at
+                the iteration's fraction-to-boundary dual step — the state the
+                driver would adopt on acceptance — and requires it to fall by
+                the configured fraction of the current error ``e0``. Costs one
+                gradient + Jacobian evaluation; consulted on the first trial
+                of a feasible-point search only.
+                """
+                gamma_e = opts.line_search.feasible_kkt_progress
+                assert gamma_e is not None  # closure only wired when enabled
+                x_t = x + alpha * step.dx
+                s_t = s + alpha * step.ds if m > 0 else s
+                x_minus_l_t, u_minus_x_t = bound_gaps(x_t)
+                residuals_t = self.kkt_error(
+                    mu=0.0,
+                    grad=self._gradient(x_t),
+                    ineq_jac=self._ineq_jac(x_t),
+                    m=m,
+                    g=self._ineq(x_t),
+                    s=s_t,
+                    y_ineq=y_ineq + alpha_d * step.dy_ineq,
+                    z_lower=z_lower + alpha_d * step.dz_lower,
+                    z_upper=z_upper + alpha_d * step.dz_upper,
+                    x_minus_l=x_minus_l_t,
+                    u_minus_x=u_minus_x_t,
+                    mask_l=mask_l,
+                    mask_u=mask_u,
+                    n_bounds=n_bounds,
+                    c=self._eq(x_t),
+                    eq_jac=self._eq_jac(x_t),
+                    m_eq=m_eq,
+                    y_eq=y_eq + alpha_d * step.dy_eq,
+                )
+                e_t = residuals_t.error
+                return math.isfinite(e_t) and e_t <= (1.0 - gamma_e) * e0
+
             soc_primal: tuple[Array, Array] | None = None
 
             def is_strictly_interior(x_t: Array, s_t: Array) -> bool:
@@ -1394,6 +1446,19 @@ class IPMDriver:
                     entries=filt.entries,
                     soc=soc,
                     grad_finite=grad_finite if use_lbfgs else None,
+                    # Feasible-point rescue: only meaningful where the eq. (19)
+                    # switching condition degenerates — numerically feasible
+                    # iterates (round-off keeps θ0 at ~1e-16, not exactly 0);
+                    # same feasibility notion as the re-center path. See
+                    # LineSearchOptions.feasible_kkt_progress.
+                    kkt_progress=(
+                        kkt_progress
+                        if (
+                            opts.line_search.feasible_kkt_progress is not None
+                            and theta0 <= feasible_theta_tol(opts.optimality.kkt_tol)
+                        )
+                        else None
+                    ),
                 )
                 alpha_p = result.alpha
                 restoration = result.restoration

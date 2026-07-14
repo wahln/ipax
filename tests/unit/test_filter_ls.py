@@ -267,6 +267,94 @@ def test_search_backtracks_past_non_finite_gradient_region():
     assert result.n_trials == 3
 
 
+def test_kkt_progress_rescues_first_trial_at_feasible_point():
+    # At θ0 = 0 the W&B eq. (19) switching condition holds for every descent
+    # direction (RHS = 0), so every trial faces the full Armijo test — the gate
+    # that ground the RT fluence case to 11–27 backtracks per iteration while
+    # IPOPT (hovering at θ > 0) accepted first trials through the near-vacuous
+    # θ-type branch. The rescue: a *first* trial that fails Armijo is still
+    # accepted when the caller certifies sufficient scaled-KKT-error decrease —
+    # at a feasible iterate, optimality progress IS progress.
+    ls = FilterLineSearch(LineSearchOptions())
+    seen: list[float] = []
+
+    def kkt_progress(alpha):
+        seen.append(alpha)
+        return True
+
+    result = ls.search(
+        alpha_max=1.0,
+        theta0=0.0,
+        phi0=1.0,
+        dphi=-1e-6,  # descent ⇒ switching holds ⇒ f-type Armijo
+        theta_max=1e4,
+        eval_point=lambda alpha: (0.0, 1.0 + 0.1 * alpha),  # φ rises ⇒ Armijo fails
+        entries=[],
+        kkt_progress=kkt_progress,
+    )
+
+    assert result.accepted
+    assert result.alpha == 1.0
+    assert result.n_trials == 1
+    assert not result.augment  # f-type-like: the filter is not augmented
+    assert seen == [1.0]
+
+
+def test_kkt_progress_consulted_only_on_the_first_trial():
+    # The certificate costs a gradient/Jacobian evaluation, so it is a
+    # first-trial rescue only (mirroring SOC); rejected ⇒ plain backtracking.
+    ls = FilterLineSearch(LineSearchOptions())
+    seen: list[float] = []
+
+    def kkt_progress(alpha):
+        seen.append(alpha)
+        return False
+
+    result = ls.search(
+        alpha_max=1.0,
+        theta0=0.0,
+        phi0=1.0,
+        dphi=-1e-6,
+        theta_max=1e4,
+        # φ rises along the ray: Armijo keeps failing, α exhausts.
+        eval_point=lambda alpha: (0.0, 1.0 + 0.1 * alpha),
+        entries=[],
+        kkt_progress=kkt_progress,
+    )
+
+    assert not result.accepted
+    assert result.restoration
+    assert seen == [1.0]  # not retried on the backtracked trials
+
+
+def test_kkt_progress_never_rescues_ascent_directions():
+    # The feasible ascent-stall guard must be untouched: an ascent direction
+    # (dφ > 0) at a feasible point fails the switching condition and takes the
+    # θ-branch — its rejection reason is not "armijo", so the certifier is
+    # never consulted and the φ-inflating trial stays rejected.
+    ls = FilterLineSearch(LineSearchOptions())
+    seen: list[float] = []
+
+    def kkt_progress(alpha):
+        seen.append(alpha)
+        return True
+
+    result = ls.search(
+        alpha_max=1.0,
+        theta0=0.0,
+        phi0=1.0,
+        dphi=5.0,  # ascent: switching can never hold
+        theta_max=1e4,
+        eval_point=lambda alpha: (0.0, 1.0 + 10.0 * alpha),  # φ inflates
+        entries=[],
+        kkt_progress=kkt_progress,
+    )
+
+    assert not result.accepted
+    assert result.restoration
+    assert seen == []
+
+
 def test_search_hands_off_to_restoration_when_gradient_never_finite():
     # If no α on the ray yields a finite gradient, the search exhausts α and
     # hands off to restoration — the same fallback as an unacceptable θ/φ.

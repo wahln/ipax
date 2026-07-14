@@ -95,7 +95,20 @@ class BarrierOptions:
 
 @dataclass(frozen=True, slots=True)
 class LineSearchOptions:
-    """Filter line-search parameters (Wächter & Biegler §2–3)."""
+    """Filter line-search constants (Wächter & Biegler 2006, §2.3/§4.1).
+
+    ``feasible_kkt_progress`` enables the feasible-point rescue acceptance: at
+    an exactly feasible iterate (θ0 = 0) the eq. (19) switching condition holds
+    for every descent direction, so every trial faces the full Armijo test —
+    there is no θ-type escape (the branch IPOPT effectively lives on at its
+    θ ≈ 1e-6 iterates, where "sufficient φ decrease vs θ0" is near-vacuous).
+    A *first* trial that fails Armijo is then still accepted when the scaled
+    KKT error decreases by at least this fraction — at a feasible iterate,
+    optimality progress *is* progress (the KKT-error-globalization philosophy
+    of Nocedal, Wächter & Waltz 2009, §5.1, applied to step acceptance). The
+    certificate costs one extra gradient/Jacobian evaluation and is consulted
+    on the first trial only. ``None`` disables the rescue.
+    """
 
     max_soc: int = 4
     alpha_min_frac: float = 1e-8
@@ -104,6 +117,9 @@ class LineSearchOptions:
     s_theta: float = 1.1
     s_phi: float = 2.3
     eta_phi: float = 1e-4  # Armijo constant
+    # Required scaled-KKT-error decrease fraction for the feasible-point rescue
+    # (see class docstring); None disables it.
+    feasible_kkt_progress: float | None = 0.1
 
 
 @dataclass(frozen=True, slots=True)
