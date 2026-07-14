@@ -119,8 +119,17 @@ class LineSearchOptions:
     s_phi: float = 2.3
     eta_phi: float = 1e-4  # Armijo constant
     # Required scaled-KKT-error decrease fraction for the feasible-point rescue
-    # (see class docstring); None disables it.
-    feasible_kkt_progress: float | None = 0.1
+    # (see class docstring); None (default) disables it. OPT-IN: the S2MPJ v14
+    # corpus sweep (2026-07-14) attributed 48 correct→incorrect flips to the
+    # rescue as a default — on unconstrained/bounds-only problems (θ ≡ 0, the
+    # rescue's whole domain) accepting Armijo-failing, KKT-decreasing steps
+    # walked nonconvex least-squares runs into different, worse stationary
+    # points (ROSENBRTU, MEYER3, GULF) or diverged f (FMINSURF family), while
+    # only 3 wins depended on it. The free-mode acceptance
+    # (``free_mode_acceptance``) covers the RT endgame this rescue was built
+    # for, and does so under the NWW §5 monitor instead of per-step
+    # certificates.
+    feasible_kkt_progress: float | None = None
     # Free-mode acceptance (NWW 2009, §5): while a non-monotone μ oracle
     # (``Options.mu_schedule`` other than "monotone") is in free mode, the
     # barrier problem changes every iteration and the W&B filter/Armijo

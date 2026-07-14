@@ -31,7 +31,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   stall (μ descends legitimately, then every iteration needs 11–27 Armijo
   backtracks at exact feasibility while IPOPT accepts first trials).
 - **Feasible-point KKT-progress acceptance in the filter line search**
-  (`LineSearchOptions.feasible_kkt_progress`, default `0.1`; `None` disables).
+  (`LineSearchOptions.feasible_kkt_progress`; **opt-in** — `None` by default,
+  set e.g. `0.1` to enable. The S2MPJ v14 sweep attributed 48
+  correct→incorrect flips to the rescue as a default: on
+  unconstrained/bounds-only problems — θ ≡ 0, exactly its domain — accepting
+  Armijo-failing, KKT-decreasing steps walked nonconvex least-squares runs
+  into worse stationary points or diverged, while only 3 wins depended on it;
+  the free-mode acceptance below covers the RT endgame it was built for).
   At a (numerically) feasible iterate the W&B eq. (19) switching condition
   holds for every descent direction — its right side is `δ·θ0^{s_θ} ≈ 0` — so
   every trial faces the full Armijo test and the θ-type acceptance branch

@@ -30,22 +30,8 @@ def _record_kkt_progress_kwargs(monkeypatch):
 
 def test_driver_passes_certifier_at_feasible_iterates(namespace, monkeypatch):
     # HS35 from a strictly feasible interior point: the linear inequality keeps
-    # θ = 0 along the whole trajectory, so every line search must receive the
-    # KKT-progress certifier.
-    seen = _record_kkt_progress_kwargs(monkeypatch)
-    problem = HS35(namespace)
-    result = solve(
-        problem,
-        array(namespace, [0.5, 0.5, 0.5]),
-        options=Options(hessian="exact", linsolve="dense"),
-    )
-
-    assert result.status is Status.OPTIMAL
-    assert len(seen) > 0
-    assert all(fn is not None for fn in seen)
-
-
-def test_certifier_disabled_by_option(namespace, monkeypatch):
+    # θ = 0 along the whole trajectory, so with the rescue enabled every line
+    # search must receive the KKT-progress certifier.
     seen = _record_kkt_progress_kwargs(monkeypatch)
     problem = HS35(namespace)
     result = solve(
@@ -54,8 +40,27 @@ def test_certifier_disabled_by_option(namespace, monkeypatch):
         options=Options(
             hessian="exact",
             linsolve="dense",
-            line_search=LineSearchOptions(feasible_kkt_progress=None),
+            line_search=LineSearchOptions(feasible_kkt_progress=0.1),
         ),
+    )
+
+    assert result.status is Status.OPTIMAL
+    assert len(seen) > 0
+    assert all(fn is not None for fn in seen)
+
+
+def test_certifier_disabled_by_default(namespace, monkeypatch):
+    # OPT-IN since the S2MPJ v14 sweep: as a default the rescue walked
+    # unconstrained/bounds-only runs (θ ≡ 0 — its whole domain) into worse
+    # stationary points (48 corpus flips attributed). The default must not
+    # wire the certifier at all.
+    assert LineSearchOptions().feasible_kkt_progress is None
+    seen = _record_kkt_progress_kwargs(monkeypatch)
+    problem = HS35(namespace)
+    result = solve(
+        problem,
+        array(namespace, [0.5, 0.5, 0.5]),
+        options=Options(hessian="exact", linsolve="dense"),
     )
 
     assert result.status is Status.OPTIMAL
@@ -65,13 +70,18 @@ def test_certifier_disabled_by_option(namespace, monkeypatch):
 
 def test_certifier_absent_at_infeasible_iterates(namespace, monkeypatch):
     # From an infeasible start (g = +3) the early iterations have θ0 > 0: the
-    # rescue is a θ0 = 0 mechanism only, so those searches get no certifier.
+    # rescue is a θ0 = 0 mechanism only, so even with the option enabled those
+    # searches get no certifier.
     seen = _record_kkt_progress_kwargs(monkeypatch)
     problem = HS35(namespace)
     result = solve(
         problem,
         array(namespace, [2.0, 2.0, 2.0]),
-        options=Options(hessian="exact", linsolve="dense"),
+        options=Options(
+            hessian="exact",
+            linsolve="dense",
+            line_search=LineSearchOptions(feasible_kkt_progress=0.1),
+        ),
     )
 
     assert result.status is Status.OPTIMAL
