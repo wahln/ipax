@@ -7,6 +7,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Free-mode line-search acceptance — the NWW §5 two-regime globalization**
+  (`LineSearchOptions.free_mode_acceptance`, default `"obj-constr-filter"`;
+  `"rigorous"` opts out). Under a non-monotone μ oracle
+  (`Options.mu_schedule` other than the default `"monotone"`) the barrier
+  problem changes every iteration, so the W&B filter/Armijo machinery is not
+  a consistent per-trial merit gate; NWW 2009 §5 carries global convergence
+  entirely in the iterate-level KKT-error monitor (`BarrierOptions.fallback`)
+  and lets the free-mode search "interfere with adaptive steps as little as
+  possible". While the monitor is in free mode, a trial is now accepted when
+  `(θ + margin, f + margin)` — the **raw objective**, comparable across μ
+  re-targets, not φ_μ — is acceptable to a filter of the previous free
+  iterates, with IPOPT's margins
+  (`free_filter_margin_fact · min(free_filter_max_margin, kkt_error)`; the
+  `filter_margin_fact`/`filter_max_margin` defaults). The θ_max guard,
+  non-finite rejections, and the L-BFGS overshoot check stay as safety
+  invariants. A *failed* free-mode search switches to monotone mode (IPOPT's
+  skipped-line-search signal: the μ oracle is suspended, μ restarts from the
+  centrality-floored complementarity, and the rigorous W&B search — with SOC,
+  the feasible-point rescue, and restoration — governs until the monitor
+  re-admits free mode). Inert for the default monotone schedule: default
+  behavior is unchanged. This is the IPOPT-parity fix for the RT filter-route
+  stall (μ descends legitimately, then every iteration needs 11–27 Armijo
+  backtracks at exact feasibility while IPOPT accepts first trials).
 - **Feasible-point KKT-progress acceptance in the filter line search**
   (`LineSearchOptions.feasible_kkt_progress`, default `0.1`; `None` disables).
   At a (numerically) feasible iterate the W&B eq. (19) switching condition

@@ -29,6 +29,7 @@ LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
 Globalization = Literal["filter", "breedveld"]
 MuSchedule = Literal["monotone", "adaptive", "breedveld", "probing", "quality"]
 MuFallback = Literal["kkt-error", "never"]
+FreeModeAcceptance = Literal["obj-constr-filter", "rigorous"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
 DenseKKTRoute = Literal["condensed", "augmented"]
@@ -120,6 +121,36 @@ class LineSearchOptions:
     # Required scaled-KKT-error decrease fraction for the feasible-point rescue
     # (see class docstring); None disables it.
     feasible_kkt_progress: float | None = 0.1
+    # Free-mode acceptance (NWW 2009, §5): while a non-monotone μ oracle
+    # (``Options.mu_schedule`` other than "monotone") is in free mode, the
+    # barrier problem changes every iteration and the W&B filter/Armijo
+    # machinery is not a consistent per-trial merit gate — global convergence
+    # is carried by the iterate-level KKT-error monitor
+    # (``BarrierOptions.fallback``). "obj-constr-filter" (default; the NWW §5
+    # obj-constr variant with IPOPT's margins) then accepts a trial when
+    # ``(θ + margin, f + margin)`` — the raw objective, comparable across μ
+    # re-targets — is acceptable to the filter of previous free iterates;
+    # once the monitor trips to monotone mode the rigorous W&B search governs
+    # again. "rigorous" keeps the W&B gate in both regimes. Inert for the
+    # (default) monotone schedule — default behavior is unchanged.
+    free_mode_acceptance: FreeModeAcceptance = "obj-constr-filter"
+    # Margin of the free-mode filter: ``margin = fact · min(max_margin,
+    # scaled KKT error)`` (IPOPT ``filter_margin_fact`` / ``filter_max_margin``
+    # defaults).
+    free_filter_margin_fact: float = 1e-5
+    free_filter_max_margin: float = 1.0
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.free_filter_margin_fact)
+            or self.free_filter_margin_fact < 0.0
+        ):
+            raise ValueError("free_filter_margin_fact must be finite and non-negative")
+        if (
+            not math.isfinite(self.free_filter_max_margin)
+            or self.free_filter_max_margin < 0.0
+        ):
+            raise ValueError("free_filter_max_margin must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,6 +632,7 @@ __all__ = [
     "CorrectionsOptions",
     "DenseKKTRoute",
     "DenseOptions",
+    "FreeModeAcceptance",
     "Globalization",
     "HessianMode",
     "KrylovMethod",

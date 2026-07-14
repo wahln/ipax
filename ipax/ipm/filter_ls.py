@@ -244,6 +244,85 @@ class FilterLineSearch:
             alpha *= 0.5
         return LineSearchResult(alpha_min, False, False, True, n_trials=trials)
 
+    def search_free(
+        self,
+        *,
+        alpha_max: float,
+        theta_max: float,
+        eval_point: Callable[[float], tuple[float, float]],
+        entries: list[tuple[float, float]],
+        margin: float,
+        grad_finite: Callable[[float], bool] | None = None,
+    ) -> LineSearchResult:
+        """Free-mode acceptance (NWW 2009, §5 globalization framework).
+
+        Under a free-mode μ oracle the barrier problem changes every iteration,
+        so the W&B filter/Armijo machinery is not a consistent per-trial merit
+        gate ("the history in the filter [is] reset at every free iteration
+        because the barrier problem itself changes" — NWW §5); global
+        convergence is carried by the iterate-level KKT-error monitor
+        (``FreeModeMonitor``), and the free-mode search should "interfere with
+        adaptive steps as little as possible". The per-trial test is the §5
+        obj-constr variant with IPOPT's margins
+        (``AdaptiveMuUpdate::CheckSufficientProgress``): the trial is accepted
+        when ``(θ_t + margin, f_t + margin)`` is acceptable to the filter of
+        previous free iterates — ``eval_point(α)`` returns ``(θ, f)`` with the
+        **raw objective** ``f``, which unlike φ_μ is comparable across μ
+        re-targets. No switching/Armijo test applies; the θ_max guard,
+        non-finite rejections, and the ``grad_finite`` overshoot check are
+        safety invariants and stay. SOC and the feasible-point KKT rescue are
+        rigorous-path mechanisms and are not consulted here.
+
+        The caller owns the free filter: it remembers each free iterate
+        (driver-side ``augment``) before searching, so the current point is an
+        entry — the margins are what keep this from degenerating to a monotone
+        requirement. Acceptance never augments the W&B filter
+        (``LineSearchResult.augment`` is always ``False``); a fully rejected
+        ray hands off to restoration exactly like the rigorous search.
+        """
+        alpha = alpha_max
+        alpha_min = self._o.alpha_min_frac
+        trials = 0
+        trace = logger.isEnabledFor(logging.DEBUG)
+        while alpha >= alpha_min:
+            trials += 1
+            theta_t, f_t = eval_point(alpha)
+            reason = self._free_reject_reason(theta_t, f_t, theta_max, margin, entries)
+            if reason is None and grad_finite is not None and not grad_finite(alpha):
+                reason = "non-finite-grad"
+            if trace:
+                logger.debug(
+                    "  ls trial %d: alpha=%.3e theta=%.3e f=%.3e -> %s",
+                    trials,
+                    alpha,
+                    theta_t,
+                    f_t,
+                    "free-accept" if reason is None else reason,
+                )
+            if reason is None:
+                return LineSearchResult(alpha, True, False, False, n_trials=trials)
+            alpha *= 0.5
+        return LineSearchResult(alpha_min, False, False, True, n_trials=trials)
+
+    def _free_reject_reason(
+        self,
+        theta_t: float,
+        f_t: float,
+        theta_max: float,
+        margin: float,
+        entries: list[tuple[float, float]],
+    ) -> str | None:
+        """The failing free-mode gate, or ``None`` if the trial is accepted."""
+        if not math.isfinite(theta_t) or not math.isfinite(f_t):
+            return "non-finite"
+        if theta_t >= theta_max:
+            return "theta-max"
+        # Sufficient progress vs every previous free iterate: beat some entry's
+        # θ or f by the margin (IPOPT: Acceptable(f + margin, θ + margin)).
+        if all(theta_t + margin < tj or f_t + margin < fj for tj, fj in entries):
+            return None
+        return "free-filter"
+
     def _switching(self, dphi: float, alpha: float, theta0: float) -> bool:
         o = self._o
         return dphi < 0.0 and alpha * _safe_pow(

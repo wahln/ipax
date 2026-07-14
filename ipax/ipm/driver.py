@@ -715,6 +715,15 @@ class IPMDriver:
         # §5: "the history in the filter [is] reset at every free iteration
         # because the barrier problem itself changes").
         filter_mu = mu
+        # Free-mode acceptance filter (NWW 2009, §5 obj-constr variant): the
+        # ``(θ, f)`` history of free-mode iterates, with the RAW objective —
+        # unlike φ_μ it is comparable across the oracle's per-iteration μ
+        # re-targets, which is why it (and not the W&B filter) is the
+        # free-mode merit memory. Never cleared during the run (IPOPT clears
+        # its globalization filter only at initialization); inert unless a
+        # non-monotone μ oracle is in free mode with
+        # ``LineSearchOptions.free_mode_acceptance="obj-constr-filter"``.
+        free_filt = Filter()
         line_search = FilterLineSearch(opts.line_search)
         # eq. (18): θ_max guard, fixed from the initial constraint violation.
         theta_max = _THETA_MAX_FACTOR * max(1.0, self._theta_l1(x, s, m, m_eq))
@@ -1443,6 +1452,7 @@ class IPMDriver:
             )
 
             used_soc = False
+            used_free_acceptance = False
             if use_breedveld:
                 alpha_p, restoration, last_line_search_iters = breedveld.search(
                     alpha_max=alpha_p_max,
@@ -1452,6 +1462,45 @@ class IPMDriver:
                     eval_point=eval_point,
                     iteration=it,
                 )
+            elif (
+                self._mu_schedule != "monotone"
+                and free_mode
+                and m + n_bounds > 0
+                and opts.line_search.free_mode_acceptance == "obj-constr-filter"
+            ):
+                # Free-mode acceptance (NWW 2009, §5; see ``search_free``): the
+                # oracle re-targets μ every iteration, so the weak (θ, f)
+                # margin-filter test governs; the KKT-error monitor above trips
+                # this branch off (``free_mode`` False ⇒ rigorous W&B search)
+                # on stagnation. Remember the current — accepted — iterate
+                # first, mirroring IPOPT's RememberCurrentPointAsAccepted: the
+                # margins are what keep the vs-current comparison from
+                # degenerating into a monotone requirement.
+                def eval_point_free(
+                    alpha: float,
+                    x: Array = x,
+                    s: Array = s,
+                    step: NewtonStep = step,
+                ) -> tuple[float, float]:
+                    x_t = x + alpha * step.dx
+                    s_t = s + alpha * step.ds if m > 0 else s
+                    return (self._theta_l1(x_t, s_t, m, m_eq), self._objective(x_t))
+
+                used_free_acceptance = True
+                free_filt.augment(theta0, objective)
+                result = line_search.search_free(
+                    alpha_max=alpha_p_max,
+                    theta_max=theta_max,
+                    eval_point=eval_point_free,
+                    entries=free_filt.entries,
+                    # IPOPT AdaptiveMuUpdate::CheckSufficientProgress margins.
+                    margin=opts.line_search.free_filter_margin_fact
+                    * min(opts.line_search.free_filter_max_margin, e0),
+                    grad_finite=grad_finite if use_lbfgs else None,
+                )
+                alpha_p = result.alpha
+                restoration = result.restoration
+                last_line_search_iters = result.n_trials
             else:
                 result = line_search.search(
                     alpha_max=alpha_p_max,
@@ -1483,6 +1532,53 @@ class IPMDriver:
                 last_line_search_iters = result.n_trials
                 if result.accepted and result.augment:
                     filt.augment(theta0, phi0)
+
+            if (
+                restoration
+                and used_free_acceptance
+                and opts.barrier.fallback != "never"
+            ):
+                # A failed free-mode line search is the switch-to-monotone
+                # trigger, not a restoration entry (NWW 2009, §5; IPOPT's
+                # skipped-line-search signal in AdaptiveMuUpdate: sufficient
+                # progress is denied, the mode flips, and the *rigorous* W&B
+                # machinery retries from the same iterate — restoration stays
+                # available to that path if it fails too). No step is taken;
+                # μ is re-seeded like the monitor's own trip at the loop top
+                # (monotone restart from the complementarity, floored by the
+                # El-Bakry centrality condition).
+                logger.debug(
+                    "iter %d: free-mode line search failed; switching to "
+                    "monotone mode (rigorous acceptance)",
+                    it,
+                )
+                mu_monitor.suspend(e0)
+                avg_compl, _ = complementarity_measures(
+                    s=s,
+                    y_ineq=y_ineq,
+                    z_lower=z_lower,
+                    z_upper=z_upper,
+                    x_minus_l=x_minus_l,
+                    u_minus_x=u_minus_x,
+                    mask_l=mask_l,
+                    mask_u=mask_u,
+                    m=m,
+                    n_bounds=n_bounds,
+                )
+                mu = fallback_mu(
+                    avg_compl,
+                    opts.barrier,
+                    opts.optimality.kkt_tol,
+                    infeasibility=max(
+                        residuals.dual_infeasibility,
+                        residuals.primal_infeasibility,
+                    ),
+                )
+                alpha_p = 0.0
+                last_alpha = 0.0
+                prev_x = None
+                last_step_solve_time = self._step_solve_seconds
+                continue
 
             if restoration:
                 outcome = self._handle_restoration(
