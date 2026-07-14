@@ -92,6 +92,19 @@ def test_filter_augment_removes_entries_dominated_by_new_pair():
     assert (0.5, 8.0) in filt.entries
 
 
+def test_filter_clear_empties_the_entries():
+    # The filter's φ coordinates are φ_μ values — meaningful only for the μ they
+    # were recorded at. The driver re-initializes the filter whenever μ changes
+    # (W&B 2006 filter re-initialization on a barrier update; IPOPT's
+    # ``FilterLSAcceptor::Reset`` via ``MonotoneMuUpdate``), so ``clear`` must
+    # restore the empty (everything-acceptable) state.
+    filt = Filter(entries=[(1.0, 10.0), (0.25, 20.0)])
+    filt.clear()
+
+    assert filt.entries == []
+    assert filt.is_acceptable(theta=1e6, phi=1e6)
+
+
 def test_ascent_step_rejected_at_feasible_point():
     # Regression: at a feasible iterate (θ0 = 0) the θ-progress branch
     # degenerates to "0 ≤ 0" and accepted *any* feasible trial — including a

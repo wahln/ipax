@@ -707,6 +707,14 @@ class IPMDriver:
         acceptable = ConditionChecker.for_acceptable(opts.acceptable)
 
         filt = Filter()
+        # μ the filter's φ entries were recorded at. The filter is
+        # re-initialized whenever the barrier parameter changes — its φ_μ
+        # coordinates are specific to that barrier problem (W&B 2006 filter
+        # re-initialization on a barrier update; IPOPT ``MonotoneMuUpdate`` /
+        # ``AdaptiveMuUpdate`` both call ``FilterLSAcceptor::Reset``; NWW 2009
+        # §5: "the history in the filter [is] reset at every free iteration
+        # because the barrier problem itself changes").
+        filter_mu = mu
         line_search = FilterLineSearch(opts.line_search)
         # eq. (18): θ_max guard, fixed from the initial constraint violation.
         theta_max = _THETA_MAX_FACTOR * max(1.0, self._theta_l1(x, s, m, m_eq))
@@ -1110,6 +1118,15 @@ class IPMDriver:
                     step_solve_failed = True
                 else:
                     step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
+
+            # Every μ-update path is complete for this iteration (fallback
+            # re-entry, free-mode oracle, monotone reduction, or a recenter
+            # escalation applied on the previous iteration's ``continue``):
+            # re-initialize the filter if the barrier problem changed, before
+            # anything consumes or augments it (see ``filter_mu`` above).
+            if mu != filter_mu:
+                filt.clear()
+                filter_mu = mu
 
             if step_solve_failed:
                 # Classify the failure: a solve that fails at an essentially

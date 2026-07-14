@@ -57,6 +57,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   diagnosed straight from the log without a rerun.
 
 ### Fixed
+- **The W&B filter is re-initialized whenever the barrier parameter changes.**
+  The filter's entries are `(θ, φ_μ)` pairs whose φ coordinate is specific to
+  the μ it was recorded at; W&B/IPOPT discard the filter history at every
+  barrier update (`FilterLSAcceptor::Reset` from both `MonotoneMuUpdate` and
+  `AdaptiveMuUpdate`; NWW 2009 §5: "the history in the filter [is] reset at
+  every free iteration because the barrier problem itself changes"). ipax
+  created one filter per solve and never cleared it, so stale old-μ φ entries
+  were compared against new-μ trial values — a spurious extra rejection gate
+  that tightens as μ shrinks. The θ_max guard region is separate state and
+  still applies across resets.
 - **The KKT-error fallback's monotone re-entry μ now respects the El-Bakry
   centrality floor.** The free-mode μ oracles were already floored at
   `κ_cent·max(dual, primal infeasibility)` (El-Bakry et al. 1996), but the

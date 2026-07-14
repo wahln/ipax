@@ -71,6 +71,19 @@ class Filter:
         ]
         self.entries.append((theta, phi))
 
+    def clear(self) -> None:
+        """Re-initialize to the empty (everything-acceptable) filter.
+
+        The φ coordinates are barrier objectives φ_μ — meaningful only for the
+        μ they were recorded at — so the filter history must be discarded
+        whenever the barrier parameter changes (W&B 2006: the filter is
+        re-initialized to eq. (18) at every barrier update; IPOPT
+        ``FilterLSAcceptor::Reset``). The eq. (18) guard region {θ ≥ θ_max}
+        survives a reset by construction: ipax keeps it as the separate
+        ``theta_max`` argument, not as entries.
+        """
+        self.entries.clear()
+
 
 @dataclass(frozen=True, slots=True)
 class LineSearchResult:
