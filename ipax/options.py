@@ -27,7 +27,7 @@ from typing import Literal
 HessianMode = Literal["auto", "lbfgs", "exact", "autodiff-hvp"]
 LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
 Globalization = Literal["filter", "breedveld"]
-MuSchedule = Literal["monotone", "adaptive", "breedveld", "probing"]
+MuSchedule = Literal["monotone", "adaptive", "breedveld", "probing", "quality"]
 MuFallback = Literal["kkt-error", "never"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
@@ -526,7 +526,13 @@ class Options:
     # config; ``"adaptive"`` re-targets μ every iteration by the LOQO
     # centrality rule (NWW 2009, eq. (3.6)); ``"breedveld"`` scales the duality
     # gap by the last accepted steplength (Breedveld et al. 2017,
-    # eqs. (10)–(12)). The oracle is orthogonal to ``corrections``: an active
+    # eqs. (10)–(12)); ``"quality"`` picks σ by minimizing a linear model of
+    # the *full* predicted KKT residual along the affine/centering family
+    # (NWW 2009, §3.3 — IPOPT's adaptive default; one extra KKT solve per
+    # iteration like probing). Unlike the complementarity-tracking oracles it
+    # is bidirectional: σ > 1 raises μ when the dual residual dominates a
+    # collapsed complementarity (the decentered-iterate failure mode).
+    # The oracle is orthogonal to ``corrections``: an active
     # corrector aims at the oracle's μ. The non-monotone oracles are
     # safeguarded by the KKT-error fallback (``BarrierOptions.fallback``;
     # NWW 2009, §5.1) and the centrality floor.

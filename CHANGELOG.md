@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **`mu_schedule="quality"` — the quality-function μ oracle** (Nocedal,
+  Wächter & Waltz 2009, §3.3; IPOPT's adaptive default), completing the NWW
+  oracle set alongside probing and LOQO. σ is chosen by minimizing a linear
+  model of the *full* predicted KKT residual — dual and primal infeasibility
+  at the fraction-to-boundary steplengths the direction attains, plus the
+  predicted complementarity — over the affine/centering family
+  `d(σ) = d_aff + σ·d_cen` (one extra solve against the already-factored KKT
+  operator; candidates are vector algebra by linearity; log-grid bracket +
+  golden section per NWW §4). Unlike the complementarity-tracking oracles
+  (Mehrotra σ ≤ 1, LOQO σ ≤ 0.8) it is **bidirectional**: σ > 1 *raises* μ
+  when the dual residual dominates a collapsed complementarity — the
+  decentered-iterate failure mode behind the RT fluence stall — while staying
+  closed-loop (a large μ scores badly through its own predicted
+  complementarity, so raises are self-limiting). Opt-in; the default schedule
+  remains `monotone`.
 - **The sparse-direct inertia check now covers the L-BFGS (default) Hessian
   route.** `_CondensedOperator.expected_inertia` previously returned `None` for
   a diagonal-plus-low-rank Hessian, so a genuinely nonconvex problem on the

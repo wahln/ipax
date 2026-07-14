@@ -170,7 +170,7 @@ def _mu_trace(result) -> tuple[float, ...]:
     return tuple(record.mu for record in result.history)
 
 
-@pytest.mark.parametrize("schedule", ["adaptive", "breedveld"])
+@pytest.mark.parametrize("schedule", ["adaptive", "breedveld", "quality"])
 def test_schedule_solves_hs35_and_changes_mu_trace(namespace, schedule):
     problem, result = _solve_hs35(namespace, schedule)
     _, monotone = _solve_hs35(namespace, "monotone")
@@ -182,7 +182,7 @@ def test_schedule_solves_hs35_and_changes_mu_trace(namespace, schedule):
     assert _mu_trace(result) != _mu_trace(monotone)
 
 
-@pytest.mark.parametrize("schedule", ["adaptive", "breedveld"])
+@pytest.mark.parametrize("schedule", ["adaptive", "breedveld", "quality"])
 def test_schedule_solves_bound_qp(namespace, schedule):
     problem = BoundConstrainedQP(namespace)
     result = solve(
@@ -211,6 +211,18 @@ def test_probing_standalone_solves_and_changes_mu_trace(namespace):
     # NWW 2009 "Mehrotra probing" as a plain strategy: the affine solve is only
     # a σ probe; the step itself is the ordinary centered Newton direction.
     problem, result = _solve_hs35(namespace, "probing")
+    _, monotone = _solve_hs35(namespace, "monotone")
+
+    assert result.status is Status.OPTIMAL
+    assert_allclose(namespace, result.x, problem.known_solution(), rtol=1e-6, atol=1e-6)
+    assert _mu_trace(result) != _mu_trace(monotone)
+
+
+def test_quality_standalone_solves_and_changes_mu_trace(namespace):
+    # NWW 2009 §3.3 quality function as a plain strategy: like probing it needs
+    # the affine direction, so the standalone mode runs the corrector path with
+    # a plain centered re-solve; σ then minimizes the predicted full-KKT model.
+    problem, result = _solve_hs35(namespace, "quality")
     _, monotone = _solve_hs35(namespace, "monotone")
 
     assert result.status is Status.OPTIMAL

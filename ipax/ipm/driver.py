@@ -69,6 +69,7 @@ from ipax.ipm.corrections import (
     CorrectionContext,
     HigherOrderCorrection,
     probing_mu,
+    quality_mu,
     select_corrector,
 )
 from ipax.ipm.filter_ls import Filter, FilterLineSearch
@@ -360,11 +361,11 @@ class IPMDriver:
         corrections = options.corrections
         assert not isinstance(corrections, str)  # normalized by Options.__post_init__
         self._corrector: HigherOrderCorrection = select_corrector(corrections)
-        # Standalone "probing" (no corrector requested) runs the corrector path
-        # with a plain centered re-solve, since the probing oracle needs the
-        # affine direction anyway (Nocedal, Wächter & Waltz 2009, §3).
+        # Standalone "probing"/"quality" (no corrector requested) run the
+        # corrector path with a plain centered re-solve, since both oracles
+        # need the affine direction (Nocedal, Wächter & Waltz 2009, §3).
         self._mu_schedule: MuSchedule = options.mu_schedule
-        if self._mu_schedule == "probing" and not self._corrector.active:
+        if self._mu_schedule in ("probing", "quality") and not self._corrector.active:
             self._corrector = CenteringOnly()
         self._problem_time_total = 0.0
         self._linear_eq_data = self._normalize_linear_eq(problem.linear_eq())
@@ -1042,9 +1043,8 @@ class IPMDriver:
                     mu=mu,
                     last_alpha=last_alpha,
                     free_mode=free_mode,
-                    infeasibility=max(
-                        residuals.dual_infeasibility, residuals.primal_infeasibility
-                    ),
+                    dual_infeasibility=residuals.dual_infeasibility,
+                    primal_infeasibility=residuals.primal_infeasibility,
                     err_kwargs=err_kwargs,
                 )
                 if corrected is None:
@@ -1631,9 +1631,11 @@ class IPMDriver:
         complementarity on every iteration: ``"adaptive"`` via the LOQO
         centrality rule (Nocedal, Wächter & Waltz 2009, eqs. (3.1)/(3.6)),
         ``"breedveld"`` via the steplength-driven duality-gap reduction
-        (Breedveld 2017, eqs. (10)–(12)). ``"probing"`` never reaches this
-        method — it needs the affine direction, so it is applied on the
-        corrector path (see ``_corrected_step``). Problems without
+        (Breedveld 2017, eqs. (10)–(12)). ``"probing"`` and ``"quality"``
+        never reach this method in free mode — they need the affine direction,
+        so they are applied on the corrector path (see ``_corrected_step``);
+        with ``free_mode`` ``False`` they fall to the monotone reduction like
+        every oracle. Problems without
         complementarity pairs — and, for the steplength rule, iterations before
         the first accepted step — fall back to keeping/reducing μ monotonically.
         With ``free_mode`` ``False`` (the NWW §5.1 safeguard tripped) every
@@ -1664,7 +1666,10 @@ class IPMDriver:
         if schedule == "adaptive":
             mu_next = adaptive_mu(avg_compl, min_compl, opts.barrier, tol)
         else:
-            assert last_alpha is not None  # narrowed above
+            # Only the steplength rule remains: probing/quality are routed to
+            # the corrector path in free mode (guaranteed by the CenteringOnly
+            # installation in __init__), monotone/suspended exited above.
+            assert schedule == "breedveld" and last_alpha is not None
             mu_next = breedveld_mu(avg_compl, last_alpha, opts.barrier, tol)
         # Centrality floor (El-Bakry et al. 1996): μ must not vanish faster
         # than the primal/dual infeasibility, or the barrier decenters at a
@@ -1782,19 +1787,23 @@ class IPMDriver:
         mu: float,
         last_alpha: float | None,
         free_mode: bool,
-        infeasibility: float,
+        dual_infeasibility: float,
+        primal_infeasibility: float,
         err_kwargs: dict[str, Any],
     ) -> tuple[float, NewtonStep, float] | None:
         """Affine predictor + μ oracle + higher-order corrector.
 
-        The affine direction doubles as the probe for the ``"probing"`` oracle;
-        any other ``mu_schedule`` picks the target via ``_next_mu`` and the
-        corrector merely aims at it (Nocedal, Wächter & Waltz 2009: the
-        corrector is not part of the barrier-parameter selection). Returns
-        ``(μ, step, δ_w)`` where ``μ`` is the barrier target the corrected
-        ``step`` aims at (adopted by the line search), or ``None`` if the
-        affine operator setup/solve failed despite regularization.
+        The affine direction doubles as the probe for the ``"probing"`` and
+        ``"quality"`` oracles (the latter also scores the centering family it
+        spans — NWW 2009, §3.3); any other ``mu_schedule`` picks the target via
+        ``_next_mu`` and the corrector merely aims at it (Nocedal, Wächter &
+        Waltz 2009: the corrector is not part of the barrier-parameter
+        selection). Returns ``(μ, step, δ_w)`` where ``μ`` is the barrier
+        target the corrected ``step`` aims at (adopted by the line search), or
+        ``None`` if the affine operator setup/solve failed despite
+        regularization.
         """
+        infeasibility = max(dual_infeasibility, primal_infeasibility)
         affine_rhs = self._condensed_rhs(0.0, 0.0, 0.0, **rhs_kwargs)
         dx_aff, dy_aff, reg_applied, ok = solve_step_timed(
             w, sigma_x, sigma_s, ineq_jac, affine_rhs, eq_jac, m_eq, -c, delta_c
@@ -1844,10 +1853,15 @@ class IPMDriver:
                 self._options.barrier.mu_min, self._options.optimality.kkt_tol / 10.0
             ),
         )
-        if free_mode and self._mu_schedule == "probing":
+        if free_mode and self._mu_schedule in ("probing", "quality"):
+            oracle_mu = (
+                quality_mu(context, dual_infeasibility, primal_infeasibility)
+                if self._mu_schedule == "quality"
+                else probing_mu(context)
+            )
             # Centrality floor (El-Bakry et al. 1996) — see BarrierOptions.
             mu_target = max(
-                probing_mu(context),
+                oracle_mu,
                 self._options.barrier.kappa_centrality * infeasibility,
             )
         else:
