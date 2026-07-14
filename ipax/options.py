@@ -69,15 +69,17 @@ class BarrierOptions:
     fallback_kappa: float = 0.9999  # κ ∈ (0, 1)
     fallback_window: int = 5  # l_max ≥ 0
     fallback_mu_factor: float = 0.8  # monotone re-entry μ factor
-    # Centrality floor for the free-mode oracles: μ ≥ κ_cent·max(dual, primal
+    # Centrality floor for μ re-targeting: μ ≥ κ_cent·max(dual, primal
     # infeasibility). El-Bakry et al. (1996)'s convergence theory requires the
     # complementarity gap not to vanish faster than the KKT residual; without
     # this floor an aggressive oracle can crush μ near a saddle while the dual
     # infeasibility is still O(1), pinning the iterate to the boundary with no
-    # barrier left to re-center (and leaving the KKT-error fallback's
-    # complementarity-based re-entry μ powerless). The complementarity
-    # component is deliberately excluded so superlinear μ decrease near a
-    # solution is unimpeded. ``0.0`` disables the floor.
+    # barrier left to re-center. Applied by the free-mode oracles *and* by the
+    # KKT-error fallback's monotone re-entry μ (whose complementarity-based
+    # value is otherwise powerless exactly when complementarity has collapsed
+    # below the true residual). The complementarity component is deliberately
+    # excluded so superlinear μ decrease near a solution is unimpeded.
+    # ``0.0`` disables the floor.
     kappa_centrality: float = 1e-2
 
     def __post_init__(self) -> None:

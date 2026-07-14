@@ -26,6 +26,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   diagnosed straight from the log without a rerun.
 
 ### Fixed
+- **The KKT-error fallback's monotone re-entry μ now respects the El-Bakry
+  centrality floor.** The free-mode μ oracles were already floored at
+  `κ_cent·max(dual, primal infeasibility)` (El-Bakry et al. 1996), but the
+  NWW §5.1 fallback re-initialized μ from `0.8·(average complementarity)`
+  alone — powerless exactly in the failure mode it guards against: a frozen
+  primal against full-fraction dual steps collapses the complementarity far
+  *below* the true KKT error, so the fallback re-entered monotone mode at the
+  ε/10 floor and was stuck there (monotone never raises μ). Observed as a
+  480-iteration μ pin at lg(μ) = −9 on an RT fluence case whose dual residual
+  sat at ~1e-4 throughout; the floored re-entry lands at ~1e-6 instead.
 - **A repeated feasible-point re-center now raises μ instead of treadmilling
   at the same barrier.** Observed on an RT fluence case (4882 lower-bounded
   variables, L-BFGS/sparse): the free-mode μ oracle pinned μ at its ε/10 floor

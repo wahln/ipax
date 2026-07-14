@@ -101,14 +101,35 @@ def breedveld_mu(
     return float(max(_mu_floor(options, tol), sigma * avg_compl))
 
 
-def fallback_mu(avg_compl: float, options: BarrierOptions, tol: float) -> float:
+def fallback_mu(
+    avg_compl: float,
+    options: BarrierOptions,
+    tol: float,
+    infeasibility: float = 0.0,
+) -> float:
     """Monotone-mode re-entry μ (Nocedal, Wächter & Waltz 2009, §5.1).
 
     When the free-mode safeguard trips, the monotone strategy restarts from a
     fraction of the current complementarity: ``μ = 0.8·(average complementarity)``
     in the paper's implementations, floored like every schedule.
+
+    ``infeasibility`` (the current primal/dual residual) applies the same
+    El-Bakry centrality floor ``μ ≥ κ_cent·infeasibility`` the free-mode
+    oracles already respect. Without it, an iterate whose complementarity has
+    collapsed *below* the true KKT error — a frozen primal against
+    full-fraction dual steps drives the products to the μ target while the
+    dual residual stands still — re-enters monotone mode at the ε/10 floor and
+    is stuck there: monotone can never raise μ, and the barrier problem at
+    that μ is unsolvable from the decentered iterate (observed as a 480-
+    iteration μ pin on an RT fluence case).
     """
-    return float(max(_mu_floor(options, tol), options.fallback_mu_factor * avg_compl))
+    return float(
+        max(
+            _mu_floor(options, tol),
+            options.fallback_mu_factor * avg_compl,
+            options.kappa_centrality * infeasibility,
+        )
+    )
 
 
 class FreeModeMonitor:

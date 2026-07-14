@@ -806,7 +806,11 @@ class IPMDriver:
                 free_mode, entered_monotone = mu_monitor.observe(e0)
                 if entered_monotone and m + n_bounds > 0:
                     # NWW 2009, §5.1: restart the monotone strategy from a
-                    # fraction of the current complementarity.
+                    # fraction of the current complementarity — floored by the
+                    # centrality condition (El-Bakry et al. 1996) on the
+                    # *current* primal/dual residual, matching the free-mode
+                    # paths: a collapsed complementarity must not re-enter
+                    # monotone mode at a μ the decentered iterate cannot solve.
                     avg_compl, _ = complementarity_measures(
                         s=s,
                         y_ineq=y_ineq,
@@ -819,7 +823,15 @@ class IPMDriver:
                         m=m,
                         n_bounds=n_bounds,
                     )
-                    mu = fallback_mu(avg_compl, opts.barrier, opts.optimality.kkt_tol)
+                    mu = fallback_mu(
+                        avg_compl,
+                        opts.barrier,
+                        opts.optimality.kkt_tol,
+                        infeasibility=max(
+                            residuals.dual_infeasibility,
+                            residuals.primal_infeasibility,
+                        ),
+                    )
                     logger.debug(
                         "iter %d: free-mode safeguard tripped (e0=%.3e); "
                         "monotone mode from mu=%.3e",
