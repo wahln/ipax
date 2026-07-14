@@ -58,7 +58,7 @@ from benchmarks.harness import (
     run_case,
     to_payload,
 )
-from ipax.options import KrylovOptions
+from ipax.options import KrylovOptions, LineSearchOptions
 from ipax.testing.backends import import_namespace
 
 # Per-route variable caps. The linear-solver routes have very different size
@@ -77,6 +77,10 @@ _SPARSE_MAX_VARS = 25000
 # (label, options, per-route variable cap). A cap of 0 means "no cap".
 ConfigSpec = tuple[str, ipax.Options, int]
 
+# Sentinel distinguishing "keep the solver default" from an explicit value for
+# option-override levers whose overrides can legitimately be None.
+_KEEP_DEFAULT: float | None = float("nan")
+
 
 def default_configs(
     max_iter: int,
@@ -88,6 +92,7 @@ def default_configs(
     sparse_max_vars: int = _SPARSE_MAX_VARS,
     krylov_preconditioner: str | None = None,
     mu_schedule: str | None = None,
+    feasible_kkt_progress: float | None = _KEEP_DEFAULT,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -112,6 +117,13 @@ def default_configs(
         # μ-oracle A/B lever (e.g. probing-default vs monotone); None keeps
         # the solver default so ordinary sweeps track it automatically.
         common["mu_schedule"] = mu_schedule
+    if feasible_kkt_progress is not _KEEP_DEFAULT:
+        # Tier-3 rescue A/B lever (None disables the feasible-point
+        # KKT-progress acceptance); the sentinel keeps the solver default so
+        # ordinary sweeps track it automatically.
+        common["line_search"] = LineSearchOptions(
+            feasible_kkt_progress=feasible_kkt_progress
+        )
     krylov_common = dict(common)
     if krylov_preconditioner is not None:
         krylov_common["krylov"] = KrylovOptions(preconditioner=krylov_preconditioner)  # type: ignore[arg-type]
@@ -400,6 +412,14 @@ def main(argv: list[str] | None = None) -> int:
         "default) — the lever for a schedule A/B such as probing vs monotone.",
     )
     parser.add_argument(
+        "--feasible-kkt-progress",
+        default=None,
+        help="override LineSearchOptions.feasible_kkt_progress on every config: "
+        "'none' disables the feasible-point KKT-progress rescue, a float sets "
+        "the required decrease fraction (default: the solver default) — the "
+        "lever for a Tier-3 rescue A/B.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -456,6 +476,15 @@ def main(argv: list[str] | None = None) -> int:
         sparse_max_vars=args.sparse_max_vars,
         krylov_preconditioner=args.preconditioner,
         mu_schedule=args.mu_schedule,
+        feasible_kkt_progress=(
+            _KEEP_DEFAULT
+            if args.feasible_kkt_progress is None
+            else (
+                None
+                if args.feasible_kkt_progress.lower() == "none"
+                else float(args.feasible_kkt_progress)
+            )
+        ),
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}
