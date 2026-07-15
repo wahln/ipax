@@ -43,6 +43,7 @@ import dataclasses
 import json
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import ipax
 from benchmarks.corpus.s2mpj import (
@@ -93,6 +94,7 @@ def default_configs(
     krylov_preconditioner: str | None = None,
     mu_schedule: str | None = None,
     feasible_kkt_progress: float | None = _KEEP_DEFAULT,
+    free_mode_acceptance: str | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -117,13 +119,19 @@ def default_configs(
         # μ-oracle A/B lever (e.g. probing-default vs monotone); None keeps
         # the solver default so ordinary sweeps track it automatically.
         common["mu_schedule"] = mu_schedule
+    # Line-search override levers; unset levers keep the solver defaults so
+    # ordinary sweeps track them automatically.
+    ls_overrides: dict[str, Any] = {}
     if feasible_kkt_progress is not _KEEP_DEFAULT:
         # Tier-3 rescue A/B lever (None disables the feasible-point
-        # KKT-progress acceptance); the sentinel keeps the solver default so
-        # ordinary sweeps track it automatically.
-        common["line_search"] = LineSearchOptions(
-            feasible_kkt_progress=feasible_kkt_progress
-        )
+        # KKT-progress acceptance).
+        ls_overrides["feasible_kkt_progress"] = feasible_kkt_progress
+    if free_mode_acceptance is not None:
+        # NWW §5 free-mode acceptance A/B lever ("rigorous" keeps the W&B gate
+        # in both regimes); only observable under a non-monotone --mu-schedule.
+        ls_overrides["free_mode_acceptance"] = free_mode_acceptance
+    if ls_overrides:
+        common["line_search"] = LineSearchOptions(**ls_overrides)
     krylov_common = dict(common)
     if krylov_preconditioner is not None:
         krylov_common["krylov"] = KrylovOptions(preconditioner=krylov_preconditioner)  # type: ignore[arg-type]
@@ -407,9 +415,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--mu-schedule",
         default=None,
-        choices=["monotone", "adaptive", "breedveld", "probing"],
+        choices=["monotone", "adaptive", "breedveld", "probing", "quality"],
         help="override the barrier μ oracle on every config (default: the solver "
         "default) — the lever for a schedule A/B such as probing vs monotone.",
+    )
+    parser.add_argument(
+        "--free-mode-acceptance",
+        default=None,
+        choices=["obj-constr-filter", "rigorous"],
+        help="override LineSearchOptions.free_mode_acceptance on every config "
+        "(default: the solver default) — the lever for the NWW §5 free-mode "
+        "acceptance A/B; only observable under a non-monotone --mu-schedule.",
     )
     parser.add_argument(
         "--feasible-kkt-progress",
@@ -485,6 +501,7 @@ def main(argv: list[str] | None = None) -> int:
                 else float(args.feasible_kkt_progress)
             )
         ),
+        free_mode_acceptance=args.free_mode_acceptance,
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}
