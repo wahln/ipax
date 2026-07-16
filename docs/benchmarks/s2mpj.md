@@ -198,23 +198,30 @@ release:
       (θ ≡ 0, exactly its domain) accepting Armijo-failing but KKT-decreasing
       steps walked nonconvex least-squares runs into worse stationary points.
       Set it (e.g. `0.1`) to opt in.
-    - **`LineSearchOptions.free_mode_acceptance`** — defaults to the NWW §5
-      `"obj-constr-filter"` weak test, but is only reachable under a
-      **non-monotone `mu_schedule`** (itself opt-in; the default schedule is
-      `monotone`), so the default solver never uses it.
+    - **`LineSearchOptions.free_mode_acceptance`** — defaults to `"rigorous"`
+      (the Wächter & Biegler gate in both regimes). The NWW §5
+      `"obj-constr-filter"` weak test is opt-in, and in any case only reachable
+      under a **non-monotone `mu_schedule`** (itself opt-in; the default
+      schedule is `monotone`), so the default solver never uses it.
 
-    Paired full-corpus A/Bs of the free-mode acceptance against `"rigorous"`
-    (the Wächter & Biegler gate in both regimes) are **≈ neutral overall** —
-    `quality` +6, `probing` ±0 — but with heavy two-way churn (~55 flips each
-    way per arm). About half the regressions are *wrong-optimum*: the weak
-    per-trial test drops the merit-function guardrail, so on basin-sensitive
-    nonconvex problems (`WOMFLET`, `OET7`, `SPIRAL`, `READING5`, `ELATTAR`,
-    `DISCS`) the solver reliably converges to a different, worse local optimum.
-    It buys a large win on the radiotherapy-style workloads it was built for
-    (near-feasible iterates where the eq. (19) switching condition degenerates
-    and the rigorous gate grinds through 10+ backtracks per iteration). If you
-    run a non-monotone oracle on a nonconvex problem and land on the wrong
-    optimum, set `free_mode_acceptance="rigorous"`.
+    Paired full-corpus A/Bs of the weak test against `"rigorous"` are
+    **≈ neutral overall** — `quality` +6, `probing` ±0 — but with heavy two-way
+    churn (~55 flips each way per arm). About half the regressions are
+    *wrong-optimum*: the weak per-trial test drops the merit-function
+    guardrail, so on basin-sensitive nonconvex problems (`WOMFLET`, `OET7`,
+    `SPIRAL`, `READING5`, `ELATTAR`, `DISCS`) the solver reliably converges to
+    a different, worse local optimum — the same set in both arms, so this is
+    characterizable rather than run-to-run noise. `"rigorous"` is also the
+    IPOPT-parity setting: released IPOPT never weakens its *per-trial* test
+    either (its `(f, θ)` margin filter is an *iterate*-level progress check),
+    and the mechanisms that make its free mode work — the filter reset on every
+    μ change and the KKT-error monitor — are unconditional here.
+
+    Enable the weak test (`free_mode_acceptance="obj-constr-filter"`) for
+    central-path-following workloads (radiotherapy-style) where the rigorous
+    gate grinds at near-feasible iterates: at θ ≈ 0 the eq. (19) switching
+    condition degenerates, so every trial faces the full Armijo test and
+    iterations can cost 10+ backtracks.
 
 ## Reproducing
 

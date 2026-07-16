@@ -133,17 +133,32 @@ class LineSearchOptions:
     feasible_kkt_progress: float | None = None
     # Free-mode acceptance (NWW 2009, §5): while a non-monotone μ oracle
     # (``Options.mu_schedule`` other than "monotone") is in free mode, the
-    # barrier problem changes every iteration and the W&B filter/Armijo
-    # machinery is not a consistent per-trial merit gate — global convergence
-    # is carried by the iterate-level KKT-error monitor
-    # (``BarrierOptions.fallback``). "obj-constr-filter" (default; the NWW §5
-    # obj-constr variant with IPOPT's margins) then accepts a trial when
-    # ``(θ + margin, f + margin)`` — the raw objective, comparable across μ
-    # re-targets — is acceptable to the filter of previous free iterates;
-    # once the monitor trips to monotone mode the rigorous W&B search governs
-    # again. "rigorous" keeps the W&B gate in both regimes. Inert for the
-    # (default) monotone schedule — default behavior is unchanged.
-    free_mode_acceptance: FreeModeAcceptance = "obj-constr-filter"
+    # barrier problem changes every iteration, so the W&B filter/Armijo
+    # machinery is arguably not a consistent per-trial merit gate — NWW §5
+    # instead carries global convergence in the iterate-level KKT-error monitor
+    # (``BarrierOptions.fallback``). "obj-constr-filter" leans on that: it
+    # accepts a trial when ``(θ + margin, f + margin)`` — the raw objective,
+    # comparable across μ re-targets, unlike φ_μ — is acceptable to the filter
+    # of previous free iterates.
+    #
+    # OPT-IN. "rigorous" (default) keeps the W&B gate in both regimes, for two
+    # reasons. (1) It is the IPOPT-parity setting: released IPOPT never weakens
+    # its per-trial test — ``SetRigorousLineSearch(false)`` is commented out in
+    # IpAdaptiveMuUpdate.cpp, and its ``rigorous_`` flag only skips restoration
+    # anyway, never the acceptance test. IPOPT's own (f, θ) margin filter is an
+    # *iterate*-level progress check (AdaptiveMuUpdate::CheckSufficientProgress),
+    # not a per-trial one. The mechanisms that make IPOPT's free mode work — the
+    # filter reset on every μ change and the KKT-error monitor — are
+    # unconditional here. (2) The paired S2MPJ A/Bs (2026-07-16) put the weak
+    # test at ≈ neutral (quality +6, probing ±0) but with ~55 flips each way per
+    # arm, about half of them landing on a *different, worse* local optimum on
+    # basin-sensitive nonconvex problems (WOMFLET, OET7, SPIRAL, READING5,
+    # ELATTAR, DISCS — the same set in both arms, so this is characterizable,
+    # not noise): dropping the merit guardrail is load-bearing there.
+    # Enable it for central-path-following workloads (radiotherapy-style) where
+    # the rigorous gate grinds at near-feasible iterates. Inert for the
+    # (default) monotone schedule either way.
+    free_mode_acceptance: FreeModeAcceptance = "rigorous"
     # Margin of the free-mode filter: ``margin = fact · min(max_margin,
     # scaled KKT error)`` (IPOPT ``filter_margin_fact`` / ``filter_max_margin``
     # defaults).

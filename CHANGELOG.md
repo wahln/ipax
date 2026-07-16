@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+- **The NWW §5 free-mode line-search acceptance is now opt-in**
+  (`LineSearchOptions.free_mode_acceptance` defaults to `"rigorous"`; was
+  `"obj-constr-filter"` in 0.7.0). It only ever applied under a non-monotone
+  `mu_schedule` (itself opt-in), so the default solver is unaffected either
+  way — but a user selecting an adaptive μ oracle now keeps the Wächter &
+  Biegler gate unless they ask for the weak test. Two reasons. **Parity:**
+  `"rigorous"` is what IPOPT actually does — released IPOPT never weakens its
+  *per-trial* test (`SetRigorousLineSearch(false)` is commented out in
+  `IpAdaptiveMuUpdate.cpp`, and its `rigorous_` flag only skips restoration,
+  never the acceptance test); IPOPT's own `(f, θ)` margin filter is an
+  *iterate*-level progress check. The mechanisms that make its free mode work
+  — the filter reset on every μ change and the KKT-error monitor — are
+  unconditional in ipax and unaffected by this default. **Evidence:** paired
+  full-corpus A/Bs scored the weak test ≈ neutral (`quality` +6, `probing` ±0)
+  but with ~55 flips each way per arm, about half landing on a *different,
+  worse* local optimum on basin-sensitive nonconvex problems (`WOMFLET`,
+  `OET7`, `SPIRAL`, `READING5`, `ELATTAR`, `DISCS` — the same set in both arms,
+  so characterizable rather than noise). Enable it explicitly
+  (`free_mode_acceptance="obj-constr-filter"`) for central-path-following
+  workloads (radiotherapy-style) where the rigorous gate grinds at
+  near-feasible iterates.
+
 ## [0.7.0] - 2026-07-16
 
 ### Added
