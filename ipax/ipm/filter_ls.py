@@ -331,24 +331,6 @@ class FilterLineSearch:
             -dphi, o.s_phi
         ) > _SWITCH_DELTA * _safe_pow(theta0, o.s_theta)
 
-    def _accept(
-        self,
-        theta_t: float,
-        phi_t: float,
-        theta0: float,
-        phi0: float,
-        dphi: float,
-        alpha: float,
-        theta_max: float,
-        entries: list[tuple[float, float]],
-    ) -> bool:
-        return (
-            self._reject_reason(
-                theta_t, phi_t, theta0, phi0, dphi, alpha, theta_max, entries
-            )
-            is None
-        )
-
     def _reject_reason(
         self,
         theta_t: float,

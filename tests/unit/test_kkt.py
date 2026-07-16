@@ -508,6 +508,53 @@ def test_condensed_expected_inertia_lbfgs_folds_m_block(namespace):
     assert _inertia_of(namespace, _coo_to_dense(namespace, op)) == (5, 2, 0)
 
 
+def test_condensed_expected_inertia_low_rank_zero_columns(namespace):
+    """A low-rank form with an empty ``U`` has no border ⇒ the plain target."""
+    dtype = array(namespace, [0.0]).dtype
+
+    class _EmptyBorderW(Dense):
+        def diagonal_low_rank_form(self):
+            # Well-formed but zero-width: no curvature columns to border with.
+            return (
+                array(namespace, [4.0, 3.0]),
+                namespace.zeros((2, 0), dtype=dtype),
+                namespace.zeros((0, 0), dtype=dtype),
+            )
+
+    W = _EmptyBorderW(array(namespace, [[4.0, 0.0], [0.0, 3.0]]))
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75]))
+    sigma_s = Diagonal(array(namespace, [2.0]))
+    jac = Dense(array(namespace, [[1.0, 2.0]]))
+    op = build_condensed_operator(W, sigma_x, sigma_s, jac, RegularizationState())
+
+    assert op.expected_inertia() == (2, 1, 0)
+
+
+def test_condensed_expected_inertia_none_for_oversized_m_block(namespace, monkeypatch):
+    """An ``M`` block past the eigensolve cap gives no target (δ_w escalation)."""
+    from ipax.ipm import kkt as kkt_module
+
+    # The cap exists so the inertia check stays cheap; below it the same L-BFGS
+    # operator yields a target, so this isolates the size guard itself.
+    W = _lbfgs_with_pairs(
+        namespace,
+        3,
+        [
+            ([1.0, 0.0, 0.0], [2.0, 0.1, 0.1]),
+            ([0.0, 1.0, 0.0], [0.1, 3.0, 0.1]),
+        ],
+    )
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 0.5]))
+    empty_sigma_s, empty_jac = _empty_ineq_n(namespace, 3)
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState()
+    )
+    assert op.expected_inertia() == (5, 2, 0)  # M is 4×4: under the real cap
+
+    monkeypatch.setattr(kkt_module, "_LOWRANK_INERTIA_MAX", 2)
+    assert op.expected_inertia() is None
+
+
 def test_condensed_expected_inertia_lbfgs_with_inequalities(namespace):
     """Each inequality adds one −Σ_s⁻¹ negative on top of the folded In(M)."""
     W = _lbfgs_with_pairs(

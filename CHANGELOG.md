@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-16
+
 ### Added
 - **Free-mode line-search acceptance — the NWW §5 two-regime globalization**
   (`LineSearchOptions.free_mode_acceptance`, default `"obj-constr-filter"`;
@@ -127,6 +129,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   regularization prints `lg(rg)` as `-` instead of `0.00e+00`, so a nonzero δ_w
   stands out. This affects only the human-readable log; `IterationRecord` still
   carries the raw `mu` / `regularization` values.
+- `LineSearchOptions` now validates `feasible_kkt_progress`: it must lie in
+  `(0, 1)` (or be `None`). The gate accepts when `e_t ≤ (1 − γ)·e0`, so γ ≤ 0
+  would certify a KKT-error *increase* as progress and γ ≥ 1 could never fire —
+  both now raise instead of degenerating silently.
 
 ## [0.6.1] - 2026-07-13
 
@@ -1146,7 +1152,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/wahln/ipax/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/wahln/ipax/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/wahln/ipax/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/wahln/ipax/compare/v0.4.0...v0.5.0

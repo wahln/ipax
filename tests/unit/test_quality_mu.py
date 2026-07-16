@@ -142,6 +142,32 @@ def test_quality_mu_no_pairs_returns_zero(namespace):
     assert quality_mu(ctx, dual_infeasibility=1.0, primal_infeasibility=1.0) == 0.0
 
 
+def test_quality_mu_returns_mu_min_on_collapsed_complementarity(namespace):
+    # μ_avg ≤ 0 (here λ = 0, so every slack product vanishes): there is no
+    # complementarity scale left to build the σ family's targets from, so the
+    # oracle degrades to its floor rather than dividing by a zero average.
+    affine = _step(namespace, ds=-0.5, dy_ineq=-0.5)
+    ctx = CorrectionContext(
+        affine=affine,
+        s=array(namespace, [1.0]),
+        y_ineq=array(namespace, [0.0]),  # ⇒ s·λ = 0 ⇒ μ_avg = 0
+        x_minus_l=array(namespace, [1.0]),
+        u_minus_x=array(namespace, [1.0]),
+        z_lower=array(namespace, [0.0]),
+        z_upper=array(namespace, [0.0]),
+        mask_l=namespace.asarray([False]),
+        mask_u=namespace.asarray([False]),
+        solve=lambda *targets: None,
+        alpha_primal=_full_alpha,
+        alpha_dual=_full_alpha,
+        mu_min=1e-9,
+    )
+
+    mu = quality_mu(ctx, dual_infeasibility=1.0, primal_infeasibility=1.0)
+
+    assert mu == 1e-9
+
+
 def test_quality_mu_falls_back_to_probing_on_solve_failure(namespace):
     # No centering direction ⇒ no σ family to score: degrade honestly to the
     # Mehrotra σ-rule, which needs only the affine probe already in hand.
