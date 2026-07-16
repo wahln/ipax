@@ -10,6 +10,7 @@ from ipax.options import (
     AcceptableStoppingOptions,
     DenseOptions,
     KrylovOptions,
+    LineSearchOptions,
     OptimalityConditionOptions,
     Options,
 )
@@ -194,3 +195,36 @@ def test_dense_options_augmented_max_size_default_and_validation():
     assert DenseOptions(augmented_max_size=5).augmented_max_size == 5
     with pytest.raises(ValueError, match="augmented_max_size"):
         DenseOptions(augmented_max_size=0)
+
+
+def test_line_search_feasible_kkt_progress_defaults_to_disabled():
+    # Opt-in: as a default the rescue cost 48 S2MPJ corpus flips (nonconvex
+    # θ ≡ 0 problems walking into worse stationary points).
+    assert LineSearchOptions().feasible_kkt_progress is None
+    assert LineSearchOptions(feasible_kkt_progress=0.1).feasible_kkt_progress == 0.1
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        -0.1,  # (1 − γ) > 1 ⇒ would accept a KKT-error *increase*
+        0.0,  # no decrease required — not a progress certificate
+        1.0,  # requires e_t ≤ 0, which a norm never satisfies ⇒ never fires
+        1.5,
+        float("nan"),
+        float("inf"),
+    ],
+)
+def test_line_search_rejects_out_of_range_feasible_kkt_progress(value):
+    # The rescue accepts when e_t ≤ (1 − γ)·e0, so only γ ∈ (0, 1) is a
+    # meaningful decrease fraction; outside it the gate silently degenerates
+    # into "always accept" or "never accept" instead of erroring.
+    with pytest.raises(ValueError, match="feasible_kkt_progress"):
+        LineSearchOptions(feasible_kkt_progress=value)
+
+
+@pytest.mark.parametrize("field", ["free_filter_margin_fact", "free_filter_max_margin"])
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_line_search_rejects_invalid_free_filter_margins(field, value):
+    with pytest.raises(ValueError, match=field):
+        LineSearchOptions(**{field: value})

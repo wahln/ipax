@@ -312,6 +312,33 @@ def test_monitor_disabled_never_switches():
         assert monitor.observe(error) == (True, False)
 
 
+def test_monitor_suspend_forces_monotone_until_the_error_drops():
+    # The recenter-escalation hook: a raised μ must not be re-targeted away by
+    # the oracle on the very next iteration, so suspension holds monotone mode
+    # until the error falls below κ of the suspension point.
+    monitor = FreeModeMonitor(BarrierOptions())
+    assert monitor.observe(1.0) == (True, False)
+    monitor.suspend(1.0)
+    assert monitor.observe(1.0) == (False, False)  # not yet below κ·1.0
+    assert monitor.observe(0.5) == (True, False)  # progress ⇒ free mode resumes
+
+
+def test_monitor_suspend_keeps_the_tighter_switch_point():
+    monitor = FreeModeMonitor(BarrierOptions())
+    monitor.suspend(1.0)
+    monitor.suspend(0.1)  # already suspended: the tighter point wins
+    assert monitor.observe(0.5) == (False, False)  # above κ·0.1, still monotone
+    assert monitor.observe(0.05) == (True, False)
+
+
+def test_monitor_suspend_is_inert_when_the_safeguard_is_disabled():
+    # fallback="never" is pure free mode (IPOPT's never-monotone-mode): nothing
+    # — not even an external suspend — may drop it out of the free regime.
+    monitor = FreeModeMonitor(BarrierOptions(fallback="never"))
+    monitor.suspend(1.0)
+    assert monitor.observe(8.0) == (True, False)
+
+
 def test_fallback_mu_reinitializes_from_average_complementarity():
     # Monotone-mode re-entry μ = 0.8·(average complementarity) (NWW 2009 §5.1).
     assert_scalar_close(fallback_mu(2.0, BarrierOptions(), _TOL), 0.8 * 2.0)

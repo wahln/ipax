@@ -14,7 +14,10 @@ default (monotone) μ schedule never engages the weak path at all.
 
 from __future__ import annotations
 
+import logging
+
 from ipax import Options, Status, solve
+from ipax._logging import LOGGER_NAME
 from ipax.ipm.filter_ls import FilterLineSearch
 from ipax.options import BarrierOptions, LineSearchOptions
 from ipax.testing.problems import HS35
@@ -98,6 +101,28 @@ def test_free_search_accepts_theta_progress_with_worse_objective():
 
     assert result.accepted
     assert result.n_trials == 1
+
+
+def test_free_search_emits_per_trial_debug_trace(caplog):
+    # The free-mode search has its own trace labels (raw f, not φ_μ, and
+    # free-accept / free-filter reasons), so a non-monotone run's line-search
+    # behavior is readable from the log like the rigorous path's.
+    ls = FilterLineSearch(LineSearchOptions())
+    with caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+        result = ls.search_free(
+            alpha_max=1.0,
+            theta_max=1e4,
+            # Rejected at α = 1 (within margin), accepted once α halves.
+            eval_point=lambda alpha: (0.0, 1.0 if alpha > 0.5 else 0.5),
+            entries=[(0.0, 1.0)],
+            margin=0.1,
+        )
+
+    assert result.accepted
+    msgs = [r.getMessage() for r in caplog.records if "ls trial" in r.getMessage()]
+    assert any("free-filter" in m for m in msgs)  # the rejected trial
+    assert any("free-accept" in m for m in msgs)  # the accepted one
+    assert all("f=" in m for m in msgs)  # raw objective, not φ_μ
 
 
 def test_free_search_keeps_the_safety_guards():

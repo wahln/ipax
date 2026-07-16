@@ -63,6 +63,48 @@ def test_search_emits_per_trial_debug_trace(caplog):
     )  # each line carries the trial quantities
 
 
+def test_search_traces_soc_trials(caplog):
+    # A second-order-correction trial is labelled soc-* in the trace, so a
+    # heavy-backtracking log distinguishes SOC attempts from plain trials.
+    line_search = FilterLineSearch(LineSearchOptions())
+    with caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+        result = line_search.search(
+            alpha_max=1.0,
+            theta0=1.0,
+            phi0=1.0,
+            dphi=1.0,
+            theta_max=1e10,
+            eval_point=lambda alpha: (2.0, 2.0),  # θ rises ⇒ SOC is attempted
+            entries=[],
+            soc=lambda alpha: (0.1, 2.0),  # ... and the corrected trial is good
+        )
+
+    assert result.accepted and result.used_soc
+    msgs = [r.getMessage() for r in caplog.records if "ls trial" in r.getMessage()]
+    assert any("soc-accept" in m for m in msgs)
+
+
+def test_search_traces_kkt_progress_rescue(caplog):
+    # The rescue's acceptance is labelled distinctly from a plain accept — it
+    # is the one path that overrides an Armijo rejection.
+    line_search = FilterLineSearch(LineSearchOptions())
+    with caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+        result = line_search.search(
+            alpha_max=1.0,
+            theta0=0.0,
+            phi0=1.0,
+            dphi=-1e-6,
+            theta_max=1e4,
+            eval_point=lambda alpha: (0.0, 1.0 + 0.1 * alpha),  # Armijo fails
+            entries=[],
+            kkt_progress=lambda alpha: True,
+        )
+
+    assert result.accepted
+    msgs = [r.getMessage() for r in caplog.records if "ls trial" in r.getMessage()]
+    assert any("kkt-progress" in m for m in msgs)
+
+
 def test_empty_filter_accepts_candidate():
     filt = Filter()
     with implemented("filter"):

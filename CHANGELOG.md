@@ -127,6 +127,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   regularization prints `lg(rg)` as `-` instead of `0.00e+00`, so a nonzero δ_w
   stands out. This affects only the human-readable log; `IterationRecord` still
   carries the raw `mu` / `regularization` values.
+- `LineSearchOptions` now validates `feasible_kkt_progress`: it must lie in
+  `(0, 1)` (or be `None`). The gate accepts when `e_t ≤ (1 − γ)·e0`, so γ ≤ 0
+  would certify a KKT-error *increase* as progress and γ ≥ 1 could never fire —
+  both now raise instead of degenerating silently.
 
 ## [0.6.1] - 2026-07-13
 

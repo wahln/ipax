@@ -108,7 +108,8 @@ class LineSearchOptions:
     optimality progress *is* progress (the KKT-error-globalization philosophy
     of Nocedal, Wächter & Waltz 2009, §5.1, applied to step acceptance). The
     certificate costs one extra gradient/Jacobian evaluation and is consulted
-    on the first trial only. ``None`` disables the rescue.
+    on the first trial only. Must lie in ``(0, 1)``; ``None`` (the default)
+    disables the rescue.
     """
 
     max_soc: int = 4
@@ -150,6 +151,15 @@ class LineSearchOptions:
     free_filter_max_margin: float = 1.0
 
     def __post_init__(self) -> None:
+        # The rescue accepts when ``e_t ≤ (1 − γ)·e0``, so only γ ∈ (0, 1) is a
+        # meaningful decrease fraction: γ ≤ 0 makes the bound ≥ e0 (an *increase*
+        # in the KKT error would certify "progress"), and γ ≥ 1 demands a
+        # non-positive error, which a norm never delivers — the rescue would
+        # silently never fire. Reject both rather than degenerate quietly.
+        if self.feasible_kkt_progress is not None and not (
+            0.0 < self.feasible_kkt_progress < 1.0
+        ):
+            raise ValueError("feasible_kkt_progress must lie in (0, 1) or be None")
         if (
             not math.isfinite(self.free_filter_margin_fact)
             or self.free_filter_margin_fact < 0.0
