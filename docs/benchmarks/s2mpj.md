@@ -47,22 +47,21 @@ from every problem file:
 
 | | |
 | --- | --- |
-| date | 2026-07-13 |
+| date | 2026-07-15 |
 | CPU | 13th Gen Intel Core i9-13900HX (32 logical CPUs) |
 | OS | Windows 11 (10.0.26200), AMD64 |
 | Python | 3.14.6 |
-| ipax | 0.6.0 + correctness fixes (develop @ `cfeb399`) |
+| ipax | 0.6.1 + μ/line-search arc (develop @ `65d6a8e`) |
 | NumPy / SciPy | 2.4.6 / 1.17.1 |
 | PyTorch | 2.12.0+cpu |
-| sparse factorization | Feral LDLᵀ 0.11.0 (CPU) |
+| sparse factorization | Feral LDLᵀ (CPU) |
 
 ### Methodology
 
-The full `{lbfgs, exact} × {dense, krylov, sparse}` matrix was swept, one
-configuration per process (six in parallel, single-threaded BLAS), each process
-additionally running **four problems concurrently** (`--jobs 4`) — the whole
-six-config corpus completes in ~2.8 h wall. Gradient-based scaling (the solver
-default), NumPy backend. Per-solve budget: `max_iter = 10000`, `max_time = 300 s`.
+The full `{lbfgs, exact} × {dense, krylov, sparse}` matrix was swept in one run
+(`--all`), **four problems concurrently** (`--jobs 4`) with single-threaded
+BLAS. Gradient-based scaling (the solver default), NumPy backend. Per-solve
+budget: `max_iter = 10000`, `max_time = 300 s`.
 Each route is gated by a **per-route variable cap** (dense 2000, Krylov 10000,
 sparse 25000) so a single full-corpus run stays tractable — three problems exceed
 the dense cap and are reported as oversized for the two dense routes. The
@@ -87,15 +86,15 @@ terminal states.
 
 | config | correct | converged | optimal | acceptable | infeasible | stalled | rest.failed | max_iter | max_time | unbounded | num.err | solve.err |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `lbfgs/dense`  | 724 / 1098 | 858 | 745 | 112 | 58 | 97 | 63 | 18 | 4  | 1 | 0 | 0 |
-| `lbfgs/krylov` | 709 / 1101 | 842 | 735 | 106 | 58 | 88 | 67 | 14 | 32 | 1 | 0 | 0 |
-| `lbfgs/sparse` | 729 / 1101 | 862 | 742 | 119 | 59 | 95 | 62 | 20 | 3  | 1 | 0 | 0 |
-| `exact/dense`  | 727 / 1098 | 854 | 769 | 84  | 58 | 75 | 63 | 27 | 21 | 1 | 0 | 0 |
-| `exact/krylov` | 680 / 1101 | 817 | 765 | 51  | 58 | 84 | 53 | 26 | 64 | 0 | 0 | 0 |
-| `exact/sparse` | **769 / 1101** | **902** | **846** | 55 | 59 | 53 | 58 | 17 | 11 | 1 | 1 | 0 |
+| `lbfgs/dense`  | 734 / 1098 | 871 | 762 | 108 | 58 | 86 | 63 | 13 | 7  | 1 | 0 | 0 |
+| `lbfgs/krylov` | 716 / 1101 | 851 | 744 | 106 | 58 | 72 | 59 | 12 | 49 | 1 | 0 | 0 |
+| `lbfgs/sparse` | 745 / 1101 | 882 | 755 | 126 | 59 | 78 | 62 | 15 | 5  | 1 | 0 | 0 |
+| `exact/dense`  | 732 / 1098 | 859 | 776 | 82  | 58 | 69 | 60 | 24 | 28 | 1 | 0 | 0 |
+| `exact/krylov` | 681 / 1101 | 824 | 773 | 50  | 58 | 73 | 54 | 24 | 69 | 0 | 0 | 0 |
+| `exact/sparse` | **776 / 1101** | **909** | **858** | 50 | 59 | 46 | 58 | 16 | 12 | 1 | 1 | 0 |
 
-Solved-correct by **at least one route: 807 / 1101**; converged by at least one
-route: **940 / 1101**.
+Solved-correct by **at least one route: 809 / 1101**; converged by at least one
+route: **942 / 1101**.
 
 ### Results — optimization vs. feasibility problems
 
@@ -106,20 +105,20 @@ the optimization rate. The optimization column shows `correct` (`converged`).
 
 | config | optimization (894) | feasibility (207) |
 | --- | --- | --- |
-| `lbfgs/dense`  | 660 / 891* (794) | 64 / 207 |
-| `lbfgs/krylov` | 646 / 894  (779) | 63 / 207 |
-| `lbfgs/sparse` | 665 / 894  (798) | 64 / 207 |
-| `exact/dense`  | 673 / 891* (799) | 54 / 207 |
-| `exact/krylov` | 612 / 894  (749) | 68 / 207 |
-| `exact/sparse` | 694 / 894  (827) | 75 / 207 |
+| `lbfgs/dense`  | 670 / 891* (807) | 64 / 207 |
+| `lbfgs/krylov` | 653 / 894  (788) | 63 / 207 |
+| `lbfgs/sparse` | 681 / 894  (818) | 64 / 207 |
+| `exact/dense`  | 679 / 891* (805) | 53 / 207 |
+| `exact/krylov` | 614 / 894  (757) | 67 / 207 |
+| `exact/sparse` | 702 / 894  (835) | 74 / 207 |
 
 <small>* dense routes ran 891 of the 894 optimization problems; three exceed the
 dense variable cap.</small>
 
 ### Observations
 
-- **`exact/sparse` is the strongest route** — most correct (769) and most
-  optimal (846). Exact-Hessian Newton steps factored by the sparse-direct route
+- **`exact/sparse` is the strongest route** — most correct (776) and most
+  optimal (858). Exact-Hessian Newton steps factored by the sparse-direct route
   (Feral LDLᵀ with inertia control) is the most robust combination here.
 - **`numerical_error` is essentially gone** (51 → 0 on `exact/dense`, and 0–1
   on every route). A Newton step the δ_w regularization ladder cannot complete
@@ -150,7 +149,7 @@ dense variable cap.</small>
   KOEBHELB — whose iterate wanders past 1e22 and then converges to f = 112 —
   flipped from `unbounded` to `optimal` on the exact routes, while genuinely
   unbounded problems (INDEF) are still detected.
-- **The RT-typical `lbfgs/sparse`** route is solid (724 correct, 3
+- **The RT-typical `lbfgs/sparse`** route is solid (745 correct, 0
   `numerical_error`), validating the L-BFGS + sparse-direct path used for
   radiotherapy-scale problems.
 - **Documented-infeasible detection works**: `BURKEHAN` and the rest of the
@@ -159,34 +158,44 @@ dense variable cap.</small>
 - **No crashes**: the `solve_error` column is zero everywhere for the first
   time (the LINSPANH and HS9 crashes of the previous run are gone).
 
-#### Changes since the 2026-07-10 run
+#### Changes since the 2026-07-13 run
 
-Every route improved on `correct` — `exact/sparse` leads at 769 (was 762) and
-`exact/krylov` gained most (671 → 680). Solved-correct by ≥1 route held at
-807 (converged 940). The deltas map to the v0.7.0 correctness-hardening fixes:
+Every route improved on `correct`: net **+46** over the previous (2026-07-13)
+baseline (4338 → 4384 across the six configs), with **every config positive** —
+`exact/sparse` leads at 776 (was 769), `lbfgs/sparse` gained most (729 → 745).
+Solved-correct by ≥1 route rose to 809 (was 807; converged 942). The deltas map
+to the barrier-μ / line-search arc landed since the correctness-hardening
+release:
 
-- **A step-solve failure hands to feasibility restoration** instead of
-  `numerical_error` (Wächter & Biegler §3.1→§3.3). This clears the exact-route
-  `numerical_error` cluster (51 → 0 on `exact/dense`) — the objective-free
-  nonlinear-equation / NLS problems now report the honest
-  `infeasible`/`restoration_failed`/`stalled`, and DEMBO7/KISSING recover to
-  `optimal`.
-- **A near-feasible restoration verdict is downgraded to `stalled`, not
-  `infeasible`.** A point feasible to IPOPT's `constr_viol_tol` band (~1e-4)
-  cannot be distinguished from a degenerate near-feasible optimum, so it is no
-  longer declared locally infeasible — LEWISPOL (a multiplicity-3 degenerate
-  root that floors at θ ~ 1e-5, the float64 limit) and the ARGAUSS / LANCZOS /
-  MISRA1B cluster relabel `infeasible → stalled`. The downgrade is terminal
-  only, leaving restoration's resume / second-chance rescue path untouched.
-- **A line-search failure at an already-feasible point re-centers the barrier
-  state** (re-floor the slacks on μ, clip the multipliers to the central band)
-  instead of looping through restoration — breaking the HS101-class main-loop
-  limit cycle that used to end at a false `infeasible` (HS101 now `optimal` on
-  all three exact routes).
-- Two documented, non-blocking limitations surfaced by this run: **AGG** — a
-  feasible netlib LP the solver fails to converge (verified feasible vs HiGHS)
-  — and **OET7** — a single `lbfgs/sparse` basin flip to a feasible near-KKT
-  point (restoration churn).
+- **The W&B filter is re-initialized whenever μ changes.** The filter's
+  `(θ, φ_μ)` entries carry a barrier objective that is meaningful only for the
+  μ they were recorded at; ipax previously kept one filter for the whole solve,
+  so stale old-μ entries gated new-μ trials as a spurious rejection that
+  tightened as μ shrank. Matching Wächter & Biegler / IPOPT (the filter is
+  reset at every barrier update) removed that drag.
+- **A repeated feasible-point re-center now raises μ instead of treadmilling.**
+  When a line search fails at an already-feasible iterate and re-centering the
+  barrier at the *same* μ fails again, the barrier parameter is now raised to
+  the scale of the stall's KKT error (Nocedal, Wächter & Waltz §5.1) and the
+  free-mode μ oracle is suspended until progress resumes — clearing several
+  stalled power-flow (`ACOPP`/`ACOPR`) and least-squares runs.
+- **The L-BFGS Hessian route gained inertia-guided δ_w.** The compact
+  quasi-Newton middle-block signature now folds into the expected-inertia
+  target (Haynsworth additivity), so a genuinely nonconvex L-BFGS-route problem
+  gets the same inertia correction the sparse-direct route already had, instead
+  of relying on Powell damping alone.
+- **OET7 — a long-standing basin-flip limitation — is now `optimal`** on three
+  routes. The one remaining non-blocking limitation is **AGG** — a feasible
+  netlib LP the solver fails to converge (verified feasible vs HiGHS).
+
+!!! note "Adaptive-μ line-search acceptance is opt-in"
+    Two acceptance heuristics from this arc are **off by default** and do not
+    affect the table above: the feasible-point KKT-progress rescue
+    (`LineSearchOptions.feasible_kkt_progress`, disabled after a corpus sweep
+    attributed nonconvex wrong-basin flips to it as a default) and the NWW §5
+    free-mode line-search acceptance (`free_mode_acceptance`, active only under
+    a non-monotone `mu_schedule`, which is itself opt-in). Both target the
+    adaptive-barrier / radiotherapy regime rather than the general corpus.
 
 ## Reproducing
 
