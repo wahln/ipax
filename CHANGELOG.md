@@ -6,6 +6,134 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-16
+
+### Added
+- **Free-mode line-search acceptance — the NWW §5 two-regime globalization**
+  (`LineSearchOptions.free_mode_acceptance`, default `"obj-constr-filter"`;
+  `"rigorous"` opts out). Under a non-monotone μ oracle
+  (`Options.mu_schedule` other than the default `"monotone"`) the barrier
+  problem changes every iteration, so the W&B filter/Armijo machinery is not
+  a consistent per-trial merit gate; NWW 2009 §5 carries global convergence
+  entirely in the iterate-level KKT-error monitor (`BarrierOptions.fallback`)
+  and lets the free-mode search "interfere with adaptive steps as little as
+  possible". While the monitor is in free mode, a trial is now accepted when
+  `(θ + margin, f + margin)` — the **raw objective**, comparable across μ
+  re-targets, not φ_μ — is acceptable to a filter of the previous free
+  iterates, with IPOPT's margins
+  (`free_filter_margin_fact · min(free_filter_max_margin, kkt_error)`; the
+  `filter_margin_fact`/`filter_max_margin` defaults). The θ_max guard,
+  non-finite rejections, and the L-BFGS overshoot check stay as safety
+  invariants. A *failed* free-mode search switches to monotone mode (IPOPT's
+  skipped-line-search signal: the μ oracle is suspended, μ restarts from the
+  centrality-floored complementarity, and the rigorous W&B search — with SOC,
+  the feasible-point rescue, and restoration — governs until the monitor
+  re-admits free mode). Inert for the default monotone schedule: default
+  behavior is unchanged. This is the IPOPT-parity fix for the RT filter-route
+  stall (μ descends legitimately, then every iteration needs 11–27 Armijo
+  backtracks at exact feasibility while IPOPT accepts first trials).
+- **Feasible-point KKT-progress acceptance in the filter line search**
+  (`LineSearchOptions.feasible_kkt_progress`; **opt-in** — `None` by default,
+  set e.g. `0.1` to enable. The S2MPJ v14 sweep attributed 48
+  correct→incorrect flips to the rescue as a default: on
+  unconstrained/bounds-only problems — θ ≡ 0, exactly its domain — accepting
+  Armijo-failing, KKT-decreasing steps walked nonconvex least-squares runs
+  into worse stationary points or diverged, while only 3 wins depended on it;
+  the free-mode acceptance below covers the RT endgame it was built for).
+  At a (numerically) feasible iterate the W&B eq. (19) switching condition
+  holds for every descent direction — its right side is `δ·θ0^{s_θ} ≈ 0` — so
+  every trial faces the full Armijo test and the θ-type acceptance branch
+  IPOPT effectively lives on at its θ ≈ 1e-6 iterates is unreachable. On the
+  RT fluence case this ground the solve to 11–27 backtracks per iteration
+  while the objective crawled (IPOPT's productive phase is visibly
+  φ-non-monotone; Armijo rejects those steps). A *first* trial that fails
+  Armijo is now still accepted when the scaled KKT error decreases by the
+  configured fraction — at a feasible iterate, optimality progress *is*
+  progress (the KKT-error-globalization philosophy of NWW 2009, §5.1, applied
+  to step acceptance). Guarded: first trial only (one extra gradient/Jacobian
+  evaluation), armijo-failures only — ascent directions take the θ-branch and
+  stay rejected, so the feasible ascent-stall fix is untouched — and the
+  filter is not augmented (f-type-like).
+- **`mu_schedule="quality"` — the quality-function μ oracle** (Nocedal,
+  Wächter & Waltz 2009, §3.3; IPOPT's adaptive default), completing the NWW
+  oracle set alongside probing and LOQO. σ is chosen by minimizing a linear
+  model of the *full* predicted KKT residual — dual and primal infeasibility
+  at the fraction-to-boundary steplengths the direction attains, plus the
+  predicted complementarity — over the affine/centering family
+  `d(σ) = d_aff + σ·d_cen` (one extra solve against the already-factored KKT
+  operator; candidates are vector algebra by linearity; log-grid bracket +
+  golden section per NWW §4). Unlike the complementarity-tracking oracles
+  (Mehrotra σ ≤ 1, LOQO σ ≤ 0.8) it is **bidirectional**: σ > 1 *raises* μ
+  when the dual residual dominates a collapsed complementarity — the
+  decentered-iterate failure mode behind the RT fluence stall — while staying
+  closed-loop (a large μ scores badly through its own predicted
+  complementarity, so raises are self-limiting). Opt-in; the default schedule
+  remains `monotone`.
+- **The sparse-direct inertia check now covers the L-BFGS (default) Hessian
+  route.** `_CondensedOperator.expected_inertia` previously returned `None` for
+  a diagonal-plus-low-rank Hessian, so a genuinely nonconvex problem on the
+  L-BFGS route relied purely on Powell damping and never got the IPOPT
+  inertia-guided δ_w correction (Wächter & Biegler 2006, §3.1). The bordered
+  system `[D U; Uᵀ M]` has, by Haynsworth inertia additivity, `In(K) = In(M) +
+  In(N)`, so the target now folds the compact middle-block signature in:
+  `(n + M₊, M₋ + m_I, 0)`, with `In(M)` from a cheap dense eigensolve of the
+  `r × r` block (`r` = the L-BFGS memory window). A singular or oversized `M`
+  block returns `None`, deferring to the factorization-failure escalation as
+  before. Applies to both the condensed and equality-saddle assemblies.
+- **Per-trial line-search debug trace.** At `verbose >= 6` (DEBUG) the filter
+  line search now logs every backtracking trial with its `alpha`, `theta`, `phi`
+  and the reason it was rejected (`filter` / `armijo` / `no-decrease` /
+  `theta-max` / `non-finite` / `non-finite-grad`, or `accept`), plus `soc-*` for
+  second-order-correction trials — so an iteration with a high `ls` count can be
+  diagnosed straight from the log without a rerun.
+
+### Fixed
+- **The W&B filter is re-initialized whenever the barrier parameter changes.**
+  The filter's entries are `(θ, φ_μ)` pairs whose φ coordinate is specific to
+  the μ it was recorded at; W&B/IPOPT discard the filter history at every
+  barrier update (`FilterLSAcceptor::Reset` from both `MonotoneMuUpdate` and
+  `AdaptiveMuUpdate`; NWW 2009 §5: "the history in the filter [is] reset at
+  every free iteration because the barrier problem itself changes"). ipax
+  created one filter per solve and never cleared it, so stale old-μ φ entries
+  were compared against new-μ trial values — a spurious extra rejection gate
+  that tightens as μ shrinks. The θ_max guard region is separate state and
+  still applies across resets.
+- **The KKT-error fallback's monotone re-entry μ now respects the El-Bakry
+  centrality floor.** The free-mode μ oracles were already floored at
+  `κ_cent·max(dual, primal infeasibility)` (El-Bakry et al. 1996), but the
+  NWW §5.1 fallback re-initialized μ from `0.8·(average complementarity)`
+  alone — powerless exactly in the failure mode it guards against: a frozen
+  primal against full-fraction dual steps collapses the complementarity far
+  *below* the true KKT error, so the fallback re-entered monotone mode at the
+  ε/10 floor and was stuck there (monotone never raises μ). Observed as a
+  480-iteration μ pin at lg(μ) = −9 on an RT fluence case whose dual residual
+  sat at ~1e-4 throughout; the floored re-entry lands at ~1e-6 instead.
+- **A repeated feasible-point re-center now raises μ instead of treadmilling
+  at the same barrier.** Observed on an RT fluence case (4882 lower-bounded
+  variables, L-BFGS/sparse): the free-mode μ oracle pinned μ at its ε/10 floor
+  while the iterate sat at exact feasibility, where the W&B eq. (19) switching
+  condition holds for every descent direction — each trial faced the full
+  Armijo test against a barrier made stiff by thousands of near-active bounds
+  (11–27 backtracking trials per iteration), and every line-search failure
+  re-centered slacks/duals at the *same* pinned μ, reproducing the identical
+  stall for hundreds of iterations. The first feasible re-center is unchanged
+  (the 0.6.1 HS101 repair); a repeat now raises μ to the scale of the stall's
+  KKT error (at least 10×, capped at `mu_init` — cf. IPOPT's adaptive oracle
+  raising μ; Nocedal, Wächter & Waltz 2009, §5.1) and suspends the free-mode
+  μ oracle until the KKT error improves, so the raise is not immediately
+  re-targeted away.
+
+### Changed
+- **Iteration table uses IPOPT-style log10 columns.** The `mu` and `reg` columns
+  are now `lg(mu)` and `lg(rg)` (base-10 logs), and a step that needed no
+  regularization prints `lg(rg)` as `-` instead of `0.00e+00`, so a nonzero δ_w
+  stands out. This affects only the human-readable log; `IterationRecord` still
+  carries the raw `mu` / `regularization` values.
+- `LineSearchOptions` now validates `feasible_kkt_progress`: it must lie in
+  `(0, 1)` (or be `None`). The gate accepts when `e_t ≤ (1 − γ)·e0`, so γ ≤ 0
+  would certify a KKT-error *increase* as progress and γ ≥ 1 could never fire —
+  both now raise instead of degenerating silently.
+
 ## [0.6.1] - 2026-07-13
 
 ### Fixed
@@ -1024,7 +1152,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/wahln/ipax/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/wahln/ipax/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/wahln/ipax/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/wahln/ipax/compare/v0.4.0...v0.5.0

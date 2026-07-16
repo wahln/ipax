@@ -69,6 +69,12 @@ def _ls_problem(xp):
         ("probing", "gondzio"),
         ("adaptive", "gondzio"),
         ("breedveld", "mehrotra"),
+        # The quality function may raise μ (σ > 1) by design, but it is
+        # closed-loop — a large μ scores badly through its own predicted
+        # complementarity — so it must not reproduce the open-loop Mehrotra
+        # runaway either.
+        ("quality", "none"),
+        ("quality", "gondzio"),
     ],
 )
 def test_free_mode_oracles_do_not_run_away_on_ill_scaled_ls(

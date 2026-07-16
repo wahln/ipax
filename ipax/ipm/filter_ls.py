@@ -24,10 +24,13 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+
+from ipax._logging import logger
 
 if TYPE_CHECKING:
     from ipax.options import LineSearchOptions
@@ -67,6 +70,19 @@ class Filter:
             (tj, fj) for tj, fj in self.entries if not (theta <= tj and phi <= fj)
         ]
         self.entries.append((theta, phi))
+
+    def clear(self) -> None:
+        """Re-initialize to the empty (everything-acceptable) filter.
+
+        The φ coordinates are barrier objectives φ_μ — meaningful only for the
+        μ they were recorded at — so the filter history must be discarded
+        whenever the barrier parameter changes (W&B 2006: the filter is
+        re-initialized to eq. (18) at every barrier update; IPOPT
+        ``FilterLSAcceptor::Reset``). The eq. (18) guard region {θ ≥ θ_max}
+        survives a reset by construction: ipax keeps it as the separate
+        ``theta_max`` argument, not as entries.
+        """
+        self.entries.clear()
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +130,7 @@ class FilterLineSearch:
         entries: list[tuple[float, float]],
         soc: Callable[[float], tuple[float, float] | None] | None = None,
         grad_finite: Callable[[float], bool] | None = None,
+        kkt_progress: Callable[[float], bool] | None = None,
     ) -> LineSearchResult:
         """Return the accepted ``(α, …)`` or signal restoration.
 
@@ -132,12 +149,31 @@ class FilterLineSearch:
         keeps backtracking to a damped step that stays in the finite region,
         reusing the existing α-reduction (and restoration hand-off if the whole
         ray is bad).
+
+        ``kkt_progress(α)``, when supplied, certifies that the trial at ``α``
+        makes sufficient scaled-KKT-error progress. At an exactly feasible
+        iterate (θ0 = 0) the switching condition (W&B eq. 19) holds for every
+        descent direction — its right side is ``δ·θ0^{s_θ} = 0`` — so every
+        trial faces the full Armijo test and there is no θ-type escape. The
+        certifier rescues a *first* trial that fails Armijo: at a feasible
+        iterate, KKT-error decrease is optimality progress even when the
+        barrier objective wiggles up (the KKT-error-globalization philosophy
+        of Nocedal, Wächter & Waltz 2009, §5.1). The caller supplies the
+        certifier only at (numerically) feasible iterates — round-off keeps
+        θ0 at ~1e-16 rather than exactly 0, and the switching condition
+        degenerates there all the same. Consulted on the first trial only
+        (the certificate costs a gradient/Jacobian evaluation), and only
+        against an ``armijo`` rejection — never for an ascent direction
+        (those fail switching and take the θ-branch, so the feasible
+        ascent-stall guard is untouched). Accepted rescues are f-type-like:
+        the filter is not augmented.
         """
         o = self._o
         alpha = alpha_max
         alpha_min = o.alpha_min_frac
         first = True
         trials = 0
+        trace = logger.isEnabledFor(logging.DEBUG)
         while alpha >= alpha_min:
             trials += 1
             theta_t, phi_t = eval_point(alpha)
@@ -147,9 +183,19 @@ class FilterLineSearch:
                 corrected = soc(alpha)
                 if corrected is not None:
                     theta_c, phi_c = corrected
-                    if self._accept(
+                    soc_reason = self._reject_reason(
                         theta_c, phi_c, theta0, phi0, dphi, alpha, theta_max, entries
-                    ):
+                    )
+                    if trace:
+                        logger.debug(
+                            "  ls trial %d: alpha=%.3e theta=%.3e phi=%.3e -> soc-%s",
+                            trials,
+                            alpha,
+                            theta_c,
+                            phi_c,
+                            "accept" if soc_reason is None else soc_reason,
+                        )
+                    if soc_reason is None:
                         # The SOC point differs from ``x + α d``; its own gradient
                         # finiteness is checked inside ``soc`` (which returns None
                         # to reject a non-finite-derivative corrected trial).
@@ -159,9 +205,38 @@ class FilterLineSearch:
                         )
             first = False
 
-            if self._accept(
+            reason = self._reject_reason(
                 theta_t, phi_t, theta0, phi0, dphi, alpha, theta_max, entries
-            ) and (grad_finite is None or grad_finite(alpha)):
+            )
+            if reason is None and grad_finite is not None and not grad_finite(alpha):
+                reason = "non-finite-grad"
+            if (
+                reason == "armijo"
+                and trials == 1
+                and kkt_progress is not None
+                and kkt_progress(alpha)
+            ):
+                # Feasible-point rescue (see docstring): certified KKT-error
+                # decrease stands in for the unreachable θ-type acceptance.
+                if trace:
+                    logger.debug(
+                        "  ls trial %d: alpha=%.3e theta=%.3e phi=%.3e -> kkt-progress",
+                        trials,
+                        alpha,
+                        theta_t,
+                        phi_t,
+                    )
+                return LineSearchResult(alpha, True, False, False, n_trials=trials)
+            if trace:
+                logger.debug(
+                    "  ls trial %d: alpha=%.3e theta=%.3e phi=%.3e -> %s",
+                    trials,
+                    alpha,
+                    theta_t,
+                    phi_t,
+                    "accept" if reason is None else reason,
+                )
+            if reason is None:
                 switching = self._switching(dphi, alpha, theta0)
                 return LineSearchResult(
                     alpha, True, not switching, False, n_trials=trials
@@ -169,13 +244,94 @@ class FilterLineSearch:
             alpha *= 0.5
         return LineSearchResult(alpha_min, False, False, True, n_trials=trials)
 
+    def search_free(
+        self,
+        *,
+        alpha_max: float,
+        theta_max: float,
+        eval_point: Callable[[float], tuple[float, float]],
+        entries: list[tuple[float, float]],
+        margin: float,
+        grad_finite: Callable[[float], bool] | None = None,
+    ) -> LineSearchResult:
+        """Free-mode acceptance (NWW 2009, §5 globalization framework).
+
+        Under a free-mode μ oracle the barrier problem changes every iteration,
+        so the W&B filter/Armijo machinery is not a consistent per-trial merit
+        gate ("the history in the filter [is] reset at every free iteration
+        because the barrier problem itself changes" — NWW §5); global
+        convergence is carried by the iterate-level KKT-error monitor
+        (``FreeModeMonitor``), and the free-mode search should "interfere with
+        adaptive steps as little as possible". The per-trial test is the §5
+        obj-constr variant with IPOPT's margins
+        (``AdaptiveMuUpdate::CheckSufficientProgress``): the trial is accepted
+        when ``(θ_t + margin, f_t + margin)`` is acceptable to the filter of
+        previous free iterates — ``eval_point(α)`` returns ``(θ, f)`` with the
+        **raw objective** ``f``, which unlike φ_μ is comparable across μ
+        re-targets. No switching/Armijo test applies; the θ_max guard,
+        non-finite rejections, and the ``grad_finite`` overshoot check are
+        safety invariants and stay. SOC and the feasible-point KKT rescue are
+        rigorous-path mechanisms and are not consulted here.
+
+        The caller owns the free filter and must remember each free iterate
+        (driver-side ``augment``) *before* searching, so the current point is
+        an entry — the margins are what keep this from degenerating to a
+        monotone requirement. An empty ``entries`` list vacuously accepts any
+        finite trial, so skipping that pre-augment would disable the merit
+        test entirely. Acceptance never augments the W&B filter
+        (``LineSearchResult.augment`` is always ``False``); a fully rejected
+        ray hands off to restoration exactly like the rigorous search.
+        """
+        alpha = alpha_max
+        alpha_min = self._o.alpha_min_frac
+        trials = 0
+        trace = logger.isEnabledFor(logging.DEBUG)
+        while alpha >= alpha_min:
+            trials += 1
+            theta_t, f_t = eval_point(alpha)
+            reason = self._free_reject_reason(theta_t, f_t, theta_max, margin, entries)
+            if reason is None and grad_finite is not None and not grad_finite(alpha):
+                reason = "non-finite-grad"
+            if trace:
+                logger.debug(
+                    "  ls trial %d: alpha=%.3e theta=%.3e f=%.3e -> %s",
+                    trials,
+                    alpha,
+                    theta_t,
+                    f_t,
+                    "free-accept" if reason is None else reason,
+                )
+            if reason is None:
+                return LineSearchResult(alpha, True, False, False, n_trials=trials)
+            alpha *= 0.5
+        return LineSearchResult(alpha_min, False, False, True, n_trials=trials)
+
+    def _free_reject_reason(
+        self,
+        theta_t: float,
+        f_t: float,
+        theta_max: float,
+        margin: float,
+        entries: list[tuple[float, float]],
+    ) -> str | None:
+        """The failing free-mode gate, or ``None`` if the trial is accepted."""
+        if not math.isfinite(theta_t) or not math.isfinite(f_t):
+            return "non-finite"
+        if theta_t >= theta_max:
+            return "theta-max"
+        # Sufficient progress vs every previous free iterate: beat some entry's
+        # θ or f by the margin (IPOPT: Acceptable(f + margin, θ + margin)).
+        if all(theta_t + margin < tj or f_t + margin < fj for tj, fj in entries):
+            return None
+        return "free-filter"
+
     def _switching(self, dphi: float, alpha: float, theta0: float) -> bool:
         o = self._o
         return dphi < 0.0 and alpha * _safe_pow(
             -dphi, o.s_phi
         ) > _SWITCH_DELTA * _safe_pow(theta0, o.s_theta)
 
-    def _accept(
+    def _reject_reason(
         self,
         theta_t: float,
         phi_t: float,
@@ -185,7 +341,13 @@ class FilterLineSearch:
         alpha: float,
         theta_max: float,
         entries: list[tuple[float, float]],
-    ) -> bool:
+    ) -> str | None:
+        """The first failing acceptance gate, or ``None`` if the trial is accepted.
+
+        Names the gate (``non-finite`` / ``theta-max`` / ``filter`` / ``armijo``
+        / ``no-decrease``) so the per-trial debug trace can report *why* a step
+        size was rejected — the signal for diagnosing heavy backtracking.
+        """
         o = self._o
         # W&B eq. (18): the filter is initialized to the guard region {θ ≥ θ_max}.
         # Reject wildly infeasible (or non-finite) trials outright, before the
@@ -196,24 +358,24 @@ class FilterLineSearch:
         # element function) would otherwise pass the Armijo test — ``φ_t = -∞`` is
         # trivially below any finite bound — instead of backtracking to a finite,
         # usable iterate.
-        if (
-            not math.isfinite(theta_t)
-            or not math.isfinite(phi_t)
-            or theta_t >= theta_max
-        ):
-            return False
+        if not math.isfinite(theta_t) or not math.isfinite(phi_t):
+            return "non-finite"
+        if theta_t >= theta_max:
+            return "theta-max"
         if not self._filter_acceptable(theta_t, phi_t, entries):
-            return False
+            return "filter"
         if self._switching(dphi, alpha, theta0):
             # f-type step: require Armijo decrease on the barrier objective.
-            return phi_t <= phi0 + o.eta_phi * alpha * dphi
+            return None if phi_t <= phi0 + o.eta_phi * alpha * dphi else "armijo"
         # θ-type step: sufficient decrease in θ or φ vs the current point
         # (W&B eq. 20). At a feasible iterate (θ0 = 0) no θ-progress step
         # exists — the branch would degenerate to "0 ≤ 0" and accept an
         # arbitrary ascent direction (W&B §2.3: only f-type/φ-decrease
         # acceptance applies there), so it requires θ0 > 0.
         theta_progress = theta0 > 0.0 and theta_t <= (1.0 - o.gamma_theta) * theta0
-        return theta_progress or phi_t <= phi0 - o.gamma_phi * theta0
+        if theta_progress or phi_t <= phi0 - o.gamma_phi * theta0:
+            return None
+        return "no-decrease"
 
 
 __all__ = ["Filter", "FilterLineSearch", "LineSearchResult"]

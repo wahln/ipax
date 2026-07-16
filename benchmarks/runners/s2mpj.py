@@ -43,6 +43,7 @@ import dataclasses
 import json
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import ipax
 from benchmarks.corpus.s2mpj import (
@@ -58,7 +59,7 @@ from benchmarks.harness import (
     run_case,
     to_payload,
 )
-from ipax.options import KrylovOptions
+from ipax.options import KrylovOptions, LineSearchOptions
 from ipax.testing.backends import import_namespace
 
 # Per-route variable caps. The linear-solver routes have very different size
@@ -77,6 +78,10 @@ _SPARSE_MAX_VARS = 25000
 # (label, options, per-route variable cap). A cap of 0 means "no cap".
 ConfigSpec = tuple[str, ipax.Options, int]
 
+# Sentinel distinguishing "keep the solver default" from an explicit value for
+# option-override levers whose overrides can legitimately be None.
+_KEEP_DEFAULT: float | None = float("nan")
+
 
 def default_configs(
     max_iter: int,
@@ -88,6 +93,8 @@ def default_configs(
     sparse_max_vars: int = _SPARSE_MAX_VARS,
     krylov_preconditioner: str | None = None,
     mu_schedule: str | None = None,
+    feasible_kkt_progress: float | None = _KEEP_DEFAULT,
+    free_mode_acceptance: str | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -112,6 +119,19 @@ def default_configs(
         # μ-oracle A/B lever (e.g. probing-default vs monotone); None keeps
         # the solver default so ordinary sweeps track it automatically.
         common["mu_schedule"] = mu_schedule
+    # Line-search override levers; unset levers keep the solver defaults so
+    # ordinary sweeps track them automatically.
+    ls_overrides: dict[str, Any] = {}
+    if feasible_kkt_progress is not _KEEP_DEFAULT:
+        # Tier-3 rescue A/B lever (None disables the feasible-point
+        # KKT-progress acceptance).
+        ls_overrides["feasible_kkt_progress"] = feasible_kkt_progress
+    if free_mode_acceptance is not None:
+        # NWW §5 free-mode acceptance A/B lever ("rigorous" keeps the W&B gate
+        # in both regimes); only observable under a non-monotone --mu-schedule.
+        ls_overrides["free_mode_acceptance"] = free_mode_acceptance
+    if ls_overrides:
+        common["line_search"] = LineSearchOptions(**ls_overrides)
     krylov_common = dict(common)
     if krylov_preconditioner is not None:
         krylov_common["krylov"] = KrylovOptions(preconditioner=krylov_preconditioner)  # type: ignore[arg-type]
@@ -395,9 +415,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--mu-schedule",
         default=None,
-        choices=["monotone", "adaptive", "breedveld", "probing"],
+        choices=["monotone", "adaptive", "breedveld", "probing", "quality"],
         help="override the barrier μ oracle on every config (default: the solver "
         "default) — the lever for a schedule A/B such as probing vs monotone.",
+    )
+    parser.add_argument(
+        "--free-mode-acceptance",
+        default=None,
+        choices=["obj-constr-filter", "rigorous"],
+        help="override LineSearchOptions.free_mode_acceptance on every config "
+        "(default: the solver default) — the lever for the NWW §5 free-mode "
+        "acceptance A/B; only observable under a non-monotone --mu-schedule.",
+    )
+    parser.add_argument(
+        "--feasible-kkt-progress",
+        default=None,
+        help="override LineSearchOptions.feasible_kkt_progress on every config: "
+        "'none' disables the feasible-point KKT-progress rescue, a float sets "
+        "the required decrease fraction (default: the solver default) — the "
+        "lever for a Tier-3 rescue A/B.",
     )
     parser.add_argument(
         "--resume",
@@ -456,6 +492,16 @@ def main(argv: list[str] | None = None) -> int:
         sparse_max_vars=args.sparse_max_vars,
         krylov_preconditioner=args.preconditioner,
         mu_schedule=args.mu_schedule,
+        feasible_kkt_progress=(
+            _KEEP_DEFAULT
+            if args.feasible_kkt_progress is None
+            else (
+                None
+                if args.feasible_kkt_progress.lower() == "none"
+                else float(args.feasible_kkt_progress)
+            )
+        ),
+        free_mode_acceptance=args.free_mode_acceptance,
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}

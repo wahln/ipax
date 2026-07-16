@@ -27,8 +27,9 @@ from typing import Literal
 HessianMode = Literal["auto", "lbfgs", "exact", "autodiff-hvp"]
 LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
 Globalization = Literal["filter", "breedveld"]
-MuSchedule = Literal["monotone", "adaptive", "breedveld", "probing"]
+MuSchedule = Literal["monotone", "adaptive", "breedveld", "probing", "quality"]
 MuFallback = Literal["kkt-error", "never"]
+FreeModeAcceptance = Literal["obj-constr-filter", "rigorous"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
 DenseKKTRoute = Literal["condensed", "augmented"]
@@ -69,15 +70,17 @@ class BarrierOptions:
     fallback_kappa: float = 0.9999  # κ ∈ (0, 1)
     fallback_window: int = 5  # l_max ≥ 0
     fallback_mu_factor: float = 0.8  # monotone re-entry μ factor
-    # Centrality floor for the free-mode oracles: μ ≥ κ_cent·max(dual, primal
+    # Centrality floor for μ re-targeting: μ ≥ κ_cent·max(dual, primal
     # infeasibility). El-Bakry et al. (1996)'s convergence theory requires the
     # complementarity gap not to vanish faster than the KKT residual; without
     # this floor an aggressive oracle can crush μ near a saddle while the dual
     # infeasibility is still O(1), pinning the iterate to the boundary with no
-    # barrier left to re-center (and leaving the KKT-error fallback's
-    # complementarity-based re-entry μ powerless). The complementarity
-    # component is deliberately excluded so superlinear μ decrease near a
-    # solution is unimpeded. ``0.0`` disables the floor.
+    # barrier left to re-center. Applied by the free-mode oracles *and* by the
+    # KKT-error fallback's monotone re-entry μ (whose complementarity-based
+    # value is otherwise powerless exactly when complementarity has collapsed
+    # below the true residual). The complementarity component is deliberately
+    # excluded so superlinear μ decrease near a solution is unimpeded.
+    # ``0.0`` disables the floor.
     kappa_centrality: float = 1e-2
 
     def __post_init__(self) -> None:
@@ -93,7 +96,21 @@ class BarrierOptions:
 
 @dataclass(frozen=True, slots=True)
 class LineSearchOptions:
-    """Filter line-search parameters (Wächter & Biegler §2–3)."""
+    """Filter line-search constants (Wächter & Biegler 2006, §2.3/§4.1).
+
+    ``feasible_kkt_progress`` enables the feasible-point rescue acceptance: at
+    an exactly feasible iterate (θ0 = 0) the eq. (19) switching condition holds
+    for every descent direction, so every trial faces the full Armijo test —
+    there is no θ-type escape (the branch IPOPT effectively lives on at its
+    θ ≈ 1e-6 iterates, where "sufficient φ decrease vs θ0" is near-vacuous).
+    A *first* trial that fails Armijo is then still accepted when the scaled
+    KKT error decreases by at least this fraction — at a feasible iterate,
+    optimality progress *is* progress (the KKT-error-globalization philosophy
+    of Nocedal, Wächter & Waltz 2009, §5.1, applied to step acceptance). The
+    certificate costs one extra gradient/Jacobian evaluation and is consulted
+    on the first trial only. Must lie in ``(0, 1)``; ``None`` (the default)
+    disables the rescue.
+    """
 
     max_soc: int = 4
     alpha_min_frac: float = 1e-8
@@ -102,6 +119,57 @@ class LineSearchOptions:
     s_theta: float = 1.1
     s_phi: float = 2.3
     eta_phi: float = 1e-4  # Armijo constant
+    # Required scaled-KKT-error decrease fraction for the feasible-point rescue
+    # (see class docstring); None (default) disables it. OPT-IN: the S2MPJ v14
+    # corpus sweep (2026-07-14) attributed 48 correct→incorrect flips to the
+    # rescue as a default — on unconstrained/bounds-only problems (θ ≡ 0, the
+    # rescue's whole domain) accepting Armijo-failing, KKT-decreasing steps
+    # walked nonconvex least-squares runs into different, worse stationary
+    # points (ROSENBRTU, MEYER3, GULF) or diverged f (FMINSURF family), while
+    # only 3 wins depended on it. The free-mode acceptance
+    # (``free_mode_acceptance``) covers the RT endgame this rescue was built
+    # for, and does so under the NWW §5 monitor instead of per-step
+    # certificates.
+    feasible_kkt_progress: float | None = None
+    # Free-mode acceptance (NWW 2009, §5): while a non-monotone μ oracle
+    # (``Options.mu_schedule`` other than "monotone") is in free mode, the
+    # barrier problem changes every iteration and the W&B filter/Armijo
+    # machinery is not a consistent per-trial merit gate — global convergence
+    # is carried by the iterate-level KKT-error monitor
+    # (``BarrierOptions.fallback``). "obj-constr-filter" (default; the NWW §5
+    # obj-constr variant with IPOPT's margins) then accepts a trial when
+    # ``(θ + margin, f + margin)`` — the raw objective, comparable across μ
+    # re-targets — is acceptable to the filter of previous free iterates;
+    # once the monitor trips to monotone mode the rigorous W&B search governs
+    # again. "rigorous" keeps the W&B gate in both regimes. Inert for the
+    # (default) monotone schedule — default behavior is unchanged.
+    free_mode_acceptance: FreeModeAcceptance = "obj-constr-filter"
+    # Margin of the free-mode filter: ``margin = fact · min(max_margin,
+    # scaled KKT error)`` (IPOPT ``filter_margin_fact`` / ``filter_max_margin``
+    # defaults).
+    free_filter_margin_fact: float = 1e-5
+    free_filter_max_margin: float = 1.0
+
+    def __post_init__(self) -> None:
+        # The rescue accepts when ``e_t ≤ (1 − γ)·e0``, so only γ ∈ (0, 1) is a
+        # meaningful decrease fraction: γ ≤ 0 makes the bound ≥ e0 (an *increase*
+        # in the KKT error would certify "progress"), and γ ≥ 1 demands a
+        # non-positive error, which a norm never delivers — the rescue would
+        # silently never fire. Reject both rather than degenerate quietly.
+        if self.feasible_kkt_progress is not None and not (
+            0.0 < self.feasible_kkt_progress < 1.0
+        ):
+            raise ValueError("feasible_kkt_progress must lie in (0, 1) or be None")
+        if (
+            not math.isfinite(self.free_filter_margin_fact)
+            or self.free_filter_margin_fact < 0.0
+        ):
+            raise ValueError("free_filter_margin_fact must be finite and non-negative")
+        if (
+            not math.isfinite(self.free_filter_max_margin)
+            or self.free_filter_max_margin < 0.0
+        ):
+            raise ValueError("free_filter_max_margin must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,7 +592,13 @@ class Options:
     # config; ``"adaptive"`` re-targets μ every iteration by the LOQO
     # centrality rule (NWW 2009, eq. (3.6)); ``"breedveld"`` scales the duality
     # gap by the last accepted steplength (Breedveld et al. 2017,
-    # eqs. (10)–(12)). The oracle is orthogonal to ``corrections``: an active
+    # eqs. (10)–(12)); ``"quality"`` picks σ by minimizing a linear model of
+    # the *full* predicted KKT residual along the affine/centering family
+    # (NWW 2009, §3.3 — IPOPT's adaptive default; one extra KKT solve per
+    # iteration like probing). Unlike the complementarity-tracking oracles it
+    # is bidirectional: σ > 1 raises μ when the dual residual dominates a
+    # collapsed complementarity (the decentered-iterate failure mode).
+    # The oracle is orthogonal to ``corrections``: an active
     # corrector aims at the oracle's μ. The non-monotone oracles are
     # safeguarded by the KKT-error fallback (``BarrierOptions.fallback``;
     # NWW 2009, §5.1) and the centrality floor.
@@ -577,6 +651,7 @@ __all__ = [
     "CorrectionsOptions",
     "DenseKKTRoute",
     "DenseOptions",
+    "FreeModeAcceptance",
     "Globalization",
     "HessianMode",
     "KrylovMethod",

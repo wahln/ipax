@@ -84,23 +84,41 @@ jobs:
           path: CHANGELOG.md
       - name: Read tag annotation
         id: tag_annotation
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          ANNOTATION=$(git tag -l --format='%(contents)' "${{ github.ref_name }}")
+          # Only an *annotated* tag carries a message. actions/checkout can
+          # fetch a tag as lightweight (pointing straight at the commit), and
+          # then `%(contents)` falls through to the commit message — which for a
+          # merge commit is multi-line text we must not put in the release notes
+          # (v0.6.1: injecting it broke the next step). Emit the annotation only
+          # for a real tag object; otherwise leave it empty and let the
+          # changelog stand alone.
+          if [ "$(git cat-file -t "$TAG" 2>/dev/null)" = "tag" ]; then
+            ANNOTATION=$(git tag -l --format='%(contents)' "$TAG")
+          else
+            ANNOTATION=""
+          fi
           {
-            echo 'annotation<<EOF'
+            echo 'annotation<<RELNOTES_EOF'
             echo "$ANNOTATION"
-            echo 'EOF'
+            echo 'RELNOTES_EOF'
           } >> "$GITHUB_OUTPUT"
       - name: Write release notes file
+        # Pass the annotation and changelog through the environment, never via
+        # `${{ }}` interpolation into the script body: multi-line values with
+        # quotes or shell metacharacters would otherwise be spliced into the
+        # bash source and break parsing (v0.6.1 exited 127 this way). Quoted
+        # `printf "%s"` on an env var is inert — no re-parsing, no word-split.
+        env:
+          ANNOTATION: ${{ steps.tag_annotation.outputs.annotation }}
+          CHANGES: ${{ steps.changelog.outputs.changes }}
         run: |
           {
-            if [[ -n "${{ steps.tag_annotation.outputs.annotation }}" ]]; then
-              echo "${{ steps.tag_annotation.outputs.annotation }}"
-              echo ""
-              echo "---"
-              echo ""
+            if [ -n "$ANNOTATION" ]; then
+              printf '%s\n\n---\n\n' "$ANNOTATION"
             fi
-            echo "${{ steps.changelog.outputs.changes }}"
+            printf '%s\n' "$CHANGES"
           } > RELEASE_NOTES.md
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -101,14 +101,35 @@ def breedveld_mu(
     return float(max(_mu_floor(options, tol), sigma * avg_compl))
 
 
-def fallback_mu(avg_compl: float, options: BarrierOptions, tol: float) -> float:
+def fallback_mu(
+    avg_compl: float,
+    options: BarrierOptions,
+    tol: float,
+    infeasibility: float = 0.0,
+) -> float:
     """Monotone-mode re-entry μ (Nocedal, Wächter & Waltz 2009, §5.1).
 
     When the free-mode safeguard trips, the monotone strategy restarts from a
     fraction of the current complementarity: ``μ = 0.8·(average complementarity)``
     in the paper's implementations, floored like every schedule.
+
+    ``infeasibility`` (the current primal/dual residual) applies the same
+    El-Bakry centrality floor ``μ ≥ κ_cent·infeasibility`` the free-mode
+    oracles already respect. Without it, an iterate whose complementarity has
+    collapsed *below* the true KKT error — a frozen primal against
+    full-fraction dual steps drives the products to the μ target while the
+    dual residual stands still — re-enters monotone mode at the ε/10 floor and
+    is stuck there: monotone can never raise μ, and the barrier problem at
+    that μ is unsolvable from the decentered iterate (observed as a 480-
+    iteration μ pin on an RT fluence case).
     """
-    return float(max(_mu_floor(options, tol), options.fallback_mu_factor * avg_compl))
+    return float(
+        max(
+            _mu_floor(options, tol),
+            options.fallback_mu_factor * avg_compl,
+            options.kappa_centrality * infeasibility,
+        )
+    )
 
 
 class FreeModeMonitor:
@@ -158,6 +179,24 @@ class FreeModeMonitor:
             self._errors.append(error)
             return True, False
         return False, False
+
+    def suspend(self, error: float) -> None:
+        """Force monotone mode from outside the KKT-error test.
+
+        Used when a repeated feasible-point re-center *raised* μ (the barrier
+        escalation): in free mode the oracle re-targets μ from the current
+        complementarity on the very next iteration — exactly the stale,
+        near-floor value the raise is escaping — silently undoing it.
+        Suspension reuses the NWW §5.1 re-entry rule of :meth:`observe`: free
+        mode resumes once the KKT error drops below ``κ`` of the suspension
+        point, i.e. once the raised barrier has produced real progress. When
+        already suspended the tighter switch point wins. A no-op when the
+        fallback safeguard is disabled.
+        """
+        if not self._enabled:
+            return
+        self._m_switch = error if self._free else min(self._m_switch, error)
+        self._free = False
 
 
 def complementarity_measures(

@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -86,9 +87,23 @@ HEADER_REPEAT_INTERVAL = 10
 
 _HEADER = (
     f"{'iter':>4} {'objective':>15} {'infeas':>10} {'kkt':>10} "
-    f"{'mu':>10} {'alpha_pr':>9} {'alpha_du':>9} {'reg':>9} {'ls':>3} "
+    f"{'lg(mu)':>10} {'alpha_pr':>9} {'alpha_du':>9} {'lg(rg)':>9} {'ls':>3} "
     f"{'prob_s':>9} {'step_s':>9}"
 )
+
+
+def _lg(value: float) -> str:
+    """``log10(value)`` for the iteration table, or ``-`` when there is nothing.
+
+    IPOPT-style ``lg(mu)`` / ``lg(rg)`` columns: a log10 scale reads more
+    naturally than scientific notation (``-6.0`` vs ``1.00e-06``), and a
+    non-positive / non-finite value — chiefly ``δ_w = 0`` on a step that needed
+    no regularization — prints a dash so a *nonzero* entry stands out instead of
+    hiding as ``0.00e+00``.
+    """
+    if not math.isfinite(value) or value <= 0.0:
+        return "-"
+    return f"{math.log10(value):.1f}"
 
 
 def verbosity_threshold(verbose: int) -> int:
@@ -163,9 +178,9 @@ def format_record(record: IterationRecord, *, acceptable: bool = False) -> str:
     """
     row = (
         f"{record.iteration:>4d} {record.objective:>15.7e} "
-        f"{record.theta:>10.3e} {record.kkt_error:>10.3e} {record.mu:>10.3e} "
+        f"{record.theta:>10.3e} {record.kkt_error:>10.3e} {_lg(record.mu):>10} "
         f"{record.alpha_primal:>9.2e} {record.alpha_dual:>9.2e} "
-        f"{record.regularization:>9.2e} {record.line_search_iters:>3d} "
+        f"{_lg(record.regularization):>9} {record.line_search_iters:>3d} "
         f"{record.problem_time:>9.2e} {record.step_solve_time:>9.2e}"
     )
     tags = []

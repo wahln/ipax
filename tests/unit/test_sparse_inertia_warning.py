@@ -19,11 +19,9 @@ import pytest
 
 from ipax._logging import LOGGER_NAME
 from ipax.backend.operators import Dense, Diagonal
-from ipax.ipm.hessian import LBFGSOperator
 from ipax.ipm.kkt import build_condensed_operator
 from ipax.linalg.regularize import RegularizationState
 from ipax.linalg.sparse import SparseDirectSolver
-from ipax.options import LBFGSOptions
 from tests._helpers import array
 
 
@@ -81,12 +79,25 @@ def _condensed_with_target(namespace):
     return op
 
 
-def _condensed_lbfgs(namespace):
-    """L-BFGS condensed operator → no inertia target (PD by damping)."""
-    W = LBFGSOperator(2, LBFGSOptions(memory=5))
-    W.update(array(namespace, [1.0, 0.5]), array(namespace, [2.0, 1.0]))
+def _condensed_no_target(namespace):
+    """Condensed operator whose low-rank middle block is singular → no target.
+
+    A Powell-damped L-BFGS block now *does* report a target (its ``In(M)`` folds
+    into the bordered inertia), so the target-less case is a diagonal-plus-low-
+    rank Hessian whose ``M`` block is singular — then ``expected_inertia`` returns
+    ``None`` and the check is skipped.
+    """
+
+    class _SingularLowRankW(Dense):
+        def diagonal_low_rank_form(self):
+            return (
+                array(namespace, [1.0, 1.0]),
+                array(namespace, [[1.0], [0.0]]),
+                array(namespace, [[0.0]]),  # singular M ⇒ no reliable target
+            )
+
     op = build_condensed_operator(
-        W,
+        _SingularLowRankW(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
         Diagonal(array(namespace, [0.25, 0.75])),
         Diagonal(array(namespace, [2.0, 0.5])),
         Dense(array(namespace, [[1.0, 2.0], [-1.0, 0.5]])),
@@ -130,11 +141,11 @@ def test_no_warning_when_backend_reports_inertia(
 
 
 def test_no_warning_without_an_inertia_target(namespace, fake_sparse_adapter, caplog):
-    # L-BFGS keeps the (1,1) block PD by Powell damping — no target, no gap,
-    # no warning.
+    # A singular low-rank middle block yields no reliable target — no target,
+    # no gap, no warning.
     caplog.set_level(logging.WARNING, logger=LOGGER_NAME)
     solver = SparseDirectSolver()
 
-    solver.factor(_condensed_lbfgs(namespace))
+    solver.factor(_condensed_no_target(namespace))
 
     assert _warnings(caplog) == []

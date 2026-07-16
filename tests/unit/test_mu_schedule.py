@@ -170,7 +170,7 @@ def _mu_trace(result) -> tuple[float, ...]:
     return tuple(record.mu for record in result.history)
 
 
-@pytest.mark.parametrize("schedule", ["adaptive", "breedveld"])
+@pytest.mark.parametrize("schedule", ["adaptive", "breedveld", "quality"])
 def test_schedule_solves_hs35_and_changes_mu_trace(namespace, schedule):
     problem, result = _solve_hs35(namespace, schedule)
     _, monotone = _solve_hs35(namespace, "monotone")
@@ -182,7 +182,7 @@ def test_schedule_solves_hs35_and_changes_mu_trace(namespace, schedule):
     assert _mu_trace(result) != _mu_trace(monotone)
 
 
-@pytest.mark.parametrize("schedule", ["adaptive", "breedveld"])
+@pytest.mark.parametrize("schedule", ["adaptive", "breedveld", "quality"])
 def test_schedule_solves_bound_qp(namespace, schedule):
     problem = BoundConstrainedQP(namespace)
     result = solve(
@@ -211,6 +211,18 @@ def test_probing_standalone_solves_and_changes_mu_trace(namespace):
     # NWW 2009 "Mehrotra probing" as a plain strategy: the affine solve is only
     # a σ probe; the step itself is the ordinary centered Newton direction.
     problem, result = _solve_hs35(namespace, "probing")
+    _, monotone = _solve_hs35(namespace, "monotone")
+
+    assert result.status is Status.OPTIMAL
+    assert_allclose(namespace, result.x, problem.known_solution(), rtol=1e-6, atol=1e-6)
+    assert _mu_trace(result) != _mu_trace(monotone)
+
+
+def test_quality_standalone_solves_and_changes_mu_trace(namespace):
+    # NWW 2009 §3.3 quality function as a plain strategy: like probing it needs
+    # the affine direction, so the standalone mode runs the corrector path with
+    # a plain centered re-solve; σ then minimizes the predicted full-KKT model.
+    problem, result = _solve_hs35(namespace, "quality")
     _, monotone = _solve_hs35(namespace, "monotone")
 
     assert result.status is Status.OPTIMAL
@@ -300,11 +312,69 @@ def test_monitor_disabled_never_switches():
         assert monitor.observe(error) == (True, False)
 
 
+def test_monitor_suspend_forces_monotone_until_the_error_drops():
+    # The recenter-escalation hook: a raised μ must not be re-targeted away by
+    # the oracle on the very next iteration, so suspension holds monotone mode
+    # until the error falls below κ of the suspension point.
+    monitor = FreeModeMonitor(BarrierOptions())
+    assert monitor.observe(1.0) == (True, False)
+    monitor.suspend(1.0)
+    assert monitor.observe(1.0) == (False, False)  # not yet below κ·1.0
+    assert monitor.observe(0.5) == (True, False)  # progress ⇒ free mode resumes
+
+
+def test_monitor_suspend_keeps_the_tighter_switch_point():
+    monitor = FreeModeMonitor(BarrierOptions())
+    monitor.suspend(1.0)
+    monitor.suspend(0.1)  # already suspended: the tighter point wins
+    assert monitor.observe(0.5) == (False, False)  # above κ·0.1, still monotone
+    assert monitor.observe(0.05) == (True, False)
+
+
+def test_monitor_suspend_is_inert_when_the_safeguard_is_disabled():
+    # fallback="never" is pure free mode (IPOPT's never-monotone-mode): nothing
+    # — not even an external suspend — may drop it out of the free regime.
+    monitor = FreeModeMonitor(BarrierOptions(fallback="never"))
+    monitor.suspend(1.0)
+    assert monitor.observe(8.0) == (True, False)
+
+
 def test_fallback_mu_reinitializes_from_average_complementarity():
     # Monotone-mode re-entry μ = 0.8·(average complementarity) (NWW 2009 §5.1).
     assert_scalar_close(fallback_mu(2.0, BarrierOptions(), _TOL), 0.8 * 2.0)
     # ... floored like every schedule at max(μ_min, tol/10).
     assert_scalar_close(fallback_mu(0.0, BarrierOptions(), _TOL), 1e-9)
+
+
+def test_fallback_mu_respects_centrality_floor():
+    # The RT-fluence pin: a frozen primal with free-running duals collapses the
+    # complementarity far below the true KKT error, so the fallback's
+    # complementarity-based re-entry μ landed at the ε/10 floor and stayed
+    # there for hundreds of iterations while the dual residual sat at ~1e-4.
+    # The re-entry value must respect the same El-Bakry centrality floor the
+    # free-mode oracles already have: μ ≥ κ_cent·(primal/dual infeasibility).
+    opts = BarrierOptions()  # kappa_centrality = 1e-2
+    mu = fallback_mu(1e-9, opts, _TOL, infeasibility=1e-4)
+    assert_scalar_close(mu, 1e-2 * 1e-4)
+
+
+def test_fallback_mu_floor_never_lowers_the_reentry_value():
+    # A healthy complementarity dominates: the floor is a max, not a target.
+    opts = BarrierOptions()
+    mu = fallback_mu(2.0, opts, _TOL, infeasibility=1e-4)
+    assert_scalar_close(mu, 0.8 * 2.0)
+
+
+def test_fallback_mu_infeasibility_defaults_to_inactive():
+    # Callers that pass no infeasibility keep the pure NWW re-entry value.
+    assert_scalar_close(fallback_mu(2.0, BarrierOptions(), _TOL), 1.6)
+
+
+def test_fallback_mu_floor_disabled_by_zero_kappa():
+    # κ_cent = 0 disables the floor (same semantics as the free-mode paths).
+    opts = BarrierOptions(kappa_centrality=0.0)
+    mu = fallback_mu(0.0, opts, _TOL, infeasibility=1e-4)
+    assert_scalar_close(mu, 1e-9)
 
 
 def test_fallback_options_validation():
@@ -374,3 +444,40 @@ def test_forced_fallback_steers_mu_and_still_converges(namespace):
     assert pure_free.status is Status.OPTIMAL
     assert_allclose(namespace, forced.x, problem.known_solution(), rtol=1e-6, atol=1e-6)
     assert _mu_trace(forced) != _mu_trace(pure_free)
+
+
+def test_driver_passes_infeasibility_to_fallback_mu(namespace, monkeypatch):
+    # Wiring proof for the fallback-path centrality floor: when the safeguard
+    # trips, the driver must hand the current primal/dual infeasibility to
+    # ``fallback_mu`` so the re-entry μ respects the El-Bakry floor. (The
+    # formula itself is pinned by the fallback_mu unit tests above; a trace
+    # comparison cannot discriminate this path because the free-mode oracles
+    # share the same floor.)
+    import ipax.ipm.driver as driver_mod
+
+    seen: dict[str, float] = {}
+    original = driver_mod.fallback_mu
+
+    def recording(avg_compl, options, tol, infeasibility=0.0):
+        seen["infeasibility"] = float(infeasibility)
+        return original(avg_compl, options, tol)
+
+    monkeypatch.setattr(driver_mod, "fallback_mu", recording)
+
+    problem = HS35(namespace)
+    result = solve(
+        problem,
+        array(namespace, [0.5, 0.5, 0.5]),
+        options=Options(
+            hessian="exact",
+            linsolve="dense",
+            mu_schedule="adaptive",
+            # Forced trip: κ = 0.01 with a length-0 window demands a 100× KKT
+            # error reduction every free-mode iteration (see above).
+            barrier=BarrierOptions(fallback_kappa=0.01, fallback_window=0),
+        ),
+    )
+
+    assert result.status is Status.OPTIMAL
+    assert "infeasibility" in seen, "the forced fallback never tripped"
+    assert seen["infeasibility"] > 0.0

@@ -2,9 +2,107 @@
 
 from __future__ import annotations
 
+import logging
+
+from ipax._logging import LOGGER_NAME
 from ipax.ipm.filter_ls import Filter, FilterLineSearch
 from ipax.options import LineSearchOptions
 from tests._helpers import implemented
+
+
+def test_reject_reason_classifies_each_gate():
+    # The rejection classifier names the first failing acceptance gate; ``None``
+    # means the trial is acceptable. This is the label the per-trial debug trace
+    # surfaces so a heavy-backtracking iteration can be diagnosed from the log.
+    ls = FilterLineSearch(LineSearchOptions())
+
+    # non-finite θ/φ (here φ = -inf on an f-type step).
+    assert ls._reject_reason(0.5, float("-inf"), 1.0, 1.0, -1e6, 1.0, 1e10, []) == (
+        "non-finite"
+    )
+    # θ past the eq. (18) guard θ_max.
+    assert ls._reject_reason(1e30, 1.0, 1.0, 1.0, -1e6, 1.0, 1e4, []) == "theta-max"
+    # dominated by a filter entry.
+    assert ls._reject_reason(2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1e10, [(1.0, 1.0)]) == (
+        "filter"
+    )
+    # f-type step (switching holds) failing the Armijo decrease.
+    assert ls._reject_reason(0.5, 5.0, 1.0, 1.0, -1e6, 1.0, 1e10, []) == "armijo"
+    # θ-type step (switching fails) with neither θ- nor φ-progress.
+    assert ls._reject_reason(2.0, 5.0, 1.0, 1.0, 1.0, 1.0, 1e10, []) == "no-decrease"
+    # acceptable ⇒ None.
+    assert ls._reject_reason(0.1, 0.1, 1.0, 1.0, 1.0, 1.0, 1e10, []) is None
+
+
+def test_search_emits_per_trial_debug_trace(caplog):
+    # At DEBUG level the search logs each backtracking trial with its α, θ, φ and
+    # the reason it was rejected (or "accept"), so 10+-trial iterations can be
+    # read directly from the log without a rerun.
+    line_search = FilterLineSearch(LineSearchOptions())
+    # f-type ray: Armijo bound is 1 - 100α; φ = 5 fails until α shrinks enough
+    # that φ drops to -200 and the step is accepted.
+    with caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+        result = line_search.search(
+            alpha_max=1.0,
+            theta0=1.0,
+            phi0=1.0,
+            dphi=-1e6,
+            theta_max=1e10,
+            eval_point=lambda alpha: (0.5, 5.0) if alpha > 0.02 else (0.5, -200.0),
+            entries=[],
+            soc=None,
+        )
+
+    assert result.accepted
+    msgs = [r.getMessage() for r in caplog.records if "ls trial" in r.getMessage()]
+    assert len(msgs) >= 2  # several backtracks were traced
+    assert any("armijo" in m for m in msgs)  # rejected trials are labelled
+    assert any("accept" in m for m in msgs)  # the accepted trial is labelled
+    assert all(
+        "alpha=" in m and "theta=" in m and "phi=" in m for m in msgs
+    )  # each line carries the trial quantities
+
+
+def test_search_traces_soc_trials(caplog):
+    # A second-order-correction trial is labelled soc-* in the trace, so a
+    # heavy-backtracking log distinguishes SOC attempts from plain trials.
+    line_search = FilterLineSearch(LineSearchOptions())
+    with caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+        result = line_search.search(
+            alpha_max=1.0,
+            theta0=1.0,
+            phi0=1.0,
+            dphi=1.0,
+            theta_max=1e10,
+            eval_point=lambda alpha: (2.0, 2.0),  # θ rises ⇒ SOC is attempted
+            entries=[],
+            soc=lambda alpha: (0.1, 2.0),  # ... and the corrected trial is good
+        )
+
+    assert result.accepted and result.used_soc
+    msgs = [r.getMessage() for r in caplog.records if "ls trial" in r.getMessage()]
+    assert any("soc-accept" in m for m in msgs)
+
+
+def test_search_traces_kkt_progress_rescue(caplog):
+    # The rescue's acceptance is labelled distinctly from a plain accept — it
+    # is the one path that overrides an Armijo rejection.
+    line_search = FilterLineSearch(LineSearchOptions())
+    with caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+        result = line_search.search(
+            alpha_max=1.0,
+            theta0=0.0,
+            phi0=1.0,
+            dphi=-1e-6,
+            theta_max=1e4,
+            eval_point=lambda alpha: (0.0, 1.0 + 0.1 * alpha),  # Armijo fails
+            entries=[],
+            kkt_progress=lambda alpha: True,
+        )
+
+    assert result.accepted
+    msgs = [r.getMessage() for r in caplog.records if "ls trial" in r.getMessage()]
+    assert any("kkt-progress" in m for m in msgs)
 
 
 def test_empty_filter_accepts_candidate():
@@ -34,6 +132,19 @@ def test_filter_augment_removes_entries_dominated_by_new_pair():
     assert (1.0, 10.0) not in filt.entries
     assert (0.25, 20.0) in filt.entries
     assert (0.5, 8.0) in filt.entries
+
+
+def test_filter_clear_empties_the_entries():
+    # The filter's φ coordinates are φ_μ values — meaningful only for the μ they
+    # were recorded at. The driver re-initializes the filter whenever μ changes
+    # (W&B 2006 filter re-initialization on a barrier update; IPOPT's
+    # ``FilterLSAcceptor::Reset`` via ``MonotoneMuUpdate``), so ``clear`` must
+    # restore the empty (everything-acceptable) state.
+    filt = Filter(entries=[(1.0, 10.0), (0.25, 20.0)])
+    filt.clear()
+
+    assert filt.entries == []
+    assert filt.is_acceptable(theta=1e6, phi=1e6)
 
 
 def test_ascent_step_rejected_at_feasible_point():
@@ -209,6 +320,94 @@ def test_search_backtracks_past_non_finite_gradient_region():
     # Trials at alpha = 1.0, 0.5, 0.25: the first two rejected on a non-finite
     # gradient, the third accepted.
     assert result.n_trials == 3
+
+
+def test_kkt_progress_rescues_first_trial_at_feasible_point():
+    # At θ0 = 0 the W&B eq. (19) switching condition holds for every descent
+    # direction (RHS = 0), so every trial faces the full Armijo test — the gate
+    # that ground the RT fluence case to 11–27 backtracks per iteration while
+    # IPOPT (hovering at θ > 0) accepted first trials through the near-vacuous
+    # θ-type branch. The rescue: a *first* trial that fails Armijo is still
+    # accepted when the caller certifies sufficient scaled-KKT-error decrease —
+    # at a feasible iterate, optimality progress IS progress.
+    ls = FilterLineSearch(LineSearchOptions())
+    seen: list[float] = []
+
+    def kkt_progress(alpha):
+        seen.append(alpha)
+        return True
+
+    result = ls.search(
+        alpha_max=1.0,
+        theta0=0.0,
+        phi0=1.0,
+        dphi=-1e-6,  # descent ⇒ switching holds ⇒ f-type Armijo
+        theta_max=1e4,
+        eval_point=lambda alpha: (0.0, 1.0 + 0.1 * alpha),  # φ rises ⇒ Armijo fails
+        entries=[],
+        kkt_progress=kkt_progress,
+    )
+
+    assert result.accepted
+    assert result.alpha == 1.0
+    assert result.n_trials == 1
+    assert not result.augment  # f-type-like: the filter is not augmented
+    assert seen == [1.0]
+
+
+def test_kkt_progress_consulted_only_on_the_first_trial():
+    # The certificate costs a gradient/Jacobian evaluation, so it is a
+    # first-trial rescue only (mirroring SOC); rejected ⇒ plain backtracking.
+    ls = FilterLineSearch(LineSearchOptions())
+    seen: list[float] = []
+
+    def kkt_progress(alpha):
+        seen.append(alpha)
+        return False
+
+    result = ls.search(
+        alpha_max=1.0,
+        theta0=0.0,
+        phi0=1.0,
+        dphi=-1e-6,
+        theta_max=1e4,
+        # φ rises along the ray: Armijo keeps failing, α exhausts.
+        eval_point=lambda alpha: (0.0, 1.0 + 0.1 * alpha),
+        entries=[],
+        kkt_progress=kkt_progress,
+    )
+
+    assert not result.accepted
+    assert result.restoration
+    assert seen == [1.0]  # not retried on the backtracked trials
+
+
+def test_kkt_progress_never_rescues_ascent_directions():
+    # The feasible ascent-stall guard must be untouched: an ascent direction
+    # (dφ > 0) at a feasible point fails the switching condition and takes the
+    # θ-branch — its rejection reason is not "armijo", so the certifier is
+    # never consulted and the φ-inflating trial stays rejected.
+    ls = FilterLineSearch(LineSearchOptions())
+    seen: list[float] = []
+
+    def kkt_progress(alpha):
+        seen.append(alpha)
+        return True
+
+    result = ls.search(
+        alpha_max=1.0,
+        theta0=0.0,
+        phi0=1.0,
+        dphi=5.0,  # ascent: switching can never hold
+        theta_max=1e4,
+        eval_point=lambda alpha: (0.0, 1.0 + 10.0 * alpha),  # φ inflates
+        entries=[],
+        kkt_progress=kkt_progress,
+    )
+
+    assert not result.accepted
+    assert result.restoration
+    assert seen == []
 
 
 def test_search_hands_off_to_restoration_when_gradient_never_finite():

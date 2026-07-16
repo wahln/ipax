@@ -34,6 +34,7 @@ the matrix-free Krylov solver, or the sparse-direct route.
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from time import perf_counter
@@ -69,6 +70,7 @@ from ipax.ipm.corrections import (
     CorrectionContext,
     HigherOrderCorrection,
     probing_mu,
+    quality_mu,
     select_corrector,
 )
 from ipax.ipm.filter_ls import Filter, FilterLineSearch
@@ -172,6 +174,21 @@ _NEAR_FEASIBLE_FACTOR = 1e4
 # RESTORATION_FAILED. Bounds the resume loop: θ must shrink geometrically, so
 # at most ~log(θ0/tol)/log(1/factor) resumes can occur.
 _RESTORATION_PROGRESS_FACTOR = 0.9
+# Barrier escalation on a *repeated* feasible-point re-center. The first
+# re-center repairs slacks/duals at the current μ (the HS101 fix); when that
+# repeats, the barrier problem itself is what cannot be solved — observed on an
+# RT fluence case where a free-mode μ oracle pinned μ at its floor and every
+# re-center re-derived the same rejected direction for hundreds of iterations
+# (at θ0 = 0 the W&B eq. (19) switching condition holds for every descent
+# direction, so each trial faces the full Armijo test against the stiff
+# barrier). The repeat raises μ to the scale of the stationarity residual the
+# barrier must absorb — the same "iterate outran the barrier" response as
+# IPOPT's adaptive oracle raising μ (cf. Nocedal, Wächter & Waltz 2009, §5.1
+# re-initialization) — by at least this factor (a smaller raise changes
+# nothing against an α-halving line search) and at most back to ``mu_init``
+# (never worse-centered than a cold start).
+_RECENTER_MU_RAISE_FACTOR = 10.0
+_RECENTER_MU_ERROR_FRACTION = 0.1  # μ_new target: fraction of the stall's KKT error
 
 
 def _norm_inf(xp: Namespace, v: Array) -> float:
@@ -277,12 +294,15 @@ class _RestorationState:
     ``second_chance_used`` fires the x0-anchored infeasibility probe at most
     once; ``uncertified_stall_theta`` tracks the θ at the last uncertified
     restoration stall so a resume is only justified while restoration keeps
-    reducing the violation between stalls. Held in an explicit object (not
+    reducing the violation between stalls; ``feasible_recenters`` counts the
+    feasible-point re-centers so a *repeat* escalates the barrier (raises μ)
+    instead of treadmilling at the same one. Held in an explicit object (not
     module state, invariant #5) and threaded through the loop.
     """
 
     second_chance_used: bool = False
     uncertified_stall_theta: float = float("inf")
+    feasible_recenters: int = 0
 
 
 @dataclass(frozen=True)
@@ -293,7 +313,10 @@ class _RestorationOutcome:
     otherwise the run terminates with ``status``/``message``. Keeping the
     control-flow decision in the return value lets the two entry points — a
     filter line-search failure and a step-solve failure the δ_w ladder could
-    not repair — share one handler.
+    not repair — share one handler. A non-``None`` ``mu`` carries a barrier
+    escalation (a repeated feasible-point re-center raised μ); the caller
+    applies it to the loop's μ and suspends any free-mode μ oracle so the
+    raise is not immediately re-targeted away.
     """
 
     resume: bool
@@ -302,6 +325,7 @@ class _RestorationOutcome:
     y_ineq: Array | None = None
     status: Status | None = None
     message: str | None = None
+    mu: float | None = None
 
 
 class IPMDriver:
@@ -338,11 +362,11 @@ class IPMDriver:
         corrections = options.corrections
         assert not isinstance(corrections, str)  # normalized by Options.__post_init__
         self._corrector: HigherOrderCorrection = select_corrector(corrections)
-        # Standalone "probing" (no corrector requested) runs the corrector path
-        # with a plain centered re-solve, since the probing oracle needs the
-        # affine direction anyway (Nocedal, Wächter & Waltz 2009, §3).
+        # Standalone "probing"/"quality" (no corrector requested) run the
+        # corrector path with a plain centered re-solve, since both oracles
+        # need the affine direction (Nocedal, Wächter & Waltz 2009, §3).
         self._mu_schedule: MuSchedule = options.mu_schedule
-        if self._mu_schedule == "probing" and not self._corrector.active:
+        if self._mu_schedule in ("probing", "quality") and not self._corrector.active:
             self._corrector = CenteringOnly()
         self._problem_time_total = 0.0
         self._linear_eq_data = self._normalize_linear_eq(problem.linear_eq())
@@ -683,6 +707,23 @@ class IPMDriver:
         acceptable = ConditionChecker.for_acceptable(opts.acceptable)
 
         filt = Filter()
+        # μ the filter's φ entries were recorded at. The filter is
+        # re-initialized whenever the barrier parameter changes — its φ_μ
+        # coordinates are specific to that barrier problem (W&B 2006 filter
+        # re-initialization on a barrier update; IPOPT ``MonotoneMuUpdate`` /
+        # ``AdaptiveMuUpdate`` both call ``FilterLSAcceptor::Reset``; NWW 2009
+        # §5: "the history in the filter [is] reset at every free iteration
+        # because the barrier problem itself changes").
+        filter_mu = mu
+        # Free-mode acceptance filter (NWW 2009, §5 obj-constr variant): the
+        # ``(θ, f)`` history of free-mode iterates, with the RAW objective —
+        # unlike φ_μ it is comparable across the oracle's per-iteration μ
+        # re-targets, which is why it (and not the W&B filter) is the
+        # free-mode merit memory. Never cleared during the run (IPOPT clears
+        # its globalization filter only at initialization); inert unless a
+        # non-monotone μ oracle is in free mode with
+        # ``LineSearchOptions.free_mode_acceptance="obj-constr-filter"``.
+        free_filt = Filter()
         line_search = FilterLineSearch(opts.line_search)
         # eq. (18): θ_max guard, fixed from the initial constraint violation.
         theta_max = _THETA_MAX_FACTOR * max(1.0, self._theta_l1(x, s, m, m_eq))
@@ -784,7 +825,11 @@ class IPMDriver:
                 free_mode, entered_monotone = mu_monitor.observe(e0)
                 if entered_monotone and m + n_bounds > 0:
                     # NWW 2009, §5.1: restart the monotone strategy from a
-                    # fraction of the current complementarity.
+                    # fraction of the current complementarity — floored by the
+                    # centrality condition (El-Bakry et al. 1996) on the
+                    # *current* primal/dual residual, matching the free-mode
+                    # paths: a collapsed complementarity must not re-enter
+                    # monotone mode at a μ the decentered iterate cannot solve.
                     avg_compl, _ = complementarity_measures(
                         s=s,
                         y_ineq=y_ineq,
@@ -797,7 +842,15 @@ class IPMDriver:
                         m=m,
                         n_bounds=n_bounds,
                     )
-                    mu = fallback_mu(avg_compl, opts.barrier, opts.optimality.kkt_tol)
+                    mu = fallback_mu(
+                        avg_compl,
+                        opts.barrier,
+                        opts.optimality.kkt_tol,
+                        infeasibility=max(
+                            residuals.dual_infeasibility,
+                            residuals.primal_infeasibility,
+                        ),
+                    )
                     logger.debug(
                         "iter %d: free-mode safeguard tripped (e0=%.3e); "
                         "monotone mode from mu=%.3e",
@@ -1008,9 +1061,8 @@ class IPMDriver:
                     mu=mu,
                     last_alpha=last_alpha,
                     free_mode=free_mode,
-                    infeasibility=max(
-                        residuals.dual_infeasibility, residuals.primal_infeasibility
-                    ),
+                    dual_infeasibility=residuals.dual_infeasibility,
+                    primal_infeasibility=residuals.primal_infeasibility,
                     err_kwargs=err_kwargs,
                 )
                 if corrected is None:
@@ -1076,6 +1128,15 @@ class IPMDriver:
                 else:
                     step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
 
+            # Every μ-update path is complete for this iteration (fallback
+            # re-entry, free-mode oracle, monotone reduction, or a recenter
+            # escalation applied on the previous iteration's ``continue``):
+            # re-initialize the filter if the barrier problem changed, before
+            # anything consumes or augments it (see ``filter_mu`` above).
+            if mu != filter_mu:
+                filt.clear()
+                filter_mu = mu
+
             if step_solve_failed:
                 # Classify the failure: a solve that fails at an essentially
                 # optimal iterate is salvaged ACCEPTABLE (ill-conditioning near
@@ -1125,6 +1186,12 @@ class IPMDriver:
                     and outcome.y_ineq is not None
                 )
                 x, s, y_ineq = outcome.x, outcome.s, outcome.y_ineq
+                if outcome.mu is not None:
+                    # Barrier escalation from a repeated feasible re-center;
+                    # suspend the free-mode μ oracle or it would re-target μ
+                    # from the stale complementarity on the next iteration.
+                    mu = outcome.mu
+                    mu_monitor.suspend(e0)
                 alpha_p = 0.0
                 last_alpha = 0.0
                 prev_x = None
@@ -1236,6 +1303,57 @@ class IPMDriver:
                 """
                 return bool(xp.all(xp.isfinite(self._gradient(x + alpha * step.dx))))
 
+            def kkt_progress(
+                alpha: float,
+                x: Array = x,
+                s: Array = s,
+                step: NewtonStep = step,
+                alpha_d: float = alpha_d,
+                y_eq: Array = y_eq,
+                y_ineq: Array = y_ineq,
+                z_lower: Array = z_lower,
+                z_upper: Array = z_upper,
+                e0: float = e0,
+            ) -> bool:
+                """Certify scaled-KKT-error decrease at the trial point.
+
+                The feasible-point rescue's acceptance certificate (see
+                ``LineSearchOptions.feasible_kkt_progress``): evaluates the
+                scaled KKT error at ``(x + α Δx, s + α Δs)`` with the duals at
+                the iteration's fraction-to-boundary dual step — the state the
+                driver would adopt on acceptance — and requires it to fall by
+                the configured fraction of the current error ``e0``. Costs one
+                gradient + Jacobian evaluation; consulted on the first trial
+                of a feasible-point search only.
+                """
+                gamma_e = opts.line_search.feasible_kkt_progress
+                assert gamma_e is not None  # closure only wired when enabled
+                x_t = x + alpha * step.dx
+                s_t = s + alpha * step.ds if m > 0 else s
+                x_minus_l_t, u_minus_x_t = bound_gaps(x_t)
+                residuals_t = self.kkt_error(
+                    mu=0.0,
+                    grad=self._gradient(x_t),
+                    ineq_jac=self._ineq_jac(x_t),
+                    m=m,
+                    g=self._ineq(x_t),
+                    s=s_t,
+                    y_ineq=y_ineq + alpha_d * step.dy_ineq,
+                    z_lower=z_lower + alpha_d * step.dz_lower,
+                    z_upper=z_upper + alpha_d * step.dz_upper,
+                    x_minus_l=x_minus_l_t,
+                    u_minus_x=u_minus_x_t,
+                    mask_l=mask_l,
+                    mask_u=mask_u,
+                    n_bounds=n_bounds,
+                    c=self._eq(x_t),
+                    eq_jac=self._eq_jac(x_t),
+                    m_eq=m_eq,
+                    y_eq=y_eq + alpha_d * step.dy_eq,
+                )
+                e_t = residuals_t.error
+                return math.isfinite(e_t) and e_t <= (1.0 - gamma_e) * e0
+
             soc_primal: tuple[Array, Array] | None = None
 
             def is_strictly_interior(x_t: Array, s_t: Array) -> bool:
@@ -1334,6 +1452,7 @@ class IPMDriver:
             )
 
             used_soc = False
+            used_free_acceptance = False
             if use_breedveld:
                 alpha_p, restoration, last_line_search_iters = breedveld.search(
                     alpha_max=alpha_p_max,
@@ -1343,6 +1462,45 @@ class IPMDriver:
                     eval_point=eval_point,
                     iteration=it,
                 )
+            elif (
+                self._mu_schedule != "monotone"
+                and free_mode
+                and m + n_bounds > 0
+                and opts.line_search.free_mode_acceptance == "obj-constr-filter"
+            ):
+                # Free-mode acceptance (NWW 2009, §5; see ``search_free``): the
+                # oracle re-targets μ every iteration, so the weak (θ, f)
+                # margin-filter test governs; the KKT-error monitor above trips
+                # this branch off (``free_mode`` False ⇒ rigorous W&B search)
+                # on stagnation. Remember the current — accepted — iterate
+                # first, mirroring IPOPT's RememberCurrentPointAsAccepted: the
+                # margins are what keep the vs-current comparison from
+                # degenerating into a monotone requirement.
+                def eval_point_free(
+                    alpha: float,
+                    x: Array = x,
+                    s: Array = s,
+                    step: NewtonStep = step,
+                ) -> tuple[float, float]:
+                    x_t = x + alpha * step.dx
+                    s_t = s + alpha * step.ds if m > 0 else s
+                    return (self._theta_l1(x_t, s_t, m, m_eq), self._objective(x_t))
+
+                used_free_acceptance = True
+                free_filt.augment(theta0, objective)
+                result = line_search.search_free(
+                    alpha_max=alpha_p_max,
+                    theta_max=theta_max,
+                    eval_point=eval_point_free,
+                    entries=free_filt.entries,
+                    # IPOPT AdaptiveMuUpdate::CheckSufficientProgress margins.
+                    margin=opts.line_search.free_filter_margin_fact
+                    * min(opts.line_search.free_filter_max_margin, e0),
+                    grad_finite=grad_finite if use_lbfgs else None,
+                )
+                alpha_p = result.alpha
+                restoration = result.restoration
+                last_line_search_iters = result.n_trials
             else:
                 result = line_search.search(
                     alpha_max=alpha_p_max,
@@ -1354,6 +1512,19 @@ class IPMDriver:
                     entries=filt.entries,
                     soc=soc,
                     grad_finite=grad_finite if use_lbfgs else None,
+                    # Feasible-point rescue: only meaningful where the eq. (19)
+                    # switching condition degenerates — numerically feasible
+                    # iterates (round-off keeps θ0 at ~1e-16, not exactly 0);
+                    # same feasibility notion as the re-center path. See
+                    # LineSearchOptions.feasible_kkt_progress.
+                    kkt_progress=(
+                        kkt_progress
+                        if (
+                            opts.line_search.feasible_kkt_progress is not None
+                            and theta0 <= feasible_theta_tol(opts.optimality.kkt_tol)
+                        )
+                        else None
+                    ),
                 )
                 alpha_p = result.alpha
                 restoration = result.restoration
@@ -1361,6 +1532,53 @@ class IPMDriver:
                 last_line_search_iters = result.n_trials
                 if result.accepted and result.augment:
                     filt.augment(theta0, phi0)
+
+            if (
+                restoration
+                and used_free_acceptance
+                and opts.barrier.fallback != "never"
+            ):
+                # A failed free-mode line search is the switch-to-monotone
+                # trigger, not a restoration entry (NWW 2009, §5; IPOPT's
+                # skipped-line-search signal in AdaptiveMuUpdate: sufficient
+                # progress is denied, the mode flips, and the *rigorous* W&B
+                # machinery retries from the same iterate — restoration stays
+                # available to that path if it fails too). No step is taken;
+                # μ is re-seeded like the monitor's own trip at the loop top
+                # (monotone restart from the complementarity, floored by the
+                # El-Bakry centrality condition).
+                logger.debug(
+                    "iter %d: free-mode line search failed; switching to "
+                    "monotone mode (rigorous acceptance)",
+                    it,
+                )
+                mu_monitor.suspend(e0)
+                avg_compl, _ = complementarity_measures(
+                    s=s,
+                    y_ineq=y_ineq,
+                    z_lower=z_lower,
+                    z_upper=z_upper,
+                    x_minus_l=x_minus_l,
+                    u_minus_x=u_minus_x,
+                    mask_l=mask_l,
+                    mask_u=mask_u,
+                    m=m,
+                    n_bounds=n_bounds,
+                )
+                mu = fallback_mu(
+                    avg_compl,
+                    opts.barrier,
+                    opts.optimality.kkt_tol,
+                    infeasibility=max(
+                        residuals.dual_infeasibility,
+                        residuals.primal_infeasibility,
+                    ),
+                )
+                alpha_p = 0.0
+                last_alpha = 0.0
+                prev_x = None
+                last_step_solve_time = self._step_solve_seconds
+                continue
 
             if restoration:
                 outcome = self._handle_restoration(
@@ -1394,6 +1612,12 @@ class IPMDriver:
                     and outcome.y_ineq is not None
                 )
                 x, s, y_ineq = outcome.x, outcome.s, outcome.y_ineq
+                if outcome.mu is not None:
+                    # Barrier escalation from a repeated feasible re-center;
+                    # suspend the free-mode μ oracle or it would re-target μ
+                    # from the stale complementarity on the next iteration.
+                    mu = outcome.mu
+                    mu_monitor.suspend(e0)
                 # A restoration jump / barrier re-center is a blocked Newton step:
                 # σ(0) = 0.01 re-centers on the next iteration (Breedveld eq. (12)),
                 # and the jump is not a Newton step, so the next curvature pair
@@ -1585,9 +1809,11 @@ class IPMDriver:
         complementarity on every iteration: ``"adaptive"`` via the LOQO
         centrality rule (Nocedal, Wächter & Waltz 2009, eqs. (3.1)/(3.6)),
         ``"breedveld"`` via the steplength-driven duality-gap reduction
-        (Breedveld 2017, eqs. (10)–(12)). ``"probing"`` never reaches this
-        method — it needs the affine direction, so it is applied on the
-        corrector path (see ``_corrected_step``). Problems without
+        (Breedveld 2017, eqs. (10)–(12)). ``"probing"`` and ``"quality"``
+        never reach this method in free mode — they need the affine direction,
+        so they are applied on the corrector path (see ``_corrected_step``);
+        with ``free_mode`` ``False`` they fall to the monotone reduction like
+        every oracle. Problems without
         complementarity pairs — and, for the steplength rule, iterations before
         the first accepted step — fall back to keeping/reducing μ monotonically.
         With ``free_mode`` ``False`` (the NWW §5.1 safeguard tripped) every
@@ -1618,7 +1844,10 @@ class IPMDriver:
         if schedule == "adaptive":
             mu_next = adaptive_mu(avg_compl, min_compl, opts.barrier, tol)
         else:
-            assert last_alpha is not None  # narrowed above
+            # Only the steplength rule remains: probing/quality are routed to
+            # the corrector path in free mode (guaranteed by the CenteringOnly
+            # installation in __init__), monotone/suspended exited above.
+            assert schedule == "breedveld" and last_alpha is not None
             mu_next = breedveld_mu(avg_compl, last_alpha, opts.barrier, tol)
         # Centrality floor (El-Bakry et al. 1996): μ must not vanish faster
         # than the primal/dual infeasibility, or the barrier decenters at a
@@ -1736,19 +1965,23 @@ class IPMDriver:
         mu: float,
         last_alpha: float | None,
         free_mode: bool,
-        infeasibility: float,
+        dual_infeasibility: float,
+        primal_infeasibility: float,
         err_kwargs: dict[str, Any],
     ) -> tuple[float, NewtonStep, float] | None:
         """Affine predictor + μ oracle + higher-order corrector.
 
-        The affine direction doubles as the probe for the ``"probing"`` oracle;
-        any other ``mu_schedule`` picks the target via ``_next_mu`` and the
-        corrector merely aims at it (Nocedal, Wächter & Waltz 2009: the
-        corrector is not part of the barrier-parameter selection). Returns
-        ``(μ, step, δ_w)`` where ``μ`` is the barrier target the corrected
-        ``step`` aims at (adopted by the line search), or ``None`` if the
-        affine operator setup/solve failed despite regularization.
+        The affine direction doubles as the probe for the ``"probing"`` and
+        ``"quality"`` oracles (the latter also scores the centering family it
+        spans — NWW 2009, §3.3); any other ``mu_schedule`` picks the target via
+        ``_next_mu`` and the corrector merely aims at it (Nocedal, Wächter &
+        Waltz 2009: the corrector is not part of the barrier-parameter
+        selection). Returns ``(μ, step, δ_w)`` where ``μ`` is the barrier
+        target the corrected ``step`` aims at (adopted by the line search), or
+        ``None`` if the affine operator setup/solve failed despite
+        regularization.
         """
+        infeasibility = max(dual_infeasibility, primal_infeasibility)
         affine_rhs = self._condensed_rhs(0.0, 0.0, 0.0, **rhs_kwargs)
         dx_aff, dy_aff, reg_applied, ok = solve_step_timed(
             w, sigma_x, sigma_s, ineq_jac, affine_rhs, eq_jac, m_eq, -c, delta_c
@@ -1798,10 +2031,15 @@ class IPMDriver:
                 self._options.barrier.mu_min, self._options.optimality.kkt_tol / 10.0
             ),
         )
-        if free_mode and self._mu_schedule == "probing":
+        if free_mode and self._mu_schedule in ("probing", "quality"):
+            oracle_mu = (
+                quality_mu(context, dual_infeasibility, primal_infeasibility)
+                if self._mu_schedule == "quality"
+                else probing_mu(context)
+            )
             # Centrality floor (El-Bakry et al. 1996) — see BarrierOptions.
             mu_target = max(
-                probing_mu(context),
+                oracle_mu,
                 self._options.barrier.kappa_centrality * infeasibility,
             )
         else:
@@ -1820,11 +2058,15 @@ class IPMDriver:
 
         Best-effort and solver-agnostic (invariant #3): it only engages when the
         injected solver reports the factor's inertia (a sparse LDLᵀ backend such
-        as Feral / cuDSS) *and* the KKT operator knows its target inertia. In
-        every other case — dense Cholesky / Krylov (no inertia, but Cholesky
-        already fails on indefiniteness), a non-inertia-revealing factorization,
-        or an L-BFGS low-rank Hessian (PD by Powell damping) — it returns ``True``
-        and leaves correction to the factorization-failure escalation.
+        as Feral / cuDSS) *and* the KKT operator knows its target inertia. For a
+        diagonal-plus-low-rank (L-BFGS) Hessian the target folds the compact
+        ``M``-block signature into the bordered inertia (see
+        :meth:`~ipax.ipm.kkt._CondensedOperator.expected_inertia`), so the check
+        now covers that route too. In every other case — dense Cholesky / Krylov
+        (no inertia, but Cholesky already fails on indefiniteness), a
+        non-inertia-revealing factorization, or a singular/oversized ``M`` block
+        (no reliable target) — it returns ``True`` and leaves correction to the
+        factorization-failure escalation.
         """
         target_fn = getattr(operator, "expected_inertia", None)
         target = target_fn() if target_fn is not None else None
@@ -2110,10 +2352,40 @@ class IPMDriver:
                 it,
             )
             filt.augment(theta0, phi0)
+            rstate.feasible_recenters += 1
+            # A *repeated* feasible re-center means repairing slacks/duals at
+            # the current μ already failed once — the barrier problem itself is
+            # what cannot be solved. Raise μ to the scale of the stall's KKT
+            # error (capped at mu_init, raised by at least the escalation
+            # factor); the caller applies it and suspends any free-mode μ
+            # oracle. See _RECENTER_MU_RAISE_FACTOR for the full rationale.
+            mu_raised: float | None = None
+            if rstate.feasible_recenters >= 2:
+                target = min(
+                    opts.barrier.mu_init,
+                    max(
+                        _RECENTER_MU_RAISE_FACTOR * mu,
+                        _RECENTER_MU_ERROR_FRACTION * record.kkt_error,
+                    ),
+                )
+                if target > mu:
+                    mu_raised = target
+                    logger.debug(
+                        "iter %d: repeated feasible re-center; raising the "
+                        "barrier mu from %.2e to %.2e",
+                        it,
+                        mu,
+                        mu_raised,
+                    )
             # ``g`` is the inequality residual at this iterate, computed at the
             # top of the loop; the failure did not move ``x``, so it is current.
-            s, y_ineq = recenter_slacks_duals(xp, g, y_ineq, mu)
-            return _RestorationOutcome(resume=True, x=x, s=s, y_ineq=y_ineq)
+            # Re-center on the μ the loop will actually resume with, so the
+            # slack floor and the multiplier central band match that barrier.
+            mu_eff = mu_raised if mu_raised is not None else mu
+            s, y_ineq = recenter_slacks_duals(xp, g, y_ineq, mu_eff)
+            return _RestorationOutcome(
+                resume=True, x=x, s=s, y_ineq=y_ineq, mu=mu_raised
+            )
         logger.debug("iter %d: entering feasibility restoration", it)
         filt.augment(theta0, phi0)
         x, s, rest_exit = self._restore(

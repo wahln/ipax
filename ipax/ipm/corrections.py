@@ -52,15 +52,16 @@ corrector returns the affine step unchanged.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ipax.backend.namespace import array_namespace
+from ipax.ipm.step import NewtonStep
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from ipax.ipm.step import NewtonStep
     from ipax.options import CorrectionsOptions
     from ipax.typing import Array, Namespace
 
@@ -81,6 +82,16 @@ _TAU_BOUNDARY = 1.0
 # threshold the corrector degrades to the plain centered Newton step at the
 # same μ target — the direction ``corrections="none"`` would compute.
 _MEHROTRA_KEEP_FRACTION = 0.5
+# Quality-function oracle (NWW 2009, §3.3/§4): σ search bounds and budget.
+# σ_max > 1 admits genuine μ *raises* — the closed-loop answer to a decentered
+# iterate whose complementarity has collapsed below the true KKT residual
+# (IPOPT's quality-function oracle likewise allows σ well above 1). A coarse
+# log-decade grid brackets the golden-section refinement because the quality
+# function need not be unimodal over the whole range (NWW §4).
+_QUALITY_SIGMA_MIN = 1e-6
+_QUALITY_SIGMA_MAX = 1e2
+_QUALITY_SECTION_STEPS = 8  # golden-section refinements inside the bracket
+_GOLDEN = (math.sqrt(5.0) - 1.0) / 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +257,110 @@ def probing_mu(ctx: CorrectionContext) -> float:
     # current gap, never raise it.
     sigma = min((mu_aff / mu) ** 3, 1.0) if mu > 0.0 else 0.0
     return max(sigma * mu, ctx.mu_min)
+
+
+def _step_axpy(base: NewtonStep, sigma: float, direction: NewtonStep) -> NewtonStep:
+    """``base + σ·direction`` componentwise (directions form a linear family)."""
+    return NewtonStep(
+        dx=base.dx + sigma * direction.dx,
+        ds=base.ds + sigma * direction.ds,
+        dy_eq=base.dy_eq + sigma * direction.dy_eq,
+        dy_ineq=base.dy_ineq + sigma * direction.dy_ineq,
+        dz_lower=base.dz_lower + sigma * direction.dz_lower,
+        dz_upper=base.dz_upper + sigma * direction.dz_upper,
+    )
+
+
+def quality_mu(
+    ctx: CorrectionContext,
+    dual_infeasibility: float,
+    primal_infeasibility: float,
+) -> float:
+    """Quality-function μ oracle (Nocedal, Wächter & Waltz 2009, §3.3).
+
+    Scores each centering parameter σ by a linear model of the *full* KKT
+    residual after the combined direction ``d(σ) = d_aff + σ·d_cen``, with the
+    fraction-to-boundary steplengths that direction actually attains::
+
+        q(σ) = ((1−α_D(σ))·‖r_dual‖)² + ((1−α_P(σ))·‖r_primal‖)² + compl(σ)²
+
+    (the 2-norm-squared flavour, IPOPT's default). The KKT system is linear in
+    the complementarity target, so ``d_cen`` costs one extra solve against the
+    already-factored operator (targets ``μ_avg·e`` minus the affine direction);
+    every σ candidate after that is pure vector algebra. σ is minimized over a
+    coarse log-decade grid bracketing a golden-section refinement (NWW §4),
+    and — unlike the Mehrotra σ-rule (σ ≤ 1) or the LOQO rule (σ ≤ 0.8) —
+    σ > 1 is admitted up to ``_QUALITY_SIGMA_MAX``: a genuine μ *raise*, the
+    closed-loop response to a decentered iterate whose complementarity has
+    collapsed below the true residual (a large μ scores badly through its own
+    predicted complementarity, so the raise is self-limiting). Falls back to
+    :func:`probing_mu` when the centering solve fails; ``0.0`` with no
+    complementarity pairs. Cost note: ~17 q-evaluations per iteration, each
+    two O(n) fraction-to-boundary reductions — comparable to a Gondzio
+    correction round, and host-syncing, so GPU runs pay a bounded per-iteration
+    latency for the oracle.
+    """
+    xp = array_namespace(ctx.affine.dx)
+    count = _counts(ctx, xp)
+    if count == 0:
+        return 0.0
+    mu_avg = _average(*_products(ctx, xp, None, 0.0, 0.0), count, xp)
+    if mu_avg <= 0.0:
+        return ctx.mu_min
+    centered = ctx.solve(
+        mu_avg * xp.ones_like(ctx.s),
+        mu_avg * xp.ones_like(ctx.x_minus_l),
+        mu_avg * xp.ones_like(ctx.u_minus_x),
+    )
+    if centered is None:
+        return probing_mu(ctx)
+    centering = _step_axpy(centered, -1.0, ctx.affine)
+
+    def q(sigma: float) -> float:
+        trial = _step_axpy(ctx.affine, sigma, centering)
+        alpha_p = ctx.alpha_primal(trial, tau=_TAU_BOUNDARY)
+        alpha_d = ctx.alpha_dual(trial, tau=_TAU_BOUNDARY)
+        compl = _average(*_products(ctx, xp, trial, alpha_p, alpha_d), count, xp)
+        r_d = (1.0 - alpha_d) * dual_infeasibility
+        r_p = (1.0 - alpha_p) * primal_infeasibility
+        return r_d * r_d + r_p * r_p + compl * compl
+
+    # Decade grid over [σ_min, σ_max]: bracket the minimizer, then refine.
+    grid = [
+        10.0**k
+        for k in range(
+            round(math.log10(_QUALITY_SIGMA_MIN)),
+            round(math.log10(_QUALITY_SIGMA_MAX)) + 1,
+        )
+    ]
+    values = [q(sigma) for sigma in grid]
+    i = min(range(len(grid)), key=values.__getitem__)
+    best_sigma, best_q = grid[i], values[i]
+
+    lo = math.log(grid[max(i - 1, 0)])
+    hi = math.log(grid[min(i + 1, len(grid) - 1)])
+    c = hi - _GOLDEN * (hi - lo)
+    d = lo + _GOLDEN * (hi - lo)
+    qc, qd = q(math.exp(c)), q(math.exp(d))
+    for _ in range(_QUALITY_SECTION_STEPS):
+        if qc < best_q:
+            best_sigma, best_q = math.exp(c), qc
+        if qd < best_q:
+            best_sigma, best_q = math.exp(d), qd
+        if qc <= qd:
+            hi, d, qd = d, c, qc
+            c = hi - _GOLDEN * (hi - lo)
+            qc = q(math.exp(c))
+        else:
+            lo, c, qc = c, d, qd
+            d = lo + _GOLDEN * (hi - lo)
+            qd = q(math.exp(d))
+    if qc < best_q:
+        best_sigma, best_q = math.exp(c), qc
+    if qd < best_q:
+        best_sigma, best_q = math.exp(d), qd
+
+    return float(max(best_sigma * mu_avg, ctx.mu_min))
 
 
 def _mehrotra_step(
@@ -441,5 +556,6 @@ __all__ = [
     "MehrotraCorrector",
     "NoCorrection",
     "probing_mu",
+    "quality_mu",
     "select_corrector",
 ]
