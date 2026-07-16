@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-16
+
 ### Added
 - **Free-mode line-search acceptance — the NWW §5 two-regime globalization**
   (`LineSearchOptions.free_mode_acceptance`, default `"obj-constr-filter"`;
@@ -1150,7 +1152,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/wahln/ipax/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/wahln/ipax/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/wahln/ipax/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/wahln/ipax/compare/v0.4.0...v0.5.0
