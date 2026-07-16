@@ -188,14 +188,33 @@ release:
   routes. The one remaining non-blocking limitation is **AGG** — a feasible
   netlib LP the solver fails to converge (verified feasible vs HiGHS).
 
-!!! note "Adaptive-μ line-search acceptance is opt-in"
-    Two acceptance heuristics from this arc are **off by default** and do not
-    affect the table above: the feasible-point KKT-progress rescue
-    (`LineSearchOptions.feasible_kkt_progress`, disabled after a corpus sweep
-    attributed nonconvex wrong-basin flips to it as a default) and the NWW §5
-    free-mode line-search acceptance (`free_mode_acceptance`, active only under
-    a non-monotone `mu_schedule`, which is itself opt-in). Both target the
-    adaptive-barrier / radiotherapy regime rather than the general corpus.
+!!! note "Adaptive-μ line-search acceptance"
+    Two acceptance heuristics from this arc target the adaptive-barrier /
+    radiotherapy regime rather than the general corpus, and neither affects the
+    table above:
+
+    - **`LineSearchOptions.feasible_kkt_progress`** — disabled by default. As a
+      default it cost 48 corpus flips: on unconstrained/bounds-only problems
+      (θ ≡ 0, exactly its domain) accepting Armijo-failing but KKT-decreasing
+      steps walked nonconvex least-squares runs into worse stationary points.
+      Set it (e.g. `0.1`) to opt in.
+    - **`LineSearchOptions.free_mode_acceptance`** — defaults to the NWW §5
+      `"obj-constr-filter"` weak test, but is only reachable under a
+      **non-monotone `mu_schedule`** (itself opt-in; the default schedule is
+      `monotone`), so the default solver never uses it.
+
+    Paired full-corpus A/Bs of the free-mode acceptance against `"rigorous"`
+    (the Wächter & Biegler gate in both regimes) are **≈ neutral overall** —
+    `quality` +6, `probing` ±0 — but with heavy two-way churn (~55 flips each
+    way per arm). About half the regressions are *wrong-optimum*: the weak
+    per-trial test drops the merit-function guardrail, so on basin-sensitive
+    nonconvex problems (`WOMFLET`, `OET7`, `SPIRAL`, `READING5`, `ELATTAR`,
+    `DISCS`) the solver reliably converges to a different, worse local optimum.
+    It buys a large win on the radiotherapy-style workloads it was built for
+    (near-feasible iterates where the eq. (19) switching condition degenerates
+    and the rigorous gate grinds through 10+ backtracks per iteration). If you
+    run a non-monotone oracle on a nonconvex problem and land on the wrong
+    optimum, set `free_mode_acceptance="rigorous"`.
 
 ## Reproducing
 
