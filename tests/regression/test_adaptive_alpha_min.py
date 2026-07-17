@@ -14,13 +14,16 @@
 
 """Regression: the driver wires the Wächter & Biegler eq. (23) α_min.
 
-Before this, ``alpha_min_frac`` was a flat ``1e-8`` backtracking floor, so a
-hopeless ray was halved 27 times before conceding to restoration regardless of
-the iterate. eq. (23) derives the threshold from the current θ and ∇φᵀd, and
-needs a θ_min the driver must compute from the *initial* constraint violation
-(θ_min = 1e-4·max(1, θ(x_0)), mirroring the existing θ_max guard) and thread into
-every line search. The unit tests in ``tests/unit/test_alpha_min.py`` pin the
-formula; these pin the driver-side plumbing that feeds it, on every backend.
+By default ``alpha_min_frac`` is a flat ``1e-8`` backtracking floor, so a
+hopeless ray is halved 27 times before conceding to restoration regardless of the
+iterate. The opt-in eq. (23) rule (``gamma_alpha``) instead derives the threshold
+from the current θ and ∇φᵀd, and needs a θ_min the driver computes from the
+*initial* constraint violation (θ_min = 1e-4·max(1, θ(x_0)), mirroring the
+existing θ_max guard) and threads into every line search.
+
+θ_min is plumbed unconditionally — both opt-ins consume it, and the plumbing is
+what these tests pin, on every backend. The unit tests in
+``tests/unit/test_alpha_min.py`` pin the formula it feeds.
 """
 
 from __future__ import annotations

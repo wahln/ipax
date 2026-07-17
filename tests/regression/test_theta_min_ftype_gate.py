@@ -57,7 +57,7 @@ def test_ftype_branch_is_gated_by_the_driver_supplied_theta_min(namespace, monke
         options=Options(
             hessian="exact",
             linsolve="dense",
-            line_search=LineSearchOptions(),
+            line_search=LineSearchOptions(ftype_requires_theta_min=True),
         ),
     )
 

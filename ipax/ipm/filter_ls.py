@@ -38,23 +38,6 @@ if TYPE_CHECKING:
 # Switching-condition constant δ (Wächter & Biegler 2006, eq. 19).
 _SWITCH_DELTA = 1.0
 
-# Finite-termination backstop under the eq. (23) α_min.
-#
-# At a feasible iterate (θ0 = 0) with a descent direction, eq. (23) evaluates to
-# *exactly* zero: both of its θ-bearing terms carry a factor of θ0. The
-# backtracking loop `while α >= α_min` would then never exit — α halves into the
-# denormals and finally to 0.0, which still passes `>= 0.0`. Floor α_min instead.
-#
-# 1e-8 is the pre-eq.(23) flat `alpha_min_frac`, so the floor is exactly the old
-# behaviour. It binds wherever eq. (23) drops below it: with ∇φᵀd < 0 and θ0 small
-# *relative to* |∇φᵀd| (at the defaults, θ0/|∇φᵀd| < 2e-2) — a ratio condition,
-# not a "near-feasible" one; a feasible iterate with an ascent direction takes
-# eq. (23)'s third branch and lands on γ_α·γ_θ = 5e-7. Keeping the floor rather
-# than the raw eq. (23) value means α_min only ever *rises*, so this change can
-# make the search concede earlier but never backtrack further than 0.7.0 did.
-# It is a deviation from IPOPT, which uses eq. (23) raw.
-_ALPHA_MIN_FLOOR = 1e-8
-
 
 def _safe_pow(base: float, exponent: float) -> float:
     """``base ** exponent`` with IEEE overflow semantics (→ ``inf``, never raise).
@@ -313,8 +296,9 @@ class FilterLineSearch:
         """
         alpha = alpha_max
         # The eq. (23) α_min is defined through ∇φᵀd and the switching/Armijo
-        # tests, none of which free mode uses; fall back to the flat backstop.
-        alpha_min = _ALPHA_MIN_FLOOR
+        # tests, none of which free mode uses, so ``gamma_alpha`` does not reach
+        # here: free mode always concedes at the flat floor.
+        alpha_min = self._o.alpha_min_frac
         trials = 0
         trace = logger.isEnabledFor(logging.DEBUG)
         while alpha >= alpha_min:
@@ -357,22 +341,32 @@ class FilterLineSearch:
         return "free-filter"
 
     def _alpha_min(self, dphi: float, theta0: float, theta_min: float) -> float:
-        """The minimum trial step size (Wächter & Biegler 2006, eq. 23).
+        """The step size at which the search concedes to restoration.
 
-        Below this α the step cannot satisfy the acceptance tests, so the search
-        stops backtracking and hands off to restoration::
+        By default the flat ``alpha_min_frac``. When ``gamma_alpha`` (γ_α) is
+        requested, the *adaptive* rule of Wächter & Biegler 2006, eq. (23),
+        derived from the current iterate::
 
                         ⎧ min{γ_θ, γ_φ·θ/(−∇φᵀd), δ·θ^{s_θ}/(−∇φᵀd)^{s_φ}}
             α_min = γ_α·⎨                        if ∇φᵀd < 0 and θ ≤ θ_min
                         ⎪ min{γ_θ, γ_φ·θ/(−∇φᵀd)} if ∇φᵀd < 0 and θ > θ_min
                         ⎩ γ_θ                     otherwise
 
-        γ_α is ``alpha_min_frac``. The third term is the switching-condition
-        (eq. 19) bound: below θ_min the f-type branch is reachable, so α_min must
-        stay under the α at which switching stops holding. The result is floored
-        (see ``_ALPHA_MIN_FLOOR``).
+        The third term is the switching-condition (eq. 19) bound: below θ_min the
+        f-type branch is reachable, so α_min must stay under the α at which
+        switching stops holding.
+
+        The result is floored at ``alpha_min_frac``. That is not decoration: at a
+        feasible iterate with a descent direction every eq. (23) term carries a
+        factor of θ0 and the rule returns *exactly* 0.0, whereupon
+        ``while α >= α_min`` never exits — α halves into the denormals, reaches
+        0.0, and still passes ``>= 0.0``. The floor also bounds the opt-in to one
+        direction: α_min can only rise, so requesting eq. (23) can make the search
+        concede sooner but never backtrack further. (IPOPT applies eq. 23 raw.)
         """
         o = self._o
+        if o.gamma_alpha is None:
+            return o.alpha_min_frac
         a = o.gamma_theta
         if dphi < 0.0:
             a = min(a, o.gamma_phi * theta0 / (-dphi))
@@ -386,7 +380,7 @@ class FilterLineSearch:
                 denom = _safe_pow(-dphi, o.s_phi)
                 if denom > 0.0:
                     a = min(a, _SWITCH_DELTA * _safe_pow(theta0, o.s_theta) / denom)
-        return max(_ALPHA_MIN_FLOOR, o.alpha_min_frac * a)
+        return max(o.alpha_min_frac, o.gamma_alpha * a)
 
     def _switching(self, dphi: float, alpha: float, theta0: float) -> bool:
         o = self._o
@@ -397,15 +391,18 @@ class FilterLineSearch:
     def _is_ftype(
         self, dphi: float, alpha: float, theta0: float, theta_min: float
     ) -> bool:
-        """Is this trial an f-type step? (W&B 2006, Algorithm A, Step 4.)
+        """Is this trial an f-type step — i.e. governed by the Armijo condition?
 
-        f-type — the branch governed by the Armijo condition — requires *both*
-        the eq. (19) switching condition **and** an already nearly-feasible
-        iterate, ``θ ≤ θ_min``. Above θ_min the barrier objective is not yet the
-        quantity to make progress on, so the step is judged by the eq. (20)
-        sufficient-decrease test in θ or φ instead.
+        By default the eq. (19) switching condition alone, which is what ipax has
+        always used. W&B Algorithm A (Step 4) additionally requires an already
+        nearly-feasible iterate, ``θ ≤ θ_min``: above θ_min the barrier objective
+        is not yet the quantity to make progress on, so the step is judged by the
+        eq. (20) sufficient-decrease test in θ or φ instead. That conjunct is
+        opt-in via ``ftype_requires_theta_min`` (see the option for why).
         """
-        return theta0 <= theta_min and self._switching(dphi, alpha, theta0)
+        if self._o.ftype_requires_theta_min and theta0 > theta_min:
+            return False
+        return self._switching(dphi, alpha, theta0)
 
     def _armijo_holds(
         self, phi_t: float, phi0: float, dphi: float, alpha: float

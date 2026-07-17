@@ -14,6 +14,9 @@
 
 """The adaptive minimum step size — Wächter & Biegler 2006, eq. (23).
 
+The rule is OPT-IN (``gamma_alpha``); ``tests/unit/test_line_search_opt_ins_default_off.py``
+pins the default. These tests all request it explicitly.
+
 ``FilterLineSearch`` operates on plain Python floats and callables, so these
 tests carry no array namespace; the multi-backend obligation for this change is
 discharged by the integration/regression layer.
@@ -23,18 +26,25 @@ from __future__ import annotations
 
 import pytest
 
-from ipax.ipm.filter_ls import _ALPHA_MIN_FLOOR, FilterLineSearch
+from ipax.ipm.filter_ls import FilterLineSearch
 from ipax.options import LineSearchOptions
 
-# Constants chosen so every eq. (23) branch lands well above _ALPHA_MIN_FLOOR,
-# isolating the formula from the finite-termination backstop.
+# The floor under eq. (23) is ``alpha_min_frac``; at its default it is the value
+# the flat rule would have returned anyway.
+_FLOOR = 1e-8
+
+# Constants chosen so every eq. (23) branch lands well above the floor, isolating
+# the formula from the finite-termination backstop.
 _ISOLATED = LineSearchOptions(
-    alpha_min_frac=0.5,  # γ_α
+    gamma_alpha=0.5,  # γ_α
     gamma_theta=0.1,
     gamma_phi=0.1,
     s_theta=2.0,
     s_phi=2.0,
 )
+
+# The shipped constants, with eq. (23) requested.
+_EQ23 = LineSearchOptions(gamma_alpha=0.05)
 
 
 def test_alpha_min_ascent_branch_is_gamma_alpha_times_gamma_theta():
@@ -72,12 +82,11 @@ def test_alpha_min_descent_below_theta_min_adds_the_switching_term():
     assert above > below
 
 
-def test_alpha_min_matches_eq23_at_the_shipped_defaults():
-    # IPOPT parity at the shipped constants (γ_α = alpha_min_frac = 0.05,
-    # γ_θ = 1e-5): a descent direction at θ = 1, dphi = −1 sits above the
-    # default θ_min, so α_min = γ_α·min{1e-5, 1e-5·1/1} = 5e-7 — nearly two
-    # decades above the 1e-8 floor this replaces.
-    ls = FilterLineSearch(LineSearchOptions())
+def test_alpha_min_matches_eq23_at_the_recommended_gamma_alpha():
+    # At IPOPT's γ_α = 0.05 and ipax's γ_θ = 1e-5: a descent direction at θ = 1,
+    # dphi = −1 sits above the default θ_min, so α_min = γ_α·min{1e-5, 1e-5·1/1}
+    # = 5e-7 — nearly two decades above the flat floor it replaces.
+    ls = FilterLineSearch(_EQ23)
 
     assert ls._alpha_min(dphi=-1.0, theta0=1.0, theta_min=1e-4) == pytest.approx(5e-7)
 
@@ -87,16 +96,16 @@ def test_alpha_min_floors_at_a_feasible_iterate():
     # (both θ-bearing terms vanish). Taken literally that makes the backtracking
     # loop non-terminating, so α_min is floored — which also keeps the feasible
     # iterate behaving exactly as it did before eq. (23) landed.
-    ls = FilterLineSearch(LineSearchOptions())
+    ls = FilterLineSearch(_EQ23)
 
-    assert ls._alpha_min(dphi=-1.0, theta0=0.0, theta_min=1e-4) == _ALPHA_MIN_FLOOR
+    assert ls._alpha_min(dphi=-1.0, theta0=0.0, theta_min=1e-4) == _FLOOR
 
 
 def test_alpha_min_survives_an_underflowing_directional_derivative():
     # (−∇φᵀd)^{s_φ} underflows to 0.0 for a tiny dphi; dividing by it would
     # raise ZeroDivisionError and take down the line search. With the switching
     # term dropped, γ_θ binds: α_min = 0.05·1e-5.
-    ls = FilterLineSearch(LineSearchOptions())
+    ls = FilterLineSearch(_EQ23)
 
     assert ls._alpha_min(dphi=-1e-200, theta0=1e-5, theta_min=1e-4) == pytest.approx(
         5e-7
@@ -106,16 +115,16 @@ def test_alpha_min_survives_an_underflowing_directional_derivative():
 def test_alpha_min_survives_an_overflowing_directional_derivative():
     # The mirror case: (−∇φᵀd)^{s_φ} overflows, so the switching term → 0 and
     # the floor takes over. Must not raise OverflowError.
-    ls = FilterLineSearch(LineSearchOptions())
+    ls = FilterLineSearch(_EQ23)
 
-    assert ls._alpha_min(dphi=-1e200, theta0=1e-5, theta_min=1e-4) == _ALPHA_MIN_FLOOR
+    assert ls._alpha_min(dphi=-1e200, theta0=1e-5, theta_min=1e-4) == _FLOOR
 
 
 def test_search_hands_off_to_restoration_at_the_eq23_alpha_min():
     # An unacceptable ray backtracks only down to the eq. (23) α_min = 5e-7
     # (see the defaults test above) rather than the old flat 1e-8, so the
     # restoration hand-off costs 21 trials instead of 27.
-    line_search = FilterLineSearch(LineSearchOptions())
+    line_search = FilterLineSearch(_EQ23)
 
     result = line_search.search(
         alpha_max=1.0,
@@ -139,7 +148,7 @@ def test_free_search_keeps_the_flat_floor():
     # eq. (23) is defined through ∇φᵀd and the Armijo/switching tests, none of
     # which the free-mode search uses — so it keeps the flat backstop and its
     # behaviour is unchanged by this parity fix.
-    line_search = FilterLineSearch(LineSearchOptions())
+    line_search = FilterLineSearch(_EQ23)
 
     result = line_search.search_free(
         alpha_max=1.0,
@@ -151,15 +160,17 @@ def test_free_search_keeps_the_flat_floor():
 
     assert not result.accepted
     assert result.restoration
-    assert result.alpha == _ALPHA_MIN_FLOOR
+    assert result.alpha == _FLOOR
 
 
-def test_alpha_min_frac_is_validated_to_the_open_unit_interval():
-    # γ_α ∈ (0, 1) (IPOPT bounds alpha_min_frac the same way): γ_α ≤ 0 would
-    # zero out α_min (no restoration hand-off), and γ_α ≥ 1 would make α_min
-    # exceed the switching-condition bound it is meant to sit safely under.
+def test_gamma_alpha_is_validated_to_the_open_unit_interval():
+    # γ_α ∈ (0, 1) (IPOPT bounds its equivalent option the same way): γ_α ≤ 0
+    # would collapse α_min onto the bare floor, silently disabling the rule just
+    # requested, and γ_α ≥ 1 would make α_min exceed the switching-condition
+    # bound it is meant to sit safely under.
     for bad in (0.0, -0.1, 1.0, 1.5):
-        with pytest.raises(ValueError, match="alpha_min_frac"):
-            LineSearchOptions(alpha_min_frac=bad)
+        with pytest.raises(ValueError, match="gamma_alpha"):
+            LineSearchOptions(gamma_alpha=bad)
 
-    LineSearchOptions(alpha_min_frac=0.05)  # the default is valid
+    LineSearchOptions(gamma_alpha=0.05)
+    assert LineSearchOptions().gamma_alpha is None  # opt-in

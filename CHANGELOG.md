@@ -6,48 +6,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- **Two opt-in Wächter & Biegler line-search refinements.** Both are faithful to
+  the paper (and verified against IPOPT's `FilterLSAcceptor`), and both **lost**
+  against the shipped baseline on the full S2MPJ corpus, so both default to off
+  and the default solver is bit-for-bit unchanged. See `docs/benchmarks/s2mpj.md`
+  for the A/B.
+
+  - `LineSearchOptions.gamma_alpha` (γ_α, default `None`) switches α_min from the
+    flat `alpha_min_frac` to the **adaptive eq. (23) rule**, deriving it per
+    iteration from the current θ and ∇φᵀd:
+    `α_min = max(alpha_min_frac, γ_α·min{γ_θ, γ_φ·θ/(−∇φᵀd), δ·θ^{s_θ}/(−∇φᵀd)^{s_φ}})`.
+    A hopeless ray then concedes to restoration as soon as no acceptable step
+    remains, instead of after a fixed 27 halvings. IPOPT applies this
+    unconditionally with γ_α = `0.05`, which is the value to request. Scored −4
+    as a default: conceding earlier is the point of the rule, but ipax's
+    restoration phase is a weaker recovery than IPOPT's, so the trade loses here.
+  - `LineSearchOptions.ftype_requires_theta_min` (default `False`) adds the
+    **θ ≤ θ_min conjunct to the f-type test** (Algorithm A, Step 4), so an
+    infeasible iterate is judged by the eq. (20) sufficient-decrease test in θ
+    *or* φ rather than by Armijo on φ. ipax keys the branch on the eq. (19)
+    switching condition alone. Scored −10 as a default, in two modes: 10 problems
+    reached a *different, worse* optimum, and 12 stalled.
+
+  Both consume a new eq. (23) constraint-violation threshold
+  θ_min = `1e-4`·max(1, θ(x_0)), fixed from the initial iterate — the mirror of
+  the existing θ_max guard, matching IPOPT's `theta_min_fact`/`theta_max_fact`
+  defaults. `alpha_min_frac` keeps its meaning (an absolute α floor, `1e-8`) and
+  additionally floors eq. (23), which is load-bearing: at a feasible iterate with
+  a descent direction every eq. (23) term carries a factor of θ and the rule
+  returns exactly `0.0`, which would make the backtracking loop non-terminating.
+  The floor also bounds the opt-in to one direction — α_min can only rise, so
+  requesting eq. (23) can make the search concede sooner but never backtrack
+  further. The free-mode search is unaffected either way: eq. (23) is defined
+  through the switching/Armijo tests, which free mode does not use.
+
 ### Fixed
-- **The f-type line-search branch now also requires θ ≤ θ_min**, as Wächter &
-  Biegler's Algorithm A (Step 4) specifies. ipax keyed the branch on the eq. (19)
-  switching condition alone, so at an *infeasible* iterate it demanded Armijo
-  decrease on the barrier objective φ where the filter method asks only for
-  sufficient decrease in θ **or** φ (eq. 20). A trial making decisive progress on
-  feasibility — but not on φ — was therefore rejected and backtracked, sometimes
-  all the way to the restoration phase, even though the algorithm accepts it.
-  This deviation is a plausible contributor to ipax needing many more
-  backtracking trials per iteration than IPOPT on the same problem. Acceptance
-  above θ_min is still governed by the eq. (20) sufficient-decrease test, and the
-  filter-augmentation bookkeeping follows the corrected f-type classification (a
-  step reclassified as θ-type now correctly augments the filter). Behaviour at
-  and below θ_min — including the feasible-iterate paths — is unchanged.
+- **Filter augmentation now tests ¬(switching ∧ Armijo)**, per W&B Step 5 (IPOPT
+  `UpdateForNextIteration`: `!IsFtype(α) || !ArmijoHolds(α)`, over a
+  switching-only `IsFtype`); ipax tested ¬switching alone, missing the Armijo
+  conjunct. This is inert unless `ftype_requires_theta_min` is set — with the
+  gate off, an accepted trial for which switching holds must have passed Armijo
+  (it took the f-type branch), so the conjunct cannot change the answer. With the
+  gate on it matters: above θ_min the eq. (20) test can accept a step that fails
+  Armijo, and that step must be recorded or nothing bounds it away from the point
+  it came from.
 
 ### Changed
-- **The filter line search now derives its minimum step size from Wächter &
-  Biegler eq. (23)** instead of backtracking to a flat floor.
-  `LineSearchOptions.alpha_min_frac` changes meaning accordingly: it is now γ_α,
-  the eq. (23) safety factor (default `0.05`, must lie in `(0, 1)`), matching
-  both the name and the semantics of IPOPT's option of the same name. It was
-  previously an absolute α floor of `1e-8`. **If you set `alpha_min_frac`
-  explicitly, re-read it against the new meaning** — a value that was a sensible
-  absolute floor is not a sensible safety factor.
-
-  α_min is now recomputed per iteration from the current constraint violation θ
-  and the barrier directional derivative ∇φᵀd, so a hopeless ray concedes to the
-  restoration phase as soon as no acceptable step remains, rather than after a
-  fixed 27 halvings. This required the eq. (23) constraint-violation threshold
-  θ_min = `1e-4`·max(1, θ(x_0)), fixed from the initial iterate — the mirror of
-  the existing θ_max guard, and IPOPT's `theta_min_fact`/`theta_max_fact`
-  defaults. At a feasible iterate with a descent direction eq. (23) evaluates to
-  exactly zero (both of its θ-bearing terms carry a factor of θ), which would
-  make the backtracking loop non-terminating, so α_min retains the previous
-  `1e-8` value as a floor. That floor binds whenever ∇φᵀd < 0 and θ is small
-  relative to |∇φᵀd| — so those iterates keep their old behaviour, while
-  everywhere else (including a feasible iterate with an *ascent* direction, where
-  eq. (23) yields γ_α·γ_θ = `5e-7`) the search concedes sooner than it used to.
-  Because α_min can only rise, ipax never backtracks *further* than it did in
-  0.7.0. The free-mode search (`free_mode_acceptance="obj-constr-filter"`) is
-  unaffected: eq. (23) is defined through the switching/Armijo tests, which free
-  mode does not use.
 - **The NWW §5 free-mode line-search acceptance is now opt-in**
   (`LineSearchOptions.free_mode_acceptance` defaults to `"rigorous"`; was
   `"obj-constr-filter"` in 0.7.0). It only ever applied under a non-monotone

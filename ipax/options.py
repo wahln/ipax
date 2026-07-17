@@ -113,17 +113,49 @@ class LineSearchOptions:
     """
 
     max_soc: int = 4
-    # γ_α, the safety factor on the eq. (23) minimum step size (IPOPT names this
-    # option identically). The line search backtracks no further than
-    # ``α_min = γ_α·min{γ_θ, γ_φ·θ/(−∇φᵀd), …}`` before conceding to restoration
-    # — an *adaptive* threshold derived from the current iterate, not a flat
-    # floor. Must lie in (0, 1). See ``FilterLineSearch._alpha_min``.
-    alpha_min_frac: float = 0.05
+    # The absolute step size below which the search concedes to restoration.
+    # Also the floor under the opt-in eq. (23) rule (see ``gamma_alpha``), where
+    # it is what keeps a feasible iterate's α_min off zero.
+    alpha_min_frac: float = 1e-8
+    # γ_α — the safety factor of the *adaptive* minimum step size (W&B 2006,
+    # eq. 23), which derives α_min from the current θ and ∇φᵀd instead of using
+    # the flat ``alpha_min_frac``:
+    #
+    #     α_min = max(alpha_min_frac,
+    #                 γ_α·min{γ_θ, γ_φ·θ/(−∇φᵀd), δ·θ^{s_θ}/(−∇φᵀd)^{s_φ}})
+    #
+    # ``None`` (the default) keeps the flat floor. IPOPT applies eq. (23)
+    # unconditionally and names this option ``alpha_min_frac`` (default 0.05);
+    # here it must be requested, and 0.05 is the value to request.
+    #
+    # OPT-IN: on the full S2MPJ corpus (2026-07-17) eq. (23) scored −4 as a
+    # default — it concedes to restoration *earlier* than the flat floor, which
+    # is its whole purpose, but ipax's restoration phase is a weaker recovery
+    # than IPOPT's, so trading line-search trials for restoration entries loses
+    # here (7 problems went optimal/acceptable → stalled, against 3 recovered).
+    # Worth requesting where the restoration phase is known to be cheap or the
+    # backtracking cost dominates. Must lie in (0, 1).
+    gamma_alpha: float | None = None
     gamma_theta: float = 1e-5
     gamma_phi: float = 1e-5
     s_theta: float = 1.1
     s_phi: float = 2.3
     eta_phi: float = 1e-4  # Armijo constant
+    # Require θ ≤ θ_min for a trial to be f-type (Armijo-governed), as W&B
+    # Algorithm A (Step 4) and IPOPT specify; ipax keys the branch on the
+    # eq. (19) switching condition alone. With this set, an infeasible iterate
+    # judges trials by the eq. (20) sufficient-decrease test in θ *or* φ rather
+    # than demanding Armijo decrease on φ.
+    #
+    # OPT-IN: on the full S2MPJ corpus (2026-07-17) the gate scored −10 as a
+    # default, in two failure modes — 10 problems converged to a *different,
+    # worse* optimum (ELATTAR, HS97, HS98, LUKVLE3: the θ-branch admits steps
+    # Armijo refused, which changes the basin) and 12 stalled, likely because
+    # above θ_min almost every accepted step becomes θ-type and so augments the
+    # filter, whose accumulated entries then choke later iterations. Note that
+    # ipax's γ_φ/η_φ differ from IPOPT's shipped values, so this gate has never
+    # been tested alongside the constants it was designed against.
+    ftype_requires_theta_min: bool = False
     # Required scaled-KKT-error decrease fraction for the feasible-point rescue
     # (see class docstring); None (default) disables it. OPT-IN: the S2MPJ v14
     # corpus sweep (2026-07-14) attributed 48 correct→incorrect flips to the
@@ -171,12 +203,15 @@ class LineSearchOptions:
     free_filter_max_margin: float = 1.0
 
     def __post_init__(self) -> None:
-        # γ_α ≤ 0 would drive the eq. (23) α_min to the bare floor (or below),
-        # discarding the adaptive hand-off; γ_α ≥ 1 would let α_min reach the
-        # switching bound it is meant to sit safely *under*, so a step the
-        # acceptance tests could still take would be refused.
-        if not 0.0 < self.alpha_min_frac < 1.0:
-            raise ValueError("alpha_min_frac must lie in (0, 1)")
+        # γ_α ≤ 0 would collapse the eq. (23) α_min onto the bare floor,
+        # silently disabling the rule the caller just asked for; γ_α ≥ 1 would
+        # let α_min reach the switching bound it is meant to sit safely *under*,
+        # refusing steps the acceptance tests would still take. IPOPT bounds its
+        # equivalent option to the same open interval.
+        if self.gamma_alpha is not None and not 0.0 < self.gamma_alpha < 1.0:
+            raise ValueError("gamma_alpha must lie in (0, 1) or be None")
+        if not math.isfinite(self.alpha_min_frac) or self.alpha_min_frac <= 0.0:
+            raise ValueError("alpha_min_frac must be finite and positive")
         # The rescue accepts when ``e_t ≤ (1 − γ)·e0``, so only γ ∈ (0, 1) is a
         # meaningful decrease fraction: γ ≤ 0 makes the bound ≥ e0 (an *increase*
         # in the KKT error would certify "progress"), and γ ≥ 1 demands a

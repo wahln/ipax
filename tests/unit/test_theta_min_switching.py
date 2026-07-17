@@ -21,6 +21,10 @@ alone, so at an infeasible iterate it demanded Armijo decrease on φ where W&B
 (and IPOPT, ``FilterLSAcceptor::CheckAcceptabilityOfTrialPoint``) ask only for
 sufficient decrease in θ *or* φ. That made the search reject trials the filter
 method accepts, backtracking further than the algorithm requires.
+
+The gate is OPT-IN (``ftype_requires_theta_min``) — it lost by 10 on the full
+S2MPJ corpus as a default. Every test here requests it;
+``tests/unit/test_line_search_opt_ins_default_off.py`` pins the default.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from __future__ import annotations
 from ipax.ipm.filter_ls import FilterLineSearch
 from ipax.options import LineSearchOptions
 
-_OPTS = LineSearchOptions()
+_OPTS = LineSearchOptions(ftype_requires_theta_min=True)  # opt-in
 
 
 def test_is_ftype_requires_both_switching_and_theta_below_theta_min():
