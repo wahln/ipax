@@ -48,6 +48,7 @@ def test_search_emits_per_trial_debug_trace(caplog):
             phi0=1.0,
             dphi=-1e6,
             theta_max=1e10,
+            theta_min=1e10,
             eval_point=lambda alpha: (0.5, 5.0) if alpha > 0.02 else (0.5, -200.0),
             entries=[],
             soc=None,
@@ -74,6 +75,7 @@ def test_search_traces_soc_trials(caplog):
             phi0=1.0,
             dphi=1.0,
             theta_max=1e10,
+            theta_min=1e10,
             eval_point=lambda alpha: (2.0, 2.0),  # θ rises ⇒ SOC is attempted
             entries=[],
             soc=lambda alpha: (0.1, 2.0),  # ... and the corrected trial is good
@@ -95,6 +97,7 @@ def test_search_traces_kkt_progress_rescue(caplog):
             phi0=1.0,
             dphi=-1e-6,
             theta_max=1e4,
+            theta_min=1e10,
             eval_point=lambda alpha: (0.0, 1.0 + 0.1 * alpha),  # Armijo fails
             entries=[],
             kkt_progress=lambda alpha: True,
@@ -161,6 +164,7 @@ def test_ascent_step_rejected_at_feasible_point():
         phi0=1.0,
         dphi=5.0,  # ascent direction: switching can never hold
         theta_max=1e4,
+        theta_min=1e10,
         eval_point=lambda alpha: (0.0, 1.0 + 10.0 * alpha),
         entries=[],
     )
@@ -180,6 +184,7 @@ def test_phi_decrease_still_accepted_at_feasible_point():
         phi0=1.0,
         dphi=5.0,
         theta_max=1e4,
+        theta_min=1e10,
         eval_point=lambda alpha: (0.0, 0.5),
         entries=[],
     )
@@ -200,6 +205,7 @@ def test_switching_condition_survives_overflowing_directional_derivative():
         phi0=1.0,
         dphi=-1e308,  # would overflow float ** s_phi before the fix
         theta_max=1e10,
+        theta_min=1e10,
         eval_point=lambda alpha: (0.5, 0.5),
         entries=[],
         soc=None,
@@ -220,6 +226,7 @@ def test_line_search_reports_accepted_soc_trial():
         phi0=1.0,
         dphi=1.0,
         theta_max=1e10,
+        theta_min=1e10,
         eval_point=lambda alpha: (2.0, 2.0),
         entries=[],
         soc=lambda alpha: (0.1, 2.0),
@@ -245,6 +252,7 @@ def test_theta_max_guard_rejects_exploding_infeasibility():
         phi0=1.0,
         dphi=-1e6,  # switching condition holds -> f-type branch
         theta_max=1e4,
+        theta_min=1e10,
         eval_point=lambda alpha: (1e30, -1e30),  # huge θ, collapsing φ
         entries=[],
         soc=None,
@@ -263,6 +271,7 @@ def test_theta_max_guard_rejects_non_finite_theta():
         phi0=1.0,
         dphi=-1e6,
         theta_max=1e4,
+        theta_min=1e10,
         eval_point=lambda alpha: (float("inf"), -1e30),
         entries=[],
         soc=None,
@@ -286,6 +295,7 @@ def test_accept_rejects_non_finite_phi():
         phi0=1.0,
         dphi=-1e6,  # switching condition holds -> f-type branch
         theta_max=1e10,  # θ is fine; only φ is non-finite
+        theta_min=1e10,
         eval_point=lambda alpha: (0.5, float("-inf")),
         entries=[],
         soc=None,
@@ -309,6 +319,7 @@ def test_search_backtracks_past_non_finite_gradient_region():
         phi0=1.0,
         dphi=-1.0,
         theta_max=1e10,
+        theta_min=1e10,
         eval_point=lambda alpha: (0.5, 0.5),  # always filter-acceptable
         entries=[],
         soc=None,
@@ -343,6 +354,7 @@ def test_kkt_progress_rescues_first_trial_at_feasible_point():
         phi0=1.0,
         dphi=-1e-6,  # descent ⇒ switching holds ⇒ f-type Armijo
         theta_max=1e4,
+        theta_min=1e10,
         eval_point=lambda alpha: (0.0, 1.0 + 0.1 * alpha),  # φ rises ⇒ Armijo fails
         entries=[],
         kkt_progress=kkt_progress,
@@ -371,6 +383,7 @@ def test_kkt_progress_consulted_only_on_the_first_trial():
         phi0=1.0,
         dphi=-1e-6,
         theta_max=1e4,
+        theta_min=1e10,
         # φ rises along the ray: Armijo keeps failing, α exhausts.
         eval_point=lambda alpha: (0.0, 1.0 + 0.1 * alpha),
         entries=[],
@@ -400,6 +413,7 @@ def test_kkt_progress_never_rescues_ascent_directions():
         phi0=1.0,
         dphi=5.0,  # ascent: switching can never hold
         theta_max=1e4,
+        theta_min=1e10,
         eval_point=lambda alpha: (0.0, 1.0 + 10.0 * alpha),  # φ inflates
         entries=[],
         kkt_progress=kkt_progress,
@@ -421,6 +435,7 @@ def test_search_hands_off_to_restoration_when_gradient_never_finite():
         phi0=1.0,
         dphi=-1.0,
         theta_max=1e10,
+        theta_min=1e10,
         eval_point=lambda alpha: (0.5, 0.5),
         entries=[],
         soc=None,

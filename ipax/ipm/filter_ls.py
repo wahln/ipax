@@ -38,6 +38,21 @@ if TYPE_CHECKING:
 # Switching-condition constant δ (Wächter & Biegler 2006, eq. 19).
 _SWITCH_DELTA = 1.0
 
+# Finite-termination backstop under the eq. (23) α_min.
+#
+# At a feasible iterate (θ0 = 0) with a descent direction, eq. (23) evaluates to
+# *exactly* zero: both of its θ-bearing terms carry a factor of θ0. The
+# backtracking loop `while α >= α_min` would then never exit — α halves into the
+# denormals and finally to 0.0, which still passes `>= 0.0`. Floor α_min instead.
+#
+# 1e-8 is the pre-eq.(23) flat `alpha_min_frac`, so this is exactly the old
+# behaviour and it binds only where eq. (23) drops *below* it — the near-feasible
+# regime (θ0 small relative to |∇φᵀd|), where being conservative about the
+# restoration hand-off is the established behaviour of this solver. Everywhere
+# else eq. (23) is far larger (γ_α·γ_θ = 5e-7 at the defaults) and the floor is
+# inert.
+_ALPHA_MIN_FLOOR = 1e-8
+
 
 def _safe_pow(base: float, exponent: float) -> float:
     """``base ** exponent`` with IEEE overflow semantics (→ ``inf``, never raise).
@@ -126,6 +141,7 @@ class FilterLineSearch:
         phi0: float,
         dphi: float,
         theta_max: float,
+        theta_min: float,
         eval_point: Callable[[float], tuple[float, float]],
         entries: list[tuple[float, float]],
         soc: Callable[[float], tuple[float, float] | None] | None = None,
@@ -138,7 +154,9 @@ class FilterLineSearch:
         ``soc(α)`` optionally returns ``(θ, φ)`` for a second-order-corrected
         trial when the full step increases θ (W&B §2.3, eq. 27). ``theta_max`` is
         the W&B eq. (18) guard: trials with ``θ ≥ θ_max`` (or non-finite θ) are
-        never acceptable.
+        never acceptable. ``theta_min`` is the eq. (23) constraint-violation
+        threshold, which decides how far the search backtracks before conceding
+        (see ``_alpha_min``).
 
         ``grad_finite(α)``, when supplied, reports whether the Lagrangian
         gradient at the trial point is finite. A step whose ``θ``/``φ`` are finite
@@ -168,9 +186,8 @@ class FilterLineSearch:
         ascent-stall guard is untouched). Accepted rescues are f-type-like:
         the filter is not augmented.
         """
-        o = self._o
         alpha = alpha_max
-        alpha_min = o.alpha_min_frac
+        alpha_min = self._alpha_min(dphi, theta0, theta_min)  # W&B eq. (23)
         first = True
         trials = 0
         trace = logger.isEnabledFor(logging.DEBUG)
@@ -283,7 +300,9 @@ class FilterLineSearch:
         ray hands off to restoration exactly like the rigorous search.
         """
         alpha = alpha_max
-        alpha_min = self._o.alpha_min_frac
+        # The eq. (23) α_min is defined through ∇φᵀd and the switching/Armijo
+        # tests, none of which free mode uses; fall back to the flat backstop.
+        alpha_min = _ALPHA_MIN_FLOOR
         trials = 0
         trace = logger.isEnabledFor(logging.DEBUG)
         while alpha >= alpha_min:
@@ -324,6 +343,36 @@ class FilterLineSearch:
         if all(theta_t + margin < tj or f_t + margin < fj for tj, fj in entries):
             return None
         return "free-filter"
+
+    def _alpha_min(self, dphi: float, theta0: float, theta_min: float) -> float:
+        """The minimum trial step size (Wächter & Biegler 2006, eq. 23).
+
+        Below this α the step cannot satisfy the acceptance tests, so the search
+        stops backtracking and hands off to restoration::
+
+                        ⎧ min{γ_θ, γ_φ·θ/(−∇φᵀd), δ·θ^{s_θ}/(−∇φᵀd)^{s_φ}}
+            α_min = γ_α·⎨                        if ∇φᵀd < 0 and θ ≤ θ_min
+                        ⎪ min{γ_θ, γ_φ·θ/(−∇φᵀd)} if ∇φᵀd < 0 and θ > θ_min
+                        ⎩ γ_θ                     otherwise
+
+        γ_α is ``alpha_min_frac``. The third term is the switching-condition
+        (eq. 19) bound: below θ_min the f-type branch is reachable, so α_min must
+        stay under the α at which switching stops holding. The result is floored
+        (see ``_ALPHA_MIN_FLOOR``).
+        """
+        o = self._o
+        a = o.gamma_theta
+        if dphi < 0.0:
+            a = min(a, o.gamma_phi * theta0 / (-dphi))
+            if theta0 <= theta_min:
+                # ``_safe_pow`` maps an overflowing (−∇φᵀd)^{s_φ} to inf (term
+                # → 0); the reciprocal hazard is an *underflow* to 0.0 on a tiny
+                # dphi, which would raise ZeroDivisionError. Both leave the floor
+                # to carry the result.
+                denom = _safe_pow(-dphi, o.s_phi)
+                if denom > 0.0:
+                    a = min(a, _SWITCH_DELTA * _safe_pow(theta0, o.s_theta) / denom)
+        return max(_ALPHA_MIN_FLOOR, o.alpha_min_frac * a)
 
     def _switching(self, dphi: float, alpha: float, theta0: float) -> bool:
         o = self._o

@@ -113,7 +113,12 @@ class LineSearchOptions:
     """
 
     max_soc: int = 4
-    alpha_min_frac: float = 1e-8
+    # γ_α, the safety factor on the eq. (23) minimum step size (IPOPT names this
+    # option identically). The line search backtracks no further than
+    # ``α_min = γ_α·min{γ_θ, γ_φ·θ/(−∇φᵀd), …}`` before conceding to restoration
+    # — an *adaptive* threshold derived from the current iterate, not a flat
+    # floor. Must lie in (0, 1). See ``FilterLineSearch._alpha_min``.
+    alpha_min_frac: float = 0.05
     gamma_theta: float = 1e-5
     gamma_phi: float = 1e-5
     s_theta: float = 1.1
@@ -166,6 +171,12 @@ class LineSearchOptions:
     free_filter_max_margin: float = 1.0
 
     def __post_init__(self) -> None:
+        # γ_α ≤ 0 would drive the eq. (23) α_min to the bare floor (or below),
+        # discarding the adaptive hand-off; γ_α ≥ 1 would let α_min reach the
+        # switching bound it is meant to sit safely *under*, so a step the
+        # acceptance tests could still take would be refused.
+        if not 0.0 < self.alpha_min_frac < 1.0:
+            raise ValueError("alpha_min_frac must lie in (0, 1)")
         # The rescue accepts when ``e_t ≤ (1 − γ)·e0``, so only γ ∈ (0, 1) is a
         # meaningful decrease fraction: γ ≤ 0 makes the bound ≥ e0 (an *increase*
         # in the KKT error would certify "progress"), and γ ≥ 1 demands a

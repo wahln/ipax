@@ -7,6 +7,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Changed
+- **The filter line search now derives its minimum step size from Wächter &
+  Biegler eq. (23)** instead of backtracking to a flat floor.
+  `LineSearchOptions.alpha_min_frac` changes meaning accordingly: it is now γ_α,
+  the eq. (23) safety factor (default `0.05`, must lie in `(0, 1)`), matching
+  both the name and the semantics of IPOPT's option of the same name. It was
+  previously an absolute α floor of `1e-8`. **If you set `alpha_min_frac`
+  explicitly, re-read it against the new meaning** — a value that was a sensible
+  absolute floor is not a sensible safety factor.
+
+  α_min is now recomputed per iteration from the current constraint violation θ
+  and the barrier directional derivative ∇φᵀd, so a hopeless ray concedes to the
+  restoration phase as soon as no acceptable step remains, rather than after a
+  fixed 27 halvings. This required the eq. (23) constraint-violation threshold
+  θ_min = `1e-4`·max(1, θ(x_0)), fixed from the initial iterate — the mirror of
+  the existing θ_max guard, and IPOPT's `theta_min_fact`/`theta_max_fact`
+  defaults. At an exactly feasible iterate eq. (23) evaluates to zero (every one
+  of its terms carries a factor of θ), which would make the backtracking loop
+  non-terminating, so α_min retains a `1e-8` floor; near-feasible iterates
+  therefore behave exactly as before. The free-mode search
+  (`free_mode_acceptance="obj-constr-filter"`) is unaffected: eq. (23) is defined
+  through the switching/Armijo tests, which free mode does not use.
 - **The NWW §5 free-mode line-search acceptance is now opt-in**
   (`LineSearchOptions.free_mode_acceptance` defaults to `"rigorous"`; was
   `"obj-constr-filter"` in 0.7.0). It only ever applied under a non-monotone

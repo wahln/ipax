@@ -60,6 +60,7 @@ def test_free_search_accepts_tiny_objective_decrease_rigorous_backtracks():
         phi0=1.0,
         dphi=-1e2,  # switching holds at θ0 = 0 ⇒ full Armijo on every trial
         theta_max=1e4,
+        theta_min=1e10,
         eval_point=lambda alpha: (0.0, 1.0 - 1e-6),
         entries=[],
     )
