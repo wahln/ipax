@@ -45,12 +45,14 @@ _SWITCH_DELTA = 1.0
 # backtracking loop `while α >= α_min` would then never exit — α halves into the
 # denormals and finally to 0.0, which still passes `>= 0.0`. Floor α_min instead.
 #
-# 1e-8 is the pre-eq.(23) flat `alpha_min_frac`, so this is exactly the old
-# behaviour and it binds only where eq. (23) drops *below* it — the near-feasible
-# regime (θ0 small relative to |∇φᵀd|), where being conservative about the
-# restoration hand-off is the established behaviour of this solver. Everywhere
-# else eq. (23) is far larger (γ_α·γ_θ = 5e-7 at the defaults) and the floor is
-# inert.
+# 1e-8 is the pre-eq.(23) flat `alpha_min_frac`, so the floor is exactly the old
+# behaviour. It binds wherever eq. (23) drops below it: with ∇φᵀd < 0 and θ0 small
+# *relative to* |∇φᵀd| (at the defaults, θ0/|∇φᵀd| < 2e-2) — a ratio condition,
+# not a "near-feasible" one; a feasible iterate with an ascent direction takes
+# eq. (23)'s third branch and lands on γ_α·γ_θ = 5e-7. Keeping the floor rather
+# than the raw eq. (23) value means α_min only ever *rises*, so this change can
+# make the search concede earlier but never backtrack further than 0.7.0 did.
+# It is a deviation from IPOPT, which uses eq. (23) raw.
 _ALPHA_MIN_FLOOR = 1e-8
 
 
@@ -201,7 +203,15 @@ class FilterLineSearch:
                 if corrected is not None:
                     theta_c, phi_c = corrected
                     soc_reason = self._reject_reason(
-                        theta_c, phi_c, theta0, phi0, dphi, alpha, theta_max, entries
+                        theta_c,
+                        phi_c,
+                        theta0,
+                        phi0,
+                        dphi,
+                        alpha,
+                        theta_max,
+                        theta_min,
+                        entries,
                     )
                     if trace:
                         logger.debug(
@@ -216,14 +226,18 @@ class FilterLineSearch:
                         # The SOC point differs from ``x + α d``; its own gradient
                         # finiteness is checked inside ``soc`` (which returns None
                         # to reject a non-finite-derivative corrected trial).
-                        switching = self._switching(dphi, alpha, theta0)
+                        # Step 5 is judged on the point actually taken — here the
+                        # corrected one (IPOPT tests ``trial_barrier_obj()``).
+                        augment = self._augments_filter(
+                            phi_c, phi0, dphi, alpha, theta0
+                        )
                         return LineSearchResult(
-                            alpha, True, not switching, False, True, trials
+                            alpha, True, augment, False, True, trials
                         )
             first = False
 
             reason = self._reject_reason(
-                theta_t, phi_t, theta0, phi0, dphi, alpha, theta_max, entries
+                theta_t, phi_t, theta0, phi0, dphi, alpha, theta_max, theta_min, entries
             )
             if reason is None and grad_finite is not None and not grad_finite(alpha):
                 reason = "non-finite-grad"
@@ -254,10 +268,8 @@ class FilterLineSearch:
                     "accept" if reason is None else reason,
                 )
             if reason is None:
-                switching = self._switching(dphi, alpha, theta0)
-                return LineSearchResult(
-                    alpha, True, not switching, False, n_trials=trials
-                )
+                augment = self._augments_filter(phi_t, phi0, dphi, alpha, theta0)
+                return LineSearchResult(alpha, True, augment, False, n_trials=trials)
             alpha *= 0.5
         return LineSearchResult(alpha_min, False, False, True, n_trials=trials)
 
@@ -365,10 +377,12 @@ class FilterLineSearch:
         if dphi < 0.0:
             a = min(a, o.gamma_phi * theta0 / (-dphi))
             if theta0 <= theta_min:
-                # ``_safe_pow`` maps an overflowing (−∇φᵀd)^{s_φ} to inf (term
-                # → 0); the reciprocal hazard is an *underflow* to 0.0 on a tiny
-                # dphi, which would raise ZeroDivisionError. Both leave the floor
-                # to carry the result.
+                # ``_safe_pow`` maps an overflowing (−∇φᵀd)^{s_φ} to inf, driving
+                # the term to 0 (the floor then carries the result). The mirror
+                # hazard is an *underflow* to 0.0 on a tiny dphi, where dividing
+                # would raise ZeroDivisionError: there the exact term is
+                # δ·θ^{s_θ}/0⁺ = +∞, so dropping it from the min is not a
+                # workaround but precisely right.
                 denom = _safe_pow(-dphi, o.s_phi)
                 if denom > 0.0:
                     a = min(a, _SWITCH_DELTA * _safe_pow(theta0, o.s_theta) / denom)
@@ -380,6 +394,46 @@ class FilterLineSearch:
             -dphi, o.s_phi
         ) > _SWITCH_DELTA * _safe_pow(theta0, o.s_theta)
 
+    def _is_ftype(
+        self, dphi: float, alpha: float, theta0: float, theta_min: float
+    ) -> bool:
+        """Is this trial an f-type step? (W&B 2006, Algorithm A, Step 4.)
+
+        f-type — the branch governed by the Armijo condition — requires *both*
+        the eq. (19) switching condition **and** an already nearly-feasible
+        iterate, ``θ ≤ θ_min``. Above θ_min the barrier objective is not yet the
+        quantity to make progress on, so the step is judged by the eq. (20)
+        sufficient-decrease test in θ or φ instead.
+        """
+        return theta0 <= theta_min and self._switching(dphi, alpha, theta0)
+
+    def _armijo_holds(
+        self, phi_t: float, phi0: float, dphi: float, alpha: float
+    ) -> bool:
+        """Armijo decrease on the barrier objective (W&B 2006, eq. 20a)."""
+        return phi_t <= phi0 + self._o.eta_phi * alpha * dphi
+
+    def _augments_filter(
+        self, phi_t: float, phi0: float, dphi: float, alpha: float, theta0: float
+    ) -> bool:
+        """Must an *accepted* trial be recorded in the filter? (W&B, Step 5.)
+
+        The filter is augmented unless the iteration is f-type in the sense of
+        W&B Step 5 — the switching condition (eq. 19) **and** Armijo (eq. 20a)
+        both holding — which is a *different* predicate from the acceptance
+        branch in ``_is_ftype``: it deliberately does not consult θ_min (IPOPT
+        ``UpdateForNextIteration``: ``!IsFtype(α) || !ArmijoHolds(α)``, over a
+        switching-only ``IsFtype``).
+
+        The distinction only bites above θ_min, where eq. (20) can accept a step
+        that fails Armijo: that step *is* recorded, because nothing else bounds
+        it away from the point it came from.
+        """
+        return not (
+            self._switching(dphi, alpha, theta0)
+            and self._armijo_holds(phi_t, phi0, dphi, alpha)
+        )
+
     def _reject_reason(
         self,
         theta_t: float,
@@ -389,6 +443,7 @@ class FilterLineSearch:
         dphi: float,
         alpha: float,
         theta_max: float,
+        theta_min: float,
         entries: list[tuple[float, float]],
     ) -> str | None:
         """The first failing acceptance gate, or ``None`` if the trial is accepted.
@@ -396,6 +451,9 @@ class FilterLineSearch:
         Names the gate (``non-finite`` / ``theta-max`` / ``filter`` / ``armijo``
         / ``no-decrease``) so the per-trial debug trace can report *why* a step
         size was rejected — the signal for diagnosing heavy backtracking.
+
+        ``theta_min`` selects the branch together with the switching condition:
+        Armijo governs only f-type trials (see ``_is_ftype``).
         """
         o = self._o
         # W&B eq. (18): the filter is initialized to the guard region {θ ≥ θ_max}.
@@ -413,9 +471,9 @@ class FilterLineSearch:
             return "theta-max"
         if not self._filter_acceptable(theta_t, phi_t, entries):
             return "filter"
-        if self._switching(dphi, alpha, theta0):
+        if self._is_ftype(dphi, alpha, theta0, theta_min):
             # f-type step: require Armijo decrease on the barrier objective.
-            return None if phi_t <= phi0 + o.eta_phi * alpha * dphi else "armijo"
+            return None if self._armijo_holds(phi_t, phi0, dphi, alpha) else "armijo"
         # θ-type step: sufficient decrease in θ or φ vs the current point
         # (W&B eq. 20). At a feasible iterate (θ0 = 0) no θ-progress step
         # exists — the branch would degenerate to "0 ≤ 0" and accept an

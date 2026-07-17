@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+- **The f-type line-search branch now also requires θ ≤ θ_min**, as Wächter &
+  Biegler's Algorithm A (Step 4) specifies. ipax keyed the branch on the eq. (19)
+  switching condition alone, so at an *infeasible* iterate it demanded Armijo
+  decrease on the barrier objective φ where the filter method asks only for
+  sufficient decrease in θ **or** φ (eq. 20). A trial making decisive progress on
+  feasibility — but not on φ — was therefore rejected and backtracked, sometimes
+  all the way to the restoration phase, even though the algorithm accepts it.
+  This deviation is a plausible contributor to ipax needing many more
+  backtracking trials per iteration than IPOPT on the same problem. Acceptance
+  above θ_min is still governed by the eq. (20) sufficient-decrease test, and the
+  filter-augmentation bookkeeping follows the corrected f-type classification (a
+  step reclassified as θ-type now correctly augments the filter). Behaviour at
+  and below θ_min — including the feasible-iterate paths — is unchanged.
+
 ### Changed
 - **The filter line search now derives its minimum step size from Wächter &
   Biegler eq. (23)** instead of backtracking to a flat floor.
@@ -22,12 +37,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   fixed 27 halvings. This required the eq. (23) constraint-violation threshold
   θ_min = `1e-4`·max(1, θ(x_0)), fixed from the initial iterate — the mirror of
   the existing θ_max guard, and IPOPT's `theta_min_fact`/`theta_max_fact`
-  defaults. At an exactly feasible iterate eq. (23) evaluates to zero (every one
-  of its terms carries a factor of θ), which would make the backtracking loop
-  non-terminating, so α_min retains a `1e-8` floor; near-feasible iterates
-  therefore behave exactly as before. The free-mode search
-  (`free_mode_acceptance="obj-constr-filter"`) is unaffected: eq. (23) is defined
-  through the switching/Armijo tests, which free mode does not use.
+  defaults. At a feasible iterate with a descent direction eq. (23) evaluates to
+  exactly zero (both of its θ-bearing terms carry a factor of θ), which would
+  make the backtracking loop non-terminating, so α_min retains the previous
+  `1e-8` value as a floor. That floor binds whenever ∇φᵀd < 0 and θ is small
+  relative to |∇φᵀd| — so those iterates keep their old behaviour, while
+  everywhere else (including a feasible iterate with an *ascent* direction, where
+  eq. (23) yields γ_α·γ_θ = `5e-7`) the search concedes sooner than it used to.
+  Because α_min can only rise, ipax never backtracks *further* than it did in
+  0.7.0. The free-mode search (`free_mode_acceptance="obj-constr-filter"`) is
+  unaffected: eq. (23) is defined through the switching/Armijo tests, which free
+  mode does not use.
 - **The NWW §5 free-mode line-search acceptance is now opt-in**
   (`LineSearchOptions.free_mode_acceptance` defaults to `"rigorous"`; was
   `"obj-constr-filter"` in 0.7.0). It only ever applied under a non-monotone

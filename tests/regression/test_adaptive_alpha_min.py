@@ -26,15 +26,14 @@ formula; these pin the driver-side plumbing that feeds it, on every backend.
 from __future__ import annotations
 
 from ipax import Options, Status, solve
+from ipax.ipm.driver import IPMDriver
 from ipax.ipm.filter_ls import FilterLineSearch
 from ipax.testing.problems import HS71, BoundConstrainedQP
 from tests._helpers import array
 
 
-def test_driver_derives_theta_min_from_the_initial_violation(namespace, monkeypatch):
-    # HS71 starts infeasible, so θ(x_0) > 1 and θ_min scales with it rather than
-    # sitting at the bare 1e-4·1. Capturing it at the seam is what proves the
-    # driver computes it from the initial iterate instead of passing a constant.
+def _spy_theta_min(monkeypatch) -> list[float]:
+    """Record the ``theta_min`` the driver hands each filter line search."""
     seen: list[float] = []
     original = FilterLineSearch.search
 
@@ -43,34 +42,48 @@ def test_driver_derives_theta_min_from_the_initial_violation(namespace, monkeypa
         return original(self, **kwargs)
 
     monkeypatch.setattr(FilterLineSearch, "search", spy)
-    problem = HS71(namespace)
-    x0 = array(namespace, [1.0, 5.0, 5.0, 1.0])
-    result = solve(problem, x0, options=Options(hessian="exact", linsolve="dense"))
+    return seen
+
+
+def test_driver_derives_theta_min_from_the_initial_violation(namespace, monkeypatch):
+    # HS71 starts infeasible, so θ(x_0) > 1 and θ_min must scale with it rather
+    # than sit at the bare 1e-4·1 floor.
+    #
+    # θ(x_0) is observed through the driver's own ``_theta_l1`` rather than read
+    # off ``result.history``: the history records ``_theta`` — the *original
+    # problem's* ∞-norm — while the filter (and so θ_min) runs on the ℓ1 norm
+    # ‖(c, g+s)‖₁. The two coincide at this particular x_0, which would let a
+    # wrong wiring pass unnoticed.
+    seen = _spy_theta_min(monkeypatch)
+    thetas: list[float] = []
+    original_theta_l1 = IPMDriver._theta_l1
+
+    def spy_theta(self, *args, **kwargs):
+        value = original_theta_l1(self, *args, **kwargs)
+        thetas.append(value)
+        return value
+
+    monkeypatch.setattr(IPMDriver, "_theta_l1", spy_theta)
+    result = solve(
+        HS71(namespace),
+        array(namespace, [1.0, 5.0, 5.0, 1.0]),
+        options=Options(hessian="exact", linsolve="dense"),
+    )
 
     assert result.status is Status.OPTIMAL
     assert seen, "the filter line search never ran"
     # Fixed for the whole run — derived once from x_0, never re-taken from the
     # current iterate (which would make α_min drift as θ collapses).
     assert len(set(seen)) == 1
-    # Scaled by the initial violation rather than pinned at the 1e-4·1 floor.
-    # Asserting the *shape* keeps the test from re-implementing the driver's own
-    # θ metric; the first row of the history is θ(x_0), which anchors it.
-    theta0 = result.history[0].theta
-    assert theta0 > 1.0, "HS71 from this x_0 should start infeasible"
-    assert seen[0] == 1e-4 * theta0
+    # The driver's first ``_theta_l1`` call is the one that seeds θ_max/θ_min.
+    assert thetas[0] > 1.0, "HS71 from this x_0 should start infeasible"
+    assert seen[0] == 1e-4 * thetas[0]
 
 
 def test_theta_min_floors_at_one_for_a_feasible_start(namespace, monkeypatch):
     # max(1, θ(x_0)) — a feasible or near-feasible start must not collapse θ_min
     # toward 0, which would permanently disable the eq. (23) switching term.
-    seen: list[float] = []
-    original = FilterLineSearch.search
-
-    def spy(self, **kwargs):
-        seen.append(kwargs["theta_min"])
-        return original(self, **kwargs)
-
-    monkeypatch.setattr(FilterLineSearch, "search", spy)
+    seen = _spy_theta_min(monkeypatch)
     result = solve(
         BoundConstrainedQP(namespace),
         array(namespace, [0.25, 0.75]),

@@ -15,23 +15,31 @@ def test_reject_reason_classifies_each_gate():
     # means the trial is acceptable. This is the label the per-trial debug trace
     # surfaces so a heavy-backtracking iteration can be diagnosed from the log.
     ls = FilterLineSearch(LineSearchOptions())
+    # Args: (θ_t, φ_t, θ0, φ0, dphi, α, θ_max, θ_min, entries). Every case sits
+    # at θ0 = 1.0 with θ_min = 1e10, i.e. below θ_min, so the f-type branch is
+    # reachable and each gate is exercised as intended; the θ_min gate itself is
+    # covered in tests/unit/test_theta_min_switching.py.
 
     # non-finite θ/φ (here φ = -inf on an f-type step).
-    assert ls._reject_reason(0.5, float("-inf"), 1.0, 1.0, -1e6, 1.0, 1e10, []) == (
-        "non-finite"
-    )
+    assert ls._reject_reason(
+        0.5, float("-inf"), 1.0, 1.0, -1e6, 1.0, 1e10, 1e10, []
+    ) == ("non-finite")
     # θ past the eq. (18) guard θ_max.
-    assert ls._reject_reason(1e30, 1.0, 1.0, 1.0, -1e6, 1.0, 1e4, []) == "theta-max"
-    # dominated by a filter entry.
-    assert ls._reject_reason(2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1e10, [(1.0, 1.0)]) == (
-        "filter"
+    assert ls._reject_reason(1e30, 1.0, 1.0, 1.0, -1e6, 1.0, 1e4, 1e10, []) == (
+        "theta-max"
     )
-    # f-type step (switching holds) failing the Armijo decrease.
-    assert ls._reject_reason(0.5, 5.0, 1.0, 1.0, -1e6, 1.0, 1e10, []) == "armijo"
+    # dominated by a filter entry.
+    assert ls._reject_reason(
+        2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1e10, 1e10, [(1.0, 1.0)]
+    ) == ("filter")
+    # f-type step (switching holds, θ0 ≤ θ_min) failing the Armijo decrease.
+    assert ls._reject_reason(0.5, 5.0, 1.0, 1.0, -1e6, 1.0, 1e10, 1e10, []) == "armijo"
     # θ-type step (switching fails) with neither θ- nor φ-progress.
-    assert ls._reject_reason(2.0, 5.0, 1.0, 1.0, 1.0, 1.0, 1e10, []) == "no-decrease"
+    assert (
+        ls._reject_reason(2.0, 5.0, 1.0, 1.0, 1.0, 1.0, 1e10, 1e10, []) == "no-decrease"
+    )
     # acceptable ⇒ None.
-    assert ls._reject_reason(0.1, 0.1, 1.0, 1.0, 1.0, 1.0, 1e10, []) is None
+    assert ls._reject_reason(0.1, 0.1, 1.0, 1.0, 1.0, 1.0, 1e10, 1e10, []) is None
 
 
 def test_search_emits_per_trial_debug_trace(caplog):
