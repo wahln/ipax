@@ -223,6 +223,35 @@ release:
     condition degenerates, so every trial faces the full Armijo test and
     iterations can cost 10+ backtracks.
 
+!!! note "Two Wächter & Biegler filter refinements (opt-in)"
+    Both are faithful to the paper — and verified line-by-line against IPOPT's
+    `FilterLSAcceptor` — yet both **lost** on the full corpus as defaults, so
+    both are disabled by default and neither affects the table above. A paired
+    sweep (2026-07-17) attributed the two independently; they sum exactly to the
+    combined −14.
+
+    - **`LineSearchOptions.gamma_alpha`** (γ_α, default `None`) switches the
+      minimum step size from the flat `alpha_min_frac` to the **adaptive eq. (23)
+      rule**, so a hopeless ray concedes to restoration as soon as no acceptable
+      step remains rather than after a fixed 27 halvings. IPOPT applies this
+      unconditionally with γ_α = `0.05`. Scored **−4**: conceding earlier is the
+      point of the rule, but ipax's restoration phase is a weaker recovery than
+      IPOPT's, so 7 problems went `optimal`/`acceptable` → `stalled` against 3
+      recovered.
+    - **`LineSearchOptions.ftype_requires_theta_min`** (default `False`) adds the
+      **θ ≤ θ_min conjunct to the f-type test** (W&B Algorithm A, Step 4), so an
+      infeasible iterate is judged by the eq. (20) sufficient-decrease test in θ
+      *or* φ instead of by Armijo on φ. Scored **−10**: 10 problems reached a
+      *different, worse* optimum (`ELATTAR`, `HS97`, `HS98`, `LUKVLE3` — the
+      θ-branch admits steps Armijo refused, changing the basin) and 12 stalled
+      (above θ_min almost every accepted step becomes θ-type and augments the
+      filter, whose entries then choke later iterations).
+
+    Caveat for whoever revisits this: ipax's `gamma_phi` (`1e-5`) and `eta_phi`
+    (`1e-4`) differ from IPOPT's shipped `1e-8`/`1e-8`, so these structural
+    changes have never been exercised alongside the constants they were designed
+    against — a prerequisite to retrying them as defaults.
+
 ## Reproducing
 
 From a checkout with `IPAX_S2MPJ_DIR` pointing at an
