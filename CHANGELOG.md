@@ -42,6 +42,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   through the switching/Armijo tests, which free mode does not use.
 
 ### Fixed
+- **The TROTS benchmark loader reads all-zero dose matrices.** MATLAB v7.3
+  stores an nnz = 0 sparse matrix as an HDF5 group holding only `jc` (`data`
+  and `ir` are omitted), which crashed `_load_matrix` with a KeyError and made
+  `Head-and-Neck_05` — whose 'Brainstem' matrix is all-zero — unloadable. The
+  case now loads and reproduces its reference objective to machine precision.
 - **Filter augmentation now tests ¬(switching ∧ Armijo)**, per W&B Step 5 (IPOPT
   `UpdateForNextIteration`: `!IsFtype(α) || !ArmijoHolds(α)`, over a
   switching-only `IsFtype`); ipax tested ¬switching alone, missing the Armijo
