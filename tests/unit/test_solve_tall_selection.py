@@ -282,3 +282,38 @@ def test_tall_equality_jacobian_failing_at_probe_keeps_krylov(ne_zone):
     solve(_ProbeShyEq(), x0, options=Options(max_iter=3, scaling="none"))
     assert len(ne_zone) == 1
     assert isinstance(ne_zone[0], KrylovSolver)
+
+
+def test_explicit_sparse_with_auto_route_condenses_tall_dense_jacobian(
+    selected_solvers,
+):
+    # Regression (TROTS Prostate_BT, 2026-07-19): ``linsolve="sparse"`` honored
+    # ``kkt_route="augmented"`` blindly, factoring an effectively dense (n+m)
+    # augmented system through sparse LDL^T on tall problems with dense dose
+    # matrices. With ``kkt_route="auto"`` the real thresholds pick the n×n NE
+    # form here without any patching: the banded QP is tall (m = 12n) and its
+    # row density (0.25) is past _TALL_DENSE_MIN_DENSITY, while its Gram fill
+    # (~0.4) is past the sparse-NE threshold — i.e. this exercises the
+    # dense-crossover branch, not the localized-rows branch.
+    from ipax.linalg.sparse import SparseDirectSolver
+    from ipax.options import SparseOptions
+
+    pytest.importorskip("scipy")
+    xp = import_namespace("numpy")
+    x0 = xp.full((_N,), 0.4)
+    result = solve(
+        _TinyTallQP(xp, jacobian="coo"),
+        x0,
+        options=Options(
+            max_iter=3,
+            linsolve="sparse",
+            sparse=SparseOptions(kkt_route="auto"),
+        ),
+    )
+
+    assert len(selected_solvers) == 1
+    assert isinstance(selected_solvers[0], SparseDirectSolver)
+    assert selected_solvers[0].form == "normal_equations"
+    # The picked form is user-visible in the routes report.
+    assert result.routes.kkt_form == "normal_equations"
+    assert result.routes.linsolve_requested == "sparse"

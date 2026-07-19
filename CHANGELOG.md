@@ -40,6 +40,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   requesting eq. (23) can make the search concede sooner but never backtrack
   further. The free-mode search is unaffected either way: eq. (23) is defined
   through the switching/Armijo tests, which free mode does not use.
+- **`SparseOptions(kkt_route="auto")` — per-problem KKT-form selection on the
+  explicit sparse route.** `linsolve="sparse"` honored `kkt_route` blindly, so a
+  tall problem (`m ≫ n`) with a dense inequality Jacobian factored an
+  effectively dense `(n+m)`-sized augmented system through sparse LDLᵀ
+  machinery — on a TROTS Prostate_BT case (n=70, m=5747, dose matrix 100%
+  dense) that is 13.6s where the n×n normal-equations condensation takes 1.8s
+  on the identical iteration path (7.6×), and the gap grows with case size
+  (median 21× per-iteration across the family). `"auto"` reuses the
+  `linsolve="auto"` tall gate and measured thresholds: for `m ≥ 10·n` it picks
+  the normal-equations form when the sampled Gram-fill estimate stays sparse
+  *or* the Jacobian density is past the dense crossover, and stays on
+  `"augmented"` whenever the NE prerequisites (L-BFGS Hessian, `gram_coo`,
+  COO-emittable equality Jacobians) are unmet. The default remains
+  `"augmented"`; the picked form is reported in `Result.routes.kkt_form`.
 
 ### Fixed
 - **The TROTS benchmark loader reads all-zero dose matrices.** MATLAB v7.3

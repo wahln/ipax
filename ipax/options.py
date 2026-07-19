@@ -33,7 +33,7 @@ FreeModeAcceptance = Literal["obj-constr-filter", "rigorous"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
 DenseKKTRoute = Literal["condensed", "augmented"]
-SparseKKTRoute = Literal["augmented", "normal_equations"]
+SparseKKTRoute = Literal["auto", "augmented", "normal_equations"]
 ScalingMethod = Literal["none", "gradient-based"]
 CorrectionsMethod = Literal["none", "mehrotra", "gondzio"]
 
@@ -377,22 +377,30 @@ class SparseOptions:
     ``"normal_equations"`` instead condenses the Gram term ``∇gᵀ Σ_s ∇g``
     *sparsely* into the logical ``n×n`` block via the Jacobian's ``gram_coo``
     (Breedveld 2017 §2: the condensed system is ``n×n`` however large ``m``
-    grows) — the right choice for tall (``m ≫ n``) problems whose Jacobian
-    rows are **localized** (banded/block dose-influence structure), where the
-    Gram stays sparse and one small factorization per iteration replaces a
-    ``(n+m)`` bordered factor. Deliberately **opt-in**: with non-localized
-    rows the Gram fills in toward dense ``n²`` and no cheap structural probe
-    can see that in advance. Requires a ``gram_coo``-capable inequality
-    Jacobian (a sparse-operator Jacobian on a sparse-adapter backend),
-    diagonal slack scaling, and no equality constraints.
+    grows) — the right choice for tall (``m ≫ n``) problems where either the
+    Gram stays sparse (localized/banded rows) or ``∇g`` is dense enough that
+    the bordered factor has no sparsity to exploit anyway. Requires a
+    ``gram_coo``-capable inequality Jacobian (a sparse-operator Jacobian on a
+    sparse-adapter backend), an L-BFGS Hessian, and COO-emittable equality
+    Jacobians (they border into the factored saddle).
+
+    ``"auto"`` picks between the two per problem, reusing the tall-problem
+    gate and measured thresholds of the ``linsolve="auto"`` heuristic
+    (``ipax/linalg/solver.py``): for ``m ≥ 10·n`` (and ``n`` under the tall
+    bound) it selects the normal-equations form when the sampled Gram-fill
+    estimate stays under the NE threshold **or** the Jacobian density is past
+    the dense crossover — the TROTS dose-matrix regime (n≈70, m≈5.7k, ∇g
+    fully dense), where the bordered factor is effectively a dense ``(n+m)``
+    factorization done through sparse machinery, ~8× slower end-to-end.
+    Whenever the NE prerequisites are unmet, auto stays on ``"augmented"``.
     """
 
     kkt_route: SparseKKTRoute = "augmented"
 
     def __post_init__(self) -> None:
-        if self.kkt_route not in ("augmented", "normal_equations"):
+        if self.kkt_route not in ("auto", "augmented", "normal_equations"):
             raise ValueError(
-                "sparse kkt_route must be 'augmented' or 'normal_equations'"
+                "sparse kkt_route must be 'auto', 'augmented' or 'normal_equations'"
             )
 
 
