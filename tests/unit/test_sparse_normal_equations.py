@@ -165,7 +165,11 @@ def test_normal_equations_form_requires_a_capable_operator(namespace):
 
 
 def test_sparse_options_validate_the_route():
-    assert SparseOptions().kkt_route == "augmented"
+    # "auto" (default) resolves per problem in select_solver — tall problems
+    # with a sparse-or-dense-enough Gram condense to n×n, everything else keeps
+    # the augmented form (see tests/unit/test_solver_selection.py).
+    assert SparseOptions().kkt_route == "auto"
+    assert Options(sparse=SparseOptions(kkt_route="augmented"))
     assert Options(sparse=SparseOptions(kkt_route="normal_equations"))
     with pytest.raises(ValueError, match="kkt_route"):
         SparseOptions(kkt_route="bogus")  # type: ignore[arg-type]

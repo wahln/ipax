@@ -370,7 +370,7 @@ class DenseOptions:
 class SparseOptions:
     """Sparse-direct KKT assembly: augmented vs. sparse normal equations.
 
-    ``"augmented"`` (default) factors the bordered indefinite system — the
+    ``"augmented"`` factors the bordered indefinite system — the
     inequality Jacobian ``∇g`` stays an explicit border with the ``−Σ_s⁻¹``
     slack block, so the factor is as sparse as ``∇g`` regardless of its
     column overlap (Friedlander & Orban 2012; Wächter & Biegler 2006 §3.1).
@@ -384,18 +384,20 @@ class SparseOptions:
     sparse-adapter backend), an L-BFGS Hessian, and COO-emittable equality
     Jacobians (they border into the factored saddle).
 
-    ``"auto"`` picks between the two per problem, reusing the tall-problem
-    gate and measured thresholds of the ``linsolve="auto"`` heuristic
-    (``ipax/linalg/solver.py``): for ``m ≥ 10·n`` (and ``n`` under the tall
-    bound) it selects the normal-equations form when the sampled Gram-fill
-    estimate stays under the NE threshold **or** the Jacobian density is past
-    the dense crossover — the TROTS dose-matrix regime (n≈70, m≈5.7k, ∇g
-    fully dense), where the bordered factor is effectively a dense ``(n+m)``
-    factorization done through sparse machinery, ~8× slower end-to-end.
-    Whenever the NE prerequisites are unmet, auto stays on ``"augmented"``.
+    ``"auto"`` (default) picks between the two per problem, reusing the
+    tall-problem gate and measured thresholds of the ``linsolve="auto"``
+    heuristic (``ipax/linalg/solver.py``): for ``m ≥ 10·n`` (and ``n`` under
+    the tall bound) it selects the normal-equations form when the sampled
+    Gram-fill estimate stays under the NE threshold **or** the Jacobian
+    density is past the dense crossover — the TROTS dose-matrix regime (n≈70,
+    m≈5.7k, ∇g fully dense), where the bordered factor is effectively a dense
+    ``(n+m)`` factorization done through sparse machinery, ~8× slower
+    end-to-end. Whenever the NE prerequisites are unmet, or the problem is
+    not tall, auto stays on ``"augmented"`` — so non-tall problems are
+    untouched by construction.
     """
 
-    kkt_route: SparseKKTRoute = "augmented"
+    kkt_route: SparseKKTRoute = "auto"
 
     def __post_init__(self) -> None:
         if self.kkt_route not in ("auto", "augmented", "normal_equations"):
