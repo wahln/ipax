@@ -247,10 +247,29 @@ release:
       (above θ_min almost every accepted step becomes θ-type and augments the
       filter, whose entries then choke later iterations).
 
-    Caveat for whoever revisits this: ipax's `gamma_phi` (`1e-5`) and `eta_phi`
-    (`1e-4`) differ from IPOPT's shipped `1e-8`/`1e-8`, so these structural
-    changes have never been exercised alongside the constants they were designed
-    against — a prerequisite to retrying them as defaults.
+    The constants caveat was then closed by a full 2×2 (2026-07-18): ipax's
+    `gamma_phi`/`eta_phi` (`1e-5`/`1e-4`) differ from IPOPT's shipped
+    `1e-8`/`1e-8`, so the sweep was repeated under IPOPT's constants with the
+    opt-ins off and on.
+
+    | corpus correct (of 6600)  | opt-ins off     | opt-ins on | marginal |
+    |---------------------------|-----------------|------------|----------|
+    | ipax constants (default)  | **4384** (v15)  | 4370       | **−14**  |
+    | IPOPT constants           | 4371            | 4373       | **+2**   |
+
+    The interaction is the finding: the two structural refinements lose −14
+    under ipax's constants but score +2 under the constants they were designed
+    alongside — structure and acceptance margins are co-adapted, and the hybrid
+    is what loses. No default changes: ipax's own co-adapted package (4384)
+    beats every other cell, including full-IPOPT emulation (4373). The
+    constants trade is also *characterizable*, not uniform: IPOPT's looser
+    margins fix `AGG` (the long-open feasible-LP failure) on 3 of 6 configs
+    plus `MINSURFO`/`BLOCKQP1`/`BATCH`, while breaking the basin-sensitive
+    eigen/packing cluster (`EIGMAXA`, `EIGMINA`, `KISSING*`) — so `AGG`'s
+    failure is an acceptance-margin issue. Full-IPOPT emulation, when wanted
+    (e.g. cross-solver comparisons):
+    `LineSearchOptions(gamma_phi=1e-8, eta_phi=1e-8, gamma_alpha=0.05,
+    ftype_requires_theta_min=True)`.
 
 ## Reproducing
 
