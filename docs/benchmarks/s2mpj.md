@@ -289,11 +289,40 @@ release:
     constants trade is also *characterizable*, not uniform: IPOPT's looser
     margins fix `AGG` (the long-open feasible-LP failure) on 3 of 6 configs
     plus `MINSURFO`/`BLOCKQP1`/`BATCH`, while breaking the basin-sensitive
-    eigen/packing cluster (`EIGMAXA`, `EIGMINA`, `KISSING*`) — so `AGG`'s
-    failure is an acceptance-margin issue. Full-IPOPT emulation, when wanted
+    eigen/packing cluster (`EIGMAXA`, `EIGMINA`, `KISSING*`). Follow-up
+    (2026-07-20) showed the `AGG` half of that is **not** really a margin
+    effect — see the note below. Full-IPOPT emulation, when wanted
     (e.g. cross-solver comparisons):
     `LineSearchOptions(gamma_phi=1e-8, eta_phi=1e-8, gamma_alpha=0.05,
     ftype_requires_theta_min=True)`.
+
+!!! note "`AGG` is a μ-schedule problem, not a margin problem (2026-07-20)"
+    `AGG` — a netlib LP that is *feasible* (HiGHS cross-check) but which the
+    default configuration ends as `restoration_failed` at an infeasible point
+    (constraint violation 19.9, objective −3.11e7 vs the true −3.60e7) — was
+    provisionally attributed to acceptance margins, because IPOPT's constants
+    fix it. Isolating the two constants shows the effect is entirely `eta_phi`
+    (the Armijo constant); `gamma_phi` alone changes nothing, not even the
+    iteration count.
+
+    That is *not* a roundoff artifact. Instrumenting the Armijo test records 64
+    failures with shortfalls of 4.5e3 … 3.6e8 (median 1.2e6), against a
+    scale-relative roundoff slack (IPOPT's `Compare_le`, `10·ε·|φ0|`) of only
+    6.9e-8 — **0 of 64** failures are within it. The median shortfall instead
+    matches the `eta_phi` 1e-4 → 1e-8 relaxation exactly, which means
+    `φ_t ≈ φ0`: the step delivers essentially **no** barrier-objective change
+    while `∇φᵀd` predicts a decrease of order 1e10 on an objective of 3e7. So
+    `eta_phi=1e-8` "fixes" `AGG` only by relaxing Armijo into a near-vacuous
+    non-increase test — it masks the real defect rather than addressing it.
+
+    The real defect is the barrier schedule, and it is fixable with shipped
+    options. `AGG` reaches the true optimum under
+    **`mu_schedule="quality"` in 42 iterations** (cleanest), under
+    `globalization="breedveld"` in 149, and under the `eta_phi` hack in 130;
+    it fails identically with `scaling="none"`, so it is not a scaling issue
+    either. The monotone schedule drives μ off the iterate's central path,
+    producing the enormous-but-unrealizable predicted decrease; an adaptive μ
+    oracle re-targets μ to the iterate and the problem solves cleanly.
 
 ## Reproducing
 
