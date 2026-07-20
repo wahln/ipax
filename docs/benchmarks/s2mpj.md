@@ -127,19 +127,26 @@ dense variable cap.</small>
     (all `max_time` transitions, from running the sweep at `--jobs 8` against a
     `--jobs 4` baseline; they net to ±0).
 
-    On `lbfgs/sparse`, **22 problems** switched to the n×n condensation:
-    **63.0s → 12.7s in aggregate** (median 1.79×), 14 faster / 8 slower — every
-    slowdown sub-second in absolute terms. The wins are not merely per-iteration:
-    `OET7` drops 539 → 36 iterations (20.6s → 0.2s, 98×), `OET6` 101 → 38, and
-    `CRESC50` 2979 → 1223, i.e. the condensed form is better conditioned on these
-    minimax/fitting problems, while well-conditioned cases keep identical
-    iteration counts (44 → 44, 71 → 71, 95 → 95).
+    On `lbfgs/sparse`, **22 problems** switched to the n×n condensation. An
+    objective-level audit (not just the `correct` flag) splits them: **19 return
+    the same objective** to ≤1e-8 relative, **1 improves** (`CRESC50` 1.061 →
+    0.599, and 4× faster), and **2 land on a different, worse local optimum** —
+    `ELATTAR` (0.1427 → 74.2) and `OET7` (4.45e-5 → 0.0872).
 
-    The single correctness cost is `ELATTAR`, which converges cleanly
-    (KKT 6.6e-9, `cviol` 0) to a *different* local optimum (74.2 vs 0.1427) —
-    the known basin-sensitivity class, not a new failure mode: `lbfgs/dense`
-    already lands wrong on `ELATTAR` independently. Pass
-    `kkt_route="augmented"` to restore the previous form.
+    On the 20 same-answer problems the route is **41.7s → 12.1s (3.44×
+    aggregate**, median 1.79×, 13 faster / 7 slower — every slowdown sub-second).
+    `OET6` (101 → 38 iterations) and `CRESC50` (2979 → 1223) are genuine
+    conditioning wins at an unchanged-or-better objective, while well-scaled
+    cases keep identical iteration counts (44 → 44, 71 → 71, 95 → 95).
+
+    **`OET7` is a scoring caveat worth knowing.** Its 539 → 36 iteration drop is
+    *not* a conditioning win: it is convergence to a ~2000× worse optimum, and
+    the corpus metric scores it `correct` in both runs because `OET7` carries no
+    reference objective, so any certified convergence counts. The corpus
+    correctness delta therefore *understates* the basin cost of this change —
+    2 basin changes, of which only `ELATTAR` (which has a reference objective) is
+    visible in the ±count. Pass `kkt_route="augmented"` to restore the previous
+    form.
 
 - **`exact/sparse` is the strongest route** — most correct (776) and most
   optimal (858). Exact-Hessian Newton steps factored by the sparse-direct route
