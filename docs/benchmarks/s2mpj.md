@@ -340,6 +340,15 @@ release:
     producing the enormous-but-unrealizable predicted decrease; an adaptive μ
     oracle re-targets μ to the iterate and the problem solves cleanly.
 
+    **Routing hint, not a default change.** `mu_schedule="quality"` stays
+    opt-in: its corpus A/B is ≈ neutral (+6, with heavy two-way churn), and on
+    the radiotherapy workload it is actively *worse* than the default (6–8 of 25
+    TROTS Prostate_BT cases certified, against 11 for the default `monotone` and
+    13 for `globalization="breedveld"`). But if a problem stalls or ends
+    `restoration_failed` while its constraint violation stays large — the `AGG`
+    signature, and an LP-like one — trying `mu_schedule="quality"` is cheap and
+    is the first thing to reach for.
+
 ## Reproducing
 
 From a checkout with `IPAX_S2MPJ_DIR` pointing at an
@@ -351,6 +360,27 @@ python -m benchmarks.runners.s2mpj --all --config exact/sparse --jobs 5 \
     --include-objective-free --resume --max-iter 10000 --max-time 300 \
     --out benchmarks/reports/s2mpj_exact_sparse
 ```
+
+A sweep is only meaningful against a baseline, so A/B two reports with:
+
+```bash
+python -m benchmarks.runners.compare \
+    benchmarks/reports/s2mpj_v17.json benchmarks/reports/s2mpj_v18.json \
+    --config lbfgs/sparse
+```
+
+It reports the correctness delta per configuration, the per-config count of
+problems whose **linear-solver route changed** (a config with zero route changes
+is a built-in control when A/B-ing linear-algebra work — anything moving there is
+unrelated), and **objective drift**: problems whose objective moved materially,
+flagged `[unscored]` when the problem carries no dataset reference objective.
+Those are the ones the correctness count structurally *cannot* see — always read
+them before accepting a delta.
+
+!!! tip "Both sweeps should use the same `--jobs`"
+    Problems near the `--max-time` cap flip status with machine load, so a sweep
+    run at a different parallelism than its baseline injects `max_time` churn
+    that is easily mistaken for a real effect.
 
 Omit `--config` to sweep the whole matrix in one process. `--jobs N` runs N
 problems concurrently in worker processes (pin BLAS threads, e.g.

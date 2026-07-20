@@ -40,6 +40,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   requesting eq. (23) can make the search concede sooner but never backtrack
   further. The free-mode search is unaffected either way: eq. (23) is defined
   through the switching/Armijo tests, which free mode does not use.
+- **`benchmarks.runners.compare` — an A/B diff for two sweep reports.** The
+  full-corpus sweep is the gate for every default change, and this is what reads
+  it: correctness delta per configuration, the count of problems whose
+  linear-solver **route** changed (a config with zero route changes is a
+  built-in control when A/B-ing linear algebra), and **objective drift**.
+  The last one closes a real blind spot: `correct` is scored against the
+  dataset's documented optimum and many problems have none, so a change that
+  converges to a *different, much worse* local optimum scores unchanged — the
+  sparse normal-equations default moved `OET7` from `4.45e-05` to `0.0872`
+  (~2000x worse) with no signal in the correct-count. Drift on such problems is
+  now reported and flagged `unscored`.
 - **`SparseOptions(kkt_route="auto")` — per-problem KKT-form selection on the
   explicit sparse route, now the default.** `linsolve="sparse"` honored
   `kkt_route` blindly, so a tall problem (`m ≫ n`) with a dense inequality
