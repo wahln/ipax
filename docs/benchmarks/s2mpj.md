@@ -283,6 +283,15 @@ release:
     `1e-8`/`1e-8`, so the sweep was repeated under IPOPT's constants with the
     opt-ins off and on.
 
+    For the record, **ipax's values are the ones Wächter & Biegler publish**
+    (§2.4: `γ_θ = γ_φ = 1e-5`, `η_φ = 1e-4`, `δ = 1`, `s_θ = 1.1`, `s_φ = 2.3`,
+    `γ_α = 0.05`, `θ_max = 1e4·max{1,θ(x₀)}`, `θ_min = 1e-4·max{1,θ(x₀)}`) —
+    every constant in the filter line search matches the paper. IPOPT's shipped
+    `1e-8`/`1e-8` is a later retuning that departs from its own paper. The paper
+    adds that the values "have been chosen because they seem to produce overall
+    good performance… but the most efficient choice … [is] usually problem
+    dependent", which is exactly what the table below measures.
+
     | corpus correct (of 6600)  | opt-ins off     | opt-ins on | marginal |
     |---------------------------|-----------------|------------|----------|
     | ipax constants (default)  | **4384** (v15)  | 4370       | **−14**  |
