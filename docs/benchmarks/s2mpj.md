@@ -117,6 +117,30 @@ dense variable cap.</small>
 
 ### Observations
 
+!!! note "`SparseOptions(kkt_route="auto")` verification (v18, 2026-07-20)"
+    The sparse route's KKT form now defaults to `"auto"`. Its verification sweep
+    isolates cleanly because the auto gate only engages where the
+    normal-equations prerequisites hold: **`exact/sparse` changed route on 0 of
+    1101 problems** (the fill probe is withheld for non-L-BFGS Hessians), so any
+    `exact/*` movement in the A/B is provably unrelated to the change — a
+    built-in control. It confirmed 4 of the 5 corpus flips as timing noise
+    (all `max_time` transitions, from running the sweep at `--jobs 8` against a
+    `--jobs 4` baseline; they net to ±0).
+
+    On `lbfgs/sparse`, **22 problems** switched to the n×n condensation:
+    **63.0s → 12.7s in aggregate** (median 1.79×), 14 faster / 8 slower — every
+    slowdown sub-second in absolute terms. The wins are not merely per-iteration:
+    `OET7` drops 539 → 36 iterations (20.6s → 0.2s, 98×), `OET6` 101 → 38, and
+    `CRESC50` 2979 → 1223, i.e. the condensed form is better conditioned on these
+    minimax/fitting problems, while well-conditioned cases keep identical
+    iteration counts (44 → 44, 71 → 71, 95 → 95).
+
+    The single correctness cost is `ELATTAR`, which converges cleanly
+    (KKT 6.6e-9, `cviol` 0) to a *different* local optimum (74.2 vs 0.1427) —
+    the known basin-sensitivity class, not a new failure mode: `lbfgs/dense`
+    already lands wrong on `ELATTAR` independently. Pass
+    `kkt_route="augmented"` to restore the previous form.
+
 - **`exact/sparse` is the strongest route** — most correct (776) and most
   optimal (858). Exact-Hessian Newton steps factored by the sparse-direct route
   (Feral LDLᵀ with inertia control) is the most robust combination here.
