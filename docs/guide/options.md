@@ -132,6 +132,20 @@ route additionally needs COO structure and a backend sparse adapter. See
 [Backends & hardware](backends.md). Krylov tolerances and the preconditioner are
 in [`KrylovOptions`](../reference.md#ipax.options.KrylovOptions).
 
+!!! tip "Very tall problems (`m ≫ n`) with a sparse Jacobian: prefer `\"sparse\"`"
+    `"auto"` routes any problem under ~10⁴ variables to the dense condensed
+    solve, which forms the `n×n` Gram `∇gᵀΣ∇g` by dense accumulation over the
+    Jacobian's rows — `O(m·n²)`. When the inequality Jacobian is both very tall
+    and *sparse* (the radiotherapy dose-influence regime: `n≈10³`, `m≈10⁵`–`10⁶`,
+    a few-percent-dense matrix), forming that Gram sparsely instead is markedly
+    cheaper. Set `linsolve="sparse"` — with the default `kkt_route="auto"` it
+    condenses to the `n×n` normal-equations form and skips the dense
+    accumulation. Measured on a TROTS proton case (`n=1080`, `m=369445`, ∇g
+    ≈5% dense): **13.8 s → 4.6 s per iteration (3×)**. The crossover is the
+    Jacobian's density, not just its shape; for a *dense* tall Jacobian the
+    dense route is faster, so this is a hint for the sparse-tall case, not a
+    blanket rule.
+
 ## Problem scaling
 
 Badly scaled problems converge faster with gradient-based auto-scaling (IPOPT's
@@ -180,6 +194,21 @@ bounds, so they never hurt there. Tune Gondzio via
   restoration phase. Robust on nonconvex problems.
 - `"breedveld"` — a lighter Markov-filter + ratio-control step controller tuned
   for convex/RT-like problems ([`BreedveldOptions`](../reference.md#ipax.options.BreedveldOptions)).
+
+!!! tip "Radiotherapy-scale planning: prefer `\"breedveld\"`"
+    On large, deeply-infeasible-at-start dose-optimization problems (TROTS-scale:
+    `n≈10³`, hundreds of thousands of dose constraints, a warm start that is
+    objective-good but far outside the feasible region), the default filter mode
+    grinds: the primal step is clipped by fraction-to-boundary to `≈10⁻³` while
+    the constraint violation is reduced, so feasibility — and thus convergence —
+    takes many iterations. The `"breedveld"` controller's non-monotone Markov
+    filter makes better use of those clipped steps and reduces the infeasibility
+    **≈3× faster** on the same iterates; it was the strongest route across the
+    TROTS Prostate_BT set. Pair it with `mu_schedule="breedveld"`. Budget
+    realistically: these cases need on the order of 10²–10³ iterations at
+    seconds-per-iteration (use `linsolve="sparse"`, above, to cut the
+    per-iteration cost), so set `max_iter`/`max_time` accordingly rather than
+    expecting the sub-second convergence of small problems.
 
 The filter constants
 ([`LineSearchOptions`](../reference.md#ipax.options.LineSearchOptions)) and the
