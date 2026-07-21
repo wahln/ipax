@@ -132,19 +132,31 @@ route additionally needs COO structure and a backend sparse adapter. See
 [Backends & hardware](backends.md). Krylov tolerances and the preconditioner are
 in [`KrylovOptions`](../reference.md#ipax.options.KrylovOptions).
 
-!!! tip "Very tall problems (`m ≫ n`) with a sparse Jacobian: prefer `\"sparse\"`"
+!!! tip "Tall problems (`m ≫ n`): the route depends on `n` *and* the Jacobian"
     `"auto"` routes any problem under ~10⁴ variables to the dense condensed
     solve, which forms the `n×n` Gram `∇gᵀΣ∇g` by dense accumulation over the
-    Jacobian's rows — `O(m·n²)`. When the inequality Jacobian is both very tall
-    and *sparse* (the radiotherapy dose-influence regime: `n≈10³`, `m≈10⁵`–`10⁶`,
-    a few-percent-dense matrix), forming that Gram sparsely instead is markedly
-    cheaper. Set `linsolve="sparse"` — with the default `kkt_route="auto"` it
-    condenses to the `n×n` normal-equations form and skips the dense
-    accumulation. Measured on a TROTS proton case (`n=1080`, `m=369445`, ∇g
-    ≈5% dense): **13.8 s → 4.6 s per iteration (3×)**. The crossover is the
-    Jacobian's density, not just its shape; for a *dense* tall Jacobian the
-    dense route is faster, so this is a hint for the sparse-tall case, not a
-    blanket rule.
+    Jacobian's rows — `O(m·n²)`. Whether that is the right choice depends on
+    both `n` and the inequality Jacobian's density, and the two RT regimes pull
+    in different directions:
+
+    - **Moderate `n` (`≈10³`) with a *sparse* Jacobian** (e.g. a TROTS proton
+      case, `n=1080`, `m=369445`, ∇g ≈5% dense): forming the Gram *sparsely* is
+      cheaper. `linsolve="sparse"` (with the default `kkt_route="auto"`
+      condensing to the normal-equations form) measured **13.8 s → 4.6 s per
+      iteration (3×)** versus the dense route.
+    - **Large `n` (`≈10⁴`) with a *dense/overlapping* Jacobian** (e.g. a TROTS
+      head-and-neck case, `n=9977`, `m=100246`): the `n×n` Gram *fills in*, so
+      condensing to it is expensive whichever way it is factored — and
+      `"sparse"` is the **worst** choice here, because it hands a near-dense
+      `10⁴×10⁴` matrix to a *sparse* `LDLᵀ`. Measured per iteration: **krylov
+      123 s < dense 247 s < sparse-NE 463 s**. At this scale prefer
+      `linsolve="krylov"`, which never forms the Gram (matvecs through the
+      Jacobian instead).
+
+    Rule of thumb: `"sparse"` only for moderate-`n` *and* genuinely sparse
+    Jacobians; `"krylov"` once `n` approaches `10⁴` with many constraints;
+    `"auto"`'s size-only heuristic does not yet weigh the Gram-formation cost,
+    so an explicit choice can beat it on these large tall problems.
 
 ## Problem scaling
 
