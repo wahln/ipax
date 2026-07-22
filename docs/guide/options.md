@@ -132,31 +132,28 @@ route additionally needs COO structure and a backend sparse adapter. See
 [Backends & hardware](backends.md). Krylov tolerances and the preconditioner are
 in [`KrylovOptions`](../reference.md#ipax.options.KrylovOptions).
 
-!!! tip "Tall problems (`m ≫ n`): the route depends on `n` *and* the Jacobian"
-    `"auto"` routes any problem under ~10⁴ variables to the dense condensed
-    solve, which forms the `n×n` Gram `∇gᵀΣ∇g` by dense accumulation over the
-    Jacobian's rows — `O(m·n²)`. Whether that is the right choice depends on
-    both `n` and the inequality Jacobian's density, and the two RT regimes pull
-    in different directions:
+!!! tip "Tall problems (`m ≫ n`), incl. radiotherapy scale: keep `\"auto\"`"
+    For a very tall inequality system (`m ≫ n`) — the radiotherapy dose regime,
+    `n≈10³`–`10⁴` with `m≈10⁵`–`10⁶` per-voxel dose constraints — `"auto"`'s
+    dense condensed route is the right choice on a normally-threaded BLAS, and
+    no override is needed. It forms the `n×n` normal-equations matrix
+    `N = ∇gᵀΣ∇g` (the same condensation Breedveld 2017 uses for this problem
+    class) and factors it by Cholesky; both the Gram accumulation (`O(m·n²)`)
+    and the factorization parallelize well. Measured per iteration with a
+    multi-threaded BLAS: a TROTS proton case (`n=1080`, `m=369445`) **3.3 s**,
+    a head-and-neck case (`n=9977`, `m=100246`) **45 s** — dense at or ahead of
+    every alternative at both scales.
 
-    - **Moderate `n` (`≈10³`) with a *sparse* Jacobian** (e.g. a TROTS proton
-      case, `n=1080`, `m=369445`, ∇g ≈5% dense): forming the Gram *sparsely* is
-      cheaper. `linsolve="sparse"` (with the default `kkt_route="auto"`
-      condensing to the normal-equations form) measured **13.8 s → 4.6 s per
-      iteration (3×)** versus the dense route.
-    - **Large `n` (`≈10⁴`) with a *dense/overlapping* Jacobian** (e.g. a TROTS
-      head-and-neck case, `n=9977`, `m=100246`): the `n×n` Gram *fills in*, so
-      condensing to it is expensive whichever way it is factored — and
-      `"sparse"` is the **worst** choice here, because it hands a near-dense
-      `10⁴×10⁴` matrix to a *sparse* `LDLᵀ`. Measured per iteration: **krylov
-      123 s < dense 247 s < sparse-NE 463 s**. At this scale prefer
-      `linsolve="krylov"`, which never forms the Gram (matvecs through the
-      Jacobian instead).
-
-    Rule of thumb: `"sparse"` only for moderate-`n` *and* genuinely sparse
-    Jacobians; `"krylov"` once `n` approaches `10⁴` with many constraints;
-    `"auto"`'s size-only heuristic does not yet weigh the Gram-formation cost,
-    so an explicit choice can beat it on these large tall problems.
+    Two caveats. **(1) Keep BLAS threaded.** With BLAS pinned to one thread the
+    ranking inverts and the sparse/matrix-free routes can look faster; that is
+    an artifact of the throttle, not representative of a real solve — the dense
+    route parallelizes far better than sparse `LDLᵀ` or (ill-conditioned,
+    late-IPM) Krylov. **(2) Do not force `linsolve="sparse"` at large `n`.**
+    When the `n×n` Gram fills in (dense/overlapping dose matrices, the
+    head-and-neck case), the sparse route hands a near-dense `10⁴×10⁴` matrix
+    to a *sparse* `LDLᵀ` — the slowest option. `linsolve="sparse"` only helps
+    for **moderate `n` with a genuinely sparse Jacobian**, and even there its
+    edge over the dense route is small once BLAS is threaded.
 
 ## Problem scaling
 
@@ -216,11 +213,12 @@ bounds, so they never hurt there. Tune Gondzio via
     takes many iterations. The `"breedveld"` controller's non-monotone Markov
     filter makes better use of those clipped steps and reduces the infeasibility
     **≈3× faster** on the same iterates; it was the strongest route across the
-    TROTS Prostate_BT set. Pair it with `mu_schedule="breedveld"`. Budget
-    realistically: these cases need on the order of 10²–10³ iterations at
-    seconds-per-iteration (use `linsolve="sparse"`, above, to cut the
-    per-iteration cost), so set `max_iter`/`max_time` accordingly rather than
-    expecting the sub-second convergence of small problems.
+    TROTS Prostate_BT set (this `≈3×` is a reduction in *iteration count*, not
+    per-iteration cost). Pair it with `mu_schedule="breedveld"`. Budget
+    realistically: these cases still need on the order of 10²–10³ iterations at
+    seconds-per-iteration on a threaded BLAS (keep the default `linsolve="auto"`,
+    above), so set `max_iter`/`max_time` accordingly rather than expecting the
+    sub-second convergence of small problems.
 
 The filter constants
 ([`LineSearchOptions`](../reference.md#ipax.options.LineSearchOptions)) and the
