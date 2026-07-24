@@ -232,7 +232,7 @@ class _ConstraintBlock:
 
 def _union_pattern(
     jac_fn: Any, points: list[np.ndarray]
-) -> tuple[np.ndarray, np.ndarray, dict[tuple[int, int], int]]:
+) -> tuple[np.ndarray, np.ndarray, dict[tuple[int, int], int] | None]:
     """The union of an operator's COO pattern over several evaluation points.
 
     IPOPT wants a *fixed* Jacobian sparsity declared once; a problem whose
@@ -242,20 +242,38 @@ def _union_pattern(
     over ``x0`` plus a generic probe point captures the superset, and the
     returned ``(row, col) -> position`` map lets the values callback scatter each
     point's nonzeros into that fixed layout.
+
+    The common case — a *stable* pattern (every point emits the same COO in the
+    same order, e.g. a linear RT dose-constraint Jacobian) — returns ``None`` for
+    the map, signalling the fast path: the values callback can use ``to_coo()``'s
+    values verbatim, no per-nonzero scatter (which at RT scale, millions of
+    nonzeros × hundreds of iterations, is the difference between usable and not).
     """
     import numpy as np
 
     from ipax.backend.operators import as_operator
 
+    def _coo(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        try:
+            r, c, v, _shape = as_operator(jac_fn(np.asarray(x))).to_coo()
+        except NotImplementedError as exc:
+            raise BaselineUnsupported("ipyopt needs a COO-structured Jacobian") from exc
+        return np.asarray(r, np.int64), np.asarray(c, np.int64), np.asarray(v, float)
+
+    patterns = [(_coo(x)[0], _coo(x)[1]) for x in points]
+    r0, c0 = patterns[0]
+    if all(
+        r.shape == r0.shape and np.array_equal(r, r0) and np.array_equal(c, c0)
+        for r, c in patterns[1:]
+    ):
+        return r0, c0, None  # stable pattern → fast path (no scatter map)
+
+    # Variable structure: build the union pattern + a (row, col) -> position map.
     seen: dict[tuple[int, int], int] = {}
     rows: list[int] = []
     cols: list[int] = []
-    for x in points:
-        try:
-            r, c, _v, _shape = as_operator(jac_fn(np.asarray(x))).to_coo()
-        except NotImplementedError as exc:
-            raise BaselineUnsupported("ipyopt needs a COO-structured Jacobian") from exc
-        for ri, ci in zip(np.asarray(r).tolist(), np.asarray(c).tolist(), strict=True):
+    for r, c in patterns:
+        for ri, ci in zip(r.tolist(), c.tolist(), strict=True):
             key = (int(ri), int(ci))
             if key not in seen:
                 seen[key] = len(rows)
@@ -299,10 +317,12 @@ def _ipyopt_blocks(
             x: np.ndarray, jfn: Any = jfn, index_of: Any = index_of, nnz: int = nnz
         ) -> np.ndarray:
             r, c, v, _shape = as_operator(jfn(np.asarray(x))).to_coo()
+            v = np.asarray(v, dtype=float)
+            if index_of is None:  # stable pattern: values are already aligned
+                return v
             out = np.zeros(nnz, dtype=float)
             r = np.asarray(r).tolist()
             c = np.asarray(c).tolist()
-            v = np.asarray(v, dtype=float)
             for k in range(len(r)):
                 pos = index_of.get((int(r[k]), int(c[k])))
                 if pos is None:  # an entry outside the union pattern
