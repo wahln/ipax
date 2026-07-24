@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **IPOPT cross-solver comparison on S2MPJ** — `benchmarks.baselines.IpyoptBaseline`
+  (IPOPT via the sparse-native `ipyopt` binding) and the
+  `benchmarks.runners.s2mpj_baselines` runner. Unlike the existing SciPy-style
+  `cyipopt` path, this consumes the constraint Jacobian as a COO pattern +
+  values (ipax's `to_coo()`/`coo_values()` contract), so it does not densify and
+  scales to the tall, sparse RT-sized systems. The runner turns each ipax result
+  into a diagnosable verdict against IPOPT from the same start — `agree`,
+  `ipax-gap` (reference solved, ipax did not), `ipax-wins`, `both-hard` — on the
+  language-neutral axis (correctness + iteration count, not wall-clock across a
+  compiled solver and a pure-Python one). It immediately confirmed `AGG` as an
+  ipax gap (IPOPT solves it in 185 iterations) and `OET7` as genuinely hard
+  (IPOPT also fails to converge). Both are opt-in dev tooling — `ipyopt` is not a
+  runtime dependency.
+
 - **Two opt-in Wächter & Biegler line-search refinements.** Both are faithful to
   the paper (and verified against IPOPT's `FilterLSAcceptor`), and both **lost**
   against the shipped baseline on the full S2MPJ corpus, so both default to off
