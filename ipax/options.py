@@ -82,6 +82,19 @@ class BarrierOptions:
     # excluded so superlinear μ decrease near a solution is unimpeded.
     # ``0.0`` disables the floor.
     kappa_centrality: float = 1e-2
+    # Scale-aware slack-initialization floor. The default flat slack floor
+    # (``ipax.ipm.init._SLACK_FLOOR`` = 1e-2) pins violated-constraint slacks near
+    # zero on a deeply-infeasible start, so the Newton direction drives them toward
+    # their infeasible target ``s = -g < 0`` and the fraction-to-boundary rule clips
+    # the primal step to ~1e-3 (the radiotherapy Phase-1 feasibility stall — many
+    # near-active/violated slacks jammed against the floor). With this ``> 0`` the
+    # floor becomes ``max(_SLACK_FLOOR, slack_init_scale·max|g(x_0)|)`` (init.py), so
+    # the slacks — and, via ``y = μ_init/s``, the initial multipliers — start scaled
+    # to the constraint magnitude instead of a fixed constant. ``0.0`` (the default)
+    # leaves the flat floor unchanged; a value in ``[0.05, 0.5]`` matches the
+    # constraint scale on RT-scale problems (Protons_01: feasibility at iter ~17 vs
+    # ~42 with the flat floor). OPT-IN pending a full-corpus sweep of the default.
+    slack_init_scale: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0.0 < self.fallback_kappa < 1.0:
@@ -92,6 +105,8 @@ class BarrierOptions:
             raise ValueError("fallback_mu_factor must be positive")
         if not math.isfinite(self.kappa_centrality) or self.kappa_centrality < 0.0:
             raise ValueError("kappa_centrality must be finite and non-negative")
+        if not math.isfinite(self.slack_init_scale) or self.slack_init_scale < 0.0:
+            raise ValueError("slack_init_scale must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)

@@ -655,6 +655,7 @@ class IPMDriver:
             ineq_fn=ineq_fn,
             mu_init=opts.barrier.mu_init,
             m=m,
+            slack_init_scale=opts.barrier.slack_init_scale,
         )
         x, s = start.x, start.s
         y_ineq, z_lower, z_upper = start.y_ineq, start.z_lower, start.z_upper

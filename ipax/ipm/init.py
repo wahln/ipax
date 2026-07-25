@@ -130,12 +130,20 @@ def initialize(
     ineq_fn: Callable[[Array], Array] | None,
     mu_init: float,
     m: int,
+    slack_init_scale: float = 0.0,
 ) -> InitialPoint:
     """Build the strictly-interior initial point for the condensed route.
 
     Slacks satisfy ``g(x) + s = 0`` where that keeps ``s`` positive, otherwise
     they are floored (Breedveld 2017, §3.1). Duals start at ``μ`` complementarity
     so ``S Λ e ≈ μ e`` and the bound complementarities match at iteration 0.
+
+    With ``slack_init_scale > 0`` the flat slack floor :data:`_SLACK_FLOOR` is
+    raised to ``max(_SLACK_FLOOR, slack_init_scale·max|g(x_0)|)`` so a
+    deeply-infeasible start does not pin every violated-constraint slack against
+    a fixed constant (which forces a ~1e-3 fraction-to-boundary step); the
+    coupled ``y = μ_init/s`` then starts the multipliers scaled to the constraint
+    magnitude too (``BarrierOptions.slack_init_scale``).
     """
     dtype = x0.dtype
     x = project_interior(xp, x0, lower_safe, upper_safe, mask_l, mask_u)
@@ -143,6 +151,9 @@ def initialize(
     if m > 0 and ineq_fn is not None:
         g = ineq_fn(x)
         floor = xp.full((m,), _SLACK_FLOOR, dtype=dtype)
+        if slack_init_scale > 0.0:
+            # Room proportional to the constraint magnitude (0-d, broadcast).
+            floor = xp.maximum(floor, slack_init_scale * xp.max(xp.abs(g)))
         s = xp.maximum(-g, floor)
         y_ineq = mu_init / s
     else:

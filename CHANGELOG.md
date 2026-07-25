@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Opt-in scale-aware slack initialization** (`BarrierOptions.slack_init_scale`,
+  default `0.0` = unchanged). The flat slack floor (`1e-2`) pins every
+  violated-constraint slack near zero on a deeply-infeasible start, so the Newton
+  direction drives them toward their infeasible target `s = −g < 0` and the
+  fraction-to-boundary rule clips the primal step to ~`1e-3` for many iterations
+  (the radiotherapy "Phase-1" feasibility stall, isolated via the IPOPT
+  cross-check). With `slack_init_scale > 0` the floor becomes
+  `max(1e-2, slack_init_scale·max|g(x₀)|)`, so the slacks — and, via
+  `y = μ_init/s`, the initial multipliers — start scaled to the constraint
+  magnitude. On `Protons_01` (TROTS) `slack_init_scale = 0.1` reaches feasibility
+  at iteration ~17 vs ~42 with the flat floor, and roughly halves the transient
+  objective excursion. Default `0.0` keeps the solver bit-for-bit unchanged; a
+  default flip is gated on a full-corpus S2MPJ sweep.
+
 - **IPOPT cross-solver comparison on S2MPJ** — `benchmarks.baselines.IpyoptBaseline`
   (IPOPT via the sparse-native `ipyopt` binding) and the
   `benchmarks.runners.s2mpj_baselines` runner. Unlike the existing SciPy-style
