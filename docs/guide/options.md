@@ -281,6 +281,29 @@ The non-monotone oracles run in *free mode*, safeguarded twice:
   complementarity component is excluded from the floor, so superlinear μ
   decrease near a solution is unimpeded. `kappa_centrality=0.0` disables it.
 
+### Slack initialization
+
+`slack_init_scale` (default `0.0`) rescales the initial slack floor. By default a
+violated inequality's slack starts at a fixed `1e-2`; on a deeply-infeasible start
+with many violated or near-active constraints, those slacks are all pinned near
+zero, so the first Newton direction drives them toward their infeasible target
+`s = −g < 0` and the fraction-to-boundary rule clips the primal step to ~`1e-3`
+for many iterations. Setting `slack_init_scale > 0` raises the floor to
+`max(1e-2, slack_init_scale·max|g(x₀)|)`, giving the slacks — and, through
+`y = μ_init/s`, the initial multipliers — a scale matched to the constraints
+instead of a fixed constant.
+
+```python
+ipax.Options(barrier=BarrierOptions(slack_init_scale=0.1))
+```
+
+It is **opt-in** because the benefit is specific to badly-infeasible,
+many-constraint starts (radiotherapy-scale problems are the motivating case,
+where it reaches feasibility in roughly half the iterations); on the general
+corpus it is net-neutral, so the default leaves the solver unchanged. A value in
+`[0.05, 0.5]` matches the constraint scale on such problems; `0.0` keeps the flat
+floor.
+
 ## Verbosity
 
 `verbose` (an integer `0`–`6`) opts in to a console handler with progressively

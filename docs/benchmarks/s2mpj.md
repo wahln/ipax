@@ -349,6 +349,38 @@ release:
     signature, and an LP-like one — trying `mu_schedule="quality"` is cheap and
     is the first thing to reach for.
 
+!!! note "Scale-aware slack initialization (`slack_init_scale`, opt-in, 2026-07-26)"
+    `BarrierOptions.slack_init_scale` (default `0.0`) raises the flat slack floor
+    (`1e-2`) to `max(1e-2, slack_init_scale·max|g(x₀)|)`. It targets a failure the
+    IPOPT cross-check isolated on radiotherapy starts: on a deeply-infeasible
+    point every violated-constraint slack is pinned at the flat floor, so the
+    Newton direction drives it toward its infeasible target `s = −g < 0` and the
+    fraction-to-boundary rule clips the primal step to ~`1e-3` for ~15 iterations
+    (the "Phase-1 stall"). Scaling the floor to the constraint magnitude gives the
+    slacks room and — via `y = μ_init/s` — starts the multipliers at a saner scale.
+    On `Protons_01` (TROTS), `slack_init_scale=0.1` reaches feasibility at
+    iteration ~20 (IPOPT parity) versus ~42 with the flat floor, and roughly
+    halves the transient objective excursion (peak ~998 vs ~1917).
+
+    It **stays opt-in**: the win is specific to deeply-infeasible, many-constraint
+    starts. A full three-route A/B (`slack_init_scale=0.1`, full corpus, NumPy) is
+    **net-neutral** — the general corpus is untouched by construction (the floor
+    only bites where a constraint is violated/near-active at `x₀`), and on the 656
+    already-correct `lbfgs/dense` cells the iteration count is a wash (median Δ0,
+    55 fewer / 56 more).
+
+    | correct (Δ vs flat floor) | `lbfgs/dense` | `lbfgs/krylov` | `lbfgs/sparse` |
+    |---------------------------|---------------|----------------|----------------|
+    | net                       | **+3** (+6/−3)| **−1** (+5/−6) | **−3** (+6/−9) |
+
+    The gains are robust across all three routes (`HS59`, `HS97`, `HS98` reach the
+    correct optimum; `SINROSNB` clears its budget) but so are two regressions
+    (`HS116` → `restoration_failed`, `WOMFLET` → a different, worse optimum), with
+    the remainder route-dependent basin/timing churn. Net-neutral-with-churn does
+    not clear the bar to change the default; the radiotherapy win is available
+    per-solve via the option. A value in `[0.05, 0.5]` matches the constraint
+    scale on RT-sized problems.
+
 ## Reproducing
 
 From a checkout with `IPAX_S2MPJ_DIR` pointing at an

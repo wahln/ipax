@@ -17,9 +17,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `max(1e-2, slack_init_scale·max|g(x₀)|)`, so the slacks — and, via
   `y = μ_init/s`, the initial multipliers — start scaled to the constraint
   magnitude. On `Protons_01` (TROTS) `slack_init_scale = 0.1` reaches feasibility
-  at iteration ~17 vs ~42 with the flat floor, and roughly halves the transient
-  objective excursion. Default `0.0` keeps the solver bit-for-bit unchanged; a
-  default flip is gated on a full-corpus S2MPJ sweep.
+  at iteration ~20 (IPOPT parity) vs ~42 with the flat floor, and roughly halves
+  the transient objective excursion. It stays **opt-in** (default `0.0` keeps the
+  solver bit-for-bit unchanged): the win is specific to deeply-infeasible,
+  many-constraint starts, and the full three-route S2MPJ A/B is net-neutral
+  (dense +3, krylov −1, sparse −3 correct; robust gains on HS59/HS97/HS98/SINROSNB
+  offset by robust regressions on HS116/WOMFLET), which does not clear the bar to
+  change the default.
 
 - **IPOPT cross-solver comparison on S2MPJ** — `benchmarks.baselines.IpyoptBaseline`
   (IPOPT via the sparse-native `ipyopt` binding) and the
