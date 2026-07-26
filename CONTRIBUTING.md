@@ -14,6 +14,7 @@ raised for discussion in the PR, not worked around silently.
    Get the namespace from the input arrays:
    ```python
    from ipax.backend.namespace import array_namespace
+
    xp = array_namespace(x)
    ```
 2. **Stay inside the Array API standard** — main namespace + the optional `linalg`

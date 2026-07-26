@@ -31,7 +31,8 @@ algorithmic details.
    labeled adapters. Get the namespace from the input arrays:
    ```python
    from ipax.backend.namespace import array_namespace
-   xp = array_namespace(x)          # then use xp.*, xp.linalg.*
+
+   xp = array_namespace(x)  # then use xp.*, xp.linalg.*
    ```
 2. **Stay inside the standard.** Use only the Array API main namespace + the optional
    `linalg` extension. The extension provides `cholesky, eigh/eigvalsh, qr, svd,

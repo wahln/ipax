@@ -21,6 +21,7 @@ Only `n_vars` and `objective` are required. Everything else is optional.
 import numpy as np
 import ipax
 
+
 class Rosenbrock(ipax.Problem):
     @property
     def n_vars(self) -> int:
@@ -28,6 +29,7 @@ class Rosenbrock(ipax.Problem):
 
     def objective(self, x):
         return 100.0 * (x[1] - x[0] ** 2) ** 2 + (1 - x[0]) ** 2
+
 
 res = ipax.solve(Rosenbrock(), x0=np.array([-1.2, 1.0]))
 print(res.status, res.x)
@@ -99,10 +101,12 @@ the log-barrier, not as general inequalities, so they are cheap.
 ```python
 class Boxed(ipax.Problem):
     @property
-    def n_vars(self): return 3
+    def n_vars(self):
+        return 3
+
     def objective(self, x): ...
     def bounds(self):
-        lo = np.zeros(3)            # x ≥ 0
+        lo = np.zeros(3)  # x ≥ 0
         hi = np.array([np.inf, 5.0, np.inf])
         return (lo, hi)
 ```
@@ -116,14 +120,17 @@ optional and filled by the precedence chain if omitted.
 ```python
 class Constrained(ipax.Problem):
     @property
-    def n_vars(self): return 2
-    def objective(self, x): return x[0] ** 2 + x[1] ** 2
+    def n_vars(self):
+        return 2
 
-    def eq_constraints(self, x):           # c(x) = 0
-        return x[0] + x[1] - 1.0           # returns a length-1 array-like
+    def objective(self, x):
+        return x[0] ** 2 + x[1] ** 2
 
-    def ineq_constraints(self, x):         # g(x) ≤ 0
-        return x[0] ** 2 - x[1]            # i.e. x[1] ≥ x[0]²
+    def eq_constraints(self, x):  # c(x) = 0
+        return x[0] + x[1] - 1.0  # returns a length-1 array-like
+
+    def ineq_constraints(self, x):  # g(x) ≤ 0
+        return x[0] ** 2 - x[1]  # i.e. x[1] ≥ x[0]²
 ```
 
 Use the sign convention exactly: equalities are `c(x) = 0`, inequalities are
@@ -137,13 +144,14 @@ Hessian term, and never get re-evaluated — a real performance lever at scale.
 
 ```python
 def linear_eq(self):
-    A = np.array([[1.0, 1.0, 1.0]])        # A x = b
+    A = np.array([[1.0, 1.0, 1.0]])  # A x = b
     b = np.array([1.0])
     return (A, b)
 
+
 def linear_ineq(self):
     A = np.array([[1.0, 0.0, 0.0]])
-    lower = np.array([-np.inf])            # two-sided:  lower ≤ A x ≤ upper
+    lower = np.array([-np.inf])  # two-sided:  lower ≤ A x ≤ upper
     upper = np.array([2.0])
     return (A, lower, upper)
 ```
@@ -163,6 +171,7 @@ change — only the [linear-solver choice](options.md#linear-solver) differs.
 ```python
 from ipax.backend.operators import MatrixFreeJacobian
 
+
 def lagrangian_hessian(self, x, y_eq, y_ineq, sigma=1.0):
     n = self.n_vars
     return MatrixFreeJacobian((n, n), matvec=lambda v: self._hess_prod(x, v))
@@ -180,7 +189,7 @@ For a QP or LP, skip the subclass entirely:
 ```python
 Q = np.array([[4.0, 1.0], [1.0, 3.0]])
 c = np.array([-1.0, -2.0])
-qp = ipax.QuadraticProblem(Q, c)          # min ½ xᵀQx + cᵀx, exact gradient & Hessian
+qp = ipax.QuadraticProblem(Q, c)  # min ½ xᵀQx + cᵀx, exact gradient & Hessian
 
 lp = ipax.LinearProblem(
     c=np.array([1.0, 1.0]),

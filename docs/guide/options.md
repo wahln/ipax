@@ -33,8 +33,9 @@ default reproduces the classic scaled-KKT test — every component ≤ `1e-8`:
 ```python
 ipax.Options(
     optimality=ipax.OptimalityConditionOptions(
-        dual_inf_tol=1e-4, compl_inf_tol=1e-4,   # loose optimality, but…
-        constr_viol_tol=1e-8,                     # …tight feasibility, in one step
+        dual_inf_tol=1e-4,
+        compl_inf_tol=1e-4,  # loose optimality, but…
+        constr_viol_tol=1e-8,  # …tight feasibility, in one step
     )
 )
 ```
@@ -53,7 +54,7 @@ dual-infeasibility-dominated residual plateaus early:
 ```python
 ipax.Options(
     acceptable=ipax.AcceptableStoppingOptions(
-        dual_inf_tol=1.0,        # tolerate the stuck dual infeasibility
+        dual_inf_tol=1.0,  # tolerate the stuck dual infeasibility
         constr_viol_tol=1e-6,
         f_rel_change_tol=1e-7,
         n_iter=5,
@@ -311,7 +312,7 @@ more detail. `0` is silent. See [Monitoring & diagnostics](diagnostics.md) for
 the full ladder and for attaching your own logging handler instead.
 
 ```python
-ipax.Options(verbose=2)   # result summary + per-iteration table
+ipax.Options(verbose=2)  # result summary + per-iteration table
 ```
 
 ## Derivative resolution toggles
