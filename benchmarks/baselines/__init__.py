@@ -403,6 +403,18 @@ class IpyoptBaseline:
         x0 = np.asarray(x0, dtype=float)
         n = int(problem.n_vars)
 
+        # IPOPT needs an explicit objective gradient (`eval_grad_f`). A Problem
+        # that leaves `gradient` to ipax's derivative resolution (autodiff /
+        # finite-diff) raises NotImplementedError here — fail fast with
+        # BaselineUnsupported (recorded as "skipped") instead of crashing
+        # mid-solve, matching the matrix-free Jacobian rejection above.
+        try:
+            problem.gradient(x0)
+        except NotImplementedError as exc:
+            raise BaselineUnsupported(
+                "ipyopt needs an explicit problem.gradient"
+            ) from exc
+
         lower, upper = problem.bounds()
         x_l = (
             np.full(n, -_IPOPT_INF) if lower is None else np.asarray(lower, dtype=float)
