@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-26
+
 ### Added
 - **Opt-in scale-aware slack initialization** (`BarrierOptions.slack_init_scale`,
   default `0.0` = unchanged). The flat slack floor (`1e-2`) pins every
@@ -1285,7 +1287,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/wahln/ipax/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/wahln/ipax/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/wahln/ipax/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/wahln/ipax/compare/v0.5.0...v0.6.0
