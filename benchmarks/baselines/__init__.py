@@ -8,6 +8,10 @@ solvers. Only baselines whose optional dependency is installed are returned by
 * :class:`CyipoptBaseline` — IPOPT via ``cyipopt`` (general NLP); shares the
   SciPy-style problem translation since ``cyipopt.minimize_ipopt`` mirrors
   ``scipy.optimize.minimize``.
+* :class:`IpyoptBaseline` — IPOPT via ``ipyopt`` (general NLP); the *sparse-native*
+  IPOPT binding — it consumes the constraint Jacobian as a COO pattern + values
+  rather than a dense matrix, so unlike the SciPy-style path it scales to the
+  tall, sparse RT-sized systems (``m ≫ n``) that would densify to gigabytes.
 * :class:`OsqpBaseline` — OSQP (convex QP with linear constraints only); raises
   :class:`BaselineUnsupported` for nonlinear/non-quadratic problems.
 
@@ -203,6 +207,303 @@ class CyipoptBaseline:
         )
 
 
+# -- sparse translation (ipyopt) --------------------------------------------
+#
+# IPOPT treats every constraint as two-sided ``g_l ≤ g(x) ≤ g_u``; ipax's
+# equality (``c(x)=0``), inequality (``g(x)≤0``) and linear (``l ≤ Ax ≤ u``)
+# blocks each collapse onto that with the right bounds. The Jacobian is handed
+# over as a fixed COO *pattern* (constructor) plus a values callback in that
+# exact order — which is precisely the ``to_coo()`` / ``coo_values()`` contract
+# ipax operators already satisfy for the sparse-direct route, so no densification.
+_IPOPT_INF = 2.0e19  # IPOPT's "infinite" bound sentinel
+
+
+@dataclass(frozen=True)
+class _ConstraintBlock:
+    """One ipax constraint block, translated to IPOPT's two-sided form."""
+
+    g_fn: Any  # x -> constraint values (m_block,)
+    g_l: np.ndarray
+    g_u: np.ndarray
+    rows: np.ndarray  # COO row indices, already offset into the stacked Jacobian
+    cols: np.ndarray
+    values_fn: Any  # x -> Jacobian nonzeros in (rows, cols) order
+
+
+def _union_pattern(
+    jac_fn: Any, points: list[np.ndarray]
+) -> tuple[np.ndarray, np.ndarray, dict[tuple[int, int], int] | None]:
+    """The union of an operator's COO pattern over several evaluation points.
+
+    IPOPT wants a *fixed* Jacobian sparsity declared once; a problem whose
+    structural nonzeros differ between points (e.g. a value that is exactly zero
+    at ``x0``, so the operator omits it there, but nonzero elsewhere — S2MPJ
+    ``OET7``) would otherwise overflow the declared pattern. Taking the union
+    over ``x0`` plus a generic probe point captures the superset, and the
+    returned ``(row, col) -> position`` map lets the values callback scatter each
+    point's nonzeros into that fixed layout.
+
+    The common case — a *stable* pattern (every point emits the same COO in the
+    same order, e.g. a linear RT dose-constraint Jacobian) — returns ``None`` for
+    the map, signalling the fast path: the values callback can use ``to_coo()``'s
+    values verbatim, no per-nonzero scatter (which at RT scale, millions of
+    nonzeros × hundreds of iterations, is the difference between usable and not).
+    """
+    import numpy as np
+
+    from ipax.backend.operators import as_operator
+
+    def _coo(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        try:
+            r, c, v, _shape = as_operator(jac_fn(np.asarray(x))).to_coo()
+        except NotImplementedError as exc:
+            raise BaselineUnsupported("ipyopt needs a COO-structured Jacobian") from exc
+        return np.asarray(r, np.int64), np.asarray(c, np.int64), np.asarray(v, float)
+
+    patterns = [(_coo(x)[0], _coo(x)[1]) for x in points]
+    r0, c0 = patterns[0]
+    if all(
+        r.shape == r0.shape and np.array_equal(r, r0) and np.array_equal(c, c0)
+        for r, c in patterns[1:]
+    ):
+        return r0, c0, None  # stable pattern → fast path (no scatter map)
+
+    # Variable structure: build the union pattern + a (row, col) -> position map.
+    seen: dict[tuple[int, int], int] = {}
+    rows: list[int] = []
+    cols: list[int] = []
+    for r, c in patterns:
+        for ri, ci in zip(r.tolist(), c.tolist(), strict=True):
+            key = (int(ri), int(ci))
+            if key not in seen:
+                seen[key] = len(rows)
+                rows.append(int(ri))
+                cols.append(int(ci))
+    return np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64), seen
+
+
+def _ipyopt_blocks(
+    problem: Problem, x0: np.ndarray
+) -> tuple[list[_ConstraintBlock], int]:
+    """Translate every ipax constraint block into IPOPT two-sided form."""
+    import numpy as np
+
+    from ipax.backend.operators import as_operator
+
+    blocks: list[_ConstraintBlock] = []
+    offset = 0
+    n = int(problem.n_vars)
+    # A second, generic point so the declared Jacobian pattern is the union over
+    # x0 and it, clamped into the bounds so it stays a valid evaluation point.
+    lower, upper = problem.bounds()
+    probe = _probe(n)
+    if lower is not None:
+        probe = np.maximum(probe, np.asarray(lower, dtype=float))
+    if upper is not None:
+        probe = np.minimum(probe, np.asarray(upper, dtype=float))
+    points = [x0, probe]
+
+    def _nonlinear(values_attr: str, jac_attr: str, lo: float, hi: float) -> None:
+        nonlocal offset
+        if not _provides(problem, values_attr, x0):
+            return
+        jfn = getattr(problem, jac_attr)
+        rows_local, cols_local, index_of = _union_pattern(jfn, points)
+        nnz = int(rows_local.shape[0])
+        m = int(as_operator(jfn(x0)).to_coo()[3][0])
+        vfn = getattr(problem, values_attr)
+
+        def _values(
+            x: np.ndarray, jfn: Any = jfn, index_of: Any = index_of, nnz: int = nnz
+        ) -> np.ndarray:
+            r, c, v, _shape = as_operator(jfn(np.asarray(x))).to_coo()
+            v = np.asarray(v, dtype=float)
+            if index_of is None:  # stable pattern: values are already aligned
+                return v
+            out = np.zeros(nnz, dtype=float)
+            r = np.asarray(r).tolist()
+            c = np.asarray(c).tolist()
+            for k in range(len(r)):
+                pos = index_of.get((int(r[k]), int(c[k])))
+                if pos is None:  # an entry outside the union pattern
+                    raise BaselineUnsupported("ipyopt: Jacobian pattern is not fixed")
+                out[pos] += v[k]
+            return out
+
+        blocks.append(
+            _ConstraintBlock(
+                g_fn=lambda x, vfn=vfn: np.asarray(vfn(np.asarray(x)), dtype=float),
+                g_l=np.full(m, lo),
+                g_u=np.full(m, hi),
+                rows=rows_local + offset,
+                cols=cols_local,
+                values_fn=_values,
+            )
+        )
+        offset += m
+
+    _nonlinear("eq_constraints", "eq_jacobian", 0.0, 0.0)
+    _nonlinear("ineq_constraints", "ineq_jacobian", -_IPOPT_INF, 0.0)
+
+    def _linear(data: Any, lo: np.ndarray, hi: np.ndarray) -> None:
+        nonlocal offset
+        op = as_operator(data)
+        try:
+            rows, cols, values, shape = op.to_coo()
+        except NotImplementedError as exc:
+            raise BaselineUnsupported("ipyopt needs a COO-structured Jacobian") from exc
+        m = int(shape[0])
+        rows = np.asarray(rows, dtype=np.int64) + offset
+        cols = np.asarray(cols, dtype=np.int64)
+        values = np.asarray(values, dtype=float)  # constant across x
+        blocks.append(
+            _ConstraintBlock(
+                g_fn=lambda x, op=op: np.asarray(
+                    op.matvec(np.asarray(x, dtype=float)), dtype=float
+                ),
+                g_l=np.asarray(lo, dtype=float),
+                g_u=np.asarray(hi, dtype=float),
+                rows=rows,
+                cols=cols,
+                values_fn=lambda x, values=values: values,
+            )
+        )
+        offset += m
+
+    linear_eq = problem.linear_eq()
+    if linear_eq is not None:
+        a, b = linear_eq
+        b = np.asarray(b, dtype=float)
+        _linear(a, b, b)  # A x = b  ⇒  b ≤ A x ≤ b
+    linear_ineq = problem.linear_ineq()
+    if linear_ineq is not None:
+        a, lo, hi = linear_ineq
+        lo = np.where(np.isfinite(lo), lo, -_IPOPT_INF)
+        hi = np.where(np.isfinite(hi), hi, _IPOPT_INF)
+        _linear(a, lo, hi)
+
+    return blocks, offset
+
+
+class IpyoptBaseline:
+    """IPOPT via the sparse-native ``ipyopt`` binding.
+
+    Uses a limited-memory (L-BFGS) Hessian to mirror ipax's default Hessian mode
+    and to sidestep supplying a Hessian sparsity pattern. Reports IPOPT's own
+    iteration count, so the comparison is on the language-neutral axis (the
+    algorithm), not wall-clock across a compiled solver and a pure-Python one.
+    """
+
+    name = "ipyopt"
+
+    def solve(self, problem: Problem, x0: np.ndarray) -> ReferenceResult:
+        import ipyopt
+        import numpy as np
+
+        x0 = np.asarray(x0, dtype=float)
+        n = int(problem.n_vars)
+
+        # IPOPT needs an explicit objective gradient (`eval_grad_f`). A Problem
+        # that leaves `gradient` to ipax's derivative resolution (autodiff /
+        # finite-diff) raises NotImplementedError here — fail fast with
+        # BaselineUnsupported (recorded as "skipped") instead of crashing
+        # mid-solve, matching the matrix-free Jacobian rejection above.
+        try:
+            problem.gradient(x0)
+        except NotImplementedError as exc:
+            raise BaselineUnsupported(
+                "ipyopt needs an explicit problem.gradient"
+            ) from exc
+
+        lower, upper = problem.bounds()
+        x_l = (
+            np.full(n, -_IPOPT_INF) if lower is None else np.asarray(lower, dtype=float)
+        )
+        x_u = (
+            np.full(n, _IPOPT_INF) if upper is None else np.asarray(upper, dtype=float)
+        )
+        x_l = np.where(np.isfinite(x_l), x_l, -_IPOPT_INF)
+        x_u = np.where(np.isfinite(x_u), x_u, _IPOPT_INF)
+
+        blocks, m = _ipyopt_blocks(problem, x0)
+        if blocks:
+            g_l = np.concatenate([b.g_l for b in blocks])
+            g_u = np.concatenate([b.g_u for b in blocks])
+            jac_rows = np.concatenate([b.rows for b in blocks])
+            jac_cols = np.concatenate([b.cols for b in blocks])
+        else:
+            g_l = g_u = np.zeros(0)
+            jac_rows = jac_cols = np.zeros(0, dtype=np.int64)
+
+        def eval_f(x: np.ndarray) -> float:
+            return float(problem.objective(np.asarray(x)))
+
+        def eval_grad_f(x: np.ndarray, out: np.ndarray) -> Any:
+            out[:] = np.asarray(problem.gradient(np.asarray(x)), dtype=float)
+            return out
+
+        def eval_g(x: np.ndarray, out: np.ndarray) -> Any:
+            if blocks:
+                out[:] = np.concatenate([b.g_fn(x) for b in blocks])
+            return out
+
+        def eval_jac_g(x: np.ndarray, out: np.ndarray) -> Any:
+            if blocks:
+                out[:] = np.concatenate([b.values_fn(x) for b in blocks])
+            return out
+
+        last_iter = {"k": 0}
+
+        def intermediate(*args: Any) -> Any:
+            # IPOPT's intermediate callback: first arg is alg_mod, second iter.
+            if len(args) >= 2:
+                last_iter["k"] = int(args[1])
+            return True
+
+        nlp = ipyopt.Problem(
+            n,
+            x_l,
+            x_u,
+            m,
+            g_l,
+            g_u,
+            (jac_rows, jac_cols),
+            (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)),
+            eval_f,
+            eval_grad_f,
+            eval_g,
+            eval_jac_g,
+            intermediate_callback=intermediate,
+            ipopt_options={
+                "hessian_approximation": "limited-memory",
+                "tol": 1e-8,
+                "max_iter": 3000,
+                "print_level": 0,
+                "sb": "yes",  # suppress the startup banner
+            },
+        )
+
+        x = x0.copy()
+        start = perf_counter()
+        x_opt, _obj, status = nlp.solve(x)
+        elapsed = perf_counter() - start
+
+        x_opt = np.asarray(x_opt, dtype=float)
+        n_iter = last_iter["k"]
+        try:
+            n_iter = int(nlp.stats().get("iter_count", n_iter))
+        except Exception:  # stats key differs across builds; fall back to callback
+            pass
+        return ReferenceResult(
+            name=self.name,
+            x=x_opt,
+            objective=float(problem.objective(x_opt)),
+            success=status in (0, 1),  # Solve_Succeeded / Solved_To_Acceptable_Level
+            n_iter=n_iter,
+            solve_time=elapsed,
+        )
+
+
 def _probe(n: int) -> np.ndarray:
     """A deterministic *nonzero* test point (so an origin start can't hide curvature)."""
     import numpy as np
@@ -343,6 +644,8 @@ def available_baselines() -> list[Baseline]:
         baselines.append(ScipyBaseline())
     if importlib.util.find_spec("cyipopt") is not None:
         baselines.append(CyipoptBaseline())
+    if importlib.util.find_spec("ipyopt") is not None:
+        baselines.append(IpyoptBaseline())
     if importlib.util.find_spec("osqp") is not None:
         baselines.append(OsqpBaseline())
     return baselines
@@ -352,6 +655,7 @@ __all__ = [
     "Baseline",
     "BaselineUnsupported",
     "CyipoptBaseline",
+    "IpyoptBaseline",
     "OsqpBaseline",
     "ReferenceResult",
     "ScipyBaseline",

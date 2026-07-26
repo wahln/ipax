@@ -186,9 +186,16 @@ def _load_matrix(path: str, j: int) -> TROTSMatrix:
         c_arr = np.asarray(f[mats["c"][j, 0]][()]).ravel()
         c = float(c_arr[0]) if c_arr.size else 0.0
         if isinstance(obj, h5py.Group):
-            # MATLAB sparse: CSC arrays (data, ir, jc) with a MATLAB_sparse row count.
-            data = np.asarray(obj["data"][()]).ravel()
-            ir = np.asarray(obj["ir"][()]).ravel().astype(np.int64)
+            # MATLAB sparse: CSC arrays (data, ir, jc) with a MATLAB_sparse row
+            # count. An all-zero matrix (nnz = 0) is written with only ``jc`` —
+            # ``data`` and ``ir`` are omitted entirely (Head-and-Neck_05's
+            # 'Brainstem' matrix), so synthesize the empty arrays.
+            if "data" in obj:
+                data = np.asarray(obj["data"][()]).ravel()
+                ir = np.asarray(obj["ir"][()]).ravel().astype(np.int64)
+            else:
+                data = np.zeros(0)
+                ir = np.zeros(0, dtype=np.int64)
             jc = np.asarray(obj["jc"][()]).ravel().astype(np.int64)
             nrows = int(obj.attrs["MATLAB_sparse"])
             ncols = jc.size - 1

@@ -131,7 +131,32 @@ def select_solver(
             raise RuntimeError("sparse linear solving is unavailable for this backend")
         from ipax.linalg.sparse import SparseDirectSolver
 
-        return SparseDirectSolver(form=options.sparse.kkt_route)
+        form = options.sparse.kkt_route
+        if form == "auto":
+            # Same tall gate and measured thresholds as the linsolve="auto"
+            # heuristic below. The caller withholds ``ineq_gram_fill`` whenever
+            # the NE form is unusable (non-L-BFGS Hessian, no gram_coo,
+            # non-COO equality Jacobians), so auto then stays on "augmented".
+            form = "augmented"
+            if (
+                n_vars < _TALL_DENSE_MAX_VARS
+                and m_ineq >= _TALL_ROW_EXCESS * n_vars
+                and ineq_gram_fill is not None
+            ):
+                fill = ineq_gram_fill()
+                if fill is not None and fill <= _TALL_SPARSE_NE_MAX_FILL:
+                    # Localized rows: the Gram provably stays sparse.
+                    form = "normal_equations"
+                elif fill is not None:
+                    # The Gram fills in — but with ∇g itself past the dense
+                    # crossover the bordered factor is effectively a dense
+                    # (n+m) factorization through sparse machinery (TROTS
+                    # dose matrices: 100% dense rows, ~8x slower end-to-end
+                    # than the n×n condensation), so tall aspect decides.
+                    density = ineq_density() if ineq_density is not None else None
+                    if density is not None and density >= _TALL_DENSE_MIN_DENSITY:
+                        form = "normal_equations"
+        return SparseDirectSolver(form=form)
 
     dense_viable = has_dense_solve() and (
         not has_equalities or "cholesky" in capabilities.linalg_functions

@@ -42,6 +42,7 @@ control, instead of using the built-in console handler:
 
 ```python
 import logging
+
 logging.getLogger("ipax").setLevel(logging.DEBUG)
 logging.getLogger("ipax").addHandler(my_handler)
 # leave Options.verbose at 0 so ipax does not add its own handler
@@ -60,6 +61,7 @@ problem's units.
 def monitor(info):
     print(info.record.iteration, info.record.kkt_error)
 
+
 res = ipax.solve(problem, x0, callback=monitor)
 ```
 
@@ -71,7 +73,8 @@ a wall-clock budget, a target objective, an external cancellation flag:
 
 ```python
 def stop_when_good_enough(info):
-    return info.record.objective < 1e-3      # stop as soon as f drops below 1e-3
+    return info.record.objective < 1e-3  # stop as soon as f drops below 1e-3
+
 
 res = ipax.solve(problem, x0, callback=stop_when_good_enough)
 assert res.status is ipax.Status.STOPPED
@@ -97,8 +100,8 @@ res1 = ipax.solve(problem, x0)
 
 res2 = ipax.solve(
     problem_perturbed,
-    x0=res1.x,                                   # start from the old solution
-    warm_start=ipax.WarmStart.from_result(res1), # reuse its multipliers
+    x0=res1.x,  # start from the old solution
+    warm_start=ipax.WarmStart.from_result(res1),  # reuse its multipliers
 )
 ```
 

@@ -277,3 +277,115 @@ def test_select_solver_auto_tall_dense_win_skips_fill_probe():
         **_tall_sparse_kwargs(ineq_density=lambda: 0.2, ineq_gram_fill=probe)
     )
     assert isinstance(solver, DenseSolver)
+
+
+# --- explicit sparse mode: kkt_route="auto" ----------------------------------
+#
+# ``linsolve="sparse"`` used to honor ``SparseOptions.kkt_route`` blindly, so a
+# tall problem with a dense Jacobian (TROTS Prostate_BT: n≈70, m≈5.7k, J 100%
+# dense) factored an effectively dense (n+m)-sized augmented system through
+# sparse LDL^T machinery — ~8x slower end-to-end than condensing to n×n.
+# ``kkt_route="auto"`` reuses the same tall gate and thresholds as the
+# ``linsolve="auto"`` heuristic to pick the form.
+
+
+def _sparse_auto_kwargs(**overrides):
+    from ipax.options import SparseOptions
+
+    kwargs = {
+        "n_vars": 1_000,
+        "has_equalities": False,
+        "capabilities": _caps(sparse=True),
+        "options": Options(linsolve="sparse", sparse=SparseOptions(kkt_route="auto")),
+        "m_ineq": 15_000,  # 15x n: past _TALL_ROW_EXCESS = 10
+        "ineq_gram_capable": lambda: True,
+        "ineq_density": lambda: 0.3,
+        "ineq_gram_fill": lambda: 0.001,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_sparse_auto_tall_sparse_gram_selects_normal_equations():
+    # Localized rows: Gram fill below _TALL_SPARSE_NE_MAX_FILL ⇒ n×n NE form.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    solver = select_solver(**_sparse_auto_kwargs())
+    assert isinstance(solver, SparseDirectSolver)
+    assert solver.form == "normal_equations"
+
+
+def test_sparse_auto_tall_dense_jacobian_selects_normal_equations():
+    # The Gram fills in (0.9 > threshold) but J itself is 30% dense: the
+    # augmented factor's border is that dense J, so there is no sparsity for it
+    # to exploit either — the tall n×n condensation wins (the same
+    # _TALL_DENSE_MIN_DENSITY crossover as the auto-mode dense-GEMM branch).
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    solver = select_solver(**_sparse_auto_kwargs(ineq_gram_fill=lambda: 0.9))
+    assert isinstance(solver, SparseDirectSolver)
+    assert solver.form == "normal_equations"
+
+
+def test_sparse_auto_filled_gram_sparse_jacobian_stays_augmented():
+    # Non-localized rows on a genuinely sparse J: NE would densify n², the
+    # augmented factor stays as sparse as J — keep it.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    solver = select_solver(
+        **_sparse_auto_kwargs(ineq_gram_fill=lambda: 0.9, ineq_density=lambda: 0.01)
+    )
+    assert isinstance(solver, SparseDirectSolver)
+    assert solver.form == "augmented"
+
+
+def test_sparse_auto_without_fill_probe_stays_augmented():
+    # The caller withholds the fill probe when the NE form is unusable (e.g.
+    # analytic Hessian, matrix-free ∇c): auto must not gamble.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    solver = select_solver(**_sparse_auto_kwargs(ineq_gram_fill=None))
+    assert isinstance(solver, SparseDirectSolver)
+    assert solver.form == "augmented"
+
+
+def test_sparse_auto_non_tall_stays_augmented_without_probing():
+    # Not tall ⇒ augmented, and the (Jacobian-evaluating) probes never run.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    def probe() -> float:
+        raise AssertionError("probes must not run for non-tall problems")
+
+    solver = select_solver(
+        **_sparse_auto_kwargs(m_ineq=5_000, ineq_density=probe, ineq_gram_fill=probe)
+    )
+    assert isinstance(solver, SparseDirectSolver)
+    assert solver.form == "augmented"
+
+
+def test_sparse_auto_beyond_tall_bound_stays_augmented():
+    # Past _TALL_DENSE_MAX_VARS the n×n condensed factor is no longer the
+    # obvious win; keep the sparse route on its documented default.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    solver = select_solver(**_sparse_auto_kwargs(n_vars=25_000, m_ineq=300_000))
+    assert isinstance(solver, SparseDirectSolver)
+    assert solver.form == "augmented"
+
+
+def test_sparse_explicit_routes_bypass_the_auto_gate():
+    # Explicit "augmented"/"normal_equations" requests are honored verbatim.
+    from ipax.linalg.sparse import SparseDirectSolver
+    from ipax.options import SparseOptions
+
+    for route in ("augmented", "normal_equations"):
+        solver = select_solver(
+            **_sparse_auto_kwargs(
+                options=Options(
+                    linsolve="sparse", sparse=SparseOptions(kkt_route=route)
+                ),
+                ineq_gram_fill=None,
+            )
+        )
+        assert isinstance(solver, SparseDirectSolver)
+        assert solver.form == route

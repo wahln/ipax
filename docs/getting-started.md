@@ -29,6 +29,7 @@ Subclass `ipax.Problem`. Only `n_vars` and `objective` are required.
 import numpy as np
 import ipax
 
+
 class Rosenbrock(ipax.Problem):
     @property
     def n_vars(self) -> int:
@@ -36,6 +37,7 @@ class Rosenbrock(ipax.Problem):
 
     def objective(self, x):
         return 100.0 * (x[1] - x[0] ** 2) ** 2 + (1 - x[0]) ** 2
+
 
 res = ipax.solve(Rosenbrock(), x0=np.array([-1.2, 1.0]))
 print(res.status, res.x)

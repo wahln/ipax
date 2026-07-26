@@ -59,7 +59,7 @@ from benchmarks.harness import (
     run_case,
     to_payload,
 )
-from ipax.options import KrylovOptions, LineSearchOptions
+from ipax.options import BarrierOptions, KrylovOptions, LineSearchOptions
 from ipax.testing.backends import import_namespace
 
 # Per-route variable caps. The linear-solver routes have very different size
@@ -95,6 +95,7 @@ def default_configs(
     mu_schedule: str | None = None,
     feasible_kkt_progress: float | None = _KEEP_DEFAULT,
     free_mode_acceptance: str | None = None,
+    slack_init_scale: float | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -132,6 +133,11 @@ def default_configs(
         ls_overrides["free_mode_acceptance"] = free_mode_acceptance
     if ls_overrides:
         common["line_search"] = LineSearchOptions(**ls_overrides)
+    if slack_init_scale is not None:
+        # Scale-aware slack-init A/B lever (BarrierOptions.slack_init_scale;
+        # 0.0 = the flat-floor default). None keeps the solver default so
+        # ordinary sweeps track it automatically.
+        common["barrier"] = BarrierOptions(slack_init_scale=slack_init_scale)
     krylov_common = dict(common)
     if krylov_preconditioner is not None:
         krylov_common["krylov"] = KrylovOptions(preconditioner=krylov_preconditioner)  # type: ignore[arg-type]
@@ -436,6 +442,15 @@ def main(argv: list[str] | None = None) -> int:
         "lever for a Tier-3 rescue A/B.",
     )
     parser.add_argument(
+        "--slack-init-scale",
+        type=float,
+        default=None,
+        help="override BarrierOptions.slack_init_scale on every config (default: "
+        "the solver default 0.0 = flat slack floor) — the lever for the "
+        "scale-aware slack-init A/B; e.g. 0.1 scales the floor to "
+        "0.1·max|g(x0)|.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -502,6 +517,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         ),
         free_mode_acceptance=args.free_mode_acceptance,
+        slack_init_scale=args.slack_init_scale,
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}

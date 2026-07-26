@@ -181,3 +181,31 @@ def test_list_and_reference_parsing():
     if ref is not None:
         assert ref.significant_figures >= 1
         assert ref.x.size == trots.load_trots_file(f"{_ROOT}/Liver_01.mat").real
+
+
+def test_all_zero_sparse_matrix_case_loads_and_validates():
+    # Regression (2026-07-19): Head-and-Neck_05's 'Brainstem' matrix is an
+    # all-zero MATLAB sparse (v7.3 writes only ``jc`` at nnz = 0), which
+    # KeyError'd the reader and made the whole case unloadable. The synthetic
+    # layout is pinned in tests/unit/test_trots_loader.py; this anchors the real
+    # file (the one smaller HN case, ~135MB — the rest of the family stays out
+    # of the gated run for load size).
+    case = "Head-and-Neck_05"
+    if case not in trots.list_trots_cases():
+        pytest.skip(f"{case} not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/{case}.mat")
+
+    empty = [
+        instance.matrix(e.data_id)
+        for e in instance.entries
+        if instance.matrix(e.data_id).matrix.nnz == 0
+    ]
+    assert empty, "expected at least one all-zero dose matrix in HN_05"
+    assert all(m.matrix.shape[0] > 0 for m in empty)
+
+    ref = trots.reference_for(case)
+    if ref is not None and instance.solution is not None:
+        obj = trots.objective_at(instance, instance.solution)
+        rel_tol = 10.0 ** (-(ref.significant_figures - 1))
+        rel_err = abs(obj - ref.objective) / max(1.0, abs(ref.objective))
+        assert rel_err <= rel_tol

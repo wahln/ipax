@@ -33,7 +33,7 @@ FreeModeAcceptance = Literal["obj-constr-filter", "rigorous"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
 DenseKKTRoute = Literal["condensed", "augmented"]
-SparseKKTRoute = Literal["augmented", "normal_equations"]
+SparseKKTRoute = Literal["auto", "augmented", "normal_equations"]
 ScalingMethod = Literal["none", "gradient-based"]
 CorrectionsMethod = Literal["none", "mehrotra", "gondzio"]
 
@@ -82,6 +82,19 @@ class BarrierOptions:
     # excluded so superlinear μ decrease near a solution is unimpeded.
     # ``0.0`` disables the floor.
     kappa_centrality: float = 1e-2
+    # Scale-aware slack-initialization floor. The default flat slack floor
+    # (``ipax.ipm.init._SLACK_FLOOR`` = 1e-2) pins violated-constraint slacks near
+    # zero on a deeply-infeasible start, so the Newton direction drives them toward
+    # their infeasible target ``s = -g < 0`` and the fraction-to-boundary rule clips
+    # the primal step to ~1e-3 (the radiotherapy Phase-1 feasibility stall — many
+    # near-active/violated slacks jammed against the floor). With this ``> 0`` the
+    # floor becomes ``max(_SLACK_FLOOR, slack_init_scale·max|g(x_0)|)`` (init.py), so
+    # the slacks — and, via ``y = μ_init/s``, the initial multipliers — start scaled
+    # to the constraint magnitude instead of a fixed constant. ``0.0`` (the default)
+    # leaves the flat floor unchanged; a value in ``[0.05, 0.5]`` matches the
+    # constraint scale on RT-scale problems (Protons_01: feasibility at iter ~17 vs
+    # ~42 with the flat floor). OPT-IN pending a full-corpus sweep of the default.
+    slack_init_scale: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0.0 < self.fallback_kappa < 1.0:
@@ -92,6 +105,8 @@ class BarrierOptions:
             raise ValueError("fallback_mu_factor must be positive")
         if not math.isfinite(self.kappa_centrality) or self.kappa_centrality < 0.0:
             raise ValueError("kappa_centrality must be finite and non-negative")
+        if not math.isfinite(self.slack_init_scale) or self.slack_init_scale < 0.0:
+            raise ValueError("slack_init_scale must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,12 +128,49 @@ class LineSearchOptions:
     """
 
     max_soc: int = 4
+    # The absolute step size below which the search concedes to restoration.
+    # Also the floor under the opt-in eq. (23) rule (see ``gamma_alpha``), where
+    # it is what keeps a feasible iterate's α_min off zero.
     alpha_min_frac: float = 1e-8
+    # γ_α — the safety factor of the *adaptive* minimum step size (W&B 2006,
+    # eq. 23), which derives α_min from the current θ and ∇φᵀd instead of using
+    # the flat ``alpha_min_frac``:
+    #
+    #     α_min = max(alpha_min_frac,
+    #                 γ_α·min{γ_θ, γ_φ·θ/(−∇φᵀd), δ·θ^{s_θ}/(−∇φᵀd)^{s_φ}})
+    #
+    # ``None`` (the default) keeps the flat floor. IPOPT applies eq. (23)
+    # unconditionally and names this option ``alpha_min_frac`` (default 0.05);
+    # here it must be requested, and 0.05 is the value to request.
+    #
+    # OPT-IN: on the full S2MPJ corpus (2026-07-17) eq. (23) scored −4 as a
+    # default — it concedes to restoration *earlier* than the flat floor, which
+    # is its whole purpose, but ipax's restoration phase is a weaker recovery
+    # than IPOPT's, so trading line-search trials for restoration entries loses
+    # here (7 problems went optimal/acceptable → stalled, against 3 recovered).
+    # Worth requesting where the restoration phase is known to be cheap or the
+    # backtracking cost dominates. Must lie in (0, 1).
+    gamma_alpha: float | None = None
     gamma_theta: float = 1e-5
     gamma_phi: float = 1e-5
     s_theta: float = 1.1
     s_phi: float = 2.3
     eta_phi: float = 1e-4  # Armijo constant
+    # Require θ ≤ θ_min for a trial to be f-type (Armijo-governed), as W&B
+    # Algorithm A (Step 4) and IPOPT specify; ipax keys the branch on the
+    # eq. (19) switching condition alone. With this set, an infeasible iterate
+    # judges trials by the eq. (20) sufficient-decrease test in θ *or* φ rather
+    # than demanding Armijo decrease on φ.
+    #
+    # OPT-IN: on the full S2MPJ corpus (2026-07-17) the gate scored −10 as a
+    # default, in two failure modes — 10 problems converged to a *different,
+    # worse* optimum (ELATTAR, HS97, HS98, LUKVLE3: the θ-branch admits steps
+    # Armijo refused, which changes the basin) and 12 stalled, likely because
+    # above θ_min almost every accepted step becomes θ-type and so augments the
+    # filter, whose accumulated entries then choke later iterations. Note that
+    # ipax's γ_φ/η_φ differ from IPOPT's shipped values, so this gate has never
+    # been tested alongside the constants it was designed against.
+    ftype_requires_theta_min: bool = False
     # Required scaled-KKT-error decrease fraction for the feasible-point rescue
     # (see class docstring); None (default) disables it. OPT-IN: the S2MPJ v14
     # corpus sweep (2026-07-14) attributed 48 correct→incorrect flips to the
@@ -133,17 +185,32 @@ class LineSearchOptions:
     feasible_kkt_progress: float | None = None
     # Free-mode acceptance (NWW 2009, §5): while a non-monotone μ oracle
     # (``Options.mu_schedule`` other than "monotone") is in free mode, the
-    # barrier problem changes every iteration and the W&B filter/Armijo
-    # machinery is not a consistent per-trial merit gate — global convergence
-    # is carried by the iterate-level KKT-error monitor
-    # (``BarrierOptions.fallback``). "obj-constr-filter" (default; the NWW §5
-    # obj-constr variant with IPOPT's margins) then accepts a trial when
-    # ``(θ + margin, f + margin)`` — the raw objective, comparable across μ
-    # re-targets — is acceptable to the filter of previous free iterates;
-    # once the monitor trips to monotone mode the rigorous W&B search governs
-    # again. "rigorous" keeps the W&B gate in both regimes. Inert for the
-    # (default) monotone schedule — default behavior is unchanged.
-    free_mode_acceptance: FreeModeAcceptance = "obj-constr-filter"
+    # barrier problem changes every iteration, so the W&B filter/Armijo
+    # machinery is arguably not a consistent per-trial merit gate — NWW §5
+    # instead carries global convergence in the iterate-level KKT-error monitor
+    # (``BarrierOptions.fallback``). "obj-constr-filter" leans on that: it
+    # accepts a trial when ``(θ + margin, f + margin)`` — the raw objective,
+    # comparable across μ re-targets, unlike φ_μ — is acceptable to the filter
+    # of previous free iterates.
+    #
+    # OPT-IN. "rigorous" (default) keeps the W&B gate in both regimes, for two
+    # reasons. (1) It is the IPOPT-parity setting: released IPOPT never weakens
+    # its per-trial test — ``SetRigorousLineSearch(false)`` is commented out in
+    # IpAdaptiveMuUpdate.cpp, and its ``rigorous_`` flag only skips restoration
+    # anyway, never the acceptance test. IPOPT's own (f, θ) margin filter is an
+    # *iterate*-level progress check (AdaptiveMuUpdate::CheckSufficientProgress),
+    # not a per-trial one. The mechanisms that make IPOPT's free mode work — the
+    # filter reset on every μ change and the KKT-error monitor — are
+    # unconditional here. (2) The paired S2MPJ A/Bs (2026-07-16) put the weak
+    # test at ≈ neutral (quality +6, probing ±0) but with ~55 flips each way per
+    # arm, about half of them landing on a *different, worse* local optimum on
+    # basin-sensitive nonconvex problems (WOMFLET, OET7, SPIRAL, READING5,
+    # ELATTAR, DISCS — the same set in both arms, so this is characterizable,
+    # not noise): dropping the merit guardrail is load-bearing there.
+    # Enable it for central-path-following workloads (radiotherapy-style) where
+    # the rigorous gate grinds at near-feasible iterates. Inert for the
+    # (default) monotone schedule either way.
+    free_mode_acceptance: FreeModeAcceptance = "rigorous"
     # Margin of the free-mode filter: ``margin = fact · min(max_margin,
     # scaled KKT error)`` (IPOPT ``filter_margin_fact`` / ``filter_max_margin``
     # defaults).
@@ -151,6 +218,15 @@ class LineSearchOptions:
     free_filter_max_margin: float = 1.0
 
     def __post_init__(self) -> None:
+        # γ_α ≤ 0 would collapse the eq. (23) α_min onto the bare floor,
+        # silently disabling the rule the caller just asked for; γ_α ≥ 1 would
+        # let α_min reach the switching bound it is meant to sit safely *under*,
+        # refusing steps the acceptance tests would still take. IPOPT bounds its
+        # equivalent option to the same open interval.
+        if self.gamma_alpha is not None and not 0.0 < self.gamma_alpha < 1.0:
+            raise ValueError("gamma_alpha must lie in (0, 1) or be None")
+        if not math.isfinite(self.alpha_min_frac) or self.alpha_min_frac <= 0.0:
+            raise ValueError("alpha_min_frac must be finite and positive")
         # The rescue accepts when ``e_t ≤ (1 − γ)·e0``, so only γ ∈ (0, 1) is a
         # meaningful decrease fraction: γ ≤ 0 makes the bound ≥ e0 (an *increase*
         # in the KKT error would certify "progress"), and γ ≥ 1 demands a
@@ -309,29 +385,39 @@ class DenseOptions:
 class SparseOptions:
     """Sparse-direct KKT assembly: augmented vs. sparse normal equations.
 
-    ``"augmented"`` (default) factors the bordered indefinite system — the
+    ``"augmented"`` factors the bordered indefinite system — the
     inequality Jacobian ``∇g`` stays an explicit border with the ``−Σ_s⁻¹``
     slack block, so the factor is as sparse as ``∇g`` regardless of its
     column overlap (Friedlander & Orban 2012; Wächter & Biegler 2006 §3.1).
     ``"normal_equations"`` instead condenses the Gram term ``∇gᵀ Σ_s ∇g``
     *sparsely* into the logical ``n×n`` block via the Jacobian's ``gram_coo``
     (Breedveld 2017 §2: the condensed system is ``n×n`` however large ``m``
-    grows) — the right choice for tall (``m ≫ n``) problems whose Jacobian
-    rows are **localized** (banded/block dose-influence structure), where the
-    Gram stays sparse and one small factorization per iteration replaces a
-    ``(n+m)`` bordered factor. Deliberately **opt-in**: with non-localized
-    rows the Gram fills in toward dense ``n²`` and no cheap structural probe
-    can see that in advance. Requires a ``gram_coo``-capable inequality
-    Jacobian (a sparse-operator Jacobian on a sparse-adapter backend),
-    diagonal slack scaling, and no equality constraints.
+    grows) — the right choice for tall (``m ≫ n``) problems where either the
+    Gram stays sparse (localized/banded rows) or ``∇g`` is dense enough that
+    the bordered factor has no sparsity to exploit anyway. Requires a
+    ``gram_coo``-capable inequality Jacobian (a sparse-operator Jacobian on a
+    sparse-adapter backend), an L-BFGS Hessian, and COO-emittable equality
+    Jacobians (they border into the factored saddle).
+
+    ``"auto"`` (default) picks between the two per problem, reusing the
+    tall-problem gate and measured thresholds of the ``linsolve="auto"``
+    heuristic (``ipax/linalg/solver.py``): for ``m ≥ 10·n`` (and ``n`` under
+    the tall bound) it selects the normal-equations form when the sampled
+    Gram-fill estimate stays under the NE threshold **or** the Jacobian
+    density is past the dense crossover — the TROTS dose-matrix regime (n≈70,
+    m≈5.7k, ∇g fully dense), where the bordered factor is effectively a dense
+    ``(n+m)`` factorization done through sparse machinery, ~8× slower
+    end-to-end. Whenever the NE prerequisites are unmet, or the problem is
+    not tall, auto stays on ``"augmented"`` — so non-tall problems are
+    untouched by construction.
     """
 
-    kkt_route: SparseKKTRoute = "augmented"
+    kkt_route: SparseKKTRoute = "auto"
 
     def __post_init__(self) -> None:
-        if self.kkt_route not in ("augmented", "normal_equations"):
+        if self.kkt_route not in ("auto", "augmented", "normal_equations"):
             raise ValueError(
-                "sparse kkt_route must be 'augmented' or 'normal_equations'"
+                "sparse kkt_route must be 'auto', 'augmented' or 'normal_equations'"
             )
 
 

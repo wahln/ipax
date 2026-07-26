@@ -117,6 +117,37 @@ dense variable cap.</small>
 
 ### Observations
 
+!!! note "`SparseOptions(kkt_route="auto")` verification (v18, 2026-07-20)"
+    The sparse route's KKT form now defaults to `"auto"`. Its verification sweep
+    isolates cleanly because the auto gate only engages where the
+    normal-equations prerequisites hold: **`exact/sparse` changed route on 0 of
+    1101 problems** (the fill probe is withheld for non-L-BFGS Hessians), so any
+    `exact/*` movement in the A/B is provably unrelated to the change — a
+    built-in control. It confirmed 4 of the 5 corpus flips as timing noise
+    (all `max_time` transitions, from running the sweep at `--jobs 8` against a
+    `--jobs 4` baseline; they net to ±0).
+
+    On `lbfgs/sparse`, **22 problems** switched to the n×n condensation. An
+    objective-level audit (not just the `correct` flag) splits them: **19 return
+    the same objective** to ≤1e-8 relative, **1 improves** (`CRESC50` 1.061 →
+    0.599, and 4× faster), and **2 land on a different, worse local optimum** —
+    `ELATTAR` (0.1427 → 74.2) and `OET7` (4.45e-5 → 0.0872).
+
+    On the 20 same-answer problems the route is **41.7s → 12.1s (3.44×
+    aggregate**, median 1.79×, 13 faster / 7 slower — every slowdown sub-second).
+    `OET6` (101 → 38 iterations) and `CRESC50` (2979 → 1223) are genuine
+    conditioning wins at an unchanged-or-better objective, while well-scaled
+    cases keep identical iteration counts (44 → 44, 71 → 71, 95 → 95).
+
+    **`OET7` is a scoring caveat worth knowing.** Its 539 → 36 iteration drop is
+    *not* a conditioning win: it is convergence to a ~2000× worse optimum, and
+    the corpus metric scores it `correct` in both runs because `OET7` carries no
+    reference objective, so any certified convergence counts. The corpus
+    correctness delta therefore *understates* the basin cost of this change —
+    2 basin changes, of which only `ELATTAR` (which has a reference objective) is
+    visible in the ±count. Pass `kkt_route="augmented"` to restore the previous
+    form.
+
 - **`exact/sparse` is the strongest route** — most correct (776) and most
   optimal (858). Exact-Hessian Newton steps factored by the sparse-direct route
   (Feral LDLᵀ with inertia control) is the most robust combination here.
@@ -198,23 +229,157 @@ release:
       (θ ≡ 0, exactly its domain) accepting Armijo-failing but KKT-decreasing
       steps walked nonconvex least-squares runs into worse stationary points.
       Set it (e.g. `0.1`) to opt in.
-    - **`LineSearchOptions.free_mode_acceptance`** — defaults to the NWW §5
-      `"obj-constr-filter"` weak test, but is only reachable under a
-      **non-monotone `mu_schedule`** (itself opt-in; the default schedule is
-      `monotone`), so the default solver never uses it.
+    - **`LineSearchOptions.free_mode_acceptance`** — defaults to `"rigorous"`
+      (the Wächter & Biegler gate in both regimes). The NWW §5
+      `"obj-constr-filter"` weak test is opt-in, and in any case only reachable
+      under a **non-monotone `mu_schedule`** (itself opt-in; the default
+      schedule is `monotone`), so the default solver never uses it.
 
-    Paired full-corpus A/Bs of the free-mode acceptance against `"rigorous"`
-    (the Wächter & Biegler gate in both regimes) are **≈ neutral overall** —
-    `quality` +6, `probing` ±0 — but with heavy two-way churn (~55 flips each
-    way per arm). About half the regressions are *wrong-optimum*: the weak
-    per-trial test drops the merit-function guardrail, so on basin-sensitive
-    nonconvex problems (`WOMFLET`, `OET7`, `SPIRAL`, `READING5`, `ELATTAR`,
-    `DISCS`) the solver reliably converges to a different, worse local optimum.
-    It buys a large win on the radiotherapy-style workloads it was built for
-    (near-feasible iterates where the eq. (19) switching condition degenerates
-    and the rigorous gate grinds through 10+ backtracks per iteration). If you
-    run a non-monotone oracle on a nonconvex problem and land on the wrong
-    optimum, set `free_mode_acceptance="rigorous"`.
+    Paired full-corpus A/Bs of the weak test against `"rigorous"` are
+    **≈ neutral overall** — `quality` +6, `probing` ±0 — but with heavy two-way
+    churn (~55 flips each way per arm). About half the regressions are
+    *wrong-optimum*: the weak per-trial test drops the merit-function
+    guardrail, so on basin-sensitive nonconvex problems (`WOMFLET`, `OET7`,
+    `SPIRAL`, `READING5`, `ELATTAR`, `DISCS`) the solver reliably converges to
+    a different, worse local optimum — the same set in both arms, so this is
+    characterizable rather than run-to-run noise. `"rigorous"` is also the
+    IPOPT-parity setting: released IPOPT never weakens its *per-trial* test
+    either (its `(f, θ)` margin filter is an *iterate*-level progress check),
+    and the mechanisms that make its free mode work — the filter reset on every
+    μ change and the KKT-error monitor — are unconditional here.
+
+    Enable the weak test (`free_mode_acceptance="obj-constr-filter"`) for
+    central-path-following workloads (radiotherapy-style) where the rigorous
+    gate grinds at near-feasible iterates: at θ ≈ 0 the eq. (19) switching
+    condition degenerates, so every trial faces the full Armijo test and
+    iterations can cost 10+ backtracks.
+
+!!! note "Two Wächter & Biegler filter refinements (opt-in)"
+    Both are faithful to the paper — and verified line-by-line against IPOPT's
+    `FilterLSAcceptor` — yet both **lost** on the full corpus as defaults, so
+    both are disabled by default and neither affects the table above. A paired
+    sweep (2026-07-17) attributed the two independently; they sum exactly to the
+    combined −14.
+
+    - **`LineSearchOptions.gamma_alpha`** (γ_α, default `None`) switches the
+      minimum step size from the flat `alpha_min_frac` to the **adaptive eq. (23)
+      rule**, so a hopeless ray concedes to restoration as soon as no acceptable
+      step remains rather than after a fixed 27 halvings. IPOPT applies this
+      unconditionally with γ_α = `0.05`. Scored **−4**: conceding earlier is the
+      point of the rule, but ipax's restoration phase is a weaker recovery than
+      IPOPT's, so 7 problems went `optimal`/`acceptable` → `stalled` against 3
+      recovered.
+    - **`LineSearchOptions.ftype_requires_theta_min`** (default `False`) adds the
+      **θ ≤ θ_min conjunct to the f-type test** (W&B Algorithm A, Step 4), so an
+      infeasible iterate is judged by the eq. (20) sufficient-decrease test in θ
+      *or* φ instead of by Armijo on φ. Scored **−10**: 10 problems reached a
+      *different, worse* optimum (`ELATTAR`, `HS97`, `HS98`, `LUKVLE3` — the
+      θ-branch admits steps Armijo refused, changing the basin) and 12 stalled
+      (above θ_min almost every accepted step becomes θ-type and augments the
+      filter, whose entries then choke later iterations).
+
+    The constants caveat was then closed by a full 2×2 (2026-07-18): ipax's
+    `gamma_phi`/`eta_phi` (`1e-5`/`1e-4`) differ from IPOPT's shipped
+    `1e-8`/`1e-8`, so the sweep was repeated under IPOPT's constants with the
+    opt-ins off and on.
+
+    For the record, **ipax's values are the ones Wächter & Biegler publish**
+    (§2.4: `γ_θ = γ_φ = 1e-5`, `η_φ = 1e-4`, `δ = 1`, `s_θ = 1.1`, `s_φ = 2.3`,
+    `γ_α = 0.05`, `θ_max = 1e4·max{1,θ(x₀)}`, `θ_min = 1e-4·max{1,θ(x₀)}`) —
+    every constant in the filter line search matches the paper. IPOPT's shipped
+    `1e-8`/`1e-8` is a later retuning that departs from its own paper. The paper
+    adds that the values "have been chosen because they seem to produce overall
+    good performance… but the most efficient choice … [is] usually problem
+    dependent", which is exactly what the table below measures.
+
+    | corpus correct (of 6600)  | opt-ins off     | opt-ins on | marginal |
+    |---------------------------|-----------------|------------|----------|
+    | ipax constants (default)  | **4384** (v15)  | 4370       | **−14**  |
+    | IPOPT constants           | 4371            | 4373       | **+2**   |
+
+    The interaction is the finding: the two structural refinements lose −14
+    under ipax's constants but score +2 under the constants they were designed
+    alongside — structure and acceptance margins are co-adapted, and the hybrid
+    is what loses. No default changes: ipax's own co-adapted package (4384)
+    beats every other cell, including full-IPOPT emulation (4373). The
+    constants trade is also *characterizable*, not uniform: IPOPT's looser
+    margins fix `AGG` (the long-open feasible-LP failure) on 3 of 6 configs
+    plus `MINSURFO`/`BLOCKQP1`/`BATCH`, while breaking the basin-sensitive
+    eigen/packing cluster (`EIGMAXA`, `EIGMINA`, `KISSING*`). Follow-up
+    (2026-07-20) showed the `AGG` half of that is **not** really a margin
+    effect — see the note below. Full-IPOPT emulation, when wanted
+    (e.g. cross-solver comparisons):
+    `LineSearchOptions(gamma_phi=1e-8, eta_phi=1e-8, gamma_alpha=0.05,
+    ftype_requires_theta_min=True)`.
+
+!!! note "`AGG` is a μ-schedule problem, not a margin problem (2026-07-20)"
+    `AGG` — a netlib LP that is *feasible* (HiGHS cross-check) but which the
+    default configuration ends as `restoration_failed` at an infeasible point
+    (constraint violation 19.9, objective −3.11e7 vs the true −3.60e7) — was
+    provisionally attributed to acceptance margins, because IPOPT's constants
+    fix it. Isolating the two constants shows the effect is entirely `eta_phi`
+    (the Armijo constant); `gamma_phi` alone changes nothing, not even the
+    iteration count.
+
+    That is *not* a roundoff artifact. Instrumenting the Armijo test records 64
+    failures with shortfalls of 4.5e3 … 3.6e8 (median 1.2e6), against a
+    scale-relative roundoff slack (IPOPT's `Compare_le`, `10·ε·|φ0|`) of only
+    6.9e-8 — **0 of 64** failures are within it. The median shortfall instead
+    matches the `eta_phi` 1e-4 → 1e-8 relaxation exactly, which means
+    `φ_t ≈ φ0`: the step delivers essentially **no** barrier-objective change
+    while `∇φᵀd` predicts a decrease of order 1e10 on an objective of 3e7. So
+    `eta_phi=1e-8` "fixes" `AGG` only by relaxing Armijo into a near-vacuous
+    non-increase test — it masks the real defect rather than addressing it.
+
+    The real defect is the barrier schedule, and it is fixable with shipped
+    options. `AGG` reaches the true optimum under
+    **`mu_schedule="quality"` in 42 iterations** (cleanest), under
+    `globalization="breedveld"` in 149, and under the `eta_phi` hack in 130;
+    it fails identically with `scaling="none"`, so it is not a scaling issue
+    either. The monotone schedule drives μ off the iterate's central path,
+    producing the enormous-but-unrealizable predicted decrease; an adaptive μ
+    oracle re-targets μ to the iterate and the problem solves cleanly.
+
+    **Routing hint, not a default change.** `mu_schedule="quality"` stays
+    opt-in: its corpus A/B is ≈ neutral (+6, with heavy two-way churn), and on
+    the radiotherapy workload it is actively *worse* than the default (6–8 of 25
+    TROTS Prostate_BT cases certified, against 11 for the default `monotone` and
+    13 for `globalization="breedveld"`). But if a problem stalls or ends
+    `restoration_failed` while its constraint violation stays large — the `AGG`
+    signature, and an LP-like one — trying `mu_schedule="quality"` is cheap and
+    is the first thing to reach for.
+
+!!! note "Scale-aware slack initialization (`slack_init_scale`, opt-in, 2026-07-26)"
+    `BarrierOptions.slack_init_scale` (default `0.0`) raises the flat slack floor
+    (`1e-2`) to `max(1e-2, slack_init_scale·max|g(x₀)|)`. It targets a failure the
+    IPOPT cross-check isolated on radiotherapy starts: on a deeply-infeasible
+    point every violated-constraint slack is pinned at the flat floor, so the
+    Newton direction drives it toward its infeasible target `s = −g < 0` and the
+    fraction-to-boundary rule clips the primal step to ~`1e-3` for ~15 iterations
+    (the "Phase-1 stall"). Scaling the floor to the constraint magnitude gives the
+    slacks room and — via `y = μ_init/s` — starts the multipliers at a saner scale.
+    On `Protons_01` (TROTS), `slack_init_scale=0.1` reaches feasibility at
+    iteration ~20 (IPOPT parity) versus ~42 with the flat floor, and roughly
+    halves the transient objective excursion (peak ~998 vs ~1917).
+
+    It **stays opt-in**: the win is specific to deeply-infeasible, many-constraint
+    starts. A full three-route A/B (`slack_init_scale=0.1`, full corpus, NumPy) is
+    **net-neutral** — the general corpus is untouched by construction (the floor
+    only bites where a constraint is violated/near-active at `x₀`), and on the 656
+    already-correct `lbfgs/dense` cells the iteration count is a wash (median Δ0,
+    55 fewer / 56 more).
+
+    | correct (Δ vs flat floor) | `lbfgs/dense` | `lbfgs/krylov` | `lbfgs/sparse` |
+    |---------------------------|---------------|----------------|----------------|
+    | net                       | **+3** (+6/−3)| **−1** (+5/−6) | **−3** (+6/−9) |
+
+    The gains are robust across all three routes (`HS59`, `HS97`, `HS98` reach the
+    correct optimum; `SINROSNB` clears its budget) but so are two regressions
+    (`HS116` → `restoration_failed`, `WOMFLET` → a different, worse optimum), with
+    the remainder route-dependent basin/timing churn. Net-neutral-with-churn does
+    not clear the bar to change the default; the radiotherapy win is available
+    per-solve via the option. A value in `[0.05, 0.5]` matches the constraint
+    scale on RT-sized problems.
 
 ## Reproducing
 
@@ -227,6 +392,27 @@ python -m benchmarks.runners.s2mpj --all --config exact/sparse --jobs 5 \
     --include-objective-free --resume --max-iter 10000 --max-time 300 \
     --out benchmarks/reports/s2mpj_exact_sparse
 ```
+
+A sweep is only meaningful against a baseline, so A/B two reports with:
+
+```bash
+python -m benchmarks.runners.compare \
+    benchmarks/reports/s2mpj_v17.json benchmarks/reports/s2mpj_v18.json \
+    --config lbfgs/sparse
+```
+
+It reports the correctness delta per configuration, the per-config count of
+problems whose **linear-solver route changed** (a config with zero route changes
+is a built-in control when A/B-ing linear-algebra work — anything moving there is
+unrelated), and **objective drift**: problems whose objective moved materially,
+flagged `[unscored]` when the problem carries no dataset reference objective.
+Those are the ones the correctness count structurally *cannot* see — always read
+them before accepting a delta.
+
+!!! tip "Both sweeps should use the same `--jobs`"
+    Problems near the `--max-time` cap flip status with machine load, so a sweep
+    run at a different parallelism than its baseline injects `max_time` churn
+    that is easily mistaken for a real effect.
 
 Omit `--config` to sweep the whole matrix in one process. `--jobs N` runs N
 problems concurrently in worker processes (pin BLAS threads, e.g.

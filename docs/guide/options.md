@@ -33,8 +33,9 @@ default reproduces the classic scaled-KKT test — every component ≤ `1e-8`:
 ```python
 ipax.Options(
     optimality=ipax.OptimalityConditionOptions(
-        dual_inf_tol=1e-4, compl_inf_tol=1e-4,   # loose optimality, but…
-        constr_viol_tol=1e-8,                     # …tight feasibility, in one step
+        dual_inf_tol=1e-4,
+        compl_inf_tol=1e-4,  # loose optimality, but…
+        constr_viol_tol=1e-8,  # …tight feasibility, in one step
     )
 )
 ```
@@ -53,7 +54,7 @@ dual-infeasibility-dominated residual plateaus early:
 ```python
 ipax.Options(
     acceptable=ipax.AcceptableStoppingOptions(
-        dual_inf_tol=1.0,        # tolerate the stuck dual infeasibility
+        dual_inf_tol=1.0,  # tolerate the stuck dual infeasibility
         constr_viol_tol=1e-6,
         f_rel_change_tol=1e-7,
         n_iter=5,
@@ -132,6 +133,29 @@ route additionally needs COO structure and a backend sparse adapter. See
 [Backends & hardware](backends.md). Krylov tolerances and the preconditioner are
 in [`KrylovOptions`](../reference.md#ipax.options.KrylovOptions).
 
+!!! tip "Tall problems (`m ≫ n`), incl. radiotherapy scale: keep `\"auto\"`"
+    For a very tall inequality system (`m ≫ n`) — the radiotherapy dose regime,
+    `n≈10³`–`10⁴` with `m≈10⁵`–`10⁶` per-voxel dose constraints — `"auto"`'s
+    dense condensed route is the right choice on a normally-threaded BLAS, and
+    no override is needed. It forms the `n×n` normal-equations matrix
+    `N = ∇gᵀΣ∇g` (the same condensation Breedveld 2017 uses for this problem
+    class) and factors it by Cholesky; both the Gram accumulation (`O(m·n²)`)
+    and the factorization parallelize well. Measured per iteration with a
+    multi-threaded BLAS: a TROTS proton case (`n=1080`, `m=369445`) **3.3 s**,
+    a head-and-neck case (`n=9977`, `m=100246`) **45 s** — dense at or ahead of
+    every alternative at both scales.
+
+    Two caveats. **(1) Keep BLAS threaded.** With BLAS pinned to one thread the
+    ranking inverts and the sparse/matrix-free routes can look faster; that is
+    an artifact of the throttle, not representative of a real solve — the dense
+    route parallelizes far better than sparse `LDLᵀ` or (ill-conditioned,
+    late-IPM) Krylov. **(2) Do not force `linsolve="sparse"` at large `n`.**
+    When the `n×n` Gram fills in (dense/overlapping dose matrices, the
+    head-and-neck case), the sparse route hands a near-dense `10⁴×10⁴` matrix
+    to a *sparse* `LDLᵀ` — the slowest option. `linsolve="sparse"` only helps
+    for **moderate `n` with a genuinely sparse Jacobian**, and even there its
+    edge over the dense route is small once BLAS is threaded.
+
 ## Problem scaling
 
 Badly scaled problems converge faster with gradient-based auto-scaling (IPOPT's
@@ -180,6 +204,22 @@ bounds, so they never hurt there. Tune Gondzio via
   restoration phase. Robust on nonconvex problems.
 - `"breedveld"` — a lighter Markov-filter + ratio-control step controller tuned
   for convex/RT-like problems ([`BreedveldOptions`](../reference.md#ipax.options.BreedveldOptions)).
+
+!!! tip "Radiotherapy-scale planning: prefer `\"breedveld\"`"
+    On large, deeply-infeasible-at-start dose-optimization problems (TROTS-scale:
+    `n≈10³`, hundreds of thousands of dose constraints, a warm start that is
+    objective-good but far outside the feasible region), the default filter mode
+    grinds: the primal step is clipped by fraction-to-boundary to `≈10⁻³` while
+    the constraint violation is reduced, so feasibility — and thus convergence —
+    takes many iterations. The `"breedveld"` controller's non-monotone Markov
+    filter makes better use of those clipped steps and reduces the infeasibility
+    **≈3× faster** on the same iterates; it was the strongest route across the
+    TROTS Prostate_BT set (this `≈3×` is a reduction in *iteration count*, not
+    per-iteration cost). Pair it with `mu_schedule="breedveld"`. Budget
+    realistically: these cases still need on the order of 10²–10³ iterations at
+    seconds-per-iteration on a threaded BLAS (keep the default `linsolve="auto"`,
+    above), so set `max_iter`/`max_time` accordingly rather than expecting the
+    sub-second convergence of small problems.
 
 The filter constants
 ([`LineSearchOptions`](../reference.md#ipax.options.LineSearchOptions)) and the
@@ -242,6 +282,29 @@ The non-monotone oracles run in *free mode*, safeguarded twice:
   complementarity component is excluded from the floor, so superlinear μ
   decrease near a solution is unimpeded. `kappa_centrality=0.0` disables it.
 
+### Slack initialization
+
+`slack_init_scale` (default `0.0`) rescales the initial slack floor. By default a
+violated inequality's slack starts at a fixed `1e-2`; on a deeply-infeasible start
+with many violated or near-active constraints, those slacks are all pinned near
+zero, so the first Newton direction drives them toward their infeasible target
+`s = −g < 0` and the fraction-to-boundary rule clips the primal step to ~`1e-3`
+for many iterations. Setting `slack_init_scale > 0` raises the floor to
+`max(1e-2, slack_init_scale·max|g(x₀)|)`, giving the slacks — and, through
+`y = μ_init/s`, the initial multipliers — a scale matched to the constraints
+instead of a fixed constant.
+
+```python
+ipax.Options(barrier=BarrierOptions(slack_init_scale=0.1))
+```
+
+It is **opt-in** because the benefit is specific to badly-infeasible,
+many-constraint starts (radiotherapy-scale problems are the motivating case,
+where it reaches feasibility in roughly half the iterations); on the general
+corpus it is net-neutral, so the default leaves the solver unchanged. A value in
+`[0.05, 0.5]` matches the constraint scale on such problems; `0.0` keeps the flat
+floor.
+
 ## Verbosity
 
 `verbose` (an integer `0`–`6`) opts in to a console handler with progressively
@@ -249,7 +312,7 @@ more detail. `0` is silent. See [Monitoring & diagnostics](diagnostics.md) for
 the full ladder and for attaching your own logging handler instead.
 
 ```python
-ipax.Options(verbose=2)   # result summary + per-iteration table
+ipax.Options(verbose=2)  # result summary + per-iteration table
 ```
 
 ## Derivative resolution toggles

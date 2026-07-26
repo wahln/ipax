@@ -6,6 +6,7 @@ to `solve`, so **the backend is whatever `x0` is**:
 
 ```python
 import torch
+
 res = ipax.solve(problem, x0=torch.tensor([-1.2, 1.0], dtype=torch.float64))
 # the entire solve runs in PyTorch; res.x is a torch.Tensor
 ```
@@ -17,9 +18,10 @@ namespace, not `np.*`). For a backend-agnostic helper inside a problem method:
 ```python
 from ipax.backend.namespace import array_namespace
 
+
 def objective(self, x):
     xp = array_namespace(x)
-    return xp.sum(x ** 2)
+    return xp.sum(x**2)
 ```
 
 ## Supported backends
@@ -50,7 +52,7 @@ Run on GPU by placing `x0` (and the arrays your problem returns) on the device:
 
 ```python
 x0 = torch.tensor([...], dtype=torch.float64, device="cuda")
-res = ipax.solve(problem, x0)        # solve executes on the GPU
+res = ipax.solve(problem, x0)  # solve executes on the GPU
 ```
 
 The dense and matrix-free Krylov routes are pure Array-API and run on whatever

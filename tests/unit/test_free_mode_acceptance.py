@@ -1,15 +1,22 @@
 """Free-mode line-search acceptance (NWW 2009 §5 globalization framework).
 
 Under a free-mode μ oracle the barrier problem changes every iteration, so the
-W&B filter/Armijo machinery is not a consistent merit gate — NWW §5 carries
-global convergence entirely in the iterate-level KKT-error monitor
+W&B filter/Armijo machinery is arguably not a consistent merit gate — NWW §5
+instead carries global convergence in the iterate-level KKT-error monitor
 (``FreeModeMonitor``) and lets the free-mode line search "interfere as little
 as possible". The weak per-trial test is the §5 obj-constr variant: a trial is
 acceptable when ``(θ_t + margin, f_t + margin)`` — the RAW objective, not
 φ_μ — is acceptable to the filter of previous free iterates, with IPOPT's
-margins (``filter_margin_fact · min(filter_max_margin, kkt_error)``). The
-rigorous W&B search governs whenever the monitor is in monotone mode, and the
-default (monotone) μ schedule never engages the weak path at all.
+margins (``filter_margin_fact · min(filter_max_margin, kkt_error)``).
+
+It is **opt-in** (``free_mode_acceptance="obj-constr-filter"``); the default is
+``"rigorous"``, which keeps the W&B gate in both regimes. See
+:class:`~ipax.options.LineSearchOptions` for the reasoning — briefly, released
+IPOPT never weakens its *per-trial* test either, and the corpus A/Bs scored the
+weak test ≈ neutral while trading wrong-basin flips on nonconvex problems. So
+these tests opt in explicitly wherever they exercise the weak path; the
+rigorous W&B search governs by default, and whenever the monitor is in
+monotone mode.
 """
 
 from __future__ import annotations
@@ -53,6 +60,7 @@ def test_free_search_accepts_tiny_objective_decrease_rigorous_backtracks():
         phi0=1.0,
         dphi=-1e2,  # switching holds at θ0 = 0 ⇒ full Armijo on every trial
         theta_max=1e4,
+        theta_min=1e10,
         eval_point=lambda alpha: (0.0, 1.0 - 1e-6),
         entries=[],
     )
@@ -195,8 +203,8 @@ def _record_search_kinds(monkeypatch):
 
 
 def test_free_oracle_runs_the_weak_acceptance(namespace, monkeypatch):
-    # With a free-mode μ oracle and the safeguard never tripping, every line
-    # search goes through the weak path.
+    # Opted in, with a free-mode μ oracle and the safeguard never tripping,
+    # every line search goes through the weak path.
     kinds = _record_search_kinds(monkeypatch)
     problem = HS35(namespace)
     result = solve(
@@ -207,6 +215,7 @@ def test_free_oracle_runs_the_weak_acceptance(namespace, monkeypatch):
             linsolve="dense",
             mu_schedule="adaptive",
             barrier=BarrierOptions(fallback="never"),
+            line_search=LineSearchOptions(free_mode_acceptance="obj-constr-filter"),
         ),
     )
 
@@ -228,6 +237,7 @@ def test_monitor_trip_reinstates_the_rigorous_search(namespace, monkeypatch):
             linsolve="dense",
             mu_schedule="adaptive",
             barrier=BarrierOptions(fallback_kappa=0.01, fallback_window=0),
+            line_search=LineSearchOptions(free_mode_acceptance="obj-constr-filter"),
         ),
     )
 
@@ -236,9 +246,14 @@ def test_monitor_trip_reinstates_the_rigorous_search(namespace, monkeypatch):
     assert "rigorous" in kinds  # the trip reinstated the W&B gate
 
 
-def test_rigorous_option_disables_the_weak_acceptance(namespace, monkeypatch):
-    # The opt-out: free-mode oracles with free_mode_acceptance="rigorous"
-    # keep the W&B gate in both regimes (the pre-feature behavior).
+def test_free_mode_acceptance_defaults_to_rigorous(namespace, monkeypatch):
+    # OPT-IN: the weak per-trial test is not IPOPT's behavior (released IPOPT
+    # never weakens its per-trial test; its (f, θ) margin filter is an
+    # iterate-level progress check), and the paired S2MPJ A/Bs put it at
+    # ≈ neutral while trading wrong-basin flips on nonconvex problems. So even
+    # under a free-mode oracle the rigorous W&B gate governs unless asked for.
+    assert LineSearchOptions().free_mode_acceptance == "rigorous"
+
     kinds = _record_search_kinds(monkeypatch)
     problem = HS35(namespace)
     result = solve(
@@ -247,8 +262,7 @@ def test_rigorous_option_disables_the_weak_acceptance(namespace, monkeypatch):
         options=Options(
             hessian="exact",
             linsolve="dense",
-            mu_schedule="adaptive",
-            line_search=LineSearchOptions(free_mode_acceptance="rigorous"),
+            mu_schedule="adaptive",  # free-mode oracle, yet still rigorous
         ),
     )
 
@@ -288,7 +302,12 @@ def test_free_search_failure_switches_to_monotone(namespace, monkeypatch):
     result = solve(
         problem,
         array(namespace, [0.5, 0.5, 0.5]),
-        options=Options(hessian="exact", linsolve="dense", mu_schedule="adaptive"),
+        options=Options(
+            hessian="exact",
+            linsolve="dense",
+            mu_schedule="adaptive",
+            line_search=LineSearchOptions(free_mode_acceptance="obj-constr-filter"),
+        ),
     )
 
     assert result.status is Status.OPTIMAL
@@ -296,11 +315,11 @@ def test_free_search_failure_switches_to_monotone(namespace, monkeypatch):
     assert kinds[1] == "rigorous"  # the monitor is suspended: W&B governs
 
 
-def test_monotone_default_never_uses_the_weak_acceptance(namespace, monkeypatch):
-    # Containment: the default μ schedule is monotone — there is no free mode,
-    # so the weak path must never engage and the default trajectory is the
-    # rigorous one, unchanged. (μ-trace identity of the default vs an explicit
-    # rigorous opt-out pins the same claim on the observable output.)
+def test_weak_acceptance_is_inert_under_the_monotone_default(namespace, monkeypatch):
+    # Containment: the default μ schedule is monotone, so there is no free mode
+    # and the weak path is unreachable — opting *in* must therefore change
+    # nothing at all. Trace identity pins that on the observable output, so the
+    # option cannot leak into the default trajectory.
     kinds = _record_search_kinds(monkeypatch)
     problem = HS35(namespace)
     x0 = array(namespace, [0.5, 0.5, 0.5])
@@ -310,16 +329,17 @@ def test_monotone_default_never_uses_the_weak_acceptance(namespace, monkeypatch)
     assert len(kinds) > 0
     assert all(kind == "rigorous" for kind in kinds)
 
-    rigorous = solve(
+    opted_in = solve(
         problem,
         x0,
         options=Options(
             hessian="exact",
             linsolve="dense",
-            line_search=LineSearchOptions(free_mode_acceptance="rigorous"),
+            line_search=LineSearchOptions(free_mode_acceptance="obj-constr-filter"),
         ),
     )
-    assert [r.mu for r in default.history] == [r.mu for r in rigorous.history]
+    assert all(kind == "rigorous" for kind in kinds)  # still never the weak path
+    assert [r.mu for r in default.history] == [r.mu for r in opted_in.history]
     assert [r.objective for r in default.history] == [
-        r.objective for r in rigorous.history
+        r.objective for r in opted_in.history
     ]

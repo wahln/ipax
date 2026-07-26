@@ -142,6 +142,9 @@ _STEP_FAILURE_ACCEPT_FACTOR = 1e2
 # Bounds how infeasible an accepted trial may be, so an f-type step whose barrier
 # objective collapses cannot be taken while the constraint violation explodes.
 _THETA_MAX_FACTOR = 1e4
+# The eq. (23) constraint-violation threshold θ_min = fac·max(1, θ(x_0)), the
+# mirror of θ_max above (IPOPT's theta_min_fact/theta_max_fact defaults).
+_THETA_MIN_FACTOR = 1e-4
 # A restoration that signals local infeasibility is only believed when the
 # returned iterate is *actually* infeasible by the driver's own θ metric — its
 # violation must exceed this multiple of the constraint-violation tolerance.
@@ -652,6 +655,7 @@ class IPMDriver:
             ineq_fn=ineq_fn,
             mu_init=opts.barrier.mu_init,
             m=m,
+            slack_init_scale=opts.barrier.slack_init_scale,
         )
         x, s = start.x, start.s
         y_ineq, z_lower, z_upper = start.y_ineq, start.z_lower, start.z_upper
@@ -726,7 +730,10 @@ class IPMDriver:
         free_filt = Filter()
         line_search = FilterLineSearch(opts.line_search)
         # eq. (18): θ_max guard, fixed from the initial constraint violation.
-        theta_max = _THETA_MAX_FACTOR * max(1.0, self._theta_l1(x, s, m, m_eq))
+        theta0_init = self._theta_l1(x, s, m, m_eq)
+        theta_max = _THETA_MAX_FACTOR * max(1.0, theta0_init)
+        # eq. (23): θ_min, likewise fixed from the initial iterate.
+        theta_min = _THETA_MIN_FACTOR * max(1.0, theta0_init)
         # Second-chance restoration anchor (S2MPJ 2026-07 audit): restoration
         # from a wandered-off iterate often converges to a nonzero LOCAL
         # minimizer of the infeasibility even though feasibility is directly
@@ -1508,6 +1515,7 @@ class IPMDriver:
                     phi0=phi0,
                     dphi=dphi,
                     theta_max=theta_max,
+                    theta_min=theta_min,
                     eval_point=eval_point,
                     entries=filt.entries,
                     soc=soc,

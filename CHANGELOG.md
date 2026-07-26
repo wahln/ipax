@@ -6,6 +6,141 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-26
+
+### Added
+- **Opt-in scale-aware slack initialization** (`BarrierOptions.slack_init_scale`,
+  default `0.0` = unchanged). The flat slack floor (`1e-2`) pins every
+  violated-constraint slack near zero on a deeply-infeasible start, so the Newton
+  direction drives them toward their infeasible target `s = −g < 0` and the
+  fraction-to-boundary rule clips the primal step to ~`1e-3` for many iterations
+  (the radiotherapy "Phase-1" feasibility stall, isolated via the IPOPT
+  cross-check). With `slack_init_scale > 0` the floor becomes
+  `max(1e-2, slack_init_scale·max|g(x₀)|)`, so the slacks — and, via
+  `y = μ_init/s`, the initial multipliers — start scaled to the constraint
+  magnitude. On `Protons_01` (TROTS) `slack_init_scale = 0.1` reaches feasibility
+  at iteration ~20 (IPOPT parity) vs ~42 with the flat floor, and roughly halves
+  the transient objective excursion. It stays **opt-in** (default `0.0` keeps the
+  solver bit-for-bit unchanged): the win is specific to deeply-infeasible,
+  many-constraint starts, and the full three-route S2MPJ A/B is net-neutral
+  (dense +3, krylov −1, sparse −3 correct; robust gains on HS59/HS97/HS98/SINROSNB
+  offset by robust regressions on HS116/WOMFLET), which does not clear the bar to
+  change the default.
+
+- **IPOPT cross-solver comparison on S2MPJ** — `benchmarks.baselines.IpyoptBaseline`
+  (IPOPT via the sparse-native `ipyopt` binding) and the
+  `benchmarks.runners.s2mpj_baselines` runner. Unlike the existing SciPy-style
+  `cyipopt` path, this consumes the constraint Jacobian as a COO pattern +
+  values (ipax's `to_coo()`/`coo_values()` contract), so it does not densify and
+  scales to the tall, sparse RT-sized systems. The runner turns each ipax result
+  into a diagnosable verdict against IPOPT from the same start — `agree`,
+  `ipax-gap` (reference solved, ipax did not), `ipax-wins`, `both-hard` — on the
+  language-neutral axis (correctness + iteration count, not wall-clock across a
+  compiled solver and a pure-Python one). It immediately confirmed `AGG` as an
+  ipax gap (IPOPT solves it in 185 iterations) and `OET7` as genuinely hard
+  (IPOPT also fails to converge). Both are opt-in dev tooling — `ipyopt` is not a
+  runtime dependency.
+
+- **Two opt-in Wächter & Biegler line-search refinements.** Both are faithful to
+  the paper (and verified against IPOPT's `FilterLSAcceptor`), and both **lost**
+  against the shipped baseline on the full S2MPJ corpus, so both default to off
+  and the default solver is bit-for-bit unchanged. See `docs/benchmarks/s2mpj.md`
+  for the A/B.
+
+  - `LineSearchOptions.gamma_alpha` (γ_α, default `None`) switches α_min from the
+    flat `alpha_min_frac` to the **adaptive eq. (23) rule**, deriving it per
+    iteration from the current θ and ∇φᵀd:
+    `α_min = max(alpha_min_frac, γ_α·min{γ_θ, γ_φ·θ/(−∇φᵀd), δ·θ^{s_θ}/(−∇φᵀd)^{s_φ}})`.
+    A hopeless ray then concedes to restoration as soon as no acceptable step
+    remains, instead of after a fixed 27 halvings. IPOPT applies this
+    unconditionally with γ_α = `0.05`, which is the value to request. Scored −4
+    as a default: conceding earlier is the point of the rule, but ipax's
+    restoration phase is a weaker recovery than IPOPT's, so the trade loses here.
+  - `LineSearchOptions.ftype_requires_theta_min` (default `False`) adds the
+    **θ ≤ θ_min conjunct to the f-type test** (Algorithm A, Step 4), so an
+    infeasible iterate is judged by the eq. (20) sufficient-decrease test in θ
+    *or* φ rather than by Armijo on φ. ipax keys the branch on the eq. (19)
+    switching condition alone. Scored −10 as a default, in two modes: 10 problems
+    reached a *different, worse* optimum, and 12 stalled.
+
+  Both consume a new eq. (23) constraint-violation threshold
+  θ_min = `1e-4`·max(1, θ(x_0)), fixed from the initial iterate — the mirror of
+  the existing θ_max guard, matching IPOPT's `theta_min_fact`/`theta_max_fact`
+  defaults. `alpha_min_frac` keeps its meaning (an absolute α floor, `1e-8`) and
+  additionally floors eq. (23), which is load-bearing: at a feasible iterate with
+  a descent direction every eq. (23) term carries a factor of θ and the rule
+  returns exactly `0.0`, which would make the backtracking loop non-terminating.
+  The floor also bounds the opt-in to one direction — α_min can only rise, so
+  requesting eq. (23) can make the search concede sooner but never backtrack
+  further. The free-mode search is unaffected either way: eq. (23) is defined
+  through the switching/Armijo tests, which free mode does not use.
+- **`benchmarks.runners.compare` — an A/B diff for two sweep reports.** The
+  full-corpus sweep is the gate for every default change, and this is what reads
+  it: correctness delta per configuration, the count of problems whose
+  linear-solver **route** changed (a config with zero route changes is a
+  built-in control when A/B-ing linear algebra), and **objective drift**.
+  The last one closes a real blind spot: `correct` is scored against the
+  dataset's documented optimum and many problems have none, so a change that
+  converges to a *different, much worse* local optimum scores unchanged — the
+  sparse normal-equations default moved `OET7` from `4.45e-05` to `0.0872`
+  (~2000x worse) with no signal in the correct-count. Drift on such problems is
+  now reported and flagged `unscored`.
+- **`SparseOptions(kkt_route="auto")` — per-problem KKT-form selection on the
+  explicit sparse route, now the default.** `linsolve="sparse"` honored
+  `kkt_route` blindly, so a tall problem (`m ≫ n`) with a dense inequality
+  Jacobian factored an effectively dense `(n+m)`-sized augmented system through
+  sparse LDLᵀ machinery — on a TROTS Prostate_BT case (n=70, m=5747, dose
+  matrix 100% dense) that is 13.6s where the n×n normal-equations condensation
+  takes 1.8s on the identical iteration path (7.6×), and the gap grows with
+  case size (median 21× per-iteration across the family). `"auto"` reuses the
+  `linsolve="auto"` tall gate and measured thresholds: for `m ≥ 10·n` it picks
+  the normal-equations form when the sampled Gram-fill estimate stays sparse
+  *or* the Jacobian density is past the dense crossover, and stays on
+  `"augmented"` whenever the NE prerequisites (L-BFGS Hessian, `gram_coo`,
+  COO-emittable equality Jacobians) are unmet or the problem is not tall — so
+  non-tall problems are untouched by construction. Pass
+  `kkt_route="augmented"` explicitly to restore the previous behaviour. The
+  picked form is reported in `Result.routes.kkt_form`.
+
+### Fixed
+- **The TROTS benchmark loader reads all-zero dose matrices.** MATLAB v7.3
+  stores an nnz = 0 sparse matrix as an HDF5 group holding only `jc` (`data`
+  and `ir` are omitted), which crashed `_load_matrix` with a KeyError and made
+  `Head-and-Neck_05` — whose 'Brainstem' matrix is all-zero — unloadable. The
+  case now loads and reproduces its reference objective to machine precision.
+- **Filter augmentation now tests ¬(switching ∧ Armijo)**, per W&B Step 5 (IPOPT
+  `UpdateForNextIteration`: `!IsFtype(α) || !ArmijoHolds(α)`, over a
+  switching-only `IsFtype`); ipax tested ¬switching alone, missing the Armijo
+  conjunct. This is inert unless `ftype_requires_theta_min` is set — with the
+  gate off, an accepted trial for which switching holds must have passed Armijo
+  (it took the f-type branch), so the conjunct cannot change the answer. With the
+  gate on it matters: above θ_min the eq. (20) test can accept a step that fails
+  Armijo, and that step must be recorded or nothing bounds it away from the point
+  it came from.
+
+### Changed
+- **The NWW §5 free-mode line-search acceptance is now opt-in**
+  (`LineSearchOptions.free_mode_acceptance` defaults to `"rigorous"`; was
+  `"obj-constr-filter"` in 0.7.0). It only ever applied under a non-monotone
+  `mu_schedule` (itself opt-in), so the default solver is unaffected either
+  way — but a user selecting an adaptive μ oracle now keeps the Wächter &
+  Biegler gate unless they ask for the weak test. Two reasons. **Parity:**
+  `"rigorous"` is what IPOPT actually does — released IPOPT never weakens its
+  *per-trial* test (`SetRigorousLineSearch(false)` is commented out in
+  `IpAdaptiveMuUpdate.cpp`, and its `rigorous_` flag only skips restoration,
+  never the acceptance test); IPOPT's own `(f, θ)` margin filter is an
+  *iterate*-level progress check. The mechanisms that make its free mode work
+  — the filter reset on every μ change and the KKT-error monitor — are
+  unconditional in ipax and unaffected by this default. **Evidence:** paired
+  full-corpus A/Bs scored the weak test ≈ neutral (`quality` +6, `probing` ±0)
+  but with ~55 flips each way per arm, about half landing on a *different,
+  worse* local optimum on basin-sensitive nonconvex problems (`WOMFLET`,
+  `OET7`, `SPIRAL`, `READING5`, `ELATTAR`, `DISCS` — the same set in both arms,
+  so characterizable rather than noise). Enable it explicitly
+  (`free_mode_acceptance="obj-constr-filter"`) for central-path-following
+  workloads (radiotherapy-style) where the rigorous gate grinds at
+  near-feasible iterates.
+
 ## [0.7.0] - 2026-07-16
 
 ### Added
@@ -1152,7 +1287,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/wahln/ipax/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/wahln/ipax/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/wahln/ipax/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/wahln/ipax/compare/v0.5.0...v0.6.0
