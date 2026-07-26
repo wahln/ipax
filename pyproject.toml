@@ -95,7 +95,7 @@ lint = [
     "codespell>=2.3",
     "mypy>=1.11",
     "pre-commit>=3.7",
-    "ruff>=0.6",
+    "ruff>=0.16",
 ]
 # Convenience meta-extra for a full local dev environment (NumPy + Torch CI set).
 dev = [

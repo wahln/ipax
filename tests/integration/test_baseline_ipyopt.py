@@ -88,6 +88,25 @@ def test_ipyopt_rejects_matrix_free_jacobian():
         IpyoptBaseline().solve(_MatrixFreeIneq(), np.array([0.5, 0.5]))
 
 
+class _NoGradient(Problem):
+    """Objective only — relies on ipax's derivative resolution for the gradient."""
+
+    @property
+    def n_vars(self) -> int:
+        return 2
+
+    def objective(self, x):
+        return float(x[0] ** 2 + x[1] ** 2)
+
+
+def test_ipyopt_rejects_missing_gradient():
+    # IPOPT calls the objective gradient directly; a Problem that leaves
+    # `gradient` to ipax's autodiff/finite-diff resolution must fail fast with
+    # BaselineUnsupported upfront rather than crashing mid-solve in eval_grad_f.
+    with pytest.raises(BaselineUnsupported):
+        IpyoptBaseline().solve(_NoGradient(), np.array([0.5, 0.5]))
+
+
 # --- the S2MPJ comparison runner's verdict logic (no ipyopt/data needed) -----
 
 

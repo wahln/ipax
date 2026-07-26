@@ -96,8 +96,9 @@ scaled-KKT test (each component ≤ `1e-8`):
 ```python
 options = ipax.Options(
     optimality=ipax.OptimalityConditionOptions(
-        dual_inf_tol=1e-4, compl_inf_tol=1e-4,  # loose optimality, but…
-        constr_viol_tol=1e-8,                    # …tight feasibility, in one step
+        dual_inf_tol=1e-4,
+        compl_inf_tol=1e-4,  # loose optimality, but…
+        constr_viol_tol=1e-8,  # …tight feasibility, in one step
     )
 )
 ```
@@ -110,9 +111,9 @@ but the objective and primal feasibility have settled:
 ```python
 options = ipax.Options(
     acceptable=ipax.AcceptableStoppingOptions(
-        dual_inf_tol=1.0,     # tolerate the stuck dual infeasibility
+        dual_inf_tol=1.0,  # tolerate the stuck dual infeasibility
         constr_viol_tol=1e-6,
-        f_tol=1e-7,           # relative objective change
+        f_tol=1e-7,  # relative objective change
         n_iter=5,
     )
 )

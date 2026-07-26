@@ -23,11 +23,11 @@ from ipax import Status
 
 match res.status:
     case Status.OPTIMAL | Status.ACCEPTABLE:
-        ...                      # res.x is usable
+        ...  # res.x is usable
     case Status.MAX_ITER | Status.MAX_TIME:
-        ...                      # ran out of budget; inspect res.kkt_error
+        ...  # ran out of budget; inspect res.kkt_error
     case _:
-        ...                      # infeasible / numerical trouble / stopped
+        ...  # infeasible / numerical trouble / stopped
 ```
 
 ### Status
@@ -72,7 +72,7 @@ gives its shadow price. With [scaling](options.md#problem-scaling) enabled the
 multipliers are still reported in original units.
 
 ```python
-active = res.y_ineq > 1e-6          # which inequalities bind at the solution
+active = res.y_ineq > 1e-6  # which inequalities bind at the solution
 ```
 
 ## Convergence diagnostics
@@ -120,6 +120,7 @@ timing splits. Use it to plot convergence or diagnose a slow solve:
 
 ```python
 import matplotlib.pyplot as plt
+
 plt.semilogy([r.kkt_error for r in res.history])
 ```
 
