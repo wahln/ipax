@@ -6,6 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- **Full-corpus IPOPT triage column.** `benchmarks.runners.s2mpj_baselines` grew
+  the accuracy sweep's unattended-run machinery — `--all`/`--names-file`/
+  `--exclude` selection, `--jobs N` worker processes, `--resume`, and a
+  flush-after-every-problem JSON + Markdown report — so the ipax-vs-IPOPT
+  comparison runs over the whole ~1100-problem corpus instead of one problem at
+  a time. Every failure in the accuracy sweep now carries a verdict: hard
+  problem (the reference fails too) or ipax gap (the reference solves it). The
+  first full run and its classified backlog are documented in
+  `docs/benchmarks/ipopt.md`.
+- `IpyoptBaseline` accepts `max_iter`, `max_time` and arbitrary `options`
+  overrides, so the reference carries the same budget ipax does and a gap can be
+  re-run with IPOPT's parameters matched to ipax's (`mu_strategy`,
+  `limited_memory_max_history`) — separating a defaults difference from a
+  structural gap.
+- Comparison rows record the **constraint violation at both solvers' returned
+  points**, measured on the raw (unscaled) constraints. A lower objective at a
+  less feasible point is not a better answer, and without this the largest class
+  of gaps was unreadable.
+
+### Fixed
+- The comparison runner credited a solver for reaching the documented objective
+  without converging, so a stall parked on the optimum scored as correct and two
+  *failed* solvers scored as agreeing with each other. Correctness now requires
+  solver success on both sides, matching the accuracy sweep's `run_case`.
+- Reports are written atomically with a retried rename, and a write failure
+  degrades to a warning instead of ending the run. A plain write truncates
+  first, so a crash during a flush replaced the whole report with an empty file
+  — and the first fix for it made a transient Windows sharing violation fatal.
+- A worker now records the problem it is running in its own pid-suffixed
+  in-flight marker, in **both** the comparison runner and the S2MPJ accuracy
+  sweep. The previous parent-side list contained every *unstarted* problem too,
+  so after a native crash it named the entire queue rather than the culprit.
+- `IpyoptBaseline` declared a Jacobian sparsity pattern too narrow to hold the
+  problem. It sampled two points and, when they agreed, passed the operator's
+  values through unscattered — but `EIGMINA` emits five nonzeros at both of
+  those points and six once the iterates move, so IPOPT received an array of the
+  wrong length and NumPy raised an unattributable shape error from inside the
+  solve. The union pattern is now built from more points, sampled strictly
+  *inside* the bounds (entries vanish exactly *on* them, which is where the old
+  clamp put every sample), and the values callback always scatters into the
+  declared layout — vectorized, so it is faster than the pass-through it
+  replaces — rejecting an out-of-pattern nonzero explicitly. All 20 problems
+  that previously could not reach the reference solver now run.
+
 ## [0.8.0] - 2026-07-26
 
 ### Added
