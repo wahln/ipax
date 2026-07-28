@@ -107,6 +107,60 @@ def test_ipyopt_rejects_missing_gradient():
         IpyoptBaseline().solve(_NoGradient(), np.array([0.5, 0.5]))
 
 
+def test_ipyopt_budget_reaches_ipopt(monkeypatch):
+    # A full-corpus comparison is unattended: the reference must carry the same
+    # kind of iteration/time budget ipax does, or one pathological problem runs
+    # until the run is abandoned. Intercept the binding to assert the budget is
+    # actually handed to IPOPT rather than merely stored on the dataclass.
+    import ipyopt
+
+    seen: dict[str, object] = {}
+
+    def _capture(*args, **kwargs):
+        seen.update(kwargs["ipopt_options"])
+        raise RuntimeError("stop before solving")
+
+    monkeypatch.setattr(ipyopt, "Problem", _capture)
+    with pytest.raises(RuntimeError, match="stop before solving"):
+        IpyoptBaseline(max_iter=17, max_time=1.5).solve(
+            HS71(np), np.array([1.0, 5.0, 5.0, 1.0])
+        )
+
+    assert seen["max_iter"] == 17
+    # Wall time is the axis ipax's max_time caps (IPOPT >= 3.14).
+    assert seen["max_wall_time"] == 1.5
+
+
+def test_ipyopt_option_overrides_win_over_the_baseline_defaults(monkeypatch):
+    # The parameter-matched-arm lever: IPOPT's defaults are not ipax's, so a
+    # gap found under defaults must be re-runnable with the schedule matched.
+    import ipyopt
+
+    seen: dict[str, object] = {}
+
+    def _capture(*args, **kwargs):
+        seen.update(kwargs["ipopt_options"])
+        raise RuntimeError("stop before solving")
+
+    monkeypatch.setattr(ipyopt, "Problem", _capture)
+    baseline = IpyoptBaseline(
+        max_iter=100,
+        options=(("mu_strategy", "monotone"), ("limited_memory_max_history", 10)),
+    )
+    with pytest.raises(RuntimeError, match="stop before solving"):
+        baseline.solve(HS71(np), np.array([1.0, 5.0, 5.0, 1.0]))
+
+    assert seen["mu_strategy"] == "monotone"
+    assert seen["limited_memory_max_history"] == 10
+    assert seen["max_iter"] == 100  # the budget still applies
+
+
+def test_ipyopt_defaults_leave_the_reference_uncapped_in_time():
+    baseline = IpyoptBaseline()
+    assert baseline.max_iter == 3000
+    assert baseline.max_time is None
+
+
 # --- the S2MPJ comparison runner's verdict logic (no ipyopt/data needed) -----
 
 
