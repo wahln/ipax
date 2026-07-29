@@ -124,8 +124,23 @@ class LBFGSOperator(LinearOperator):
             return x  # B = ξI with ξ = 1 (identity seed)
         xp = array_namespace(x)
         u_t_x = xp.matmul(xp.permute_dims(self._u, (1, 0)), x)
-        z = xp.linalg.solve(self._m, u_t_x)
-        return self._xi * x - xp.matmul(self._u, z)
+        # A singular middle matrix leaves the low-rank correction undefined, and
+        # letting the backend's error escape aborts the whole solve (S2MPJ
+        # ``LINSPANH`` on ``lbfgs/krylov``). ``SᵀS`` degenerates when a stored
+        # ``δ = x⁺ − x`` is (nearly) collinear with an existing column — an exact
+        # zero is already dropped by the curvature safeguard in ``update``, a
+        # near-duplicate is not. Fall back to the identity seed ``ξx`` for this
+        # application: it keeps ``B`` positive definite, which is what the
+        # condensed route needs, and only costs the curvature information the
+        # unusable factors could not have supplied anyway.
+        try:
+            z = xp.linalg.solve(self._m, u_t_x)
+        except Exception:
+            return self._xi * x
+        result = self._xi * x - xp.matmul(self._u, z)
+        if not bool(xp.all(xp.isfinite(result))):
+            return self._xi * x
+        return result
 
     def diagonal(self, like: Array | None = None) -> Array:
         """Diagonal of the compact Hessian ``B = ξI − U M⁻¹ Uᵀ`` (§4.3).
@@ -145,9 +160,30 @@ class LBFGSOperator(LinearOperator):
         del like
         xp = array_namespace(self._u)
         # z = M⁻¹ Uᵀ (2k×n); (U M⁻¹ Uᵀ)_kk = Σ_j U_kj z_jk.
-        z = xp.linalg.solve(self._m, xp.permute_dims(self._u, (1, 0)))
+        #
+        # A singular M makes the correction — and therefore the diagonal —
+        # undefined. That is the same situation as "before the first curvature
+        # pair" from the caller's point of view, so report it the same way:
+        # ``spd_preconditioner_diagonal`` propagates ``NotImplementedError`` and
+        # the Krylov solver drops to a preconditioner that needs no diagonal.
+        # Letting the backend's own error escape instead aborted the whole solve
+        # (S2MPJ ``LINSPANH`` on ``lbfgs/krylov``). Backends disagree on how they
+        # fail — NumPy raises ``LinAlgError``, Torch its own type, and some
+        # return inf/nan — so both paths are covered.
+        try:
+            z = xp.linalg.solve(self._m, xp.permute_dims(self._u, (1, 0)))
+        except Exception as exc:
+            raise NotImplementedError(
+                "L-BFGS diagonal is unavailable: the compact middle matrix is singular"
+            ) from exc
         correction = xp.sum(self._u * xp.permute_dims(z, (1, 0)), axis=1)
-        return self._xi - correction
+        diagonal = self._xi - correction
+        if not bool(xp.all(xp.isfinite(diagonal))):
+            raise NotImplementedError(
+                "L-BFGS diagonal is unavailable: the compact middle matrix is "
+                "numerically singular"
+            )
+        return diagonal
 
     def compact_form(self) -> tuple[float, Array, Array]:
         """Return the compact-form factors ``(ξ, U, M)`` of ``B = ξI − U M⁻¹ Uᵀ``.
