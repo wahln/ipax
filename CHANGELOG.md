@@ -26,7 +26,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   less feasible point is not a better answer, and without this the largest class
   of gaps was unreadable.
 
+- `ipax.ipm.init.least_squares_duals` — the equality-multiplier estimate
+  `argmin_y ‖∇f + Aᵀy‖`, solved matrix-free by conjugate gradients on the
+  regularized normal equations. The Array API has no `lstsq` and forming the
+  Jacobian densely would defeat the sparse and matrix-free routes at scale, so
+  it touches the operator only through `matvec`/`rmatvec`. This fills the dual
+  initialization the module has documented as unimplemented since it was
+  written; it is currently used for the repair below, not yet at startup.
+
 ### Fixed
+- **The solver no longer stalls short of feasibility on equality-only problems.**
+  A globalization failure at an already-feasible iterate repairs the barrier
+  state instead of entering a restoration that cannot move the point — but the
+  guard doing so required inequality constraints to exist, because re-centering
+  means re-flooring *slacks*. On the CUTEst nonlinear-equation systems, which
+  have no inequalities, it therefore never fired and the driver did exactly what
+  the guard exists to prevent: entered restoration, got the identical point
+  back, resumed with stale state, and re-derived the same rejected direction
+  until the stall detector ended the run. Measured beforehand, `METHANL8`,
+  `DRCAVTY1` and `CYCLOOCF` each entered restoration 26 times, every one exiting
+  "feasible" at an unchanged `x`.
+
+  Three things were needed. The guard now applies whenever the problem has
+  constraints at all, not only inequalities. It measures the violation the way
+  restoration does (`‖·‖_∞`, not the filter's `‖·‖_1`), which on a wide problem
+  is the difference between predicting a no-op restoration and walking into one.
+  And the repair now includes the **equality** multipliers, which previously had
+  no analogue of the inequality central-band clip and drifted to `1e6` on
+  problems whose objective is identically zero — where the correct multiplier is
+  provably `0`.
+
+  Across the S2MPJ corpus on all three linear-solver routes: **+62 correct with
+  no losses** on the objective-free systems this targets (185 → 247), and +12 on
+  the rest (14 gains, 2 losses; `ACOPP30`/`ACOPR30` on the sparse route lose
+  their acceptable-tolerance exit).
+
+- **Problems with no constraints are unaffected.** The feasible-point repair
+  applies only when there is barrier state tied to constraints; a bound-only
+  problem has `θ ≡ 0`, so an unguarded test would fire on every failure and
+  choose between two no-ops. It cost `HADAMALS` its convergence during
+  development and is now covered by a regression test.
+
+- **A singular L-BFGS middle matrix no longer aborts the solve.** `SᵀS`
+  degenerates when a stored curvature pair is nearly collinear with an earlier
+  one — an exact zero is dropped by the existing safeguard, a near-duplicate is
+  not — and the backend's `LinAlgError` escaped all the way out of `solve`
+  (S2MPJ `LINSPANH` on the Krylov route). `diagonal()` now reports the diagonal
+  as unavailable through the `NotImplementedError` channel its callers already
+  handle, and applying the operator falls back to the identity seed, which keeps
+  the approximation positive definite. `LINSPANH` converges instead of raising.
 - The comparison runner credited a solver for reaching the documented objective
   without converging, so a stall parked on the optimum scored as correct and two
   *failed* solvers scored as agreeing with each other. Correctness now requires
