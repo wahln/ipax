@@ -75,7 +75,12 @@ from ipax.ipm.corrections import (
 )
 from ipax.ipm.filter_ls import Filter, FilterLineSearch
 from ipax.ipm.hessian import LBFGSOperator
-from ipax.ipm.init import apply_warm_start, initialize, recenter_slacks_duals
+from ipax.ipm.init import (
+    apply_warm_start,
+    initialize,
+    least_squares_duals,
+    recenter_slacks_duals,
+)
 from ipax.ipm.kkt import build_condensed_operator, build_saddle_operator
 from ipax.ipm.restoration import RestorationExit, feasible_theta_tol, restore
 from ipax.ipm.step import NewtonStep, recover_eliminated
@@ -319,13 +324,16 @@ class _RestorationOutcome:
     not repair — share one handler. A non-``None`` ``mu`` carries a barrier
     escalation (a repeated feasible-point re-center raised μ); the caller
     applies it to the loop's μ and suspends any free-mode μ oracle so the
-    raise is not immediately re-targeted away.
+    raise is not immediately re-targeted away. A non-``None`` ``y_eq`` carries
+    repaired equality multipliers (the analogue of the inequality central-band
+    clip, for problems whose only constraints are equalities).
     """
 
     resume: bool
     x: Array | None = None
     s: Array | None = None
     y_ineq: Array | None = None
+    y_eq: Array | None = None
     status: Status | None = None
     message: str | None = None
     mu: float | None = None
@@ -1166,6 +1174,7 @@ class IPMDriver:
                     x=x,
                     s=s,
                     y_ineq=y_ineq,
+                    y_eq=y_eq,
                     g=g,
                     mu=mu,
                     m=m,
@@ -1175,6 +1184,7 @@ class IPMDriver:
                     lower_safe=lower_safe,
                     upper_safe=upper_safe,
                     theta0=theta0,
+                    theta_inf=self._theta_linf(x, s, m, m_eq),
                     phi0=phi0,
                     record=record,
                     filt=filt,
@@ -1193,6 +1203,8 @@ class IPMDriver:
                     and outcome.y_ineq is not None
                 )
                 x, s, y_ineq = outcome.x, outcome.s, outcome.y_ineq
+                if outcome.y_eq is not None:
+                    y_eq = outcome.y_eq
                 if outcome.mu is not None:
                     # Barrier escalation from a repeated feasible re-center;
                     # suspend the free-mode μ oracle or it would re-target μ
@@ -1593,6 +1605,7 @@ class IPMDriver:
                     x=x,
                     s=s,
                     y_ineq=y_ineq,
+                    y_eq=y_eq,
                     g=g,
                     mu=mu,
                     m=m,
@@ -1602,6 +1615,7 @@ class IPMDriver:
                     lower_safe=lower_safe,
                     upper_safe=upper_safe,
                     theta0=theta0,
+                    theta_inf=self._theta_linf(x, s, m, m_eq),
                     phi0=phi0,
                     record=record,
                     filt=filt,
@@ -1620,6 +1634,8 @@ class IPMDriver:
                     and outcome.y_ineq is not None
                 )
                 x, s, y_ineq = outcome.x, outcome.s, outcome.y_ineq
+                if outcome.y_eq is not None:
+                    y_eq = outcome.y_eq
                 if outcome.mu is not None:
                     # Barrier escalation from a repeated feasible re-center;
                     # suspend the free-mode μ oracle or it would re-target μ
@@ -2268,6 +2284,25 @@ class IPMDriver:
             val += _norm1(xp, self._eq(x))
         return val
 
+    def _theta_linf(self, x: Array, s: Array, m: int, m_eq: int) -> float:
+        """Constraint violation ``θ = ‖(c, g+s)‖_∞`` — restoration's own measure.
+
+        The feasible-point guard must predict whether :func:`restore` would
+        no-op, so it has to ask the question the way restoration answers it.
+        The filter's ``θ`` is the ℓ1 norm, which on a wide problem exceeds the
+        tolerance that the ℓ∞ norm passes: S2MPJ ``DRCAVTY1`` sums 100 residuals
+        to ``1.2e-8`` where ``max|c|`` is ``7.1e-10``, so the guard declared the
+        point infeasible and handed it to a restoration that immediately
+        declared it feasible and returned it unchanged.
+        """
+        xp = self._xp
+        val = 0.0
+        if m > 0:
+            val = max(val, float(xp.max(xp.abs(self._ineq(x) + s))))
+        if m_eq > 0:
+            val = max(val, float(xp.max(xp.abs(self._eq(x)))))
+        return val
+
     def _dphi(
         self,
         x: Array,
@@ -2294,12 +2329,59 @@ class IPMDriver:
         )
         return dd
 
+    def _repair_equality_duals(self, x: Array, y_eq: Array, m_eq: int) -> Array:
+        """Repair the equality multipliers at a feasible-point failure.
+
+        The counterpart of :func:`recenter_slacks_duals`, which clips the
+        *inequality* multipliers into the central band (W&B eq. (16)). An
+        equality-only problem has no slacks to re-floor, so without this the
+        re-center is a no-op and the driver re-derives the same rejected
+        direction (S2MPJ ``COOLHANS``: ``‖y_eq‖∞`` drifts to 1.1e6 on a problem
+        whose objective is identically zero, which forces ``y* = 0``).
+
+        The estimate is the least-squares one, ``argmin_y ‖∇f + Aᵀy‖`` — the
+        multipliers this iterate can actually justify — solved matrix-free so
+        the sparse and matrix-free routes are unaffected (see
+        :func:`least_squares_duals`). On an objective-free system it returns
+        exactly zero, which is the correct multiplier there.
+
+        Measured on the 12 class-A reproducers: 0/12 reach feasibility without
+        this repair, 6/12 with it (METHANL8, HYDCAR6, DRCAVTY1, DRCAVTY3,
+        CYCLOOCF, ROBOT, all to 1e-9 or better). A drifted estimate is only
+        replaced when the new one is finite and actually closer to
+        stationarity, so a repair can never make the iterate worse.
+        """
+        if m_eq == 0:
+            return y_eq
+        xp = self._xp
+        try:
+            eq_jac = self._eq_jac(x)
+            grad = self._gradient(x)
+            estimate = least_squares_duals(eq_jac, grad, xp=xp, m_eq=m_eq)
+        except Exception:  # a repair must never be the thing that fails
+            return y_eq
+        if not bool(xp.all(xp.isfinite(estimate))):
+            return y_eq
+
+        def _stationarity(mult: Array) -> float:
+            return float(xp.max(xp.abs(grad + eq_jac.rmatvec(mult))))
+
+        if _stationarity(estimate) >= _stationarity(y_eq):
+            return y_eq
+        logger.debug(
+            "iter: repairing equality multipliers, ||y||inf %.2e -> %.2e",
+            float(xp.max(xp.abs(y_eq))) if y_eq.shape[0] else 0.0,
+            float(xp.max(xp.abs(estimate))) if estimate.shape[0] else 0.0,
+        )
+        return estimate
+
     def _handle_restoration(
         self,
         *,
         x: Array,
         s: Array,
         y_ineq: Array,
+        y_eq: Array,
         g: Array,
         mu: float,
         m: int,
@@ -2309,6 +2391,7 @@ class IPMDriver:
         lower_safe: Array,
         upper_safe: Array,
         theta0: float,
+        theta_inf: float,
         phi0: float,
         record: IterationRecord,
         filt: Filter,
@@ -2353,7 +2436,24 @@ class IPMDriver:
         # iterate). Repair the barrier state instead: re-floor the slacks on the
         # current μ and clip the multipliers to the central band (Wächter &
         # Biegler 2006, §3.3 / eq. (16)).
-        if m > 0 and theta0 <= feasible_theta_tol(opts.optimality.kkt_tol):
+        #
+        # The test is deliberately independent of whether the problem *has*
+        # inequality constraints. Re-centering repairs slacks, so requiring
+        # ``m > 0`` looked natural when this guard was written for the HS101
+        # class (inequalities, no equalities) — but the harm being prevented is
+        # entering a restoration that cannot move the iterate, and that does not
+        # depend on slacks existing. On the equality-only CUTEst systems the
+        # guard never fired and the driver livelocked exactly as described above
+        # (S2MPJ v3: METHANL8/DRCAVTY1/CYCLOOCF each entered restoration 26
+        # times, every one exiting FEASIBLE at an unchanged ``x``, and reported
+        # `stalled` at a violation IPOPT clears in a handful of iterations).
+        # ``m + m_eq > 0`` keeps the guard to problems that *have* barrier state
+        # tied to constraints. With neither block there is nothing to re-center
+        # and nothing for restoration to do either, so the branch would only
+        # choose between two no-ops — and it chose worse: S2MPJ ``HADAMALS``
+        # (bounds only, so θ ≡ 0 and this fires on every failure) went from
+        # `optimal` to `stalled` at a worse objective on two routes.
+        if m + m_eq > 0 and theta_inf <= feasible_theta_tol(opts.optimality.kkt_tol):
             logger.debug(
                 "iter %d: globalization failed at a feasible point; "
                 "re-centering slacks/duals instead of restoration",
@@ -2391,8 +2491,9 @@ class IPMDriver:
             # slack floor and the multiplier central band match that barrier.
             mu_eff = mu_raised if mu_raised is not None else mu
             s, y_ineq = recenter_slacks_duals(xp, g, y_ineq, mu_eff)
+            y_eq = self._repair_equality_duals(x, y_eq, m_eq)
             return _RestorationOutcome(
-                resume=True, x=x, s=s, y_ineq=y_ineq, mu=mu_raised
+                resume=True, x=x, s=s, y_ineq=y_ineq, y_eq=y_eq, mu=mu_raised
             )
         logger.debug("iter %d: entering feasibility restoration", it)
         filt.augment(theta0, phi0)
