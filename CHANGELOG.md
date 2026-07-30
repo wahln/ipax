@@ -64,6 +64,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   diagnosed signature — a solve that reaches a feasible point and reports
   `stalled` with a large dual infeasibility, typically with redundant or
   rank-deficient constraints — and not as a general setting.
+
+  On the Krylov route, pair it with `KrylovOptions(preconditioner="lbfgs")`. The
+  whole corpus-level negative is that route, and it is a preconditioner mismatch
+  rather than a cost of the repair: correct multipliers on a zero-objective
+  problem leave the Lagrangian Hessian near zero, so the condensed system
+  degenerates and the default Jacobi preconditioner has nothing to work with
+  (per-iteration Krylov solve 4–11x more expensive). With the L-BFGS
+  preconditioner `METHANL8` and `HYDCAR6` go from `max_time` back to `optimal` in
+  3 and 4 iterations.
 - `ipax.ipm.init.least_squares_duals` — the equality-multiplier estimate
   `argmin_y ‖∇f + Aᵀy‖`, solved matrix-free by conjugate gradients on the
   regularized normal equations. The Array API has no `lstsq` and forming the

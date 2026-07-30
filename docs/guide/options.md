@@ -366,6 +366,29 @@ solve reaches a feasible point and reports `stalled` with a large dual
 infeasibility, or when the constraints are known to be redundant or
 rank-deficient, and verify on your own problem.
 
+!!! warning "On the Krylov route, pair it with the L-BFGS preconditioner"
+
+    The entire corpus-level negative is the Krylov route (dense +2, sparse ±0,
+    Krylov −3), and it is a **preconditioner mismatch**, not a cost of the repair
+    itself. Repairing the multipliers to their correct value on a zero-objective
+    problem leaves the Lagrangian Hessian genuinely near zero, so the condensed
+    system degenerates and the default diagonal (Jacobi) preconditioner has
+    nothing to work with — the per-iteration Krylov solve gets 4–11x more
+    expensive (`DRCAVTY1`: 155 ms → 1688 ms) and problems that solved in seconds
+    hit the time limit.
+
+    `KrylovOptions(preconditioner="lbfgs")` removes it: `METHANL8` goes from
+    `max_time` to `optimal` in 3 iterations, `HYDCAR6` from `max_time` to
+    `optimal` in 4.
+
+    ```python
+    ipax.Options(
+        linsolve="krylov",
+        krylov=KrylovOptions(preconditioner="lbfgs"),
+        regularization=RegularizationOptions(equality_dual_repair=1e10),
+    )
+    ```
+
 ## Verbosity
 
 `verbose` (an integer `0`–`6`) opts in to a console handler with progressively
