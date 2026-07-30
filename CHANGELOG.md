@@ -26,6 +26,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   less feasible point is not a better answer, and without this the largest class
   of gaps was unreadable.
 
+- **`RegularizationOptions.equality_dual_repair`** — opt-in, divergence-gated
+  repair of the equality multipliers on every accepted step. A rank-deficient
+  `∇c` leaves the multipliers *under-determined*: the dual block is singular, so
+  `‖Δy‖` is bounded only by `delta_c` and a single step can inject `‖c‖/δ_c ≈ 1e7`
+  of null-space noise. The filter cannot see it — its acceptance tests are on
+  `(θ, φ)` only — so a step that improves feasibility while destroying
+  stationarity is taken at full length, and the poisoned multipliers then feed the
+  L-BFGS Lagrangian pairs and every later step system. On `NONSCOMPNE`, whose
+  Jacobian is rank 24 of 25 at the starting point, `‖y‖_∞` goes from `0` to
+  `7.9e7` between iterations 0 and 1 — on a problem whose zero objective forces
+  `y* = 0`.
+
+  When set, `y_eq` is replaced by the least-squares estimate whenever the current
+  multipliers' stationarity residual exceeds this factor times the estimate's.
+  The gate is a *ratio*, so it measures divergence against what the iterate can
+  actually justify rather than an absolute magnitude, and it is self-limiting:
+  once repaired, the test stops tripping. It must be conservative — an ungated
+  repair pins the dual residual near `1e-8` and degrades healthy equality
+  problems from `optimal` to `acceptable`.
+
+  It is **off by default, and the full-corpus sweep is why**. At `1e10` across the
+  whole S2MPJ corpus on the three L-BFGS routes (3300 solves): **2217 → 2216
+  correct, a net −1** — 22 fixed against 23 broken (dense +2, Krylov −3, sparse
+  ±0). The fixes are precisely the targeted family — `VANDERM1`, `VANDERM2`,
+  `COOLHANS`, `ARTIF`, `LAKES`, `HYDCAR20` reach `optimal`, five of them
+  long-standing gaps against IPOPT. The breakages are two distinct effects: 11 are
+  `max_time` caused by the repair's own cost (a least-squares solve on every
+  accepted step; iteration counts on rows correct in both arms move only −0.5%, so
+  it is per-iteration overhead rather than slower convergence), and the remainder
+  are trajectory changes concentrated in the EIGEN family and `RES`, which settle
+  on a different eigenvalue. Of 49 objective drifts, 39 are on problems with no
+  documented optimum and move both ways (`LAKES` `2.8e11 → 3.5e5` better, `GASOIL`
+  `1.08 → 12.0` worse).
+
+  So it is a characterized trade, not an improvement: worth enabling for the
+  diagnosed signature — a solve that reaches a feasible point and reports
+  `stalled` with a large dual infeasibility, typically with redundant or
+  rank-deficient constraints — and not as a general setting.
 - `ipax.ipm.init.least_squares_duals` — the equality-multiplier estimate
   `argmin_y ‖∇f + Aᵀy‖`, solved matrix-free by conjugate gradients on the
   regularized normal equations. The Array API has no `lstsq` and forming the

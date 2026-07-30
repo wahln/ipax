@@ -1666,6 +1666,15 @@ class IPMDriver:
                 y_ineq = y_ineq + alpha_d * step.dy_ineq
             if m_eq > 0:
                 y_eq = y_eq + alpha_p * step.dy_eq
+                # A rank-deficient ∇c leaves this update free to inject
+                # ‖c‖/δ_c of null-space noise that the (θ, φ) filter cannot
+                # see. Opt-in, and gated on gross divergence so ordinary
+                # primal-dual coupling is untouched.
+                repair_factor = opts.regularization.equality_dual_repair
+                if repair_factor is not None:
+                    y_eq = self._repair_equality_duals(
+                        x, y_eq, m_eq, factor=repair_factor
+                    )
             z_lower = xp.where(
                 mask_l, z_lower + alpha_d * step.dz_lower, xp.zeros_like(x)
             )
@@ -2329,7 +2338,9 @@ class IPMDriver:
         )
         return dd
 
-    def _repair_equality_duals(self, x: Array, y_eq: Array, m_eq: int) -> Array:
+    def _repair_equality_duals(
+        self, x: Array, y_eq: Array, m_eq: int, *, factor: float = 1.0
+    ) -> Array:
         """Repair the equality multipliers at a feasible-point failure.
 
         The counterpart of :func:`recenter_slacks_duals`, which clips the
@@ -2350,6 +2361,14 @@ class IPMDriver:
         CYCLOOCF, ROBOT, all to 1e-9 or better). A drifted estimate is only
         replaced when the new one is finite and actually closer to
         stationarity, so a repair can never make the iterate worse.
+
+        ``factor`` scales the estimate's residual in that comparison, so the
+        repair fires only when the current multipliers are worse by more than
+        this ratio. The default ``1.0`` *is* the "strictly closer" rule above —
+        the restoration path's contract. The accepted-step call site
+        (``RegularizationOptions.equality_dual_repair``) passes a large factor so
+        only genuine null-space divergence is corrected; see that option for why
+        the gate has to be conservative.
         """
         if m_eq == 0:
             return y_eq
@@ -2366,7 +2385,7 @@ class IPMDriver:
         def _stationarity(mult: Array) -> float:
             return float(xp.max(xp.abs(grad + eq_jac.rmatvec(mult))))
 
-        if _stationarity(estimate) >= _stationarity(y_eq):
+        if _stationarity(y_eq) <= factor * _stationarity(estimate):
             return y_eq
         logger.debug(
             "iter: repairing equality multipliers, ||y||inf %.2e -> %.2e",

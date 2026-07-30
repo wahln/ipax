@@ -61,7 +61,12 @@ from benchmarks.harness import (
     run_case,
     to_payload,
 )
-from ipax.options import BarrierOptions, KrylovOptions, LineSearchOptions
+from ipax.options import (
+    BarrierOptions,
+    KrylovOptions,
+    LineSearchOptions,
+    RegularizationOptions,
+)
 from ipax.testing.backends import import_namespace
 
 # Per-route variable caps. The linear-solver routes have very different size
@@ -98,6 +103,7 @@ def default_configs(
     feasible_kkt_progress: float | None = _KEEP_DEFAULT,
     free_mode_acceptance: str | None = None,
     slack_init_scale: float | None = None,
+    equality_dual_repair: float | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -140,6 +146,13 @@ def default_configs(
         # 0.0 = the flat-floor default). None keeps the solver default so
         # ordinary sweeps track it automatically.
         common["barrier"] = BarrierOptions(slack_init_scale=slack_init_scale)
+    if equality_dual_repair is not None:
+        # Divergence-gated equality-multiplier repair A/B lever
+        # (RegularizationOptions.equality_dual_repair; None = the solver default,
+        # which is off). Only observable on equality-constrained problems.
+        common["regularization"] = RegularizationOptions(
+            equality_dual_repair=equality_dual_repair
+        )
     krylov_common = dict(common)
     if krylov_preconditioner is not None:
         krylov_common["krylov"] = KrylovOptions(preconditioner=krylov_preconditioner)  # type: ignore[arg-type]
@@ -491,6 +504,16 @@ def main(argv: list[str] | None = None) -> int:
         "0.1·max|g(x0)|.",
     )
     parser.add_argument(
+        "--equality-dual-repair",
+        type=float,
+        default=None,
+        help="override RegularizationOptions.equality_dual_repair on every config "
+        "(default: the solver default None = off) — the lever for the "
+        "divergence-gated equality-multiplier repair A/B; e.g. 1e10 repairs "
+        "multipliers whose stationarity residual exceeds 1e10x the "
+        "least-squares estimate's.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -558,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         free_mode_acceptance=args.free_mode_acceptance,
         slack_init_scale=args.slack_init_scale,
+        equality_dual_repair=args.equality_dual_repair,
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}
