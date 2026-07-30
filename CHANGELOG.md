@@ -122,6 +122,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   as unavailable through the `NotImplementedError` channel its callers already
   handle, and applying the operator falls back to the identity seed, which keeps
   the approximation positive definite. `LINSPANH` converges instead of raising.
+  The apply-path guard checks the *solve output* (`2k`-sized, `k` = L-BFGS
+  memory) rather than the finished `n`-sized product: `_apply` is the matvec, so
+  scanning the result would allocate a temporary and force a host
+  synchronisation on every application — invisible on a CPU profile, where the
+  condensed Gram build dominates, but the pattern that cost ~23x on GPU in
+  `barrier.py`.
 - The comparison runner credited a solver for reaching the documented objective
   without converging, so a stall parked on the optimum scored as correct and two
   *failed* solvers scored as agreeing with each other. Correctness now requires

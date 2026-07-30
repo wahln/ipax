@@ -133,14 +133,21 @@ class LBFGSOperator(LinearOperator):
         # application: it keeps ``B`` positive definite, which is what the
         # condensed route needs, and only costs the curvature information the
         # unusable factors could not have supplied anyway.
+        # Backends disagree on how a singular solve fails: NumPy raises
+        # ``LinAlgError``, Torch its own type, and some return inf/nan instead.
+        # The non-finite check is on ``z`` rather than on the finished product:
+        # the garbage originates in the solve, and ``z`` is ``2k``-sized (k =
+        # L-BFGS memory) where the result is ``n``-sized. This is the matvec —
+        # scanning ``n`` here allocates a temporary and forces a host
+        # synchronisation on *every* application, the pattern that cost ~23x on
+        # GPU in ``barrier.py``.
         try:
             z = xp.linalg.solve(self._m, u_t_x)
         except Exception:
             return self._xi * x
-        result = self._xi * x - xp.matmul(self._u, z)
-        if not bool(xp.all(xp.isfinite(result))):
+        if not bool(xp.all(xp.isfinite(z))):
             return self._xi * x
-        return result
+        return self._xi * x - xp.matmul(self._u, z)
 
     def diagonal(self, like: Array | None = None) -> Array:
         """Diagonal of the compact Hessian ``B = ξI − U M⁻¹ Uᵀ`` (§4.3).
