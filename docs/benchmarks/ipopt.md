@@ -52,56 +52,72 @@ to separate a defaults difference from a structural gap.
 iteration and wall-clock budget by default (`--ref-max-iter` inherits
 `--max-iter`); a reference with a larger budget manufactures gaps.
 
-## Latest run (v3, 2026-07-28)
+## Latest run (v4, 2026-07-30)
 
-ipax `0.8.0` · Python 3.14.6 · Windows 11 · NumPy 2.4.6 · SciPy 1.17.1.
-Config `lbfgs/dense`, 1000 iterations / 60 s per solve on both sides, the
-accuracy sweep's dense variable cap (2000). 1098 problems compared, 3 skipped
-as oversized, **every one of them reaching both solvers**.
+ipax `0.8.0` + the feasible-point barrier repair · Python 3.14.6 · Windows 11 ·
+NumPy 2.4.6 · SciPy 1.17.1. Config `lbfgs/dense`, 1000 iterations / 60 s per
+solve on both sides, the accuracy sweep's dense variable cap (2000). 1098
+problems compared, 3 skipped as oversized, **every one of them reaching both
+solvers**.
 
-| verdict | count |
-| --- | --- |
-| `agree` + `agree*` | 624 |
-| `both-hard` + `both-hard*` | 322 |
-| `ipax-wins` + `ipax-wins*` | 64 |
-| `differ*` | 35 |
-| **`ipax-gap` + `ipax-gap*`** | **53** |
+| verdict | v3 (2026-07-28) | v4 |
+| --- | --- | --- |
+| `agree` + `agree*` | 624 | **637** |
+| `both-hard` + `both-hard*` | 322 | 310 |
+| `ipax-wins` + `ipax-wins*` | 64 | **76** |
+| `differ*` | 35 | 35 |
+| **`ipax-gap` + `ipax-gap*`** | 53 | **40** |
 
-### The confound-free backlog: 47 problems
+### The confound-free backlog: 34 problems
 
-Re-running the 53 gaps with the reference's parameters matched to ipax's
+Re-running the 40 gaps with the reference's parameters matched to ipax's
 (`mu_strategy=monotone`, `limited_memory_max_history=10`, equal budget) clears
-6 and leaves **47 that survive**. The parameter asymmetry accounts for about an
-eighth of the list, not the list — `AGG` in particular survives fully matched,
-with IPOPT solving it in 324 iterations under ipax's own settings.
+6 and leaves **34 that survive** — down from 47 in v3. The parameter asymmetry
+accounts for about an eighth of the list, not the list: `AGG` in particular
+survives fully matched, with IPOPT solving it in 324 iterations under ipax's own
+settings.
 
-Classifying those 46 by what actually went wrong — using the constraint
+Classifying those 34 by what actually went wrong — using the constraint
 violation at each solver's returned point, measured on the *raw* (unscaled)
 constraints so both points are judged by one ruler:
 
-| class | count | what it means |
-| --- | --- | --- |
-| **A. never reached feasibility** | **23** | ipax stops at a violated point where IPOPT reaches ~1e-9 |
-| B. reached it, would not certify it | 8 | same objective, feasible, but ipax reports `stalled`/`max_iter` |
-| C. worse objective, both feasible | 9 | a genuine optimality gap |
-| D. lower objective, both feasible | 4 | ipax below the documented optimum — dataset or basin question |
-| E. out of wall time | 3 | `ROTDISC` (n=905), `TWIRIMD1` (n=1247), `YORKNET` — speed, not correctness |
+| class | v3 | v4 | what it means |
+| --- | --- | --- | --- |
+| A. never reached feasibility | 23 | **9** | ipax stops at a violated point where IPOPT reaches ~1e-9 |
+| B. reached it, would not certify it | 8 | 7 | same objective, feasible, but ipax reports `stalled`/`max_iter` |
+| **C. worse objective, both feasible** | 9 | **9** | a genuine optimality gap |
+| D. lower objective, both feasible | 4 | 4 | ipax below the documented optimum — dataset or basin question |
+| E. out of wall time | 3 | 5 | speed, not correctness |
 
-!!! note "Class A is one coherent theme, not 23 unrelated bugs"
+!!! note "Class A was one coherent theme, and fixing it closed two thirds of it"
 
-    Most of class A are the CUTEst **nonlinear-equation systems** run as
-    feasibility problems — `ARTIF`, `COOLHANS`, `HYDCAR6`/`HYDCAR20`,
-    `METHANL8`, `DRCAVTY1`/`DRCAVTY2`/`DRCAVTY3`, `VANDERM2`/`VANDERM3`,
-    `HATFLDFLNE`, `CYCLOOCF`, `EXTROSNBNE`. ipax stops at violations from
-    `1e-3` to `6.7e3` while IPOPT drives the same systems to machine precision.
-    This is the same *feasibility-phase* weakness the radiotherapy work isolated
-    from the other direction (the Phase-1 stall behind
-    `BarrierOptions.slack_init_scale`), which makes feasibility restoration —
-    not optimality — the highest-value target the corpus currently points at.
+    Class A was dominated by the CUTEst **nonlinear-equation systems** run as
+    feasibility problems, where ipax stopped at violations of `1e-3` to `6.7e3`
+    while IPOPT drove the same systems to machine precision — the same
+    *feasibility-phase* weakness the radiotherapy work isolated from the other
+    direction (the Phase-1 stall behind `BarrierOptions.slack_init_scale`).
 
-Class B is a distinct and cheaper target: on 8 problems ipax is *at* the answer
-and will not say so, which is a termination-criteria question rather than a
-search one.
+    The cause was a guard that skipped a no-op restoration only when the problem
+    had *inequality* constraints, so it never fired on equality-only systems;
+    see the changelog for the three changes that were needed together. That
+    closed 14 of the 23 — `CORE2`, `CYCLOOCF`, `DRCAVTY1`/`2`/`3`, `DRUGDIS`,
+    `EXTROSNBNE`, `HADAMARD`, `HYDCAR6`, `METHANL8`, `OPTCNTRL`, `ROBOT`,
+    `SPANHYD`, `SPINOP` — most of them from a violation of order 1 to below
+    `1e-9`.
+
+    The **9 that remain** are `AGG`, `ARTIF`, `COOLHANS`, `DISCS`, `HATFLDFLNE`,
+    `HYDCAR20`, `LAKES`, `VANDERM2`, `VANDERM3`. `COOLHANS` is the informative
+    one: its restoration exits *stationary* rather than *feasible*, so the
+    repaired guard never engages — a different sub-case of the same phase.
+
+With class A cut to 9, **class C is now tied for the largest class**: 9 problems
+where both solvers land feasible and ipax settles for a worse objective. That is
+an optimality question rather than a feasibility one, so the corpus no longer
+points primarily at the feasibility phase.
+
+Class B remains the cheapest target: on 7 problems ipax is *at* the answer and
+will not say so, which is a termination-criteria question rather than a search
+one.
 
 Note that `ipax_infeasibility` in the report is the **raw** constraint violation,
 while `Result.constraint_violation` is measured on the gradient-scaled problem.
