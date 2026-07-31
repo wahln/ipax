@@ -6,6 +6,154 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-31
+
+### Added
+- **Full-corpus IPOPT triage column.** `benchmarks.runners.s2mpj_baselines` grew
+  the accuracy sweep's unattended-run machinery — `--all`/`--names-file`/
+  `--exclude` selection, `--jobs N` worker processes, `--resume`, and a
+  flush-after-every-problem JSON + Markdown report — so the ipax-vs-IPOPT
+  comparison runs over the whole ~1100-problem corpus instead of one problem at
+  a time. Every failure in the accuracy sweep now carries a verdict: hard
+  problem (the reference fails too) or ipax gap (the reference solves it). The
+  first full run and its classified backlog are documented in
+  `docs/benchmarks/ipopt.md`.
+- `IpyoptBaseline` accepts `max_iter`, `max_time` and arbitrary `options`
+  overrides, so the reference carries the same budget ipax does and a gap can be
+  re-run with IPOPT's parameters matched to ipax's (`mu_strategy`,
+  `limited_memory_max_history`) — separating a defaults difference from a
+  structural gap.
+- Comparison rows record the **constraint violation at both solvers' returned
+  points**, measured on the raw (unscaled) constraints. A lower objective at a
+  less feasible point is not a better answer, and without this the largest class
+  of gaps was unreadable.
+
+- **`RegularizationOptions.equality_dual_repair`** — opt-in, divergence-gated
+  repair of the equality multipliers on every accepted step. A rank-deficient
+  `∇c` leaves the multipliers *under-determined*: the dual block is singular, so
+  `‖Δy‖` is bounded only by `delta_c` and a single step can inject `‖c‖/δ_c ≈ 1e7`
+  of null-space noise. The filter cannot see it — its acceptance tests are on
+  `(θ, φ)` only — so a step that improves feasibility while destroying
+  stationarity is taken at full length, and the poisoned multipliers then feed the
+  L-BFGS Lagrangian pairs and every later step system. On `NONSCOMPNE`, whose
+  Jacobian is rank 24 of 25 at the starting point, `‖y‖_∞` goes from `0` to
+  `7.9e7` between iterations 0 and 1 — on a problem whose zero objective forces
+  `y* = 0`.
+
+  When set, `y_eq` is replaced by the least-squares estimate whenever the current
+  multipliers' stationarity residual exceeds this factor times the estimate's.
+  The gate is a *ratio*, so it measures divergence against what the iterate can
+  actually justify rather than an absolute magnitude, and it is self-limiting:
+  once repaired, the test stops tripping. It must be conservative — an ungated
+  repair pins the dual residual near `1e-8` and degrades healthy equality
+  problems from `optimal` to `acceptable`.
+
+  It is **off by default, and the full-corpus sweep is why**. At `1e10` across the
+  whole S2MPJ corpus on the three L-BFGS routes (3300 solves): **2217 → 2216
+  correct, a net −1** — 22 fixed against 23 broken (dense +2, Krylov −3, sparse
+  ±0). The fixes are precisely the targeted family — `VANDERM1`, `VANDERM2`,
+  `COOLHANS`, `ARTIF`, `LAKES`, `HYDCAR20` reach `optimal`, five of them
+  long-standing gaps against IPOPT. The breakages are two distinct effects: 11 are
+  `max_time` caused by the repair's own cost (a least-squares solve on every
+  accepted step; iteration counts on rows correct in both arms move only −0.5%, so
+  it is per-iteration overhead rather than slower convergence), and the remainder
+  are trajectory changes concentrated in the EIGEN family and `RES`, which settle
+  on a different eigenvalue. Of 49 objective drifts, 39 are on problems with no
+  documented optimum and move both ways (`LAKES` `2.8e11 → 3.5e5` better, `GASOIL`
+  `1.08 → 12.0` worse).
+
+  So it is a characterized trade, not an improvement: worth enabling for the
+  diagnosed signature — a solve that reaches a feasible point and reports
+  `stalled` with a large dual infeasibility, typically with redundant or
+  rank-deficient constraints — and not as a general setting.
+
+  On the Krylov route, pair it with `KrylovOptions(preconditioner="lbfgs")`. The
+  whole corpus-level negative is that route, and it is a preconditioner mismatch
+  rather than a cost of the repair: correct multipliers on a zero-objective
+  problem leave the Lagrangian Hessian near zero, so the condensed system
+  degenerates and the default Jacobi preconditioner has nothing to work with
+  (per-iteration Krylov solve 4–11x more expensive). With the L-BFGS
+  preconditioner `METHANL8` and `HYDCAR6` go from `max_time` back to `optimal` in
+  3 and 4 iterations.
+- `ipax.ipm.init.least_squares_duals` — the equality-multiplier estimate
+  `argmin_y ‖∇f + Aᵀy‖`, solved matrix-free by conjugate gradients on the
+  regularized normal equations. The Array API has no `lstsq` and forming the
+  Jacobian densely would defeat the sparse and matrix-free routes at scale, so
+  it touches the operator only through `matvec`/`rmatvec`. This fills the dual
+  initialization the module has documented as unimplemented since it was
+  written; it is currently used for the repair below, not yet at startup.
+
+### Fixed
+- **The solver no longer stalls short of feasibility on equality-only problems.**
+  A globalization failure at an already-feasible iterate repairs the barrier
+  state instead of entering a restoration that cannot move the point — but the
+  guard doing so required inequality constraints to exist, because re-centering
+  means re-flooring *slacks*. On the CUTEst nonlinear-equation systems, which
+  have no inequalities, it therefore never fired and the driver did exactly what
+  the guard exists to prevent: entered restoration, got the identical point
+  back, resumed with stale state, and re-derived the same rejected direction
+  until the stall detector ended the run. Measured beforehand, `METHANL8`,
+  `DRCAVTY1` and `CYCLOOCF` each entered restoration 26 times, every one exiting
+  "feasible" at an unchanged `x`.
+
+  Three things were needed. The guard now applies whenever the problem has
+  constraints at all, not only inequalities. It measures the violation the way
+  restoration does (`‖·‖_∞`, not the filter's `‖·‖_1`), which on a wide problem
+  is the difference between predicting a no-op restoration and walking into one.
+  And the repair now includes the **equality** multipliers, which previously had
+  no analogue of the inequality central-band clip and drifted to `1e6` on
+  problems whose objective is identically zero — where the correct multiplier is
+  provably `0`.
+
+  Across the S2MPJ corpus on all three linear-solver routes: **+62 correct with
+  no losses** on the objective-free systems this targets (185 → 247), and +12 on
+  the rest (14 gains, 2 losses; `ACOPP30`/`ACOPR30` on the sparse route lose
+  their acceptable-tolerance exit).
+
+- **Problems with no constraints are unaffected.** The feasible-point repair
+  applies only when there is barrier state tied to constraints; a bound-only
+  problem has `θ ≡ 0`, so an unguarded test would fire on every failure and
+  choose between two no-ops. It cost `HADAMALS` its convergence during
+  development and is now covered by a regression test.
+
+- **A singular L-BFGS middle matrix no longer aborts the solve.** `SᵀS`
+  degenerates when a stored curvature pair is nearly collinear with an earlier
+  one — an exact zero is dropped by the existing safeguard, a near-duplicate is
+  not — and the backend's `LinAlgError` escaped all the way out of `solve`
+  (S2MPJ `LINSPANH` on the Krylov route). `diagonal()` now reports the diagonal
+  as unavailable through the `NotImplementedError` channel its callers already
+  handle, and applying the operator falls back to the identity seed, which keeps
+  the approximation positive definite. `LINSPANH` converges instead of raising.
+  The apply-path guard checks the *solve output* (`2k`-sized, `k` = L-BFGS
+  memory) rather than the finished `n`-sized product: `_apply` is the matvec, so
+  scanning the result would allocate a temporary and force a host
+  synchronisation on every application — invisible on a CPU profile, where the
+  condensed Gram build dominates, but the pattern that cost ~23x on GPU in
+  `barrier.py`.
+- The comparison runner credited a solver for reaching the documented objective
+  without converging, so a stall parked on the optimum scored as correct and two
+  *failed* solvers scored as agreeing with each other. Correctness now requires
+  solver success on both sides, matching the accuracy sweep's `run_case`.
+- Reports are written atomically with a retried rename, and a write failure
+  degrades to a warning instead of ending the run. A plain write truncates
+  first, so a crash during a flush replaced the whole report with an empty file
+  — and the first fix for it made a transient Windows sharing violation fatal.
+- A worker now records the problem it is running in its own pid-suffixed
+  in-flight marker, in **both** the comparison runner and the S2MPJ accuracy
+  sweep. The previous parent-side list contained every *unstarted* problem too,
+  so after a native crash it named the entire queue rather than the culprit.
+- `IpyoptBaseline` declared a Jacobian sparsity pattern too narrow to hold the
+  problem. It sampled two points and, when they agreed, passed the operator's
+  values through unscattered — but `EIGMINA` emits five nonzeros at both of
+  those points and six once the iterates move, so IPOPT received an array of the
+  wrong length and NumPy raised an unattributable shape error from inside the
+  solve. The union pattern is now built from more points, sampled strictly
+  *inside* the bounds (entries vanish exactly *on* them, which is where the old
+  clamp put every sample), and the values callback always scatters into the
+  declared layout — vectorized, so it is faster than the pass-through it
+  replaces — rejecting an out-of-pattern nonzero explicitly. All 20 problems
+  that previously could not reach the reference solver now run.
+
 ## [0.8.0] - 2026-07-26
 
 ### Added
@@ -1287,7 +1435,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/wahln/ipax/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/wahln/ipax/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/wahln/ipax/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/wahln/ipax/compare/v0.6.0...v0.6.1

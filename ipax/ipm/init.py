@@ -16,18 +16,21 @@
 
 - Slacks/duals floored to a positive constant; ``x_0`` projected strictly inside
   ``[x_L, x_U]`` (Wächter & Biegler 2006, §3.6).
-- Optional least-squares dual initialization ``∇g(x_0)ᵀ y_0 = −∇f(x_0)`` (LSQR
-  in the matrix-free path) — not currently implemented.
+- Least-squares dual estimate ``argmin_y ‖∇f + Aᵀy‖`` (:func:`least_squares_duals`),
+  matrix-free via CG on the normal equations — used to repair drifted equality
+  multipliers; not yet wired as the *initial* dual estimate.
 - Warm-start hook (the RT layer may inject an application-specific start).
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ipax.backend.operators import LinearOperator
     from ipax.result import WarmStart
     from ipax.typing import Array, Namespace
 
@@ -52,6 +55,15 @@ _WARM_FLOOR = 1e-8
 # already consistent with the central path (sλ ≈ μ) always passes untouched.
 _RECENTER_SLACK_FRACTION = 0.1
 _RECENTER_KAPPA = 1e2
+
+# Least-squares multiplier estimate. The normal-equations regularization keeps a
+# rank-deficient Jacobian solvable — which is exactly the case that matters,
+# since a degenerate Jacobian is when multipliers drift in the first place. The
+# iteration cap is small because this is a repair, not a precise solve: a rough
+# estimate that is O(1) instead of O(1e6) is all the barrier problem needs.
+_LSQ_DUAL_REGULARIZATION = 1e-8
+_LSQ_DUAL_MAX_ITER = 50
+_LSQ_DUAL_RTOL = 1e-8
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +212,73 @@ def recenter_slacks_duals(
     return s, y
 
 
+def least_squares_duals(
+    eq_jac: LinearOperator,
+    grad: Array,
+    *,
+    xp: Namespace,
+    m_eq: int | None = None,
+) -> Array:
+    """Least-squares equality multipliers ``argmin_y ‖∇f + Aᵀy‖``.
+
+    The multipliers closest to satisfying stationarity at the current point.
+    Used to **repair** multipliers that have drifted away from the ones the
+    iterate can justify: on an objective-free system ``∇f ≡ 0`` forces
+    ``y* = 0``, and S2MPJ ``COOLHANS`` reaches ``‖y‖∞ ≈ 1.1e6`` there while the
+    line search rejects every step. It is the natural *initial* dual estimate
+    too — the one this module has documented as unimplemented since it was
+    written — but nothing wires it into :func:`initialize` yet, so that use is
+    still hypothetical.
+
+    Solved through the **normal equations** ``(A Aᵀ + δI) y = −A ∇f`` by
+    conjugate gradients, touching the Jacobian only through ``matvec`` and
+    ``rmatvec``. The Array API's ``linalg`` extension has no ``lstsq``
+    (invariant #2), and forming ``A`` densely would defeat the sparse and
+    matrix-free routes at radiotherapy scale (invariant #4); CG on the normal
+    equations needs neither. ``δ`` keeps a rank-deficient ``A`` solvable.
+
+    Squaring the condition number is acceptable here precisely because this is a
+    repair: the estimate only has to be the right order of magnitude to unstick
+    the barrier problem, and it is checked for finiteness before use.
+    """
+    rows = int(eq_jac.shape[0]) if m_eq is None else int(m_eq)
+    dtype = grad.dtype
+    if rows == 0:
+        return xp.zeros((0,), dtype=dtype)
+
+    def normal_matvec(v: Array) -> Array:
+        return eq_jac.matvec(eq_jac.rmatvec(v)) + _LSQ_DUAL_REGULARIZATION * v
+
+    rhs = -eq_jac.matvec(grad)
+    y = xp.zeros((rows,), dtype=dtype)
+    residual = rhs
+    rhs_norm = float(xp.sqrt(xp.sum(rhs * rhs)))
+    if rhs_norm == 0.0:  # ∇f ⟂ range(A): y = 0 is exact (the objective-free case)
+        return y
+    direction = residual
+    rs_old = float(xp.sum(residual * residual))
+    for _ in range(_LSQ_DUAL_MAX_ITER):
+        q = normal_matvec(direction)
+        denom = float(xp.sum(direction * q))
+        if denom <= 0.0:  # numerical breakdown; keep the best estimate so far
+            break
+        step = rs_old / denom
+        y = y + step * direction
+        residual = residual - step * q
+        rs_new = float(xp.sum(residual * residual))
+        # ``rs_new`` and ``rhs_norm`` are already Python floats, so the
+        # convergence test stays scalar: routing it back through the array
+        # namespace would build a 0-d array only to take its truth value, which
+        # is needless and not every backend is happy to do it.
+        if math.sqrt(rs_new) <= _LSQ_DUAL_RTOL * rhs_norm:
+            break
+        direction = residual + (rs_new / rs_old) * direction
+        rs_old = rs_new
+    if not bool(xp.all(xp.isfinite(y))):
+        return xp.zeros((rows,), dtype=dtype)
+    return y
+
+
 def _floor_positive(xp: Namespace, arr: Array) -> Array:
     """Push ``arr`` up to the warm-start interiority floor where it falls below."""
     return xp.maximum(arr, xp.full_like(arr, _WARM_FLOOR))
@@ -258,6 +337,7 @@ __all__ = [
     "InitialPoint",
     "apply_warm_start",
     "initialize",
+    "least_squares_duals",
     "project_interior",
     "recenter_slacks_duals",
     "relax_fixed_bounds",

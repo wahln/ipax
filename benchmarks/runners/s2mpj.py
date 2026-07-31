@@ -32,8 +32,9 @@ are sorted before every flush — and the flush-per-problem crash survival is
 kept. Two caveats: per-solve wall times (and therefore ``--max-time`` hits) can
 inflate under CPU oversubscription, so pin BLAS threads (e.g.
 ``OMP_NUM_THREADS=1``) or keep N modest for timing-comparable sweeps; and a
-native crash in a worker breaks the whole pool — the ``.inflight`` file then
-lists the candidate culprits, so ``--resume --exclude <name>`` steps past it.
+native crash in a worker breaks the whole pool — each worker records what it is
+running in a pid-suffixed ``.inflight`` marker, so at most N candidates are named
+and ``--resume --exclude <name>`` steps past the culprit.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -59,7 +61,12 @@ from benchmarks.harness import (
     run_case,
     to_payload,
 )
-from ipax.options import BarrierOptions, KrylovOptions, LineSearchOptions
+from ipax.options import (
+    BarrierOptions,
+    KrylovOptions,
+    LineSearchOptions,
+    RegularizationOptions,
+)
 from ipax.testing.backends import import_namespace
 
 # Per-route variable caps. The linear-solver routes have very different size
@@ -96,6 +103,7 @@ def default_configs(
     feasible_kkt_progress: float | None = _KEEP_DEFAULT,
     free_mode_acceptance: str | None = None,
     slack_init_scale: float | None = None,
+    equality_dual_repair: float | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -138,6 +146,13 @@ def default_configs(
         # 0.0 = the flat-floor default). None keeps the solver default so
         # ordinary sweeps track it automatically.
         common["barrier"] = BarrierOptions(slack_init_scale=slack_init_scale)
+    if equality_dual_repair is not None:
+        # Divergence-gated equality-multiplier repair A/B lever
+        # (RegularizationOptions.equality_dual_repair; None = the solver default,
+        # which is off). Only observable on equality-constrained problems.
+        common["regularization"] = RegularizationOptions(
+            equality_dual_repair=equality_dual_repair
+        )
     krylov_common = dict(common)
     if krylov_preconditioner is not None:
         krylov_common["krylov"] = KrylovOptions(preconditioner=krylov_preconditioner)  # type: ignore[arg-type]
@@ -248,6 +263,7 @@ def _run_problem_cases(
     configs: list[ConfigSpec],
     global_max_vars: int,
     max_build_seconds: float,
+    inflight_prefix: str | None = None,
 ) -> tuple[list[CaseResult], str | None]:
     """Run one problem across the config matrix; ``(rows, skip_reason)``.
 
@@ -257,7 +273,44 @@ def _run_problem_cases(
     the per-config rebuilds. ``skip_reason`` is ``"no_objective"``,
     ``"too_large"``, ``"slow_build"``, or ``None`` when rows were produced (a
     genuine build error is recorded as a ``build_error`` row, not a skip).
+
+    ``inflight_prefix`` makes the worker record what it is running in its own
+    pid-suffixed marker file, cleared on the way out. A native crash takes the
+    worker down with no chance to report, and the parent cannot identify the
+    culprit from its pending futures: with every problem submitted up front,
+    that list is the whole queue. At most ``--jobs`` markers survive a crash.
     """
+    marker = None
+    if inflight_prefix is not None:
+        marker = Path(f"{inflight_prefix}.{os.getpid()}")
+        marker.write_text(f"{backend} {bare}", encoding="utf-8")
+    try:
+        return _run_problem_cases_inner(
+            root,
+            bare,
+            backend,
+            size,
+            feasibility,
+            configs,
+            global_max_vars,
+            max_build_seconds,
+        )
+    finally:
+        if marker is not None:
+            marker.unlink(missing_ok=True)
+
+
+def _run_problem_cases_inner(
+    root: str,
+    bare: str,
+    backend: str,
+    size: int | None,
+    feasibility: bool,
+    configs: list[ConfigSpec],
+    global_max_vars: int,
+    max_build_seconds: float,
+) -> tuple[list[CaseResult], str | None]:
+    """The sweep proper; see :func:`_run_problem_cases`."""
     xp = import_namespace(backend)
 
     # Optional build guard: abandon a problem whose sized build is too slow
@@ -451,6 +504,16 @@ def main(argv: list[str] | None = None) -> int:
         "0.1·max|g(x0)|.",
     )
     parser.add_argument(
+        "--equality-dual-repair",
+        type=float,
+        default=None,
+        help="override RegularizationOptions.equality_dual_repair on every config "
+        "(default: the solver default None = off) — the lever for the "
+        "divergence-gated equality-multiplier repair A/B; e.g. 1e10 repairs "
+        "multipliers whose stationarity residual exceeds 1e10x the "
+        "least-squares estimate's.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -518,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         free_mode_acceptance=args.free_mode_acceptance,
         slack_init_scale=args.slack_init_scale,
+        equality_dual_repair=args.equality_dual_repair,
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}
@@ -575,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
             configs,
             args.max_vars,
             args.max_build_seconds,
+            str(inflight_path),
         )
 
     def _record(
@@ -602,9 +667,9 @@ def main(argv: list[str] | None = None) -> int:
         # Problems are independent, so fan them out over worker processes. Each
         # worker runs one problem's whole config matrix (sharing the lru-cached
         # instance + verified fast evaluator), and the parent flushes after every
-        # completion, preserving the crash-surviving report. The in-flight file
-        # lists every currently-running problem: a native crash in a worker breaks
-        # the pool, and the file then names the candidate culprits for --exclude.
+        # completion, preserving the crash-surviving report. Each worker also
+        # marks what it is running, so a native crash that breaks the pool leaves
+        # at most --jobs named candidates for --exclude.
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor, as_completed
         from concurrent.futures.process import BrokenProcessPool
@@ -619,32 +684,25 @@ def main(argv: list[str] | None = None) -> int:
                 for backend, bare in work
             }
 
-            def _write_inflight() -> None:
-                if futures:
-                    inflight_path.write_text(
-                        "\n".join(f"{b} {n}" for b, n in futures.values())
-                    )
-                else:
-                    inflight_path.unlink(missing_ok=True)
-
-            _write_inflight()
             try:
                 for future in as_completed(dict(futures)):
                     backend, bare = futures[future]
-                    # .result() re-raises BrokenProcessPool for the future whose
-                    # worker died — pop only afterwards, so the except-block's
-                    # candidate list still contains the culprit.
                     rows, skip = future.result()
                     del futures[future]
                     _record(backend, bare, rows, skip)
-                    _write_inflight()
             except BrokenProcessPool:
-                candidates = sorted(f"{b}/{n}" for b, n in futures.values())
+                # The workers' own markers, not the pending futures: with every
+                # problem submitted up front the latter names the whole queue.
+                markers = sorted(inflight_path.parent.glob(inflight_path.name + ".*"))
+                candidates = sorted(
+                    m.read_text(encoding="utf-8").replace(" ", "/") for m in markers
+                )
                 _flush()
+                named = ", ".join(candidates) or "(no marker survived)"
                 print(
                     "S2MPJ sweep: a worker process died (native crash?); the "
-                    f"culprit is one of: {', '.join(candidates)} — see "
-                    f"{inflight_path}, then --resume --exclude it"
+                    f"culprit is one of the {len(candidates)} problem(s) that "
+                    f"were running: {named} — then --resume --exclude it"
                 )
                 # Exit 2, not 1: a wrapper must be able to tell "pool broke,
                 # resume after identifying the crasher" apart from the normal

@@ -25,7 +25,7 @@ from __future__ import annotations
 import importlib.util
 from dataclasses import dataclass
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     import numpy as np
@@ -230,56 +230,78 @@ class _ConstraintBlock:
     values_fn: Any  # x -> Jacobian nonzeros in (rows, cols) order
 
 
-def _union_pattern(
-    jac_fn: Any, points: list[np.ndarray]
-) -> tuple[np.ndarray, np.ndarray, dict[tuple[int, int], int] | None]:
+@dataclass(frozen=True)
+class _Pattern:
+    """A fixed COO sparsity declaration plus the means to scatter into it."""
+
+    rows: np.ndarray
+    cols: np.ndarray
+    keys: np.ndarray  # the declared (row, col) pairs, encoded and sorted
+    positions: np.ndarray  # keys[i] belongs at declared position positions[i]
+    n_cols: int  # the width the keys were encoded with
+
+    @property
+    def nnz(self) -> int:
+        return int(self.rows.shape[0])
+
+
+def _encode(rows: np.ndarray, cols: np.ndarray, n_cols: int) -> np.ndarray:
+    """``(row, col)`` pairs as single sortable integers."""
+    import numpy as np
+
+    return np.asarray(rows, dtype=np.int64) * np.int64(n_cols) + np.asarray(
+        cols, dtype=np.int64
+    )
+
+
+def _union_pattern(jac_fn: Any, points: list[np.ndarray], n_cols: int) -> _Pattern:
     """The union of an operator's COO pattern over several evaluation points.
 
-    IPOPT wants a *fixed* Jacobian sparsity declared once; a problem whose
-    structural nonzeros differ between points (e.g. a value that is exactly zero
-    at ``x0``, so the operator omits it there, but nonzero elsewhere — S2MPJ
-    ``OET7``) would otherwise overflow the declared pattern. Taking the union
-    over ``x0`` plus a generic probe point captures the superset, and the
-    returned ``(row, col) -> position`` map lets the values callback scatter each
-    point's nonzeros into that fixed layout.
+    IPOPT wants a *fixed* Jacobian sparsity declared once, and many CUTEst
+    problems do not oblige: an entry whose value is exactly zero at a given point
+    is absent from the operator's triplets there (S2MPJ ``OET7``, ``EIGMINA``),
+    so the structural pattern depends on where you look. Sampling several points
+    and declaring the union gives a superset the callback can scatter into,
+    storing an explicit zero wherever an entry is missing at the current point.
 
-    The common case — a *stable* pattern (every point emits the same COO in the
-    same order, e.g. a linear RT dose-constraint Jacobian) — returns ``None`` for
-    the map, signalling the fast path: the values callback can use ``to_coo()``'s
-    values verbatim, no per-nonzero scatter (which at RT scale, millions of
-    nonzeros × hundreds of iterations, is the difference between usable and not).
+    Sampling cannot *prove* coverage, though — ``EIGMINA`` emits five nonzeros at
+    both the start point and the generic probe and six once the iterates move,
+    which is precisely how a two-point sample used to conclude "stable" and hand
+    the solver values of the wrong length. So the returned scatter map is always
+    built, and the values callback verifies rather than assumes.
     """
     import numpy as np
 
     from ipax.backend.operators import as_operator
 
-    def _coo(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _coo(x: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
         try:
-            r, c, v, _shape = as_operator(jac_fn(np.asarray(x))).to_coo()
+            r, c, _v, _shape = as_operator(jac_fn(np.asarray(x))).to_coo()
         except NotImplementedError as exc:
             raise BaselineUnsupported("ipyopt needs a COO-structured Jacobian") from exc
-        return np.asarray(r, np.int64), np.asarray(c, np.int64), np.asarray(v, float)
+        return np.asarray(r, np.int64), np.asarray(c, np.int64)
 
-    patterns = [(_coo(x)[0], _coo(x)[1]) for x in points]
-    r0, c0 = patterns[0]
-    if all(
-        r.shape == r0.shape and np.array_equal(r, r0) and np.array_equal(c, c0)
-        for r, c in patterns[1:]
-    ):
-        return r0, c0, None  # stable pattern → fast path (no scatter map)
+    patterns = [_coo(points[0])]  # the start point must evaluate
+    for x in points[1:]:
+        try:
+            patterns.append(_coo(x))
+        except BaselineUnsupported:
+            raise
+        except Exception:
+            # A sampled point may leave the problem's domain (a log of a
+            # negative, a division by zero). It contributes nothing; the others
+            # still widen the pattern.
+            continue
 
-    # Variable structure: build the union pattern + a (row, col) -> position map.
-    seen: dict[tuple[int, int], int] = {}
-    rows: list[int] = []
-    cols: list[int] = []
-    for r, c in patterns:
-        for ri, ci in zip(r.tolist(), c.tolist(), strict=True):
-            key = (int(ri), int(ci))
-            if key not in seen:
-                seen[key] = len(rows)
-                rows.append(int(ri))
-                cols.append(int(ci))
-    return np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64), seen
+    keys = np.unique(
+        np.concatenate([_encode(r, c, n_cols) for r, c in patterns if r is not None])
+    )
+    rows, cols = np.divmod(keys, np.int64(n_cols))
+    # `keys` is sorted, so searchsorted finds a point's entries in it directly;
+    # `positions` is the identity because the declaration is laid out in key
+    # order. Kept explicit so the layout can change without touching the scatter.
+    positions = np.arange(keys.shape[0], dtype=np.int64)
+    return _Pattern(rows=rows, cols=cols, keys=keys, positions=positions, n_cols=n_cols)
 
 
 def _ipyopt_blocks(
@@ -293,50 +315,88 @@ def _ipyopt_blocks(
     blocks: list[_ConstraintBlock] = []
     offset = 0
     n = int(problem.n_vars)
-    # A second, generic point so the declared Jacobian pattern is the union over
-    # x0 and it, clamped into the bounds so it stays a valid evaluation point.
+    # Sample points whose union is the declared Jacobian pattern, each clamped
+    # into the bounds so it stays a valid evaluation point. Beyond x0 and a
+    # generic probe, perturb x0: structural entries usually go missing because a
+    # variable sits at exactly zero, and a start point of all zeros (common in
+    # CUTEst) hides them all. Perturbing stays near the problem's own domain,
+    # where a fresh random point would often hit a log of a negative.
     lower, upper = problem.bounds()
-    probe = _probe(n)
-    if lower is not None:
-        probe = np.maximum(probe, np.asarray(lower, dtype=float))
-    if upper is not None:
-        probe = np.minimum(probe, np.asarray(upper, dtype=float))
-    points = [x0, probe]
+
+    def _clamp(x: np.ndarray) -> np.ndarray:
+        """Bring a sample point *strictly* inside the box.
+
+        Clamping onto a bound is the wrong place to look: entries routinely
+        vanish exactly there (S2MPJ ``EIGMINA`` loses a Jacobian entry when its
+        first variable sits at its upper bound of 1), and an interior-point
+        solver's iterates never reach a bound anyway. Sampling the interior
+        samples where the pattern actually has to hold.
+        """
+        lo = None if lower is None else np.asarray(lower, dtype=float)
+        hi = None if upper is None else np.asarray(upper, dtype=float)
+        if lo is not None and hi is not None:
+            span = hi - lo
+            inset = np.where(np.isfinite(span), 0.01 * span, 0.0)
+            # A fixed variable (lo == hi) has no interior; leave it alone.
+            return np.clip(x, lo + inset, hi - inset)
+        if lo is not None:
+            return np.maximum(x, lo + 0.01 * np.maximum(np.abs(lo), 1.0))
+        if hi is not None:
+            return np.minimum(x, hi - 0.01 * np.maximum(np.abs(hi), 1.0))
+        return x
+
+    # Seeded: a report has to reproduce, so the declared pattern cannot drift
+    # between runs.
+    rng = np.random.default_rng(0)
+    points = [x0, _clamp(_probe(n))]
+    for scale in (0.1, 1.0, 10.0):
+        points.append(_clamp(x0 + rng.normal(scale=scale, size=n)))
 
     def _nonlinear(values_attr: str, jac_attr: str, lo: float, hi: float) -> None:
         nonlocal offset
         if not _provides(problem, values_attr, x0):
             return
         jfn = getattr(problem, jac_attr)
-        rows_local, cols_local, index_of = _union_pattern(jfn, points)
-        nnz = int(rows_local.shape[0])
+        pattern = _union_pattern(jfn, points, n)
         m = int(as_operator(jfn(x0)).to_coo()[3][0])
         vfn = getattr(problem, values_attr)
 
         def _values(
-            x: np.ndarray, jfn: Any = jfn, index_of: Any = index_of, nnz: int = nnz
+            x: np.ndarray, jfn: Any = jfn, pattern: _Pattern = pattern
         ) -> np.ndarray:
             r, c, v, _shape = as_operator(jfn(np.asarray(x))).to_coo()
+            r = np.asarray(r, dtype=np.int64)
+            c = np.asarray(c, dtype=np.int64)
             v = np.asarray(v, dtype=float)
-            if index_of is None:  # stable pattern: values are already aligned
-                return v
-            out = np.zeros(nnz, dtype=float)
-            r = np.asarray(r).tolist()
-            c = np.asarray(c).tolist()
-            for k in range(len(r)):
-                pos = index_of.get((int(r[k]), int(c[k])))
-                if pos is None:  # an entry outside the union pattern
-                    raise BaselineUnsupported("ipyopt: Jacobian pattern is not fixed")
-                out[pos] += v[k]
-            return out
+            if r.shape[0] == pattern.nnz and np.array_equal(r, pattern.rows):
+                if np.array_equal(c, pattern.cols):
+                    return v  # already in the declared layout
+
+            # Scatter into the declared layout, leaving stored zeros where this
+            # point has no entry. Vectorized: at RT scale this runs on millions
+            # of nonzeros every iteration.
+            key = _encode(r, c, pattern.n_cols)
+            index = np.searchsorted(pattern.keys, key)
+            index = np.clip(index, 0, pattern.keys.shape[0] - 1)
+            if not np.array_equal(pattern.keys[index], key):
+                # No finite sample can guarantee coverage, so say so plainly
+                # rather than hand IPOPT an array of the wrong length and let it
+                # surface as an unattributable shape error mid-solve.
+                raise BaselineUnsupported(
+                    "ipyopt: the Jacobian has a nonzero outside the sampled "
+                    "sparsity pattern"
+                )
+            return np.bincount(
+                pattern.positions[index], weights=v, minlength=pattern.nnz
+            )
 
         blocks.append(
             _ConstraintBlock(
                 g_fn=lambda x, vfn=vfn: np.asarray(vfn(np.asarray(x)), dtype=float),
                 g_l=np.full(m, lo),
                 g_u=np.full(m, hi),
-                rows=rows_local + offset,
-                cols=cols_local,
+                rows=pattern.rows + offset,
+                cols=pattern.cols,
                 values_fn=_values,
             )
         )
@@ -385,6 +445,7 @@ def _ipyopt_blocks(
     return blocks, offset
 
 
+@dataclass(frozen=True)
 class IpyoptBaseline:
     """IPOPT via the sparse-native ``ipyopt`` binding.
 
@@ -392,9 +453,25 @@ class IpyoptBaseline:
     and to sidestep supplying a Hessian sparsity pattern. Reports IPOPT's own
     iteration count, so the comparison is on the language-neutral axis (the
     algorithm), not wall-clock across a compiled solver and a pure-Python one.
+
+    ``max_iter``/``max_time`` bound the reference the way :class:`ipax.Options`
+    bounds ipax, so an unattended full-corpus comparison terminates on both
+    sides under budgets that can be stated as equal. ``max_time=None`` leaves
+    IPOPT's own (unbounded) default in place.
+
+    ``options`` passes extra IPOPT options straight through (as ``(key, value)``
+    pairs, so the dataclass stays hashable). It is what makes a *parameter-
+    matched* arm possible: IPOPT's defaults are not ipax's — notably
+    ``mu_strategy`` (IPOPT's build default is adaptive; ipax defaults to
+    monotone) and ``limited_memory_max_history`` (6 vs ipax's 10) — so a
+    default-vs-default verdict and a matched-parameter verdict answer different
+    questions, and both are worth running.
     """
 
-    name = "ipyopt"
+    name: ClassVar[str] = "ipyopt"
+    max_iter: int = 3000
+    max_time: float | None = None
+    options: tuple[tuple[str, Any], ...] = ()
 
     def solve(self, problem: Problem, x0: np.ndarray) -> ReferenceResult:
         import ipyopt
@@ -460,28 +537,48 @@ class IpyoptBaseline:
                 last_iter["k"] = int(args[1])
             return True
 
-        nlp = ipyopt.Problem(
-            n,
-            x_l,
-            x_u,
-            m,
-            g_l,
-            g_u,
-            (jac_rows, jac_cols),
-            (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)),
-            eval_f,
-            eval_grad_f,
-            eval_g,
-            eval_jac_g,
-            intermediate_callback=intermediate,
-            ipopt_options={
-                "hessian_approximation": "limited-memory",
-                "tol": 1e-8,
-                "max_iter": 3000,
-                "print_level": 0,
-                "sb": "yes",  # suppress the startup banner
-            },
-        )
+        ipopt_options: dict[str, Any] = {
+            "hessian_approximation": "limited-memory",
+            "tol": 1e-8,
+            "max_iter": self.max_iter,
+            "print_level": 0,
+            "sb": "yes",  # suppress the startup banner
+        }
+        if self.max_time is not None:
+            # Wall time is the axis ipax's ``max_time`` caps, so budgets stated
+            # for the two solvers mean the same thing.
+            ipopt_options["max_wall_time"] = float(self.max_time)
+        # Caller overrides last, so a parameter-matched arm can replace any of
+        # the defaults chosen above.
+        ipopt_options.update(dict(self.options))
+
+        def _build(options: dict[str, Any]) -> Any:
+            return ipyopt.Problem(
+                n,
+                x_l,
+                x_u,
+                m,
+                g_l,
+                g_u,
+                (jac_rows, jac_cols),
+                (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)),
+                eval_f,
+                eval_grad_f,
+                eval_g,
+                eval_jac_g,
+                intermediate_callback=intermediate,
+                ipopt_options=options,
+            )
+
+        try:
+            nlp = _build(ipopt_options)
+        except Exception:
+            # ``max_wall_time`` needs IPOPT >= 3.14; older builds reject the
+            # option at construction and only expose the CPU-time cap.
+            if "max_wall_time" not in ipopt_options:
+                raise
+            ipopt_options["max_cpu_time"] = ipopt_options.pop("max_wall_time")
+            nlp = _build(ipopt_options)
 
         x = x0.copy()
         start = perf_counter()

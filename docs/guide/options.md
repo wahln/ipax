@@ -305,6 +305,90 @@ corpus it is net-neutral, so the default leaves the solver unchanged. A value in
 `[0.05, 0.5]` matches the constraint scale on such problems; `0.0` keeps the flat
 floor.
 
+## Equality-multiplier repair
+
+`equality_dual_repair` (default `None`, i.e. off) guards against equality
+multipliers that diverge on a **rank-deficient constraint Jacobian**. When `∇c`
+loses rank the multipliers are under-determined — the dual block is singular, so
+`‖Δy‖` is limited only by the `delta_c` regularization and one step can inject
+`‖c‖/δ_c ≈ 1e7` of pure null-space noise. The filter line search cannot detect
+this, because it tests only the constraint violation `θ` and the barrier objective
+`φ`: a step that improves feasibility while destroying stationarity passes at full
+length. The damage compounds, since the multipliers feed the L-BFGS Lagrangian
+curvature pairs and every subsequent step system.
+
+The signature is a solve that reaches a feasible point and reports `stalled` with
+a dual infeasibility orders of magnitude above tolerance. It is most visible on
+feasibility problems (`min 0` subject to `c(x) = 0`), where the exact multipliers
+are provably `y* = 0`: CUTEst `NONSCOMPNE` has Jacobian rank 24 of 25 at its
+starting point and reaches `‖y‖_∞ = 1e8`.
+
+Setting the option replaces `y_eq` with the least-squares estimate
+`argmin_y ‖∇f + Aᵀy‖` whenever the current multipliers' stationarity residual
+exceeds this factor times the estimate's:
+
+```python
+ipax.Options(regularization=RegularizationOptions(equality_dual_repair=1e10))
+```
+
+The factor must be `>= 1.0`, and it should be **large**. The gate is a ratio
+against the residual the iterate can actually justify, not an absolute magnitude,
+which is what leaves ordinary primal–dual coupling alone; it is also
+self-limiting, since a repaired multiplier no longer trips the test. Repairing
+eagerly is actively harmful — it overwrites legitimate coupling and, near
+convergence, pins the dual residual at the repair's own accuracy, degrading
+problems that would otherwise reach `optimal` down to `acceptable`.
+
+It is **opt-in**, and the full-corpus sweep is the reason. Measured at `1e10`
+across the whole S2MPJ corpus on the three L-BFGS routes (3300 solves), it is a
+**net −1 correct**: 22 problems fixed against 23 broken (dense +2, Krylov −3,
+sparse ±0).
+
+The fixes are exactly the family it targets — `VANDERM1`, `VANDERM2`, `COOLHANS`,
+`ARTIF`, `LAKES` and `HYDCAR20` reach `optimal`, five of them long-standing gaps
+against IPOPT. The breakages are two separate effects worth knowing before you
+enable it:
+
+- **Cost.** Eleven of them are wall-clock timeouts. The repair runs a
+  least-squares solve on every accepted step of every equality-constrained
+  problem; iteration counts on problems solved in both arms move by only −0.5%,
+  so this is per-iteration overhead, not slower convergence. The Krylov route
+  suffers most.
+- **Trajectory changes.** The rest cluster in the EIGEN family and `RES`, which
+  converge to a *different eigenvalue* once the multipliers are reset. More
+  broadly, 39 of 49 objective drifts are on problems with no documented optimum,
+  so the headline count cannot see them, and they move in both directions
+  (`LAKES` improves from `2.8e11` to `3.5e5`; `GASOIL` degrades from `1.08` to
+  `12.0`).
+
+Treat it as a targeted remedy rather than a general setting: enable it when a
+solve reaches a feasible point and reports `stalled` with a large dual
+infeasibility, or when the constraints are known to be redundant or
+rank-deficient, and verify on your own problem.
+
+!!! warning "On the Krylov route, pair it with the L-BFGS preconditioner"
+
+    The entire corpus-level negative is the Krylov route (dense +2, sparse ±0,
+    Krylov −3), and it is a **preconditioner mismatch**, not a cost of the repair
+    itself. Repairing the multipliers to their correct value on a zero-objective
+    problem leaves the Lagrangian Hessian genuinely near zero, so the condensed
+    system degenerates and the default diagonal (Jacobi) preconditioner has
+    nothing to work with — the per-iteration Krylov solve gets 4–11x more
+    expensive (`DRCAVTY1`: 155 ms → 1688 ms) and problems that solved in seconds
+    hit the time limit.
+
+    `KrylovOptions(preconditioner="lbfgs")` removes it: `METHANL8` goes from
+    `max_time` to `optimal` in 3 iterations, `HYDCAR6` from `max_time` to
+    `optimal` in 4.
+
+    ```python
+    ipax.Options(
+        linsolve="krylov",
+        krylov=KrylovOptions(preconditioner="lbfgs"),
+        regularization=RegularizationOptions(equality_dual_repair=1e10),
+    )
+    ```
+
 ## Verbosity
 
 `verbose` (an integer `0`–`6`) opts in to a console handler with progressively

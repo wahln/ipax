@@ -269,6 +269,55 @@ class RegularizationOptions:
     # contaminate that repair and the distorted dual step cycled forever), hence
     # the generous default.
     delta_c_trigger: float = 1e10
+    # Divergence-gated least-squares repair of the equality multipliers, applied
+    # on every accepted step. A rank-deficient ∇c leaves the multipliers
+    # *under-determined*: the dual block is singular, so ‖Δy‖ is bounded only by
+    # the Friedlander & Orban (2012) (2,2)-block regularization ``delta_c``, and
+    # one step can inject ‖c‖/δ_c ≈ 1e7 of pure null-space noise.
+    # The filter cannot see it — acceptance tests (θ, φ) only — so a step that
+    # improves feasibility while destroying stationarity is taken at full length,
+    # and the poisoned multipliers then feed the L-BFGS Lagrangian pairs and every
+    # later step system. Measured on S2MPJ NONSCOMPNE (∇c rank 24 of 25, exactly
+    # singular): ‖y‖∞ goes 0 → 7.9e7 between iterations 0 and 1 on a problem whose
+    # zero objective forces y* = 0.
+    #
+    # When set, ``y_eq`` is replaced by the least-squares estimate
+    # ``argmin_y ‖∇f + Aᵀy‖`` (:func:`ipax.ipm.init.least_squares_duals`, solved
+    # matrix-free) whenever the current multipliers' stationarity residual exceeds
+    # this factor times the estimate's. The gate must be *conservative*: the
+    # threshold has to clear a genuine 8–10 order-of-magnitude divergence without
+    # disturbing ordinary primal–dual coupling. Firing eagerly is harmful — an
+    # ungated repair pins the dual residual near 1e-8 and degrades healthy
+    # equality problems from ``optimal`` to ``acceptable``, and gentler thresholds
+    # cost SPANHYD its acceptable exit and move ROBOT's basin.
+    #
+    # It stays OPT-IN because the full-corpus sweep says it is a *trade*, not a
+    # win. At 1e10 over the whole S2MPJ corpus on the three L-BFGS routes (3300
+    # solves, 2026-07-30): **2217 → 2216 correct, net −1** — 22 fixed, 23 broken
+    # (dense +2, krylov −3, sparse ±0). The fixes are the targeted family and are
+    # exactly reproducible (VANDERM1, VANDERM2, COOLHANS, ARTIF, LAKES, HYDCAR20
+    # → optimal, five of them long-standing gaps against IPOPT). The breakages
+    # split two ways: 11 are ``max_time`` from the repair's own cost — a
+    # least-squares CG solve on *every* accepted step, and iteration counts on
+    # rows correct in both arms move only −0.5%, so this is per-iteration
+    # overhead, not slower convergence — and the rest are trajectory changes
+    # concentrated in the EIGEN family and ``RES``, which converge to a different
+    # eigenvalue (EIGMAXA −1 → −0.998283 on all three routes). 39 unscored
+    # objective drifts move in both directions (LAKES 2.8e11 → 3.5e5 and UBH5
+    # 43.5 → 2.3 better; GASOIL 1.08 → 12.0 and HS90/HS91 1.36 → 86.7 worse).
+    #
+    # Enable it for the diagnosed signature — a solve that reaches a feasible
+    # point and reports ``stalled`` with a large dual infeasibility, typically
+    # with redundant or rank-deficient constraints — not as a general setting.
+    equality_dual_repair: float | None = None
+
+    def __post_init__(self) -> None:
+        repair = self.equality_dual_repair
+        if repair is not None and not (math.isfinite(repair) and repair >= 1.0):
+            raise ValueError(
+                "equality_dual_repair must be finite and >= 1.0, or None to "
+                "disable the accepted-step multiplier repair"
+            )
 
 
 @dataclass(frozen=True, slots=True)
