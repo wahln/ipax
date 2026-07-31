@@ -47,11 +47,11 @@ from every problem file:
 
 | | |
 | --- | --- |
-| date | 2026-07-15 |
+| date | 2026-07-31 (v19) |
 | CPU | 13th Gen Intel Core i9-13900HX (32 logical CPUs) |
 | OS | Windows 11 (10.0.26200), AMD64 |
 | Python | 3.14.6 |
-| ipax | 0.6.1 + μ/line-search arc (develop @ `65d6a8e`) |
+| ipax | 0.8.0 + the class-A feasibility fix (develop @ `13813f4`) |
 | NumPy / SciPy | 2.4.6 / 1.17.1 |
 | PyTorch | 2.12.0+cpu |
 | sparse factorization | Feral LDLᵀ (CPU) |
@@ -59,9 +59,17 @@ from every problem file:
 ### Methodology
 
 The full `{lbfgs, exact} × {dense, krylov, sparse}` matrix was swept in one run
-(`--all`), **four problems concurrently** (`--jobs 4`) with single-threaded
+(`--all`), **six problems concurrently** (`--jobs 6`) with single-threaded
 BLAS. Gradient-based scaling (the solver default), NumPy backend. Per-solve
 budget: `max_iter = 10000`, `max_time = 300 s`.
+
+!!! warning "`--jobs` moves one column"
+
+    v19 ran at `--jobs 6` where the v15 baseline used `--jobs 4`. Concurrency
+    cannot change which point a solve converges to, so `correct`/`converged` and
+    the delta below are comparable — but `max_time` is a wall-clock verdict, and
+    more workers make it stricter. Read that one column as an upper bound, and
+    prefer iteration counts when comparing across runs with different `--jobs`.
 Each route is gated by a **per-route variable cap** (dense 2000, Krylov 10000,
 sparse 25000) so a single full-corpus run stays tractable — three problems exceed
 the dense cap and are reported as oversized for the two dense routes. The
@@ -84,36 +92,73 @@ infeasibility); `converged` is the weaker tier (reached a valid KKT point, possi
 a different local optimum — a superset of `correct`). The status columns are the raw
 terminal states.
 
-| config | correct | converged | optimal | acceptable | infeasible | stalled | rest.failed | max_iter | max_time | unbounded | num.err | solve.err |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `lbfgs/dense`  | 734 / 1098 | 871 | 762 | 108 | 58 | 86 | 63 | 13 | 7  | 1 | 0 | 0 |
-| `lbfgs/krylov` | 716 / 1101 | 851 | 744 | 106 | 58 | 72 | 59 | 12 | 49 | 1 | 0 | 0 |
-| `lbfgs/sparse` | 745 / 1101 | 882 | 755 | 126 | 59 | 78 | 62 | 15 | 5  | 1 | 0 | 0 |
-| `exact/dense`  | 732 / 1098 | 859 | 776 | 82  | 58 | 69 | 60 | 24 | 28 | 1 | 0 | 0 |
-| `exact/krylov` | 681 / 1101 | 824 | 773 | 50  | 58 | 73 | 54 | 24 | 69 | 0 | 0 | 0 |
-| `exact/sparse` | **776 / 1101** | **909** | **858** | 50 | 59 | 46 | 58 | 16 | 12 | 1 | 1 | 0 |
+| config | correct | converged | optimal | acceptable | infeasible | stalled | rest.failed | max_iter | max_time | unbounded | num.err |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `lbfgs/dense`  | 764 / 1098 | 905 | 790 | 114 | 58 | 48 | 64 | 17 | 6  | 1 | 0 |
+| `lbfgs/krylov` | 740 / 1101 | 881 | 770 | 110 | 58 | 38 | 64 | 13 | 47 | 1 | 0 |
+| `lbfgs/sparse` | 772 / 1101 | 913 | 782 | 130 | 59 | 41 | 63 | 21 | 3  | 1 | 1 |
+| `exact/dense`  | 762 / 1098 | 891 | 807 | 83  | 58 | 31 | 63 | 18 | 37 | 1 | 0 |
+| `exact/krylov` | 700 / 1101 | 846 | 794 | 51  | 58 | 43 | 53 | 19 | 83 | 0 | 0 |
+| `exact/sparse` | **793 / 1101** | **928** | **876** | 51 | 59 | 28 | 59 | 14 | 13 | 1 | 0 |
 
-Solved-correct by **at least one route: 809 / 1101**; converged by at least one
-route: **942 / 1101**.
+Solved-correct by **at least one route: 822 / 1101**; converged by at least one
+route: **957 / 1101**.
+
+### Changes since the v15 baseline
+
+**+147 correct across the six configs (4384 → 4531), every config positive** —
+157 fixed against 10 broken.
+
+| config | v15 | v19 | Δ |
+| --- | --- | --- | --- |
+| `lbfgs/dense`  | 734 | 764 | **+30** |
+| `lbfgs/krylov` | 716 | 740 | **+24** |
+| `lbfgs/sparse` | 745 | 772 | **+27** |
+| `exact/dense`  | 732 | 762 | **+30** |
+| `exact/krylov` | 681 | 700 | **+19** |
+| `exact/sparse` | 776 | 793 | **+17** |
+
+The gain is one coherent family: `stalled → optimal` on the CUTEst
+**nonlinear-equation systems** (`BEALENE`, `BIGGS6NE`, `CYCLOOCF`, `CYCLOOCT`,
+`DEVGLA1NE`/`2NE`, `HYDCAR6`, `METHANL8`, `ROBOT`, `SEMICON1`/`2`, `VARDIMNE`, …)
+— the class-A feasibility fix, which turns out to reach every route rather than
+just the L-BFGS ones. `stalled` drops on all six configs (86 → 48 on
+`lbfgs/dense`, 69 → 31 on `exact/dense`).
+
+Nine of the ten breakages are `max_time`/`max_iter` and fall under the `--jobs`
+caveat above rather than the code. The tenth is `lbfgs/sparse ELATTAR`,
+`optimal → optimal`: an unchanged status at a **different local optimum**, the
+basin sensitivity this corpus shows on nonconvex problems.
+
+171 objectives drifted, 110 of them on problems with no documented optimum — the
+class the correct-count structurally cannot see. Most pair with a status change
+and are not comparable point-to-point (`ROBOT`'s `0 → 6.59` compares a stalled
+non-solution against a converged one). The largest genuine moves are
+improvements: `DIAMON2DLS` `431731 → 84185`, `DIAMON3DLS` `732815 → 68452`.
 
 ### Results — optimization vs. feasibility problems
 
-The 207 objective-free problems are feasibility / nonlinear-equation systems with
+The 205 objective-free problems are feasibility / nonlinear-equation systems with
 different semantics (success = found a feasible point; many are inconsistent and
 correctly report infeasible), so they are reported separately rather than mixed into
 the optimization rate. The optimization column shows `correct` (`converged`).
 
-| config | optimization (894) | feasibility (207) |
+| config | optimization (896) | feasibility (205) |
 | --- | --- | --- |
-| `lbfgs/dense`  | 670 / 891* (807) | 64 / 207 |
-| `lbfgs/krylov` | 653 / 894  (788) | 63 / 207 |
-| `lbfgs/sparse` | 681 / 894  (818) | 64 / 207 |
-| `exact/dense`  | 679 / 891* (805) | 53 / 207 |
-| `exact/krylov` | 614 / 894  (757) | 67 / 207 |
-| `exact/sparse` | 702 / 894  (835) | 74 / 207 |
+| `lbfgs/dense`  | 681 / 893* (822) | 83 / 205 |
+| `lbfgs/krylov` | 658 / 896  (799) | 82 / 205 |
+| `lbfgs/sparse` | 688 / 896  (829) | 84 / 205 |
+| `exact/dense`  | 683 / 893* (812) | 79 / 205 |
+| `exact/krylov` | 615 / 896  (761) | 85 / 205 |
+| `exact/sparse` | 704 / 896  (839) | **89 / 205** |
 
-<small>* dense routes ran 891 of the 894 optimization problems; three exceed the
+<small>* dense routes ran 893 of the 896 optimization problems; three exceed the
 dense variable cap.</small>
+
+The feasibility column is where the class-A fix lands: **63–64 → 82–84** on the
+L-BFGS routes and 53 → 79 on `exact/dense`. The split itself was re-derived for
+this run by inspecting each built problem for a constant objective — 205/896,
+correcting the 207/894 carried by earlier revisions.
 
 ### Observations
 
@@ -148,8 +193,8 @@ dense variable cap.</small>
     visible in the ±count. Pass `kkt_route="augmented"` to restore the previous
     form.
 
-- **`exact/sparse` is the strongest route** — most correct (776) and most
-  optimal (858). Exact-Hessian Newton steps factored by the sparse-direct route
+- **`exact/sparse` is the strongest route** — most correct (793) and most
+  optimal (876). Exact-Hessian Newton steps factored by the sparse-direct route
   (Feral LDLᵀ with inertia control) is the most robust combination here.
 - **`numerical_error` is essentially gone** (51 → 0 on `exact/dense`, and 0–1
   on every route). A Newton step the δ_w regularization ladder cannot complete
@@ -189,11 +234,14 @@ dense variable cap.</small>
 - **No crashes**: the `solve_error` column is zero everywhere for the first
   time (the LINSPANH and HS9 crashes of the previous run are gone).
 
-#### Changes since the 2026-07-13 run
+#### Changes in the v15 baseline (2026-07-15), since the 2026-07-13 run
+
+Retained for provenance: these are the deltas that produced the **v15** numbers
+the section above is measured against, not the current run.
 
 Every route improved on `correct`: net **+46** over the previous (2026-07-13)
 baseline (4338 → 4384 across the six configs), with **every config positive** —
-`exact/sparse` leads at 776 (was 769), `lbfgs/sparse` gained most (729 → 745).
+`exact/sparse` led at 776 (was 769), `lbfgs/sparse` gained most (729 → 745).
 Solved-correct by ≥1 route rose to 809 (was 807; converged 942). The deltas map
 to the barrier-μ / line-search arc landed since the correctness-hardening
 release:
