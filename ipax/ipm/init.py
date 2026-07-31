@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -221,10 +222,13 @@ def least_squares_duals(
     """Least-squares equality multipliers ``argmin_y ‖∇f + Aᵀy‖``.
 
     The multipliers closest to satisfying stationarity at the current point.
-    Used both as a dual initialization and to repair multipliers that have
-    drifted away from the ones the iterate can justify: on an objective-free
-    system ``∇f ≡ 0`` forces ``y* = 0``, and S2MPJ ``COOLHANS`` reaches
-    ``‖y‖∞ ≈ 1.1e6`` there while the line search rejects every step.
+    Used to **repair** multipliers that have drifted away from the ones the
+    iterate can justify: on an objective-free system ``∇f ≡ 0`` forces
+    ``y* = 0``, and S2MPJ ``COOLHANS`` reaches ``‖y‖∞ ≈ 1.1e6`` there while the
+    line search rejects every step. It is the natural *initial* dual estimate
+    too — the one this module has documented as unimplemented since it was
+    written — but nothing wires it into :func:`initialize` yet, so that use is
+    still hypothetical.
 
     Solved through the **normal equations** ``(A Aᵀ + δI) y = −A ∇f`` by
     conjugate gradients, touching the Jacobian only through ``matvec`` and
@@ -262,7 +266,11 @@ def least_squares_duals(
         y = y + step * direction
         residual = residual - step * q
         rs_new = float(xp.sum(residual * residual))
-        if xp.sqrt(xp.asarray(rs_new)) <= _LSQ_DUAL_RTOL * rhs_norm:
+        # ``rs_new`` and ``rhs_norm`` are already Python floats, so the
+        # convergence test stays scalar: routing it back through the array
+        # namespace would build a 0-d array only to take its truth value, which
+        # is needless and not every backend is happy to do it.
+        if math.sqrt(rs_new) <= _LSQ_DUAL_RTOL * rhs_norm:
             break
         direction = residual + (rs_new / rs_old) * direction
         rs_old = rs_new
