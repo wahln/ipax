@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-31
+
 ### Added
 - **Full-corpus IPOPT triage column.** `benchmarks.runners.s2mpj_baselines` grew
   the accuracy sweep's unattended-run machinery — `--all`/`--names-file`/
@@ -1433,7 +1435,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/wahln/ipax/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/wahln/ipax/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/wahln/ipax/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/wahln/ipax/compare/v0.6.0...v0.6.1
