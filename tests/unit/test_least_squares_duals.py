@@ -148,3 +148,70 @@ def test_scale_invariance_of_the_estimate(namespace, scale):
     scaled = least_squares_duals(A, array(namespace, [scale, scale]), xp=namespace)
 
     assert_allclose(namespace, scaled, base * scale, rtol=1e-4, atol=1e-8)
+
+
+def test_a_non_positive_curvature_breaks_the_iteration_off(namespace):
+    # ``(A Aᵀ + δI)`` is positive definite for a genuine operator, so this can
+    # only happen when ``matvec``/``rmatvec`` are mutually inconsistent — a
+    # user-supplied pair that does not transpose. The estimator must break out
+    # with the best iterate so far rather than divide by a non-positive
+    # curvature.
+    class _NotATranspose(LinearOperator):
+        shape = (1, 1)
+
+        def matvec(self, v):
+            return -v  # the sign that makes the normal operator indefinite
+
+        def rmatvec(self, v):
+            return v
+
+        def matmat(self, V):  # pragma: no cover - not used by the estimator
+            raise AssertionError("the estimator must stay matrix-free")
+
+    y = least_squares_duals(_NotATranspose(), array(namespace, [1.0]), xp=namespace)
+
+    assert bool(namespace.all(namespace.isfinite(y)))
+    assert_allclose(namespace, y, array(namespace, [0.0]), atol=1e-12)
+
+
+def test_a_non_finite_iterate_falls_back_to_zero_multipliers(namespace):
+    # A repair must never hand back inf/nan: the caller compares stationarity
+    # residuals with it, and a NaN comparison would silently keep the drifted
+    # multipliers instead of reporting that no estimate is available.
+    nan = float("nan")
+
+    class _Poisoned(LinearOperator):
+        shape = (1, 1)
+
+        def matvec(self, v):
+            return v * nan
+
+        def rmatvec(self, v):
+            return v
+
+        def matmat(self, V):  # pragma: no cover - not used by the estimator
+            raise AssertionError("the estimator must stay matrix-free")
+
+    y = least_squares_duals(_Poisoned(), array(namespace, [1.0]), xp=namespace)
+
+    assert bool(namespace.all(namespace.isfinite(y)))
+    assert_allclose(namespace, y, array(namespace, [0.0]), atol=1e-12)
+
+
+def test_the_iteration_is_capped_when_it_cannot_converge(namespace):
+    # CG needs as many iterations as there are distinct eigenvalues; with more
+    # of them than the cap the estimator must return the best iterate it has
+    # rather than loop on. The result is still a usable descent on the
+    # stationarity residual, which is all the repair asks of it.
+    n = 80
+    rows = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        rows[i][i] = 10.0 ** (-4.0 * i / (n - 1))  # spread over eight decades
+    A = _op(namespace, rows)
+    grad = array(namespace, [1.0] * n)
+
+    y = least_squares_duals(A, grad, xp=namespace, m_eq=n)
+
+    assert bool(namespace.all(namespace.isfinite(y)))
+    residual = float(namespace.max(namespace.abs(grad + A.rmatvec(y))))
+    assert residual < float(namespace.max(namespace.abs(grad)))

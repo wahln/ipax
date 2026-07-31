@@ -158,3 +158,25 @@ def test_the_default_factor_is_the_restoration_rule(namespace):
     repaired = driver._repair_equality_duals(x, array(namespace, [100.0]), 1)
 
     assert abs(norm_inf(driver._xp, repaired) - 1.0) < 1e-6
+
+
+def test_a_non_finite_estimate_keeps_the_current_multipliers(namespace, monkeypatch):
+    # ``least_squares_duals`` guarantees a finite return today, so this contract
+    # is the driver refusing to *depend* on that: a repair compares stationarity
+    # residuals, and NaN comparisons are all false, which would silently adopt
+    # an unusable estimate. Stubbed at the module boundary because the real
+    # estimator cannot produce the input.
+    import ipax.ipm.driver as driver_module
+
+    driver = _overdetermined(namespace)
+    x = array(namespace, [0.0, 0.0])
+    current = array(namespace, [1e12])
+    nan = float("nan")
+
+    monkeypatch.setattr(
+        driver_module,
+        "least_squares_duals",
+        lambda *a, **k: array(namespace, [nan]),
+    )
+
+    assert driver._repair_equality_duals(x, current, 1, factor=1e10) is current
