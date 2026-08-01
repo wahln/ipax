@@ -300,7 +300,47 @@ def format_markdown(results: list[CaseResult], environment: dict[str, object]) -
             f"| {r.n_iter} | {_fmt(r.kkt_error)} | {_fmt(r.constraint_violation)} "
             f"| {obj_gap} | {err} | {r.solve_time:.3f} | {r.linear_solver or '—'} |"
         )
+    lines += _routing_hint_lines(results)
     return "\n".join(lines) + "\n"
+
+
+def _routing_hint_lines(results: list[CaseResult]) -> list[str]:
+    """The *Routing hints* section: measured wins next to rows that missed.
+
+    A row qualifies when the curated registry (:mod:`benchmarks.routing_hints`)
+    records a lever win for its problem **and** this run's default
+    configuration did not score ``correct`` on it — a correct row needs no
+    hint. Returns no lines at all when nothing qualifies, so the section
+    simply does not exist in a clean report.
+    """
+    from benchmarks.routing_hints import hints_for
+
+    hinted = [
+        (r, hint)
+        for r in sorted(results, key=lambda r: (r.problem, r.backend, r.config))
+        if not r.correct
+        for hint in hints_for(r.problem)
+    ]
+    if not hinted:
+        return []
+    lines = [
+        "",
+        "## Routing hints",
+        "",
+        "Problems above that the default configuration missed and for which a "
+        "**measured** opt-in win is on record (`benchmarks/routing_hints.py`). "
+        "The *this run* column is the default result the lever beats.",
+        "",
+        "| problem | config | this run | lever | measured win |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for r, hint in hinted:
+        this_run = f"{r.status}, {r.n_iter} it, obj {r.objective:.4g}"
+        lines.append(
+            f"| {r.problem} | `{r.config}` | {this_run} "
+            f"| `{hint.options}` | {hint.win} |"
+        )
+    return lines
 
 
 # -- reference cross-check (§9.3) --------------------------------------------

@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Routing-hints registry + report section.** `benchmarks/routing_hints.py`
+  is a curated registry of *measured* per-problem wins for the opt-in levers
+  (recipe, metrics, failure signature, budget), and the S2MPJ sweep report
+  gained a *Routing hints* section that prints the known win next to any
+  default-configuration row that missed a hinted problem — omitted entirely
+  when nothing applies. The new docs page *Routing hints* maps each failure
+  signature to its lever (quality-μ for the `AGG` class, `slack_init_scale`
+  for the `HS59` class, `damping_skip_ratio` for the `ORTHRGDS` class,
+  `seed_formula="scalar1"` for the `GASOIL` class).
 - **`LBFGSOptions.seed_formula`** — which Rayleigh estimate seeds the L-BFGS
   identity block ξ. `"direct"` (the default, Nocedal & Wright eq. 7.20
   inverted for the direct Hessian: `ξ = γᵀγ/δᵀγ`) and `"scalar1"` (IPOPT's

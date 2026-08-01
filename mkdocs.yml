@@ -19,6 +19,7 @@ nav:
       - Defining a problem: guide/problems.md
       - Configuring the solver: guide/options.md
       - Interpreting results: guide/results.md
+      - Routing hints: guide/routing-hints.md
       - Backends & hardware: guide/backends.md
       - Monitoring & re-solving: guide/diagnostics.md
   - Concepts:
