@@ -106,6 +106,7 @@ def default_configs(
     slack_init_scale: float | None = None,
     equality_dual_repair: float | None = None,
     powell_damping: bool | None = None,
+    damping_skip_ratio: float | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -155,11 +156,16 @@ def default_configs(
         common["regularization"] = RegularizationOptions(
             equality_dual_repair=equality_dual_repair
         )
-    if powell_damping is not None:
-        # Powell-damping A/B lever (LBFGSOptions.powell_damping; the solver
-        # default damps, `off` skips non-PD pairs like IPOPT's limited-memory
-        # update). Only observable on the L-BFGS configs.
-        common["lbfgs"] = LBFGSOptions(powell_damping=powell_damping)
+    if powell_damping is not None or damping_skip_ratio is not None:
+        # L-BFGS update-policy A/B levers (LBFGSOptions.powell_damping /
+        # .damping_skip_ratio; the solver default damps every non-PD pair,
+        # `--powell-damping off` skips them all like IPOPT's limited-memory
+        # update, `--damping-skip-ratio C` skips only pairs with
+        # s·y < −C·s·Bs). Only observable on the L-BFGS configs.
+        common["lbfgs"] = LBFGSOptions(
+            powell_damping=True if powell_damping is None else powell_damping,
+            damping_skip_ratio=damping_skip_ratio,
+        )
     krylov_common = dict(common)
     if krylov_preconditioner is not None:
         krylov_common["krylov"] = KrylovOptions(preconditioner=krylov_preconditioner)  # type: ignore[arg-type]
@@ -530,6 +536,15 @@ def main(argv: list[str] | None = None) -> int:
         "limited-memory update); only observable on the L-BFGS configs.",
     )
     parser.add_argument(
+        "--damping-skip-ratio",
+        type=float,
+        default=None,
+        help="override LBFGSOptions.damping_skip_ratio on every config (default: "
+        "the solver default None = damp every non-PD pair) — the hybrid lever: "
+        "a curvature pair with s·y < −RATIO·s·Bs is skipped instead of "
+        "Powell-damped; only observable on the L-BFGS configs.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -601,6 +616,7 @@ def main(argv: list[str] | None = None) -> int:
         powell_damping=(
             None if args.powell_damping is None else args.powell_damping == "on"
         ),
+        damping_skip_ratio=args.damping_skip_ratio,
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}

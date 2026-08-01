@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- **`LBFGSOptions.damping_skip_ratio`** — opt-in threshold on how much a
+  curvature pair may *contradict* positive curvature before the L-BFGS update
+  drops it instead of Powell-damping it: a pair with `δᵀγ < −ratio·δᵀBδ` is
+  skipped, anything milder gets the usual blend. Powell damping keeps `B`
+  positive definite by θ-mixing `γ` toward `Bδ`, which on a strongly
+  indefinite stretch *fabricates* curvature evidence the function actively
+  contradicts — and that fabricated pair then steers every step for the next
+  `m` updates. On S2MPJ `ORTHRGDS` a handful of such pairs (`δᵀγ/δᵀBδ` down to
+  −25, only 12 of 996 updates damped at all) cost 1000+ iterations at a worse
+  optimum; with them skipped the solve reaches IPOPT's objective in ~20.
+
+  It is a threshold, not a switch, because the full-corpus damp-vs-skip A/B
+  refuted blanket skipping (IPOPT's limited-memory policy,
+  `powell_damping=False`): net **−31** over the three L-BFGS routes — mild
+  indefiniteness is exactly where the blend genuinely helps. The hybrid at
+  `ratio=1.0`, probed on the A/B's fourteen decisive cells, keeps five of the
+  six skip-arm wins (`ORTHRGDS`, `DEMBO7`, `CRESC4`, `SPIRAL`) while avoiding
+  seven of its eight losses (`DRCAVTY2`, `FLOSP2TM`, `HS116`, `LAUNCH`,
+  `HAHN1LS`, `DRUGDIS` all recover). The default (`None`) keeps pure Powell
+  damping bit-for-bit; the full-corpus characterization sweep decides whether
+  a value earns the default.
+
 ### Fixed
 - **A run parked at an acceptable KKT point no longer reports failure because
   of multipliers the point never asked for.** The per-iteration convergence

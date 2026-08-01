@@ -250,6 +250,18 @@ class LBFGSOperator(LinearOperator):
         s_bs = float(xp.sum(s * bs))
         s_y = float(xp.sum(s * y))
 
+        # A pair that strongly *contradicts* positive curvature is dropped
+        # rather than damped: the Powell blend below would fabricate PD
+        # evidence out of it (θ-mixing y toward Bs), and that fabricated
+        # curvature steers the search from the history for m more updates
+        # (S2MPJ ORTHRGDS: s·y/s·Bs down to −25 damped ⇒ 1000+ iterations at
+        # a worse optimum; skipped ⇒ ~20 to IPOPT's objective). Milder
+        # indefiniteness falls through to the damping branch, where the
+        # full-corpus A/B shows the blend genuinely helps.
+        skip_ratio = self._options.damping_skip_ratio
+        if skip_ratio is not None and s_bs > 0.0 and s_y < -skip_ratio * s_bs:
+            return
+
         if self._options.powell_damping and s_y < _POWELL_KAPPA * s_bs:
             denom = s_bs - s_y
             # denom > 0 here since s_y < κ·s_bs ≤ s_bs (and s_bs ≥ 0 for PD B).

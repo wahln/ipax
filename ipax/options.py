@@ -333,11 +333,30 @@ class BreedveldOptions:
 
 @dataclass(frozen=True, slots=True)
 class LBFGSOptions:
-    """Limited-memory Hessian (compact, Powell-damped) — invariant of PD (§4.3)."""
+    """Limited-memory Hessian (compact, Powell-damped) — invariant of PD (§4.3).
+
+    ``damping_skip_ratio`` bounds how much a curvature pair may *contradict*
+    positive curvature before it is dropped instead of damped: a pair with
+    ``δᵀγ < −ratio · δᵀBδ`` is skipped, anything milder gets the usual Powell
+    blend. Powell damping keeps ``B`` PD by fabricating positive curvature out
+    of the pair — on strongly indefinite stretches that fabricated evidence
+    redirects the search (S2MPJ ``ORTHRGDS``: ratios down to −25 damped ⇒
+    1000+ iterations at a worse optimum; skipped ⇒ ~20 to IPOPT's). Blanket
+    skipping (``powell_damping=False``, IPOPT's limited-memory policy) lost
+    the full-corpus A/B by −31 — mild indefiniteness is where damping genuinely
+    helps — hence a threshold rather than a switch. ``None`` (default) keeps
+    pure Powell damping bit-for-bit.
+    """
 
     memory: int = 10  # m ∈ [5, 20]
     powell_damping: bool = True
     initial_scaling: bool = True  # direct-Hessian seed ξ = γᵀγ / δᵀγ
+    damping_skip_ratio: float | None = None
+
+    def __post_init__(self) -> None:
+        ratio = self.damping_skip_ratio
+        if ratio is not None and not (math.isfinite(ratio) and ratio > 0.0):
+            raise ValueError("damping_skip_ratio must be a positive finite float")
 
 
 @dataclass(frozen=True, slots=True)
