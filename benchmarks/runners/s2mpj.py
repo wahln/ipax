@@ -64,6 +64,7 @@ from benchmarks.harness import (
 from ipax.options import (
     BarrierOptions,
     KrylovOptions,
+    LBFGSOptions,
     LineSearchOptions,
     RegularizationOptions,
 )
@@ -104,6 +105,7 @@ def default_configs(
     free_mode_acceptance: str | None = None,
     slack_init_scale: float | None = None,
     equality_dual_repair: float | None = None,
+    powell_damping: bool | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -153,6 +155,11 @@ def default_configs(
         common["regularization"] = RegularizationOptions(
             equality_dual_repair=equality_dual_repair
         )
+    if powell_damping is not None:
+        # Powell-damping A/B lever (LBFGSOptions.powell_damping; the solver
+        # default damps, `off` skips non-PD pairs like IPOPT's limited-memory
+        # update). Only observable on the L-BFGS configs.
+        common["lbfgs"] = LBFGSOptions(powell_damping=powell_damping)
     krylov_common = dict(common)
     if krylov_preconditioner is not None:
         krylov_common["krylov"] = KrylovOptions(preconditioner=krylov_preconditioner)  # type: ignore[arg-type]
@@ -514,6 +521,15 @@ def main(argv: list[str] | None = None) -> int:
         "least-squares estimate's.",
     )
     parser.add_argument(
+        "--powell-damping",
+        choices=("on", "off"),
+        default=None,
+        help="override LBFGSOptions.powell_damping on every config (default: the "
+        "solver default, which damps non-PD curvature pairs) — the lever for "
+        "the damp-vs-skip A/B ('off' skips non-PD pairs like IPOPT's "
+        "limited-memory update); only observable on the L-BFGS configs.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -582,6 +598,9 @@ def main(argv: list[str] | None = None) -> int:
         free_mode_acceptance=args.free_mode_acceptance,
         slack_init_scale=args.slack_init_scale,
         equality_dual_repair=args.equality_dual_repair,
+        powell_damping=(
+            None if args.powell_damping is None else args.powell_damping == "on"
+        ),
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}
