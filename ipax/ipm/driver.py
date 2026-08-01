@@ -628,6 +628,129 @@ class IPMDriver:
             complementarity=compl / s_c,
         )
 
+    def _terminal_certificate(
+        self,
+        *,
+        x: Array,
+        g: Array,
+        c: Array,
+        s: Array,
+        m: int,
+        m_eq: int,
+        mask_l: Array,
+        mask_u: Array,
+        n_bounds: int,
+        x_minus_l: Array,
+        u_minus_x: Array,
+        recorded_primal: float,
+        recorded_objective: float,
+    ) -> tuple[KKTResiduals, Array, Array, Array, Array] | None:
+        """Certify the returned iterate with multipliers it can justify.
+
+        KKT satisfaction is an existence claim over the multipliers, but the
+        per-iteration test (W&B 2006, eq. (5) ``E_0``) evaluates whatever
+        duals the trajectory happens to carry. When those drifted — a
+        rank-deficient ``∇c`` under-determines ``y``; μ-complementarity bound
+        duals stay where initialization put them once the line search freezes
+        — a certifiable point reports a large residual and the run ends in a
+        failure status while parked at the answer.
+
+        Candidate multipliers: the least-squares equality estimate (the duals
+        the point itself justifies — exactly 0 on an objective-free system)
+        and inequality/bound duals at the zero the ``E_0`` complementarity
+        term demands at a strictly interior point (interiority of ``s`` and
+        the bound gaps is maintained by the fraction-to-boundary rule, so
+        zero duals are always sign-feasible here). A genuinely active
+        constraint needs a nonzero multiplier, so its dropped dual leaves the
+        raw gradient in the residual and the certificate *declines*:
+        exhibited duals upper-bound the achievable dual infeasibility within
+        the ``E_0`` test's own IPOPT ``s_d`` scaling semantics (§4.5) — the
+        same scaled measure every in-loop test uses — so the certificate can
+        under-certify but not certify a point the loop's own test would
+        reject with the same multipliers.
+
+        The gate is the acceptable-stopping family (IPOPT ``acceptable_tol``
+        semantics — "what the caller is willing to accept"): every enabled
+        residual tolerance plus ``f_tol`` must pass. ``dual_inf_tol`` is
+        **required** to be enabled — with the candidate multipliers the
+        complementarity residual is zero by construction, so without an
+        enabled dual test a legal partial-``None`` configuration could
+        certify a non-stationary point. ``f_rel_change_tol`` compares
+        consecutive iterates and has no one-shot terminal analogue, so an
+        enabled setting declines the certificate rather than silently
+        weakening the caller's acceptance test.
+
+        Returns ``(residuals, y_eq, y_ineq, z_lower, z_upper)`` on success,
+        else ``None``.
+        """
+        opts = self._options.acceptable
+        if opts.dual_inf_tol is None:
+            return None
+        if opts.f_rel_change_tol is not None:
+            return None
+        # Record-level early-outs before any problem evaluation: the primal
+        # residual and the objective are independent of the multipliers, so a
+        # returned iterate that already fails those tolerances cannot be
+        # certified — and this method runs on the common failure exits.
+        if opts.constr_viol_tol is not None and not (
+            recorded_primal <= opts.constr_viol_tol
+        ):
+            return None
+        if opts.f_tol is not None and not abs(recorded_objective) <= opts.f_tol:
+            return None
+        xp = self._xp
+        dtype = x.dtype
+        try:
+            grad = self._gradient(x)
+            eq_jac = self._eq_jac(x)
+            ineq_jac = self._ineq_jac(x)
+            y_c = (
+                least_squares_duals(eq_jac, grad, xp=xp, m_eq=m_eq)
+                if m_eq > 0
+                else xp.zeros((0,), dtype=dtype)
+            )
+        except Exception:  # a certificate must never be the thing that fails
+            logger.debug("terminal certificate: evaluation failed", exc_info=True)
+            return None
+        if m_eq > 0 and not bool(xp.all(xp.isfinite(y_c))):
+            logger.debug("terminal certificate: non-finite dual estimate")
+            return None
+        lam_c = xp.zeros((m,), dtype=dtype)
+        z_zero = xp.zeros_like(x)
+        residuals = self.kkt_error(
+            mu=0.0,
+            grad=grad,
+            ineq_jac=ineq_jac,
+            m=m,
+            g=g,
+            s=s,
+            y_ineq=lam_c,
+            z_lower=z_zero,
+            z_upper=z_zero,
+            x_minus_l=x_minus_l,
+            u_minus_x=u_minus_x,
+            mask_l=mask_l,
+            mask_u=mask_u,
+            n_bounds=n_bounds,
+            c=c,
+            eq_jac=eq_jac,
+            m_eq=m_eq,
+            y_eq=y_c,
+        )
+        checks = (
+            (opts.dual_inf_tol, residuals.dual_infeasibility),
+            (opts.constr_viol_tol, residuals.primal_infeasibility),
+            (opts.compl_inf_tol, residuals.complementarity),
+        )
+        for tol, value in checks:
+            # ``not (value <= tol)`` rather than ``value > tol``: a NaN
+            # residual must decline the certificate, not slip past it.
+            if tol is not None and not value <= tol:
+                return None
+        # Distinct zero arrays for the two bound-dual blocks: returning one
+        # shared object would alias ``Result.z_lower`` and ``Result.z_upper``.
+        return residuals, y_c, lam_c, z_zero, xp.zeros_like(x)
+
     # -- main loop -------------------------------------------------------
 
     def run(self, x0: Array) -> Result:
@@ -1712,29 +1835,79 @@ class IPMDriver:
                 f"(KKT {final_record.kkt_error:.3e} at iteration "
                 f"{final_record.iteration})"
             )
-        # Budget exhaustion at an essentially optimal returned iterate reports
-        # ACCEPTABLE, mirroring the stall/step-failure salvage paths: a stall
-        # at KKT 6e-7 already reports ACCEPTABLE through the relaxed
-        # tolerance, so running out of iterations or clock at the same quality
-        # must not read as a harsher failure (S2MPJ budget-cluster audit:
-        # DIAMON2DLS oscillates at the acceptable level without holding it for
-        # the acceptable-iter window, then reported MAX_TIME from a 6.7e-7
-        # best iterate).
-        if status in (Status.MAX_ITER, Status.MAX_TIME) and _within_relaxed_tol(
-            self._options.optimality, final_record
-        ):
+        # Budget exhaustion — or a stall — at an essentially optimal returned
+        # iterate reports ACCEPTABLE, mirroring the step-failure salvage
+        # paths: a stall at KKT 6e-7 already reports ACCEPTABLE through the
+        # relaxed tolerance, so running out of iterations or clock at the same
+        # quality must not read as a harsher failure (S2MPJ budget-cluster
+        # audit: DIAMON2DLS oscillates at the acceptable level without holding
+        # it for the acceptable-iter window, then reported MAX_TIME from a
+        # 6.7e-7 best iterate). STALLED is re-judged here too because the
+        # in-loop stall check saw only the frozen *tail* iterate, while the
+        # salvage above may have swapped in a better best iterate (S2MPJ
+        # WEEDS: best 3.8e-7 — inside the relaxed band — frozen tail 6.2e-6).
+        if status in (
+            Status.MAX_ITER,
+            Status.MAX_TIME,
+            Status.STALLED,
+        ) and _within_relaxed_tol(self._options.optimality, final_record):
             status = Status.ACCEPTABLE
             message = (
-                "acceptable: the iteration/time budget ran out at an iterate "
-                f"within the relaxed KKT tolerance ({message})"
+                "acceptable: the run ended at an iterate within the relaxed "
+                f"KKT tolerance ({message})"
             )
         x_minus_l, u_minus_x = bound_gaps(x)
         g = self._ineq(x)
         c = self._eq(x)
+        final_kkt = final_record.kkt_error
+        final_dual_inf = final_record.dual_infeasibility
+        final_primal_inf = final_record.primal_infeasibility
+        final_compl = final_record.complementarity
+        # Terminal KKT certificate (IPOPT-triage class B — "reached the
+        # answer, won't certify"): a run can end STALLED/MAX_ITER/MAX_TIME
+        # *at* an acceptable KKT point whose recorded residual is polluted by
+        # multipliers the point never asked for — a rank-deficient ``∇c``
+        # under-determines ``y`` (S2MPJ NONSCOMPNE: recorded KKT 6.8e-5 at a
+        # point whose least-squares multipliers give dual infeasibility
+        # exactly 0), and initialized bound duals never re-converge once the
+        # line search freezes. KKT satisfaction is an existence claim over the
+        # multipliers, so the returned iterate is re-judged with candidate
+        # duals it can justify; exhibited duals only ever *upper-bound* the
+        # achievable dual infeasibility, so this can under-certify but never
+        # falsely certify. Terminal-only: the loop, restoration and rescue
+        # paths are untouched (the 0.6.1 near-feasible-band precedent).
+        if status in (Status.STALLED, Status.MAX_ITER, Status.MAX_TIME):
+            certificate = self._terminal_certificate(
+                x=x,
+                g=g,
+                c=c,
+                s=s,
+                m=m,
+                m_eq=m_eq,
+                mask_l=mask_l,
+                mask_u=mask_u,
+                n_bounds=n_bounds,
+                x_minus_l=x_minus_l,
+                u_minus_x=u_minus_x,
+                recorded_primal=final_record.primal_infeasibility,
+                recorded_objective=final_record.objective,
+            )
+            if certificate is not None:
+                residuals_c, y_eq, y_ineq, z_lower, z_upper = certificate
+                final_kkt = residuals_c.error
+                final_dual_inf = residuals_c.dual_infeasibility
+                final_primal_inf = residuals_c.primal_infeasibility
+                final_compl = residuals_c.complementarity
+                status = Status.ACCEPTABLE
+                message = (
+                    "acceptable: terminal KKT certificate at the returned "
+                    f"iterate — repaired multipliers give dual infeasibility "
+                    f"{final_dual_inf:.3e}, feasibility {final_primal_inf:.3e}, "
+                    f"complementarity {final_compl:.3e} ({message})"
+                )
         final_theta = self._theta(
             x, g, s, c, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
         )
-        final_kkt = final_record.kkt_error
 
         # The human-readable result/timing summary is emitted by ``solve`` once
         # the solution has been unscaled; the driver only assembles the Result.
@@ -1754,9 +1927,9 @@ class IPMDriver:
             z_upper=z_upper if self._upper is not None else None,
             n_iter=len(history),
             kkt_error=final_kkt,
-            dual_infeasibility=final_record.dual_infeasibility,
-            primal_infeasibility=final_record.primal_infeasibility,
-            complementarity=final_record.complementarity,
+            dual_infeasibility=final_dual_inf,
+            primal_infeasibility=final_primal_inf,
+            complementarity=final_compl,
             constraint_violation=final_theta,
             derivative_sources=self._sources,
             history=tuple(history),

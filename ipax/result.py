@@ -175,6 +175,13 @@ class Result:
     ``success`` is true for strict :attr:`Status.OPTIMAL` and the explicitly
     enabled :attr:`Status.ACCEPTABLE` exit. The status itself records the stopping
     condition; component KKT residuals provide the corresponding diagnostics.
+
+    When an :attr:`Status.ACCEPTABLE` exit came from the terminal KKT
+    certificate (a failing run salvaged at its returned best iterate with
+    repaired multipliers — ``message`` says so), ``kkt_error`` and the
+    component residuals describe that certificate and therefore need not
+    match any row of ``history``, which keeps the residuals as the loop
+    measured them.
     """
 
     status: Status

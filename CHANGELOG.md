@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+- **A run parked at an acceptable KKT point no longer reports failure because
+  of multipliers the point never asked for.** The per-iteration convergence
+  test evaluates the KKT residual with whatever duals the trajectory happens
+  to carry — but KKT satisfaction is an existence claim over the multipliers.
+  Two ways the carried duals lie about a certifiable point, both from the
+  IPOPT-triage "class B" backlog ("reached the answer, won't certify"): a
+  rank-deficient `∇c` under-determines `y`, so S2MPJ `NONSCOMPNE` ends
+  `stalled` reporting KKT 6.8e-5 at a point whose least-squares multipliers
+  give dual infeasibility *exactly zero* (its objective is identically zero,
+  forcing `y* = 0`); and a frozen line search strands the μ-complementarity
+  bound duals where initialization put them, so `WEEDS` reports `stalled`
+  while the best iterate it *returns* sits at KKT 3.8e-7 — inside the
+  acceptable band — because the in-loop check only ever saw the frozen tail
+  iterate at 6.2e-6.
+
+  Runs ending `stalled` / `max_iter` / `max_time` now re-judge the returned
+  best iterate. First against the relaxed KKT tolerance as the budget exits
+  already did (`stalled` was the one failure status missing from that check);
+  then, if the recorded residual still fails, with a **terminal KKT
+  certificate**: candidate multipliers the point itself justifies —
+  least-squares equality duals, inequality/bound duals at the zero that the
+  `E_0` complementarity term demands at an interior point — re-evaluated
+  through the full scaled residual. Passing every enabled acceptable-stopping
+  tolerance upgrades the run to `acceptable` and returns the certified
+  multipliers. Exhibited duals can only *upper-bound* the achievable dual
+  infeasibility, so the certificate under-certifies at worst — a genuinely
+  active constraint's dropped dual leaves the raw gradient in the residual
+  and the certificate declines. It is terminal-only: the loop, restoration
+  and rescue paths are untouched, and disabling acceptable stopping (all
+  tolerances `None`) disables it.
+
+  `WEEDS`, `NONSCOMPNE` and `VANDERM1` now certify `acceptable` at the
+  IPOPT-agreeing answers they already returned. The other four class-B rows
+  are genuine trajectory gaps the certificate correctly declines (`CURLY30`
+  floors at 1.3e-6, just outside the band; `POWELLBSLS`/`ORTHREGA` are
+  parked at non-stationary points — verified against exact least-squares
+  duals at both solvers' returned iterates; `GAUSS3LS` is an IPOPT "win" at
+  a 1000× worse objective on an underflow plateau).
+
 ## [0.9.0] - 2026-07-31
 
 ### Added
