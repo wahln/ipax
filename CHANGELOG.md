@@ -26,8 +26,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   six skip-arm wins (`ORTHRGDS`, `DEMBO7`, `CRESC4`, `SPIRAL`) while avoiding
   seven of its eight losses (`DRCAVTY2`, `FLOSP2TM`, `HS116`, `LAUNCH`,
   `HAHN1LS`, `DRUGDIS` all recover). The default (`None`) keeps pure Powell
-  damping bit-for-bit; the full-corpus characterization sweep decides whether
-  a value earns the default.
+  damping bit-for-bit.
+
+  The full-corpus characterization sweep at `ratio=1.0` is **corpus-neutral
+  with two-way churn** — net −1 over the three L-BFGS routes (21 fixed / 22
+  broken; dense +6, krylov −2, sparse −5) — so, per the project's standing
+  precedent for neutral-with-churn acceptance changes, it **stays opt-in**.
+  It is the lever to reach for on the diagnosed signature: an L-BFGS run that
+  stalls or grinds at a worse objective than a reference on a nonconvex
+  problem (`ORTHRGDS` reaches IPOPT's objective on all three routes with it;
+  `HS25` and `ELATTAR` also flip to `optimal`).
 
 ### Fixed
 - **A run parked at an acceptable KKT point no longer reports failure because
