@@ -107,6 +107,7 @@ def default_configs(
     equality_dual_repair: float | None = None,
     powell_damping: bool | None = None,
     damping_skip_ratio: float | None = None,
+    lbfgs_seed: str | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -156,15 +157,21 @@ def default_configs(
         common["regularization"] = RegularizationOptions(
             equality_dual_repair=equality_dual_repair
         )
-    if powell_damping is not None or damping_skip_ratio is not None:
-        # L-BFGS update-policy A/B levers (LBFGSOptions.powell_damping /
-        # .damping_skip_ratio; the solver default damps every non-PD pair,
-        # `--powell-damping off` skips them all like IPOPT's limited-memory
-        # update, `--damping-skip-ratio C` skips only pairs with
-        # s·y < −C·s·Bs). Only observable on the L-BFGS configs.
+    if (
+        powell_damping is not None
+        or damping_skip_ratio is not None
+        or lbfgs_seed is not None
+    ):
+        # L-BFGS A/B levers (LBFGSOptions; the solver defaults damp every
+        # non-PD pair with the "direct" ξ seed): `--powell-damping off` skips
+        # all non-PD pairs like IPOPT's limited-memory update,
+        # `--damping-skip-ratio C` skips only pairs with s·y < −C·s·Bs, and
+        # `--lbfgs-seed scalar1` switches the ξ estimate to IPOPT's
+        # δᵀγ/δᵀδ. Only observable on the L-BFGS configs.
         common["lbfgs"] = LBFGSOptions(
             powell_damping=True if powell_damping is None else powell_damping,
             damping_skip_ratio=damping_skip_ratio,
+            seed_formula="direct" if lbfgs_seed is None else lbfgs_seed,  # type: ignore[arg-type]
         )
     krylov_common = dict(common)
     if krylov_preconditioner is not None:
@@ -545,6 +552,14 @@ def main(argv: list[str] | None = None) -> int:
         "Powell-damped; only observable on the L-BFGS configs.",
     )
     parser.add_argument(
+        "--lbfgs-seed",
+        choices=("direct", "scalar1"),
+        default=None,
+        help="override LBFGSOptions.seed_formula on every config (default: the "
+        "solver default 'direct' = γᵀγ/δᵀγ) — the lever for the ξ-seed A/B; "
+        "'scalar1' is IPOPT's δᵀγ/δᵀδ; only observable on the L-BFGS configs.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -617,6 +632,7 @@ def main(argv: list[str] | None = None) -> int:
             None if args.powell_damping is None else args.powell_damping == "on"
         ),
         damping_skip_ratio=args.damping_skip_ratio,
+        lbfgs_seed=args.lbfgs_seed,
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}

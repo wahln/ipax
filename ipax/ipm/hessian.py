@@ -292,18 +292,26 @@ class LBFGSOperator(LinearOperator):
         assert s is not None and y is not None
         k = int(s.shape[1])
 
-        # Initial scaling ξ from the newest pair (Nocedal & Wright eq. 7.20,
-        # inverted for the direct Hessian): ξ = γᵀγ / δᵀγ. When disabled,
-        # use the unscaled identity seed for the compact update.
+        # Initial scaling ξ from the newest pair; when disabled, the unscaled
+        # identity seed. Two standard estimates (LBFGSOptions.seed_formula):
+        # "direct" (Nocedal & Wright eq. 7.20, inverted for the direct
+        # Hessian) is ξ = γᵀγ/δᵀγ; "scalar1" (IPOPT's
+        # limited_memory_initialization) is ξ = δᵀγ/δᵀδ. They differ by the
+        # δ–γ misalignment factor 1/cos²∠(δ,γ) ≥ 1, which badly-scaled least
+        # squares can drive to ~1e15 (S2MPJ NELSONLS) — an over-stiff seed
+        # freezes the primal step and feeds the Powell-damping test an
+        # inflated δᵀBδ.
         s_last = s[:, k - 1]
         y_last = y[:, k - 1]
         s_y_last = float(xp.sum(s_last * y_last))
-        y_y_last = float(xp.sum(y_last * y_last))
-        xi = (
-            y_y_last / s_y_last
-            if self._options.initial_scaling and s_y_last > 0.0
-            else 1.0
-        )
+        xi = 1.0
+        if self._options.initial_scaling and s_y_last > 0.0:
+            if self._options.seed_formula == "scalar1":
+                s_s_last = float(xp.sum(s_last * s_last))
+                xi = s_y_last / s_s_last if s_s_last > 0.0 else 1.0
+            else:
+                y_y_last = float(xp.sum(y_last * y_last))
+                xi = y_y_last / s_y_last
         self._xi = xi
 
         s_t = xp.permute_dims(s, (1, 0))

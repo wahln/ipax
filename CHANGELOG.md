@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **`LBFGSOptions.seed_formula`** — which Rayleigh estimate seeds the L-BFGS
+  identity block ξ. `"direct"` (the default, Nocedal & Wright eq. 7.20
+  inverted for the direct Hessian: `ξ = γᵀγ/δᵀγ`) and `"scalar1"` (IPOPT's
+  `limited_memory_initialization`: `ξ = δᵀγ/δᵀδ`) differ by exactly the δ–γ
+  misalignment factor `1/cos²∠(δ,γ)` — and badly-scaled least squares drives
+  that factor to ~1e15: S2MPJ `NELSONLS` runs the direct seed at a median
+  `ξ ≈ 1e20` (steps frozen, KKT pinned at 4.8 for 1000 iterations) where
+  scalar1 sits at 6e3. The over-stiff seed also feeds the Powell-damping test
+  an inflated `δᵀBδ`, so every pair looks damping-worthy — the mechanism
+  behind part of the L-BFGS-vs-IPOPT quality gap. Probed under scalar1:
+  `GASOIL` goes from 508 stalled iterations to **optimal in 25 (IPOPT
+  parity)** on both routes, `ORTHRGDS` to optimal in 24 without the
+  damping-skip knob, `SINROSNB` to its documented optimum. The default is
+  unchanged pending the full-corpus characterization sweep.
 - **`LBFGSOptions.damping_skip_ratio`** — opt-in threshold on how much a
   curvature pair may *contradict* positive curvature before the L-BFGS update
   drops it instead of Powell-damping it: a pair with `δᵀγ < −ratio·δᵀBδ` is

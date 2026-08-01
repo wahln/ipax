@@ -350,13 +350,22 @@ class LBFGSOptions:
 
     memory: int = 10  # m ∈ [5, 20]
     powell_damping: bool = True
-    initial_scaling: bool = True  # direct-Hessian seed ξ = γᵀγ / δᵀγ
+    initial_scaling: bool = True  # ξ seed from the newest pair (see seed_formula)
     damping_skip_ratio: float | None = None
+    # ξ estimate when ``initial_scaling`` is on. Both are standard Rayleigh
+    # seeds, but they diverge by the δ–γ misalignment factor 1/cos²∠(δ,γ):
+    # "direct" (N&W eq. 7.20 inverted, γᵀγ/δᵀγ) is always ≥ "scalar1"
+    # (IPOPT ``limited_memory_initialization``, δᵀγ/δᵀδ) — catastrophically so
+    # on badly-scaled least squares (S2MPJ NELSONLS: median ξ 1e20 vs 6e3,
+    # freezing every step; GASOIL: 508 stalled iterations vs optimal in 25).
+    seed_formula: Literal["direct", "scalar1"] = "direct"
 
     def __post_init__(self) -> None:
         ratio = self.damping_skip_ratio
         if ratio is not None and not (math.isfinite(ratio) and ratio > 0.0):
             raise ValueError("damping_skip_ratio must be a positive finite float")
+        if self.seed_formula not in ("direct", "scalar1"):
+            raise ValueError("seed_formula must be 'direct' or 'scalar1'")
 
 
 @dataclass(frozen=True, slots=True)
