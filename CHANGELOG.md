@@ -28,8 +28,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   behind part of the L-BFGS-vs-IPOPT quality gap. Probed under scalar1:
   `GASOIL` goes from 508 stalled iterations to **optimal in 25 (IPOPT
   parity)** on both routes, `ORTHRGDS` to optimal in 24 without the
-  damping-skip knob, `SINROSNB` to its documented optimum. The default is
-  unchanged pending the full-corpus characterization sweep.
+  damping-skip knob, `SINROSNB` to its documented optimum.
+
+  As a blanket default, scalar1 **loses decisively** — the full-corpus
+  characterization sweep scores net **−140** over the three L-BFGS routes
+  (29 fixed / 169 broken, ≈−45 on each route): the direct seed's extra
+  stiffness is load-bearing for the globalization machinery on most of the
+  corpus, and the softer seed lets steps overshoot. So the option stays
+  opt-in, documented as the routing hint for the frozen-KKT-plateau
+  signature.
 - **`LBFGSOptions.damping_skip_ratio`** — opt-in threshold on how much a
   curvature pair may *contradict* positive curvature before the L-BFGS update
   drops it instead of Powell-damping it: a pair with `δᵀγ < −ratio·δᵀBδ` is
