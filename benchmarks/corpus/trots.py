@@ -78,11 +78,19 @@ if TYPE_CHECKING:
 # Host bridge helpers
 # --------------------------------------------------------------------------- #
 def _to_numpy(x: Array) -> Any:
-    """Array-API array → 1-D NumPy array (host bridge)."""
+    """Array-API array → 1-D NumPy array (host bridge).
+
+    Device arrays (CuPy) refuse implicit host conversion; ``.get()`` is the
+    explicit device→host copy. The problem callbacks evaluate host-side with
+    SciPy regardless of the solve namespace — at ``n ≈ 10³`` the per-iteration
+    transfer is ~16 kB, negligible next to the device-side KKT solve.
+    """
     import numpy as np
 
     if isinstance(x, np.ndarray):
         return np.reshape(x, (-1,))
+    if hasattr(x, "__cuda_array_interface__") and hasattr(x, "get"):
+        return np.reshape(np.asarray(x.get()), (-1,))
     try:
         return np.reshape(np.from_dlpack(x), (-1,))
     except (TypeError, RuntimeError, BufferError, ValueError):
