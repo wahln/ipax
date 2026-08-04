@@ -51,10 +51,15 @@ Because these problems have far more constraints than variables (``n ≈ 1e3``,
 dose matrices through matvecs and forms only the ``n×n`` system — is far cheaper
 per iteration than factoring the full ``(n+m)`` saddle with ``linsolve="sparse"``.
 
-Like the S2MPJ bridge, evaluation runs in NumPy/SciPy on the host and converts
-to/from the target namespace, so ipax's linear algebra runs on any CPU backend
-while the (large, host-resident) dose matrices stay in SciPy. This forces a host
-sync per evaluation — it is for accuracy/cross-backend work, not GPU performance.
+Like the S2MPJ bridge, evaluation runs in NumPy/SciPy on the host by default and
+converts to/from the target namespace, so ipax's linear algebra runs on any CPU
+backend while the (large, host-resident) dose matrices stay in SciPy. For **CuPy
+namespaces** the evaluation matrices are mirrored to the device once and the
+callbacks evaluate device-side (the elementwise cost math dispatches from NumPy's
+functions to CuPy via NEP-18), so a GPU solve no longer pays a host round-trip
+per callback — only scalar reductions sync. The exact Lagrangian Hessian
+(:class:`TROTSExactProblem`) still assembles host-side (per-term sparse SpGEMM;
+it serves the accuracy tests, not the RT performance runs).
 """
 
 from __future__ import annotations
@@ -596,6 +601,36 @@ class TROTSProblem(Problem):
         for k, (_mat, w, minimise) in enumerate(self._minimax):
             self._c_obj[self._n + k] = (1.0 if minimise else -1.0) * w
 
+        # Device-side evaluation (CuPy namespaces): keep z and the evaluation
+        # matrices on the device so the per-callback dose products (incl. the
+        # big constant G spmv) run on the GPU instead of round-tripping to
+        # SciPy. The elementwise cost math (`_cost_value` & friends) is written
+        # against NumPy's public functions, which dispatch to CuPy via the
+        # NEP-18/ufunc protocols, so the same code serves both spaces. Host
+        # NumPy/SciPy remains the path for every non-CUDA namespace.
+        self._eval_device = False
+        self._cxs: Any = None  # cupyx.scipy.sparse, when active
+        self._dev_mats: dict[int, Any] = {}  # id(TROTSMatrix) -> device CSR
+        self._dev_vecs: dict[int, Any] = {}  # id(TROTSMatrix) -> device b
+        self._G_eval: Any = self._G
+        self._h_eval: Any = self._h
+        self._c_obj_eval: Any = self._c_obj
+        try:
+            probe = xp.asarray(0.0)
+        except Exception:  # namespace probing only — any failure means "host"
+            probe = None
+        if probe is not None and hasattr(probe, "__cuda_array_interface__"):
+            try:
+                import cupyx.scipy.sparse as cxs
+            except ImportError:
+                cxs = None
+            if cxs is not None:
+                self._cxs = cxs
+                self._eval_device = True
+                self._G_eval = cxs.csr_matrix(self._G)
+                self._h_eval = xp.asarray(self._h)
+                self._c_obj_eval = xp.asarray(self._c_obj)
+
     # -- dimensions & bounds ------------------------------------------------
     @property
     def n_vars(self) -> int:
@@ -690,19 +725,55 @@ class TROTSProblem(Problem):
             x = np.full((self._n,), scale, dtype=float)
         return _from_numpy(self.xp, self._pad_aux(x))
 
+    # -- evaluation-space accessors -----------------------------------------
+    # Host (default): NumPy vectors + the SciPy matrices as loaded. Device
+    # (CuPy namespaces): the same objects mirrored once to the GPU, keyed by
+    # the TROTSMatrix identity (matrices are immutable for the problem's
+    # lifetime). The evaluation loops below are written once against these
+    # accessors; NumPy's functions dispatch to CuPy on device arrays.
+    def _eval_z(self, z: Array) -> Any:
+        if self._eval_device:
+            return self.xp.reshape(self.xp.asarray(z), (-1,))
+        return _to_numpy(z)
+
+    def _eval_mat(self, mat: TROTSMatrix) -> Any:
+        if not self._eval_device:
+            return mat.matrix
+        dev = self._dev_mats.get(id(mat))
+        if dev is None:
+            dev = self._cxs.csr_matrix(mat.matrix.tocsr())
+            self._dev_mats[id(mat)] = dev
+        return dev
+
+    def _eval_b(self, mat: TROTSMatrix) -> Any:
+        if not self._eval_device:
+            return mat.b
+        dev = self._dev_vecs.get(id(mat))
+        if dev is None:
+            dev = self.xp.asarray(mat.b)
+            self._dev_vecs[id(mat)] = dev
+        return dev
+
+    def _dose(self, mat: TROTSMatrix, x: Any) -> Any:
+        """``d = A x (+ b)`` in evaluation space (offset only when per-row)."""
+        d = self._eval_mat(mat) @ x
+        if mat.b.size == mat.matrix.shape[0]:
+            d = d + self._eval_b(mat)
+        return d
+
     # -- objective ----------------------------------------------------------
     def objective(self, z: Array) -> Scalar:
         import numpy as np
 
-        zc = _to_numpy(z)
+        zc = self._eval_z(z)
         x = zc[: self._n]
-        total = float(self._c_obj @ zc) + self._lin_obj_const
+        total = float(self._c_obj_eval @ zc) + self._lin_obj_const
         for mat, coef in self._quad_obj:
-            ax = mat.matrix @ x
-            lin = float(mat.b @ x) if mat.b.size == x.size else 0.0
+            ax = self._eval_mat(mat) @ x
+            lin = float(self._eval_b(mat) @ x) if mat.b.size == self._n else 0.0
             total += coef * (0.5 * float(x @ ax) + lin + mat.c)
         for mat, coef, ctype, par in self._nl_obj:
-            d = mat.matrix @ x + (mat.b if mat.b.size == mat.matrix.shape[0] else 0.0)
+            d = self._dose(mat, x)
             try:
                 total += coef * _cost_value(ctype, d, par)
             except (OverflowError, FloatingPointError):
@@ -710,20 +781,20 @@ class TROTSProblem(Problem):
         return _from_numpy(self.xp, np.asarray(total))
 
     def gradient(self, z: Array) -> Array:
-        import numpy as np
-
-        zc = _to_numpy(z)
+        zc = self._eval_z(z)
         x = zc[: self._n]
-        g = np.array(self._c_obj, dtype=float)
+        g = self._c_obj_eval.copy()
         for mat, coef in self._quad_obj:
-            gx = mat.matrix @ x
-            if mat.b.size == x.size:
-                gx = gx + mat.b
+            gx = self._eval_mat(mat) @ x
+            if mat.b.size == self._n:
+                gx = gx + self._eval_b(mat)
             g[: self._n] += coef * gx
         for mat, coef, ctype, par in self._nl_obj:
-            d = mat.matrix @ x + (mat.b if mat.b.size == mat.matrix.shape[0] else 0.0)
+            d = self._dose(mat, x)
             gd = _cost_grad_d(ctype, d, par)
-            g[: self._n] += coef * (mat.matrix.T @ gd)
+            g[: self._n] += coef * (self._eval_mat(mat).T @ gd)
+        if self._eval_device:
+            return g
         return _from_numpy(self.xp, g)
 
     # -- inequality constraints (nonlinear cost rows first, then linear) ----
@@ -742,21 +813,23 @@ class TROTSProblem(Problem):
 
         if self._n_nl_ineq == 0 and self._n_lin_ineq == 0:
             raise NotImplementedError
-        zc = _to_numpy(z)
+        zc = self._eval_z(z)
         x = zc[: self._n]
         vals: list[float] = []
         for mat, sign, ctype, par, bound in self._nl_con:
-            d = mat.matrix @ x + (mat.b if mat.b.size == mat.matrix.shape[0] else 0.0)
+            d = self._dose(mat, x)
             vals.append(sign * (_cost_value(ctype, d, par) - bound))
         for mat, sign, bound in self._quad_con:
-            ax = mat.matrix @ x
-            lin = float(mat.b @ x) if mat.b.size == x.size else 0.0
+            ax = self._eval_mat(mat) @ x
+            lin = float(self._eval_b(mat) @ x) if mat.b.size == self._n else 0.0
             f = 0.5 * float(x @ ax) + lin + mat.c
             vals.append(sign * (f - bound))
         nl = np.asarray(vals, dtype=float)
         if self._n_lin_ineq == 0:
             return _from_numpy(self.xp, nl)
-        lin_vals = self._G @ zc + self._h
+        lin_vals = self._G_eval @ zc + self._h_eval
+        if self._eval_device:
+            return np.concatenate([self.xp.asarray(nl), lin_vals])
         return _from_numpy(self.xp, np.concatenate([nl, lin_vals]))
 
     def ineq_jacobian(self, z: Array) -> Array | LinearOperator:
@@ -771,20 +844,22 @@ class TROTSProblem(Problem):
         if self._n_nl_ineq == 0:
             assert lin_op is not None
             return lin_op
-        x = _to_numpy(z)[: self._n]
+        x = self._eval_z(z)[: self._n]
         rows: list[Any] = []
         for mat, sign, ctype, par, _bound in self._nl_con:
-            d = mat.matrix @ x + (mat.b if mat.b.size == mat.matrix.shape[0] else 0.0)
+            d = self._dose(mat, x)
             gd = _cost_grad_d(ctype, d, par)
-            rows.append(sign * (mat.matrix.T @ gd))
+            rows.append(sign * (self._eval_mat(mat).T @ gd))
         for mat, sign, _bound in self._quad_con:
-            gx = mat.matrix @ x
-            if mat.b.size == x.size:
-                gx = gx + mat.b
+            gx = self._eval_mat(mat) @ x
+            if mat.b.size == self._n:
+                gx = gx + self._eval_b(mat)
             rows.append(sign * gx)
+        spx = self._cxs if self._eval_device else sp
         J_x = np.stack(rows) if rows else np.zeros((0, self._n))
-        J = sp.hstack(
-            [sp.csr_matrix(J_x), sp.csr_matrix((len(rows), self._n_aux))], format="csr"
+        J = spx.hstack(
+            [spx.csr_matrix(J_x), spx.csr_matrix((len(rows), self._n_aux))],
+            format="csr",
         )
         nl_op = self._csr_operator(J, symmetric=False)
         if lin_op is None:
@@ -793,7 +868,7 @@ class TROTSProblem(Problem):
 
     # -- sparse-operator helper --------------------------------------------
     def _csr_operator(self, csr: Any, *, symmetric: bool) -> LinearOperator:
-        """Wrap a host ``scipy.csr_matrix`` as an Array-API ``CSROperator``."""
+        """Wrap a host SciPy (or device cupyx) CSR as an Array-API ``CSROperator``."""
         import numpy as np
 
         from ipax.backend.operators import CSROperator
@@ -801,6 +876,15 @@ class TROTSProblem(Problem):
         csr = csr.tocsr()
         csr.sort_indices()
         xp = self.xp
+        if hasattr(csr.data, "__cuda_array_interface__"):
+            # Already device-resident (device evaluation path): no host bounce.
+            return CSROperator(
+                xp.asarray(csr.indptr, dtype=xp.int64),
+                xp.asarray(csr.indices, dtype=xp.int64),
+                xp.asarray(csr.data, dtype=xp.float64),
+                (int(csr.shape[0]), int(csr.shape[1])),
+                symmetric=symmetric,
+            )
         return CSROperator(
             xp.asarray(np.asarray(csr.indptr, dtype=np.int64)),
             xp.asarray(np.asarray(csr.indices, dtype=np.int64)),
