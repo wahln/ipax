@@ -68,6 +68,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `HS25` and `ELATTAR` also flip to `optimal`).
 
 ### Changed
+- **The tall sparse-Gram gate now outranks the small-`n` dense rule in
+  `linsolve="auto"`.** A tall problem (`m ≥ 10n`) whose Gram *pattern* is
+  provably sparse (banded/localized rows, fill ≤ 1 %) previously routed to the
+  dense solver whenever `n < 10 000` — forming the condensed block and then
+  densely factoring a matrix it certifiably knew was sparse. The sparse
+  normal-equations route is measured **16–49× faster per iteration at every
+  `n` from 250 to 9000** on banded tall QPs (`m = 10n`), so the fill-certified
+  gate is now consulted first. Dense-rowed tall problems (the radiotherapy
+  dose-matrix regime, density past the dense-GEMM crossover) are unaffected —
+  the fill probe is not even consulted there, and TROTS routing is verified
+  unchanged. The fill certificate (`gram_fill_estimate`) is conservative, so
+  problems without provable Gram sparsity keep their previous routes.
 - **The dense-accumulated Gram uses the symmetric rank-k BLAS update.** The
   SciPy sparse adapter's chunked accumulation of `Aᵀ diag(w) A` — the dominant
   per-iteration cost of the condensed route on tall dense-ish problems

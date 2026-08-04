@@ -160,6 +160,33 @@ def test_tall_sparse_gram_selects_normal_equations(ne_zone):
     assert ne_zone[0].form == "normal_equations"
 
 
+def test_small_tall_sparse_gram_outranks_the_dense_rule(monkeypatch):
+    # The tall-gate fix: with the REAL small-n dense cutoff in force (no
+    # _DENSE_AUTO_MAX_VARS shrink), a tall banded QP whose Gram fill passes
+    # the NE threshold routes to sparse-NE — previously the small-n rule
+    # returned the dense solver before the tall gates were ever consulted.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    pytest.importorskip("scipy")
+    monkeypatch.setattr(solver_mod, "_TALL_DENSE_MIN_DENSITY", 0.5)
+    monkeypatch.setattr(solver_mod, "_TALL_SPARSE_NE_MAX_FILL", 0.9)
+
+    chosen: list[object] = []
+    real_select = solve_mod.select_solver
+
+    def spy(**kwargs):
+        solver = real_select(**kwargs)
+        chosen.append(solver)
+        return solver
+
+    monkeypatch.setattr(solve_mod, "select_solver", spy)
+    _run(_TinyTallQP(import_namespace("numpy"), jacobian="coo"))
+
+    assert len(chosen) == 1
+    assert isinstance(chosen[0], SparseDirectSolver)
+    assert chosen[0].form == "normal_equations"
+
+
 def test_tall_analytic_hessian_keeps_krylov(ne_zone):
     # The NE form folds the Gram into the condensed block only for an L-BFGS
     # (diagonal + low-rank) Hessian; with an analytic Hessian the auto route

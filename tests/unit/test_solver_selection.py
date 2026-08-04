@@ -238,6 +238,37 @@ def test_select_solver_auto_tall_sparse_gram_selects_normal_equations():
     assert solver.form == "normal_equations"
 
 
+def test_select_solver_auto_small_tall_sparse_gram_selects_normal_equations():
+    # The tall-gate fix (2026-08-05): the sparse-NE gate outranks the small-n
+    # dense rule. A tall problem with a provably-sparse Gram (banded/localized
+    # rows) measured 16-49x faster per iteration on sparse-NE than dense at
+    # EVERY n from 250 to 9000 (banded tall QP, m = 10n) — the small-n dense
+    # rule was hiding the better route below n = 10_000.
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    solver = select_solver(**_tall_sparse_kwargs(n_vars=5_000, m_ineq=100_000))
+    assert isinstance(solver, SparseDirectSolver)
+    assert solver.form == "normal_equations"
+
+
+def test_select_solver_auto_small_tall_dense_rows_skip_fill_probe():
+    # Dense-ish rows below the small-n cutoff: the dense route stays (the
+    # dense-GEMM Gram regime), and the Jacobian-evaluating fill probe must not
+    # even be consulted.
+    def probe() -> float:
+        raise AssertionError("fill probe must not run when rows are dense-ish")
+
+    solver = select_solver(
+        **_tall_sparse_kwargs(
+            n_vars=5_000,
+            m_ineq=100_000,
+            ineq_density=lambda: 0.2,
+            ineq_gram_fill=probe,
+        )
+    )
+    assert isinstance(solver, DenseSolver)
+
+
 def test_select_solver_auto_tall_filled_gram_stays_krylov():
     # Scattered sparsity: the Gram fills in (the reason the route was opt-in) —
     # the probe reports it and the selection keeps Krylov.

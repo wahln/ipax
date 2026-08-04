@@ -161,6 +161,37 @@ def select_solver(
     dense_viable = has_dense_solve() and (
         not has_equalities or "cholesky" in capabilities.linalg_functions
     )
+
+    # Tall n ≪ m with a provably-sparse Gram *pattern* (localized/banded rows —
+    # the ``gram_fill_estimate`` sampled-column-overlap probe): one small sparse
+    # factorization of the condensed n×n block per iteration beats BOTH the
+    # dense route (which would form and then densely factor the same block,
+    # ignoring the sparsity it certifiably has — banded tall QP with m = 10n:
+    # sparse-NE 16–49× faster per iteration at every n from 250 to 9000,
+    # 2026-08 crossover measurement) and Krylov (iteration counts blow up on
+    # the ill-conditioned late-IPM Σ; Breedveld 2017 §2; banded validation
+    # n=20k: NE optimal in 62 s vs Krylov 50+ min unconverged). This gate
+    # therefore outranks the small-n dense rule below. The fill probe is only
+    # consulted when the rows are NOT dense-ish (a density at or past the
+    # dense-GEMM crossover fills the Gram anyway, and the probe evaluates the
+    # Jacobian — don't pay it when the dense route is already the winner).
+    # Equalities border into the factored saddle explicitly; whether ∇c can
+    # emit that border is the caller's probe's concern (it withholds
+    # ``ineq_gram_fill`` when it cannot).
+    if (
+        n_vars < _TALL_DENSE_MAX_VARS
+        and m_ineq >= _TALL_ROW_EXCESS * n_vars
+        and capabilities.has_sparse_adapter
+        and ineq_gram_fill is not None
+    ):
+        density = ineq_density() if ineq_density is not None else None
+        if density is None or density < _TALL_DENSE_MIN_DENSITY:
+            fill = ineq_gram_fill()
+            if fill is not None and fill <= _TALL_SPARSE_NE_MAX_FILL:
+                from ipax.linalg.sparse import SparseDirectSolver
+
+                return SparseDirectSolver(form="normal_equations")
+
     if n_vars < _DENSE_AUTO_MAX_VARS and dense_viable:
         return DenseSolver(options.dense)
 
@@ -168,29 +199,14 @@ def select_solver(
     # exist, and a Gram-capable Jacobian forms it without densifying m×n —
     # prefer the direct dense route over Krylov through the huge Jacobian,
     # but only when the rows are dense enough for the dense-GEMM Gram (see
-    # the threshold comments above; sparse tall Jacobians measure faster on
-    # Krylov in this zone).
+    # the threshold comments above; sparse tall Jacobians with a *filling*
+    # Gram measure faster on Krylov in this zone, and the provably-sparse-Gram
+    # case was already routed to sparse-NE above).
     if n_vars < _TALL_DENSE_MAX_VARS and m_ineq >= _TALL_ROW_EXCESS * n_vars:
         if dense_viable and ineq_gram_capable is not None and ineq_gram_capable():
             density = ineq_density() if ineq_density is not None else None
             if density is None or density >= _TALL_DENSE_MIN_DENSITY:
                 return DenseSolver(options.dense)
-        # Sparse tall rows lose the dense-GEMM Gram, but when the Gram
-        # *pattern* provably stays sparse (localized/banded rows — the
-        # ``gram_fill_estimate`` sampled-column-overlap probe) one small
-        # sparse factorization of the condensed n×n block per iteration
-        # beats Krylov, whose iteration counts blow up on the
-        # ill-conditioned late-IPM Σ (Breedveld 2017 §2; banded validation
-        # n=20k: NE optimal in 62 s vs Krylov 50+ min unconverged).
-        # Equalities border into the factored saddle explicitly; whether ∇c
-        # can emit that border is the caller's probe's concern (it withholds
-        # ``ineq_gram_fill`` when it cannot).
-        if capabilities.has_sparse_adapter and ineq_gram_fill is not None:
-            fill = ineq_gram_fill()
-            if fill is not None and fill <= _TALL_SPARSE_NE_MAX_FILL:
-                from ipax.linalg.sparse import SparseDirectSolver
-
-                return SparseDirectSolver(form="normal_equations")
 
     return KrylovSolver(options.krylov)
 
