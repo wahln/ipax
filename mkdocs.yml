@@ -29,6 +29,7 @@ nav:
   - Benchmarks:
       - S2MPJ / CUTEst: benchmarks/s2mpj.md
       - IPOPT cross-check: benchmarks/ipopt.md
+      - TROTS radiotherapy: benchmarks/trots.md
   - Architecture & invariants: architecture.md
   - API reference: reference.md
   - Contributing: contributing.md

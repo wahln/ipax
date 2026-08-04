@@ -159,6 +159,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--max-iter", type=int, default=300)
     parser.add_argument("--max-time", type=float, default=120.0)
+    # A/B levers for the RT recipe measurements (docs/benchmarks/trots.md);
+    # left unset they keep the solve bit-identical to the plain configs.
+    parser.add_argument(
+        "--mu-schedule", default=None, help="override Options.mu_schedule"
+    )
+    parser.add_argument(
+        "--globalization", default=None, help="override Options.globalization"
+    )
+    parser.add_argument(
+        "--slack-init-scale",
+        type=float,
+        default=None,
+        help="BarrierOptions.slack_init_scale (RT recipe: 0.1)",
+    )
+    parser.add_argument(
+        "--kappa-centrality",
+        type=float,
+        default=None,
+        help="BarrierOptions.kappa_centrality (proton stack: 1e-4)",
+    )
     args = parser.parse_args(argv)
 
     root = trots_dir(args.dir)
@@ -201,10 +221,27 @@ def main(argv: list[str] | None = None) -> int:
         unknown = [label for label in labels if label not in _CONFIGS]
         if unknown:
             parser.error(f"unknown --config {unknown}; choose from {list(_CONFIGS)}")
+        lever_kwargs: dict[str, object] = {}
+        if args.mu_schedule is not None:
+            lever_kwargs["mu_schedule"] = args.mu_schedule
+        if args.globalization is not None:
+            lever_kwargs["globalization"] = args.globalization
+        barrier_kwargs: dict[str, float] = {}
+        if args.slack_init_scale is not None:
+            barrier_kwargs["slack_init_scale"] = args.slack_init_scale
+        if args.kappa_centrality is not None:
+            barrier_kwargs["kappa_centrality"] = args.kappa_centrality
+        if barrier_kwargs:
+            from ipax.options import BarrierOptions
+
+            lever_kwargs["barrier"] = BarrierOptions(**barrier_kwargs)
         for case in cases:
             for label in labels:
                 opts = ipax.Options(
-                    max_iter=args.max_iter, max_time=args.max_time, **_CONFIGS[label]
+                    max_iter=args.max_iter,
+                    max_time=args.max_time,
+                    **_CONFIGS[label],
+                    **lever_kwargs,
                 )
                 result = _solve_case(root, case, label, opts, xp)
                 solve_rows.append(result)
