@@ -135,6 +135,13 @@ class DenseSolver:
         self._mixed_engaged = False
         self._mixed_disabled = False
         self._mixed_ever_engaged = False
+        # Consecutive mixed-route failures (refinement rejection or a
+        # precision-caused PD mismatch). κ(N) is NOT monotone along an IPM run
+        # (μ jumps, δ_w regularization, re-centering), so one hard iteration
+        # must not permanently forfeit the reduced-precision savings; only
+        # ``refine_failure_limit`` failures in a row flip the kill switch.
+        # Any certified mixed solve resets the counter.
+        self._mixed_failures = 0
         self.refine_iterations = 0  # corrections applied by the last solve()
 
     def describe(self) -> str:
@@ -227,17 +234,26 @@ class DenseSolver:
 
         refined = self._refine(x, rhs, xp)
         if refined is not None:
+            self._mixed_failures = 0
             return refined
-        # Refinement stalled (or could not run): the reduced-precision factor
-        # is not accurate enough for this system — the κ(N)·u32 ≳ 1 endgame.
-        # Rebuild the exact matrix, permanently switch this instance to
-        # native precision, and answer from the exact factorization.
-        self._mixed_disabled = True
+        # Refinement rejected the solve (stall or budget exhaustion above the
+        # acceptance level): the reduced-precision factor is not accurate
+        # enough for THIS system. Rebuild the exact matrix and answer from
+        # the exact factorization; only ``refine_failure_limit`` consecutive
+        # failures disable the mixed route for good — conditioning along an
+        # IPM run is not monotone (μ jumps, δ_w, re-centering), so one hard
+        # iteration must not forfeit the savings on every later one.
+        self._register_mixed_failure()
         self._mixed_engaged = False
         self._cholesky_factor = None
         self._matrix = self._materialize_dense_matrix(rhs, xp, n)
         self._guard_positive_definite(self._matrix, xp)
         return self._solve_factored(self._matrix, rhs, xp)
+
+    def _register_mixed_failure(self) -> None:
+        self._mixed_failures += 1
+        if self._mixed_failures >= self._options.refine_failure_limit:
+            self._mixed_disabled = True
 
     def _materialize_and_guard(self, rhs: Array, xp: Any, n: int) -> None:
         """Materialize + PD-probe ``self._matrix``, preferring the mixed route.
@@ -280,7 +296,7 @@ class DenseSolver:
                     self._cholesky_factor = None
                     exact = self._materialize_dense_matrix(rhs, xp, n)
                     self._guard_positive_definite(exact, xp)  # genuine ⇒ raises
-                    self._mixed_disabled = True
+                    self._register_mixed_failure()
                     self._mixed_engaged = False
                     self._matrix = exact
                     return
@@ -315,9 +331,12 @@ class DenseSolver:
         (Wilkinson; Carson & Higham 2018, SIAM J. Sci. Comput. 40(2)): each
         correction contracts the error by ρ ≈ κ(N)·u32, so a handful of
         O(n²)-solve + matvec steps restores working accuracy whenever
-        ρ < 1. Returns ``None`` when a step contracts by less than
-        ``refine_stall_ratio`` (or the budget runs out before ``refine_tol``)
-        — the caller's signal to rebuild in native precision.
+        ρ < 1. The target is ``refine_tol``; when the budget runs out or the
+        contraction plateaus (which includes plateauing at the achievable
+        rounding floor ~κ·u64), the solve is still *accepted* if its
+        measured exact residual is within ``refine_accept_tol`` — an honest
+        certificate, just a looser one. Returns ``None`` only when even that
+        level is missed — the caller's signal to rebuild in native precision.
         """
         assert self._operator is not None and self._matrix is not None
         apply = self._operator.matvec if len(rhs.shape) == 1 else self._operator.matmat
@@ -331,9 +350,11 @@ class DenseSolver:
             self._options.refine_tol,
             _REFINE_TOL_EPS_FACTOR * float(xp.finfo(rhs.dtype).eps),
         )
+        accept_tol = max(self._options.refine_accept_tol, tol)
         stall_ratio = self._options.refine_stall_ratio
+        max_iters = self._options.refine_max_iters
         previous = math.inf
-        for iteration in range(self._options.refine_max_iters + 1):
+        for iteration in range(max_iters + 1):
             self.refine_iterations = iteration
             try:
                 residual = rhs - apply(x)
@@ -342,8 +363,10 @@ class DenseSolver:
             rnorm = float(xp.max(xp.abs(residual)))
             if rnorm <= tol * bnorm:
                 return x
-            if rnorm >= stall_ratio * previous:
-                return None
+            if rnorm >= stall_ratio * previous or iteration == max_iters:
+                # Plateaued or out of budget: accept on the measured exact
+                # residual if it clears the (looser) acceptance certificate.
+                return x if rnorm <= accept_tol * bnorm else None
             previous = rnorm
             x = x + self._solve_factored(self._matrix, residual, xp)
         return None

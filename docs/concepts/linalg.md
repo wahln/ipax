@@ -35,18 +35,23 @@ radiotherapy dose matrices are — while everything else stays float64. Full
 working accuracy is restored per solve by **iterative refinement** against the
 exact float64 operator matvec (Carson & Higham 2018): each O(n²)-solve +
 matvec correction contracts the error by ρ ≈ κ(N)·u₃₂, so a handful of steps
-reach `refine_tol`. The scheme is accuracy-preserving by construction: a
-refinement stall, or a positive-definiteness failure the exact matrix does not
-reproduce (both the signature of the late-barrier κ(N)·u₃₂ ≳ 1 regime),
-rebuilds the exact matrix and permanently returns that solver instance to
-native precision — the accuracy of the returned step is never traded, only
-accumulation cost. (The PD probe itself runs on the approximate matrix; the
-stall detector is what catches the masked-indefinite case, and the pair is
-pinned by a regression test.) The option applies to the inequality/bound
-**condensed** assembly — equality-constrained saddle systems currently
-assemble exactly and ignore it. `Result.routes` reports the engaged route as
-`dense (gram=float32)`, or `dense (gram=float32->native)` after a
-self-disable.
+reach `refine_tol` — and a solve that runs out of budget or plateaus is still
+accepted when its *measured exact residual* clears the looser
+`refine_accept_tol` certificate (mid-barrier Newton steps need nowhere near
+direct-solve accuracy). A solve missing even that level — or a
+positive-definiteness failure the exact matrix does not reproduce (both the
+signature of a κ(N)·u₃₂ ≳ 1 stretch) — rebuilds the exact matrix for that
+factorization; `refine_failure_limit` *consecutive* failures return the
+instance to native precision for good. Conditioning along an IPM run is not
+monotone (μ jumps, δ_w, re-centering), which is why one hard iteration is not
+terminal. Every returned step carries a measured exact-residual certificate —
+only accumulation cost is ever traded. (The PD probe itself runs on the
+approximate matrix; the refinement rejection is what catches the
+masked-indefinite case, and the pair is pinned by a regression test.) The
+option applies to the inequality/bound **condensed** assembly —
+equality-constrained saddle systems currently assemble exactly and ignore it.
+`Result.routes` reports the engaged route as `dense (gram=float32)`, or
+`dense (gram=float32->native)` after a self-disable.
 
 !!! warning "Known limitation: matrix-free Krylov on equality saddles"
 

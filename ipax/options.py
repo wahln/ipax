@@ -454,25 +454,33 @@ class DenseOptions:
     TROTS dose matrices) — then restores working accuracy with fixed-precision
     iterative refinement against the exact float64 operator matvec (Carson &
     Higham 2018, SIAM J. Sci. Comput. 40(2)): up to ``refine_max_iters``
-    correction steps, stopping at a relative residual of ``refine_tol``.
-    A refinement step contracting by less than ``refine_stall_ratio`` (the
-    ``κ(N)·u₃₂ ≳ 1`` endgame regime), or a positive-definiteness failure the
-    exact matrix does not reproduce, rebuilds the exact matrix and permanently
-    switches that solver instance back to native precision — the accuracy of
-    the returned step is never traded, only the accumulation cost of
-    well-conditioned iterations. (The PD probe runs on the approximate matrix
-    and relies on the refinement stall detector to catch a masked-indefinite
-    exact block — see ``DenseSolver._materialize_and_guard``.) Applies to the
-    inequality/bound **condensed** assembly; equality-constrained saddle
-    systems currently assemble exactly and ignore the request.
+    correction steps, targeting a relative residual of ``refine_tol``. When
+    the budget runs out or the contraction plateaus, the solve is still
+    accepted if its *measured exact residual* is within ``refine_accept_tol``
+    (an honest, looser certificate — mid-barrier Newton steps need nowhere
+    near direct-solve accuracy); only a solve missing even that level fails.
+    A failed solve — or a positive-definiteness failure the exact matrix does
+    not reproduce — rebuilds the exact matrix for that factorization, and
+    ``refine_failure_limit`` *consecutive* failures switch the instance back
+    to native precision for good (conditioning along an IPM run is not
+    monotone, so one hard stretch must not forfeit the savings everywhere
+    else). The accuracy of every returned step is certified by a measured
+    exact residual — only accumulation cost is traded. (The PD probe runs on
+    the approximate matrix and relies on the refinement rejection to catch a
+    masked-indefinite exact block — see
+    ``DenseSolver._materialize_and_guard``.) Applies to the inequality/bound
+    **condensed** assembly; equality-constrained saddle systems currently
+    assemble exactly and ignore the request.
     """
 
     kkt_route: DenseKKTRoute = "condensed"
     augmented_max_size: int = 20_000
     gram_dtype: str = "native"
     refine_tol: float = 1e-10
+    refine_accept_tol: float = 1e-8
     refine_max_iters: int = 15
     refine_stall_ratio: float = 0.9
+    refine_failure_limit: int = 3
 
     def __post_init__(self) -> None:
         if self.kkt_route not in ("condensed", "augmented"):
@@ -483,10 +491,14 @@ class DenseOptions:
             raise ValueError("gram_dtype must be 'native' or 'float32'")
         if self.refine_tol <= 0.0:
             raise ValueError("refine_tol must be positive")
+        if not self.refine_tol <= self.refine_accept_tol < 1.0:
+            raise ValueError("refine_accept_tol must be in [refine_tol, 1)")
         if self.refine_max_iters < 1:
             raise ValueError("refine_max_iters must be a positive integer")
         if not 0.0 < self.refine_stall_ratio <= 1.0:
             raise ValueError("refine_stall_ratio must be in (0, 1]")
+        if self.refine_failure_limit < 1:
+            raise ValueError("refine_failure_limit must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)

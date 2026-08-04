@@ -65,8 +65,12 @@ def test_gram_dtype_option_is_validated():
         DenseOptions(refine_max_iters=0)
     with pytest.raises(ValueError, match="refine_tol"):
         DenseOptions(refine_tol=0.0)
+    with pytest.raises(ValueError, match="refine_accept_tol"):
+        DenseOptions(refine_accept_tol=1e-12)  # below refine_tol
     with pytest.raises(ValueError, match="refine_stall_ratio"):
         DenseOptions(refine_stall_ratio=1.5)
+    with pytest.raises(ValueError, match="refine_failure_limit"):
+        DenseOptions(refine_failure_limit=0)
 
 
 def test_mixed_materialization_is_actually_reduced(namespace):
@@ -166,27 +170,88 @@ def _spd(n=12, seed=5, cond=100.0):
     return q @ np.diag(eigs) @ q.T
 
 
-def test_refinement_stall_rebuilds_exact_and_disables_mixed(namespace):
+def test_refinement_stall_rebuilds_exact_and_counts_failures(namespace):
+    # Each rejected solve answers from the exact rebuild (correct step), and
+    # only refine_failure_limit CONSECUTIVE failures disable the mixed route
+    # for good — conditioning along an IPM run is not monotone, so one hard
+    # factorization must not forfeit the savings on every later one.
     xp = namespace
     a = _spd()
     op = _FakeMixedOperator(xp, a, err=0.05)
     rng = np.random.default_rng(1)
     rhs = xp.asarray(rng.standard_normal(a.shape[0]), dtype=xp.float64)
 
-    solver = DenseSolver(DenseOptions(gram_dtype="float32"))
-    solver.factor(op)
-    x = np.asarray(solver.solve(rhs))
+    solver = DenseSolver(DenseOptions(gram_dtype="float32", refine_failure_limit=3))
+    for expected_mixed_calls in (1, 2, 3):
+        solver.factor(op)
+        x = np.asarray(solver.solve(rhs))
+        np.testing.assert_allclose(x, np.linalg.solve(a, np.asarray(rhs)), rtol=1e-8)
+        assert op.mixed_calls == expected_mixed_calls
+        assert op.exact_calls >= expected_mixed_calls
 
-    np.testing.assert_allclose(x, np.linalg.solve(a, np.asarray(rhs)), rtol=1e-8)
-    assert op.mixed_calls == 1
-    assert op.exact_calls >= 1
-    # Permanently native from here on: a fresh factorization must not try
-    # the mixed materialization again.
+    # Third consecutive failure hit the limit: permanently native from here.
     solver.factor(op)
     np.asarray(solver.solve(rhs))
-    assert op.mixed_calls == 1
+    assert op.mixed_calls == 3
     # Sticky honesty marker: the run used the reduced Gram before disabling.
     assert solver.describe() == "dense (gram=float32->native)"
+
+
+def test_budget_exhaustion_accepts_certified_residual(namespace):
+    # A refinement that runs out of budget while already below the (looser)
+    # refine_accept_tol certificate is a *success*: the refined solve is
+    # returned, no exact rebuild happens, and the failure counter stays 0.
+    xp = namespace
+    a = _spd()
+    op = _FakeMixedOperator(xp, a, err=0.005)  # ρ ≈ 0.2: converging, slowly
+    rng = np.random.default_rng(3)
+    rhs = xp.asarray(rng.standard_normal(a.shape[0]), dtype=xp.float64)
+
+    solver = DenseSolver(
+        DenseOptions(
+            gram_dtype="float32",
+            refine_tol=1e-15,  # unreachable in the budget, on purpose
+            refine_accept_tol=0.05,
+            refine_max_iters=4,
+        )
+    )
+    solver.factor(op)
+    x = solver.solve(rhs)
+
+    residual = np.asarray(rhs - op.matvec(x))
+    bnorm = float(np.max(np.abs(np.asarray(rhs))))
+    assert float(np.max(np.abs(residual))) <= 0.05 * bnorm
+    assert op.exact_calls == 0  # accepted: no exact rebuild
+    assert solver._mixed_failures == 0
+    solver.factor(op)
+    solver.solve(rhs)
+    assert op.mixed_calls == 2  # still on the mixed route
+
+
+def test_failure_counter_resets_on_success(namespace):
+    xp = namespace
+    a = _spd()
+    op = _FakeMixedOperator(xp, a, err=0.5)  # hopeless: every refine fails
+    rng = np.random.default_rng(4)
+    rhs = xp.asarray(rng.standard_normal(a.shape[0]), dtype=xp.float64)
+
+    solver = DenseSolver(DenseOptions(gram_dtype="float32", refine_failure_limit=2))
+    solver.factor(op)
+    solver.solve(rhs)
+    assert solver._mixed_failures == 1 and not solver._mixed_disabled
+
+    op._err = 0.0  # mixed == exact: refinement certifies immediately
+    solver.factor(op)
+    solver.solve(rhs)
+    assert solver._mixed_failures == 0  # success resets the streak
+
+    op._err = 0.5
+    solver.factor(op)
+    solver.solve(rhs)
+    assert solver._mixed_failures == 1 and not solver._mixed_disabled
+    solver.factor(op)
+    solver.solve(rhs)
+    assert solver._mixed_disabled  # two consecutive failures = the limit
 
 
 def test_precision_caused_pd_failure_falls_back_to_exact(namespace):
@@ -206,7 +271,7 @@ def test_precision_caused_pd_failure_falls_back_to_exact(namespace):
     rng = np.random.default_rng(2)
     rhs = xp.asarray(rng.standard_normal(a.shape[0]), dtype=xp.float64)
 
-    solver = DenseSolver(DenseOptions(gram_dtype="float32"))
+    solver = DenseSolver(DenseOptions(gram_dtype="float32", refine_failure_limit=1))
     solver.factor(op)
     x = np.asarray(solver.solve(rhs))  # must NOT raise LinearSolveError
 
@@ -214,7 +279,7 @@ def test_precision_caused_pd_failure_falls_back_to_exact(namespace):
     assert op.mixed_calls == 1
     solver.factor(op)
     np.asarray(solver.solve(rhs))
-    assert op.mixed_calls == 1  # permanently disabled
+    assert op.mixed_calls == 1  # limit 1: disabled by the single PD mismatch
 
 
 def test_genuine_non_pd_still_raises(namespace):

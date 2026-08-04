@@ -13,11 +13,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (the TROTS dose matrices are float32 in the source files; scoped in by
   explicit decision, with AGENTS.md updated), while every other block stays
   float64. Working accuracy is restored per solve by fixed-precision iterative
-  refinement against the exact float64 operator matvec (Carson & Higham 2018),
-  and the scheme is accuracy-preserving by construction: a refinement stall or
-  a positive-definiteness failure the exact matrix does not reproduce — the
-  late-barrier `κ(N)·u32 ≳ 1` regime — rebuilds the exact matrix and
-  permanently returns that solver instance to native precision.
+  refinement against the exact float64 operator matvec (Carson & Higham 2018);
+  every returned step carries a measured exact-residual certificate:
+  refinement targets `refine_tol`, budget-exhausted/plateaued solves are
+  still accepted within the looser `refine_accept_tol`, and a solve missing
+  even that — or a positive-definiteness failure the exact matrix does not
+  reproduce (a `κ(N)·u32 ≳ 1` stretch) — answers from an exact rebuild, with
+  `refine_failure_limit` *consecutive* failures returning the instance to
+  native precision for good (conditioning along an IPM run is not monotone,
+  so one hard factorization is not terminal). Measured on TROTS Protons_01
+  (CPU, 32-thread BLAS): the Gram kernel 11.7 → 5.4 s per compute (2.15×).
   Plumbing: `LinearOperator.gram` gains an optional best-effort
   `accumulate_dtype` keyword (forwarded by `VStack`, the CSR routing wrapper
   and row scaling; honored by the SciPy and CuPy adapters via a cast-once
