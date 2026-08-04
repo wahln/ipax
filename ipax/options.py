@@ -455,10 +455,13 @@ class DenseOptions:
     iterative refinement against the exact float64 operator matvec (Carson &
     Higham 2018, SIAM J. Sci. Comput. 40(2)): up to ``refine_max_iters``
     correction steps, targeting a relative residual of ``refine_tol``. When
-    the budget runs out or the contraction plateaus, the solve is still
-    accepted if its *measured exact residual* is within ``refine_accept_tol``
-    (an honest, looser certificate — mid-barrier Newton steps need nowhere
-    near direct-solve accuracy); only a solve missing even that level fails.
+    the budget runs out, the contraction plateaus, or the sequence diverges
+    (fp32 rounding concentrated in the small-eigenvalue subspace makes the
+    *first* iterate the best one), the best iterate seen is still accepted if
+    its *measured exact residual* is within ``refine_accept_tol`` — an
+    honest, looser certificate, and still far tighter than the inexact-Newton
+    forcing the Krylov route solves the same systems with (Dembo, Eisenstat &
+    Steihaug 1982); only a solve missing even that level fails.
     A failed solve — or a positive-definiteness failure the exact matrix does
     not reproduce — rebuilds the exact matrix for that factorization, and
     ``refine_failure_limit`` *consecutive* failures switch the instance back
@@ -477,7 +480,7 @@ class DenseOptions:
     augmented_max_size: int = 20_000
     gram_dtype: str = "native"
     refine_tol: float = 1e-10
-    refine_accept_tol: float = 1e-8
+    refine_accept_tol: float = 1e-6
     refine_max_iters: int = 15
     refine_stall_ratio: float = 0.9
     refine_failure_limit: int = 3

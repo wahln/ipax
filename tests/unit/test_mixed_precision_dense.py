@@ -170,6 +170,25 @@ def _spd(n=12, seed=5, cond=100.0):
     return q @ np.diag(eigs) @ q.T
 
 
+class _HopelessMixed(_FakeMixedOperator):
+    """Mixed materialization that is SPD (passes the guard) but structurally
+    wrong: ``tr(A)·I`` gives refinement a ~1−λ_min/tr(A) contraction (an
+    immediate plateau at the stall ratio) with an O(1) best residual — every
+    mixed solve must be rejected. ``broken = False`` returns the exact matrix
+    instead (a certified success), for exercising the failure-streak reset."""
+
+    broken = True
+
+    def dense_matrix_mixed(self, like, gram_dtype):
+        self.mixed_calls += 1
+        if not self.broken:
+            return self._xp.asarray(self._a, dtype=self._xp.float64)
+        n = self._a.shape[0]
+        return self._xp.asarray(
+            float(np.trace(self._a)) * np.eye(n), dtype=self._xp.float64
+        )
+
+
 def test_refinement_stall_rebuilds_exact_and_counts_failures(namespace):
     # Each rejected solve answers from the exact rebuild (correct step), and
     # only refine_failure_limit CONSECUTIVE failures disable the mixed route
@@ -177,7 +196,7 @@ def test_refinement_stall_rebuilds_exact_and_counts_failures(namespace):
     # factorization must not forfeit the savings on every later one.
     xp = namespace
     a = _spd()
-    op = _FakeMixedOperator(xp, a, err=0.05)
+    op = _HopelessMixed(xp, a, err=0.0)
     rng = np.random.default_rng(1)
     rhs = xp.asarray(rng.standard_normal(a.shape[0]), dtype=xp.float64)
 
@@ -231,7 +250,7 @@ def test_budget_exhaustion_accepts_certified_residual(namespace):
 def test_failure_counter_resets_on_success(namespace):
     xp = namespace
     a = _spd()
-    op = _FakeMixedOperator(xp, a, err=0.5)  # hopeless: every refine fails
+    op = _HopelessMixed(xp, a, err=0.0)  # broken: every refine fails
     rng = np.random.default_rng(4)
     rhs = xp.asarray(rng.standard_normal(a.shape[0]), dtype=xp.float64)
 
@@ -240,12 +259,12 @@ def test_failure_counter_resets_on_success(namespace):
     solver.solve(rhs)
     assert solver._mixed_failures == 1 and not solver._mixed_disabled
 
-    op._err = 0.0  # mixed == exact: refinement certifies immediately
+    op.broken = False  # mixed == exact: refinement certifies immediately
     solver.factor(op)
     solver.solve(rhs)
     assert solver._mixed_failures == 0  # success resets the streak
 
-    op._err = 0.5
+    op.broken = True
     solver.factor(op)
     solver.solve(rhs)
     assert solver._mixed_failures == 1 and not solver._mixed_disabled

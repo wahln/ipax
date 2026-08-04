@@ -354,6 +354,12 @@ class DenseSolver:
         stall_ratio = self._options.refine_stall_ratio
         max_iters = self._options.refine_max_iters
         previous = math.inf
+        # Track the best iterate: when κ·u32 > 1 the sequence diverges, and
+        # because the fp32 Gram's rounding concentrates in the small-eigenvalue
+        # subspace the *initial* iterate is typically the best one — accepting
+        # the minimum-residual iterate instead of the last keeps those solves.
+        best = x
+        best_rnorm = math.inf
         for iteration in range(max_iters + 1):
             self.refine_iterations = iteration
             try:
@@ -361,12 +367,16 @@ class DenseSolver:
             except Exception:
                 return None  # no exact matvec ⇒ a mixed factor is uncertifiable
             rnorm = float(xp.max(xp.abs(residual)))
+            if rnorm < best_rnorm:
+                best = x
+                best_rnorm = rnorm
             if rnorm <= tol * bnorm:
                 return x
             if rnorm >= stall_ratio * previous or iteration == max_iters:
-                # Plateaued or out of budget: accept on the measured exact
-                # residual if it clears the (looser) acceptance certificate.
-                return x if rnorm <= accept_tol * bnorm else None
+                # Plateaued, diverging, or out of budget: accept the best
+                # iterate on its measured exact residual if it clears the
+                # (looser) acceptance certificate.
+                return best if best_rnorm <= accept_tol * bnorm else None
             previous = rnorm
             x = x + self._solve_factored(self._matrix, residual, xp)
         return None
