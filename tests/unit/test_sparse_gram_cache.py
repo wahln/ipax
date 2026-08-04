@@ -304,6 +304,69 @@ def test_gram_dense_strategy_mixed_dtype_promotes(monkeypatch):
     )
 
 
+def test_gram_accumulate_dtype_float32_reduced_but_close(monkeypatch):
+    # ``accumulate_dtype="float32"`` runs the dense accumulation in float32
+    # (cached reduced-data CSR, fp32 syrk) and upcasts the n×n result: the
+    # values must be float64-typed, close to the exact Gram at fp32 rounding,
+    # and *different* from it (proof the reduced path really ran).
+    import ipax.backend.sparse.numpy_scipy as adapter
+
+    monkeypatch.setattr(adapter, "_GRAM_DENSE_MIN_DENSITY", 0.0)
+    monkeypatch.setattr(adapter, "_GRAM_DENSE_CHUNK_ELEMENTS", 64)
+    calls = _spy_blas_dispatch(monkeypatch)
+
+    rng = np.random.default_rng(21)
+    matrix = scipy_sparse.csr_matrix(rng.standard_normal((37, 6)) * 1e3)
+    weights = rng.uniform(1e-3, 1e2, size=37)
+
+    op = _operator(matrix)
+    exact = np.asarray(op.gram(xp_numpy.asarray(weights)))
+    reduced = np.asarray(op.gram(xp_numpy.asarray(weights), accumulate_dtype="float32"))
+
+    assert calls == ["syrk", "syrk"]  # both strategies stayed on the syrk path
+    assert reduced.dtype == np.float64
+    rel = np.max(np.abs(reduced - exact)) / np.max(np.abs(exact))
+    assert 1e-12 < rel < 1e-4
+    np.testing.assert_array_equal(reduced, reduced.T)
+
+
+def test_gram_memo_is_keyed_by_accumulate_dtype(monkeypatch):
+    # A reduced-precision request must not serve (or poison) the native memo —
+    # and the two dtypes get *separate* slots, so the mixed route's legitimate
+    # exact/reduced alternation with identical weights (a mixed PD failure
+    # re-materializing exactly inside a δ_w retry) never thrashes the memo.
+    import ipax.backend.sparse.numpy_scipy as adapter
+
+    monkeypatch.setattr(adapter, "_GRAM_DENSE_MIN_DENSITY", 0.0)
+
+    op = _operator()
+    weights = np.asarray([0.5, 2.0, 1.0, 0.25, 3.0, 0.75])
+    op.gram(xp_numpy.asarray(weights))
+    assert op._gram_compute_count == 1
+    op.gram(xp_numpy.asarray(weights), accumulate_dtype="float32")
+    assert op._gram_compute_count == 2  # recomputed, not served from memo
+    op.gram(xp_numpy.asarray(weights), accumulate_dtype="float32")
+    assert op._gram_compute_count == 2  # reduced request memo-hits now
+    op.gram(xp_numpy.asarray(weights))
+    assert op._gram_compute_count == 2  # native slot survived the alternation
+
+
+def test_reduced_data_csr_is_released_on_native_fallback(monkeypatch):
+    # After the mixed route permanently falls back, requests are all-native:
+    # the fp32 data copy (4 bytes/nnz — multi-GB at RT scale) must be freed on
+    # the first native request rather than pinned for the rest of the run.
+    import ipax.backend.sparse.numpy_scipy as adapter
+
+    monkeypatch.setattr(adapter, "_GRAM_DENSE_MIN_DENSITY", 0.0)
+
+    op = _operator()
+    weights = np.asarray([0.5, 2.0, 1.0, 0.25, 3.0, 0.75])
+    op.gram(xp_numpy.asarray(weights), accumulate_dtype="float32")
+    assert op._reduced_csr is not None
+    op.gram(xp_numpy.asarray(weights))
+    assert op._reduced_csr is None
+
+
 def test_gram_dense_strategy_negative_weights_match_reference(monkeypatch):
     # Negative weights make √w-scaling impossible, so the accumulation must
     # fall back to the general GEMM form — values still match the reference.

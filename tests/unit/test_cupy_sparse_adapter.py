@@ -890,6 +890,29 @@ def test_cupy_gram_dense_strategy_uses_syrk_and_mirrors(
     )
 
 
+def test_cupy_gram_accumulate_dtype_float32(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Mirror of the SciPy adapter's reduced-precision accumulate: float32
+    # accumulation (the ~10x lever on consumer GPUs), float64 result.
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_MIN_DENSITY", 0.0)
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_CHUNK_ELEMENTS", 40)
+
+    rng = np.random.default_rng(15)
+    matrix = scipy_sparse.csr_matrix(rng.standard_normal((19, 5)) * 1e3)
+    weights = rng.uniform(1e-3, 1e2, size=19)
+    operator = _dense_gram_operator(cupy_sparse_module, matrix, weights)
+
+    exact = np.asarray(operator.gram(weights))
+    reduced = np.asarray(operator.gram(weights, accumulate_dtype="float32"))
+
+    assert reduced.dtype == np.float64
+    rel = np.max(np.abs(reduced - exact)) / np.max(np.abs(exact))
+    assert 1e-12 < rel < 1e-4
+    np.testing.assert_array_equal(reduced, reduced.T)
+    assert operator._gram_compute_count == 2  # memo keyed by dtype
+
+
 def test_cupy_gram_dense_strategy_negative_weights_fall_back(
     cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:

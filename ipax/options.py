@@ -446,16 +446,47 @@ class DenseOptions:
     gigabytes for a system whose condensed form is only ``n × n``. When the
     assembled size would exceed this bound the solver silently falls back to
     the condensed route (losing only the inertia diagnostic, not correctness).
+
+    ``gram_dtype="float32"`` (opt-in; default ``"native"``) accumulates the
+    FLOP-dominant condensed inequality Gram term ``∇gᵀ Σ_s ∇g`` in float32 —
+    ~2× on CPUs and up to the fp32/fp64 rate ratio on consumer GPUs, and the
+    natural fit when the constraint data is float32 at the source (e.g. the
+    TROTS dose matrices) — then restores working accuracy with fixed-precision
+    iterative refinement against the exact float64 operator matvec (Carson &
+    Higham 2018, SIAM J. Sci. Comput. 40(2)): up to ``refine_max_iters``
+    correction steps, stopping at a relative residual of ``refine_tol``.
+    A refinement step contracting by less than ``refine_stall_ratio`` (the
+    ``κ(N)·u₃₂ ≳ 1`` endgame regime), or a positive-definiteness failure the
+    exact matrix does not reproduce, rebuilds the exact matrix and permanently
+    switches that solver instance back to native precision — the accuracy of
+    the returned step is never traded, only the accumulation cost of
+    well-conditioned iterations. (The PD probe runs on the approximate matrix
+    and relies on the refinement stall detector to catch a masked-indefinite
+    exact block — see ``DenseSolver._materialize_and_guard``.) Applies to the
+    inequality/bound **condensed** assembly; equality-constrained saddle
+    systems currently assemble exactly and ignore the request.
     """
 
     kkt_route: DenseKKTRoute = "condensed"
     augmented_max_size: int = 20_000
+    gram_dtype: str = "native"
+    refine_tol: float = 1e-10
+    refine_max_iters: int = 15
+    refine_stall_ratio: float = 0.9
 
     def __post_init__(self) -> None:
         if self.kkt_route not in ("condensed", "augmented"):
             raise ValueError("dense kkt_route must be 'condensed' or 'augmented'")
         if self.augmented_max_size < 1:
             raise ValueError("augmented_max_size must be a positive integer")
+        if self.gram_dtype not in ("native", "float32"):
+            raise ValueError("gram_dtype must be 'native' or 'float32'")
+        if self.refine_tol <= 0.0:
+            raise ValueError("refine_tol must be positive")
+        if self.refine_max_iters < 1:
+            raise ValueError("refine_max_iters must be a positive integer")
+        if not 0.0 < self.refine_stall_ratio <= 1.0:
+            raise ValueError("refine_stall_ratio must be in (0, 1]")
 
 
 @dataclass(frozen=True, slots=True)

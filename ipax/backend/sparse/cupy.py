@@ -257,9 +257,11 @@ class SparseOperator(LinearOperator):
         self._gram_transpose: Any = None  # Aᵀ as CSR
         self._gram_scaled: Any = None  # diag(w)A same-pattern buffer
         self._gram_row_index: Any = None  # nnz → row map for w expansion
-        self._gram_weights: Any = None  # memo key (last weights, device)
-        self._gram_value: Any = None  # memoized dense n×n result (device)
+        # One memo slot per accumulate_dtype (see the SciPy adapter's comment:
+        # mixed/exact alternation with identical weights must not evict).
+        self._gram_memo: dict[str | None, tuple[Any, Any]] = {}
         self._gram_compute_count = 0  # observability/testing: actual SpGEMM runs
+        self._reduced_csr: Any = None  # cast-once reduced-precision data CSR
         self._squared: Any = None  # A∘A (shared by the Gram diagonals)
         # Sparse-Gram (COO) memo for the sparse normal-equations route.
         self._gram_coo_weights: Any = None
@@ -325,17 +327,20 @@ class SparseOperator(LinearOperator):
         out = self._squared_csr.T @ _to_cupy(weights)
         return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
 
-    def gram(self, weights: Array) -> Array:
+    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
         # Aᵀ diag(w) A as a dense n×n matrix via sparse arithmetic (row-scale then
         # sparse Gram), densifying only the small n×n result — mirror of the SciPy
         # adapter's cached ``gram`` (see its comment for the caching rationale).
         # The memo compare costs one device reduction + host sync per call; the
         # SpGEMM it skips is orders of magnitude more work at n ≪ m scale.
         w = _to_cupy(weights).reshape(-1)
-        if self._gram_value is not None and bool(
-            cupy.array_equal(w, self._gram_weights)
-        ):
-            return cast("Array", to_xp_array(self._gram_value, self._xp))
+        if accumulate_dtype is None and self._reduced_csr is not None:
+            # Native request after reduced ones: the mixed route has fallen
+            # back — free the reduced-data device copy (multi-GB at RT nnz).
+            self._reduced_csr = None
+        memo = self._gram_memo.get(accumulate_dtype)
+        if memo is not None and bool(cupy.array_equal(w, memo[0])):
+            return cast("Array", to_xp_array(memo[1], self._xp))
 
         a = self._matrix
         m, n = a.shape
@@ -344,7 +349,19 @@ class SparseOperator(LinearOperator):
             # Dense-ish rows: chunked dense GEMM (cuBLAS) beats SpGEMM — the
             # CPU-calibrated crossover of the SciPy adapter, if anything more
             # pronounced on GPU tensor pipelines.
-            gram = self._gram_dense_accumulate(a, w)
+            if accumulate_dtype is not None:
+                # Mixed-precision accumulate — mirror of the SciPy adapter:
+                # cast-once reduced-data CSR, reduced-dtype cuBLAS
+                # accumulation (the fp32/fp64 rate ratio is the whole point
+                # on consumer GPUs), upcast only the n×n result. Dense
+                # strategy only; the SpGEMM branch ignores the request.
+                acc = cupy.dtype(accumulate_dtype)
+                gram = self._gram_dense_accumulate(
+                    self._reduced_data_csr(acc), w.astype(acc, copy=False)
+                )
+                gram = gram.astype(cupy.result_type(a.dtype, w.dtype), copy=False)
+            else:
+                gram = self._gram_dense_accumulate(a, w)
         else:
             if self._gram_transpose is None:
                 self._gram_transpose = a.T.tocsr()
@@ -359,10 +376,22 @@ class SparseOperator(LinearOperator):
             scaled = self._gram_scaled
             scaled.data = a.data * w[self._gram_row_index]
             gram = cupy.asarray((self._gram_transpose @ scaled).toarray())
-        self._gram_weights = w.copy()
-        self._gram_value = gram
+        self._gram_memo[accumulate_dtype] = (w.copy(), gram)
         self._gram_compute_count += 1
         return cast("Array", to_xp_array(gram, self._xp))
+
+    def _reduced_data_csr(self, dtype: Any) -> Any:
+        """Same-structure CSR with the data cast once to ``dtype`` (device).
+
+        Index arrays are shared with the wrapped matrix; only the value array
+        is duplicated, so reduced-precision accumulates read half the bytes
+        with no per-chunk cast."""
+        if self._reduced_csr is None or self._reduced_csr.dtype != dtype:
+            a = self._matrix
+            self._reduced_csr = cupyx.scipy.sparse.csr_matrix(
+                (a.data.astype(dtype), a.indices, a.indptr), shape=a.shape
+            )
+        return self._reduced_csr
 
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         # ``Aᵀ diag(w) A`` kept SPARSE for the sparse normal-equations route —

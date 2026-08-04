@@ -7,6 +7,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Mixed-precision condensed Gram (opt-in): `DenseOptions(gram_dtype="float32")`.**
+  The dense condensed route's dominant kernel — accumulating `∇gᵀ Σ_s ∇g`,
+  80–90% of per-iteration wall at radiotherapy scale — can now run in float32
+  (the TROTS dose matrices are float32 in the source files; scoped in by
+  explicit decision, with AGENTS.md updated), while every other block stays
+  float64. Working accuracy is restored per solve by fixed-precision iterative
+  refinement against the exact float64 operator matvec (Carson & Higham 2018),
+  and the scheme is accuracy-preserving by construction: a refinement stall or
+  a positive-definiteness failure the exact matrix does not reproduce — the
+  late-barrier `κ(N)·u32 ≳ 1` regime — rebuilds the exact matrix and
+  permanently returns that solver instance to native precision.
+  Plumbing: `LinearOperator.gram` gains an optional best-effort
+  `accumulate_dtype` keyword (forwarded by `VStack`, the CSR routing wrapper
+  and row scaling; honored by the SciPy and CuPy adapters via a cast-once
+  reduced-data CSR), `_CondensedOperator.dense_matrix_mixed` covers
+  gram-capable and generic (pure Array-API `float32`) Jacobians alike, and
+  `Result.routes` reports the engaged route as `dense (gram=float32)`.
 - **Routing-hints registry + report section.** `benchmarks/routing_hints.py`
   is a curated registry of *measured* per-problem wins for the opt-in levers
   (recipe, metrics, failure signature, budget), and the S2MPJ sweep report

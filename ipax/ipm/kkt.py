@@ -338,6 +338,21 @@ class _CondensedOperator(LinearOperator):
 
     def dense_matrix(self, like: Array | None = None) -> Array:
         """Materialize the condensed dense block from explicit operator pieces."""
+        return self._dense_matrix_impl(like, None)
+
+    def dense_matrix_mixed(self, like: Array | None, gram_dtype: str) -> Array:
+        """:meth:`dense_matrix` with the Gram term accumulated in ``gram_dtype``.
+
+        The mixed-precision dense route (``DenseOptions.gram_dtype``): the
+        FLOP-dominant ``∇gᵀ Σ_s ∇g`` accumulation runs in reduced precision
+        (float32) while every other block — and the returned matrix — stays in
+        the working dtype. ``DenseSolver`` restores full accuracy afterwards by
+        iterative refinement against this operator's exact :meth:`matvec`
+        (Carson & Higham 2018).
+        """
+        return self._dense_matrix_impl(like, gram_dtype)
+
+    def _dense_matrix_impl(self, like: Array | None, gram_dtype: str | None) -> Array:
         dense = self.logical_dense_block(like)
 
         if self._ineq_jac.shape[0] > 0:
@@ -347,32 +362,58 @@ class _CondensedOperator(LinearOperator):
             # built by sparse arithmetic, never densifying the m×n Jacobian. Falls
             # back to the explicit densify-and-matmul when the operator has no
             # ``gram`` (e.g. a dense/matrix-free Jacobian) or Σ_s is non-diagonal.
-            gram = self._sparse_gram(dense)
+            gram = self._sparse_gram(dense, gram_dtype)
             if gram is not None:
-                dense = dense + gram
+                dense = dense + xp.astype(gram, dense.dtype, copy=False)
             else:
                 jac = self._ineq_jac.dense_matrix(dense)
-                if isinstance(self._sigma_s, (Diagonal, Identity)):
-                    sigma_s_jac = (
-                        xp.expand_dims(self._sigma_s.diagonal(jac), axis=1) * jac
-                    )
+                if gram_dtype is not None:
+                    # Generic reduced-precision path (any Array-API backend):
+                    # cast the densified Jacobian and weights down, accumulate
+                    # the Gram product in reduced precision, upcast only the
+                    # n×n result. ``float32`` is a required Array-API dtype, so
+                    # this needs no backend-specific code.
+                    reduced = getattr(xp, gram_dtype)
+                    jac_r = xp.astype(jac, reduced)
+                    if isinstance(self._sigma_s, (Diagonal, Identity)):
+                        sigma_r = xp.astype(self._sigma_s.diagonal(jac), reduced)
+                        sigma_s_jac = xp.expand_dims(sigma_r, axis=1) * jac_r
+                    else:
+                        sigma_r = xp.astype(self._sigma_s.dense_matrix(jac), reduced)
+                        sigma_s_jac = xp.matmul(sigma_r, jac_r)
+                    product = xp.matmul(xp.permute_dims(jac_r, (1, 0)), sigma_s_jac)
+                    dense = dense + xp.astype(product, dense.dtype)
                 else:
-                    sigma_s_jac = xp.matmul(self._sigma_s.dense_matrix(jac), jac)
-                dense = dense + xp.matmul(xp.permute_dims(jac, (1, 0)), sigma_s_jac)
+                    if isinstance(self._sigma_s, (Diagonal, Identity)):
+                        sigma_s_jac = (
+                            xp.expand_dims(self._sigma_s.diagonal(jac), axis=1) * jac
+                        )
+                    else:
+                        sigma_s_jac = xp.matmul(self._sigma_s.dense_matrix(jac), jac)
+                    dense = dense + xp.matmul(xp.permute_dims(jac, (1, 0)), sigma_s_jac)
 
         return dense
 
-    def _sparse_gram(self, like: Array) -> Array | None:
+    def _sparse_gram(self, like: Array, gram_dtype: str | None = None) -> Array | None:
         """``∇gᵀ Σ_s ∇g`` via the Jacobian's sparse Gram, or ``None`` to densify.
 
         Available only when Σ_s is diagonal (the standard slack scaling) and the
         inequality Jacobian exposes :meth:`~ipax.backend.operators.LinearOperator.
         gram`; either absent returns ``None`` so the caller densifies instead.
+        ``gram_dtype`` forwards the mixed-precision accumulate request; operators
+        predating the keyword (``TypeError``) are retried without it, so the
+        request degrades to an exact Gram rather than failing.
         """
         if not isinstance(self._sigma_s, (Diagonal, Identity)):
             return None
+        weights = self._sigma_s.diagonal(like)
         try:
-            return self._ineq_jac.gram(self._sigma_s.diagonal(like))
+            if gram_dtype is None:
+                return self._ineq_jac.gram(weights)
+            try:
+                return self._ineq_jac.gram(weights, accumulate_dtype=gram_dtype)
+            except TypeError:
+                return self._ineq_jac.gram(weights)
         except NotImplementedError:
             return None
 

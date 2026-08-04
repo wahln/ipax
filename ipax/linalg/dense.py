@@ -48,6 +48,7 @@ expose the bordered matrix (e.g. an L-BFGS Hessian, already PD by damping).
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any
 
 from ipax.backend.namespace import array_namespace
@@ -59,6 +60,16 @@ if TYPE_CHECKING:
     from ipax.backend.operators import LinearOperator
     from ipax.options import DenseOptions
     from ipax.typing import Array
+
+
+# Floor for the refinement stopping tolerance, in units of the rhs dtype's
+# machine epsilon: ``DenseOptions.refine_tol`` assumes float64 working
+# precision, so on a float32 working dtype the absolute default (1e-10) would
+# be unreachable and every solve would burn the whole refinement budget before
+# falling back. The achievable limiting residual of fixed-precision refinement
+# is a small multiple of u·‖N‖‖x‖ (Carson & Higham 2018), hence a small
+# constant times eps.
+_REFINE_TOL_EPS_FACTOR = 16.0
 
 
 def _eigenvalue_inertia(eigenvalues: Array, xp: Any) -> tuple[int, int, int]:
@@ -115,10 +126,32 @@ class DenseSolver:
         self._cholesky_factor: Array | None = None
         self._cholesky_solve: Callable[[Array, Array], Array] | None = None
         self._cholesky_solve_checked = False
+        # Mixed-precision Gram state (DenseOptions.gram_dtype): whether the
+        # *current* factorization was materialized with a reduced-precision
+        # Gram (so solves must be refined), and the instance-wide kill switch
+        # set the first time reduced precision demonstrably fails (refinement
+        # stall, or a PD failure the exact matrix does not reproduce) — the
+        # κ(N)·u32 ≳ 1 endgame, after which every factorization stays native.
+        self._mixed_engaged = False
+        self._mixed_disabled = False
+        self._mixed_ever_engaged = False
+        self.refine_iterations = 0  # corrections applied by the last solve()
 
     def describe(self) -> str:
-        """Human-readable label for diagnostics."""
-        return "dense (augmented)" if self._inertia is not None else "dense"
+        """Human-readable label for diagnostics.
+
+        The mixed marker is sticky: a run that used the reduced-precision
+        Gram and later self-disabled reports ``gram=float32->native`` rather
+        than pretending it ran native throughout (``Result.routes`` captures
+        this label once, after the driver returns).
+        """
+        if self._inertia is not None:
+            return "dense (augmented)"
+        if self._mixed_engaged:
+            return f"dense (gram={self._options.gram_dtype})"
+        if self._mixed_disabled and self._mixed_ever_engaged:
+            return f"dense (gram={self._options.gram_dtype}->native)"
+        return "dense"
 
     def kkt_form(self) -> str:
         """The KKT assembly actually factored (``Result.routes.kkt_form``).
@@ -145,6 +178,8 @@ class DenseSolver:
         self._eigenvectors = None
         self._inertia = None
         self._cholesky_factor = None
+        self._mixed_engaged = False
+        self.refine_iterations = 0
 
     def solve(self, rhs: Array) -> Array:
         if self._operator is None:
@@ -181,11 +216,83 @@ class DenseSolver:
                 except Exception as exc:
                     raise LinearSolveError("dense structured solve failed") from exc
 
-            self._matrix = self._materialize_dense_matrix(rhs, xp, n)
-            self._guard_positive_definite(self._matrix, xp)
+            self._materialize_and_guard(rhs, xp, n)
 
         matrix = self._matrix
         assert matrix is not None
+        self.refine_iterations = 0
+        x = self._solve_factored(matrix, rhs, xp)
+        if not self._mixed_engaged:
+            return x
+
+        refined = self._refine(x, rhs, xp)
+        if refined is not None:
+            return refined
+        # Refinement stalled (or could not run): the reduced-precision factor
+        # is not accurate enough for this system — the κ(N)·u32 ≳ 1 endgame.
+        # Rebuild the exact matrix, permanently switch this instance to
+        # native precision, and answer from the exact factorization.
+        self._mixed_disabled = True
+        self._mixed_engaged = False
+        self._cholesky_factor = None
+        self._matrix = self._materialize_dense_matrix(rhs, xp, n)
+        self._guard_positive_definite(self._matrix, xp)
+        return self._solve_factored(self._matrix, rhs, xp)
+
+    def _materialize_and_guard(self, rhs: Array, xp: Any, n: int) -> None:
+        """Materialize + PD-probe ``self._matrix``, preferring the mixed route.
+
+        With ``gram_dtype != "native"`` (and no prior failure) the condensed
+        matrix is materialized through the operator's ``dense_matrix_mixed``
+        hook — the Gram term accumulated in reduced precision. A PD failure of
+        the mixed matrix that the exact matrix does *not* reproduce is
+        precision noise: the solver keeps the exact matrix and permanently
+        disables the mixed route; a failure the exact matrix reproduces is
+        genuine (propagates, mixed stays enabled).
+
+        Note the PD probe runs on the *approximate* matrix, so the converse
+        masking — an indefinite exact ``N`` whose mixed materialization is PD —
+        passes the guard here. That masking requires a negative eigenvalue of
+        size ≲ u32·‖N‖, which forces the refinement contraction ρ ≈ κ·u32 ≳ 1:
+        the stall detector in :meth:`_refine` then rejects the solve and the
+        exact rebuild re-probes (and fails) on the exact matrix. The guard and
+        the stall detector are a *pair* — weakening either breaks the dense
+        route's indefiniteness detection under mixed precision (pinned by
+        ``test_masked_indefinite_exact_matrix_still_escalates``).
+        """
+        mixed_hook = getattr(self._operator, "dense_matrix_mixed", None)
+        if (
+            self._options.gram_dtype != "native"
+            and not self._mixed_disabled
+            and mixed_hook is not None
+        ):
+            try:
+                matrix = mixed_hook(rhs, self._options.gram_dtype)
+            except NotImplementedError:
+                matrix = None
+            except Exception as exc:
+                raise LinearSolveError("dense matrix materialization failed") from exc
+            if matrix is not None:
+                self._mixed_ever_engaged = True
+                try:
+                    self._guard_positive_definite(matrix, xp)
+                except LinearSolveError:
+                    self._cholesky_factor = None
+                    exact = self._materialize_dense_matrix(rhs, xp, n)
+                    self._guard_positive_definite(exact, xp)  # genuine ⇒ raises
+                    self._mixed_disabled = True
+                    self._mixed_engaged = False
+                    self._matrix = exact
+                    return
+                self._mixed_engaged = True
+                self._matrix = matrix
+                return
+        self._mixed_engaged = False
+        self._matrix = self._materialize_dense_matrix(rhs, xp, n)
+        self._guard_positive_definite(self._matrix, xp)
+
+    def _solve_factored(self, matrix: Array, rhs: Array, xp: Any) -> Array:
+        """Back-substitute the kept Cholesky factor, falling back to LU."""
         if self._cholesky_factor is not None:
             solve_cholesky = self._lookup_cholesky_solve(xp)
             if solve_cholesky is not None:
@@ -198,6 +305,48 @@ class DenseSolver:
                     # (the factor is dropped so later solves skip the retry).
                     self._cholesky_factor = None
         return self._solve_lu(matrix, rhs, xp)
+
+    def _refine(self, x: Array, rhs: Array, xp: Any) -> Array | None:
+        """Fixed-precision iterative refinement against the exact operator.
+
+        The factorization approximates ``N`` only to the reduced-precision
+        Gram's rounding, but the residual is evaluated with the operator's
+        exact float64 ``matvec`` — classic fixed-precision refinement
+        (Wilkinson; Carson & Higham 2018, SIAM J. Sci. Comput. 40(2)): each
+        correction contracts the error by ρ ≈ κ(N)·u32, so a handful of
+        O(n²)-solve + matvec steps restores working accuracy whenever
+        ρ < 1. Returns ``None`` when a step contracts by less than
+        ``refine_stall_ratio`` (or the budget runs out before ``refine_tol``)
+        — the caller's signal to rebuild in native precision.
+        """
+        assert self._operator is not None and self._matrix is not None
+        apply = self._operator.matvec if len(rhs.shape) == 1 else self._operator.matmat
+        bnorm = float(xp.max(xp.abs(rhs)))
+        if bnorm == 0.0 or not math.isfinite(bnorm):
+            return x
+        # Floor the stopping tolerance on the working dtype's eps: the
+        # configured default assumes float64 and would be unreachable on a
+        # float32 working dtype (see _REFINE_TOL_EPS_FACTOR).
+        tol = max(
+            self._options.refine_tol,
+            _REFINE_TOL_EPS_FACTOR * float(xp.finfo(rhs.dtype).eps),
+        )
+        stall_ratio = self._options.refine_stall_ratio
+        previous = math.inf
+        for iteration in range(self._options.refine_max_iters + 1):
+            self.refine_iterations = iteration
+            try:
+                residual = rhs - apply(x)
+            except Exception:
+                return None  # no exact matvec ⇒ a mixed factor is uncertifiable
+            rnorm = float(xp.max(xp.abs(residual)))
+            if rnorm <= tol * bnorm:
+                return x
+            if rnorm >= stall_ratio * previous:
+                return None
+            previous = rnorm
+            x = x + self._solve_factored(self._matrix, residual, xp)
+        return None
 
     def _solve_lu(self, matrix: Array, rhs: Array, xp: Any) -> Array:
         try:

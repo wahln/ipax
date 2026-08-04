@@ -229,9 +229,14 @@ class SparseOperator(LinearOperator):
         self._gram_transpose: scipy.sparse.csr_matrix | None = None  # Aᵀ as CSR
         self._gram_scaled: scipy.sparse.csr_matrix | None = None  # diag(w)A buffer
         self._gram_row_index: np.ndarray | None = None  # nnz → row map for w
-        self._gram_weights: np.ndarray | None = None  # memo key (last weights)
-        self._gram_value: np.ndarray | None = None  # memoized dense n×n result
+        # One memo slot per accumulate_dtype: the mixed-precision dense route
+        # legitimately alternates reduced and exact requests with identical
+        # weights (e.g. a mixed PD failure re-materializing exactly inside a
+        # δ_w retry), and a single slot would evict on every alternation —
+        # exactly where the memo is meant to pay off. At most 2 keys × n².
+        self._gram_memo: dict[str | None, tuple[np.ndarray, np.ndarray]] = {}
         self._gram_compute_count = 0  # observability/testing: actual SpGEMM runs
+        self._reduced_csr: scipy.sparse.csr_matrix | None = None  # cast-once data
         self._squared: scipy.sparse.csr_matrix | None = None  # A∘A (Gram diagonals)
         # Sparse-Gram (COO) memo for the sparse normal-equations route.
         self._gram_coo_weights: np.ndarray | None = None
@@ -310,7 +315,7 @@ class SparseOperator(LinearOperator):
         out = self._squared_csr.T @ _to_numpy(weights)
         return to_xp_array(np.asarray(out).reshape(-1), self._xp)
 
-    def gram(self, weights: Array) -> Array:
+    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
         # Aᵀ diag(w) A as a dense n×n matrix, formed by sparse arithmetic: scale
         # rows by w (still sparse) then a sparse Aᵀ·(diag(w)A) product, densifying
         # only the small n×n result — never the m×n matrix A itself (the point at
@@ -325,12 +330,14 @@ class SparseOperator(LinearOperator):
         # besides the product itself. Callers must treat the returned array as
         # read-only; the condensed route only ever adds it out-of-place.
         w = _to_numpy(weights).reshape(-1)
-        if (
-            self._gram_value is not None
-            and self._gram_weights is not None
-            and np.array_equal(w, self._gram_weights)
-        ):
-            return to_xp_array(self._gram_value, self._xp)
+        if accumulate_dtype is None and self._reduced_csr is not None:
+            # A native request after reduced ones means the mixed route has
+            # (permanently) fallen back — release the fp32 data copy rather
+            # than pinning nnz·4 bytes with no remaining consumer.
+            self._reduced_csr = None
+        memo = self._gram_memo.get(accumulate_dtype)
+        if memo is not None and np.array_equal(w, memo[0]):
+            return to_xp_array(memo[1], self._xp)
 
         a = self._csr_matrix
         m, n = a.shape
@@ -340,7 +347,20 @@ class SparseOperator(LinearOperator):
             # dense GEMM — SpGEMM's Σ nnz_row² hash arithmetic (plus its
             # per-call symbolic pass) is the wrong algorithm here (see
             # _GRAM_DENSE_MIN_DENSITY for the model and measurements).
-            gram = self._gram_dense_accumulate(a, w)
+            if accumulate_dtype is not None:
+                # Mixed-precision accumulate (``DenseOptions.gram_dtype``):
+                # run the chunked accumulation in the reduced dtype through a
+                # cached same-structure CSR (data cast once, indices shared),
+                # then upcast only the small n×n result. Only this dense
+                # strategy honors the request — the SpGEMM branch below is
+                # memory-bound, so reduced arithmetic buys little there.
+                acc = np.dtype(accumulate_dtype)
+                gram = self._gram_dense_accumulate(
+                    self._reduced_data_csr(acc), w.astype(acc, copy=False)
+                )
+                gram = gram.astype(np.result_type(a.dtype, w.dtype), copy=False)
+            else:
+                gram = self._gram_dense_accumulate(a, w)
         else:
             if self._gram_transpose is None:
                 # One-time symbolic work: the n×m transpose CSR (scipy would
@@ -356,10 +376,23 @@ class SparseOperator(LinearOperator):
             assert scaled is not None and self._gram_row_index is not None
             scaled.data = a.data * w[self._gram_row_index]
             gram = np.asarray((self._gram_transpose @ scaled).toarray())
-        self._gram_weights = np.array(w, copy=True)
-        self._gram_value = gram
+        self._gram_memo[accumulate_dtype] = (np.array(w, copy=True), gram)
         self._gram_compute_count += 1
         return to_xp_array(gram, self._xp)
+
+    def _reduced_data_csr(self, dtype: np.dtype) -> scipy.sparse.csr_matrix:
+        """Same-structure CSR with the data cast once to ``dtype``.
+
+        Index arrays are shared with the wrapped matrix (no copy); only the
+        value array is duplicated (e.g. +4 bytes/nnz for float32) — so every
+        later reduced-precision accumulate reads half the bytes instead of
+        paying a per-chunk cast."""
+        if self._reduced_csr is None or self._reduced_csr.dtype != dtype:
+            a = self._csr_matrix
+            self._reduced_csr = scipy.sparse.csr_matrix(
+                (a.data.astype(dtype), a.indices, a.indptr), shape=a.shape
+            )
+        return self._reduced_csr
 
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         # ``Aᵀ diag(w) A`` kept SPARSE: the sparse normal-equations route

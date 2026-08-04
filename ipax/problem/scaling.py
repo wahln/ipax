@@ -82,11 +82,13 @@ class _RowScaled(LinearOperator):
         # diag((DJ)ᵀ W (DJ))_k = Σ_i W_i d_i² J_ik² = J.gram_diagonal(d²·W).
         return self._jac.gram_diagonal(self._d * self._d * weights)
 
-    def gram(self, weights: Array) -> Array:
+    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
         # (DJ)ᵀ diag(W) (DJ) = Jᵀ diag(d²·W) J = J.gram(d²·W): the row scaling folds
         # into the weights, so the condensed dense route keeps the sparse-Gram fast
         # path through gradient-based scaling instead of densifying the Jacobian.
-        return self._jac.gram(self._d * self._d * weights)
+        return self._jac.gram(
+            self._d * self._d * weights, accumulate_dtype=accumulate_dtype
+        )
 
     def gram_capable(self) -> bool:
         # Row scaling folds into the weights (see ``gram``), so capability is
@@ -105,6 +107,15 @@ class _RowScaled(LinearOperator):
         # Row scaling never changes the sparsity pattern (the factors are
         # strictly positive), so the Gram fill is exactly the wrapped one's.
         return self._jac.gram_fill_estimate()
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        # (DJ) densifies exactly when J does: forward and row-scale. Matrix-free
+        # inner operators keep raising NotImplementedError, so the dense KKT
+        # route's densify decisions (incl. the mixed-precision Gram fallback)
+        # see the wrapped operator's true capability instead of a blanket "no".
+        inner = self._jac.dense_matrix(like)
+        xp = array_namespace(self._d, inner)
+        return xp.expand_dims(self._d, axis=1) * inner
 
     def row_gram_diagonal(self, weights: Array) -> Array:
         # diag((DJ) W (DJ)ᵀ)_j = d_j² Σ_k W_k J_jk² = d²·J.row_gram_diagonal(W).

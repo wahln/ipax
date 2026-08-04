@@ -24,6 +24,30 @@ Selection is automatic (size, constraint shape, Jacobian density, estimated
 Gram fill, namespace capabilities) and user-overridable via `Options.linsolve`.
 Adding a solver never touches `ipm/driver.py` (invariant #3).
 
+### Mixed-precision Gram accumulation (dense route, opt-in)
+
+For tall inequality problems the dense condensed route spends 80–90% of its
+per-iteration wall forming the Gram term `∇gᵀ Σ_s ∇g` (O(m·n²) FLOPs). With
+`DenseOptions(gram_dtype="float32")` that accumulation runs in float32 —
+~2× on CPUs (twice the SIMD width), up to the fp32/fp64 rate ratio on GPUs,
+and the natural choice when the constraint data is float32 at the source, as
+radiotherapy dose matrices are — while everything else stays float64. Full
+working accuracy is restored per solve by **iterative refinement** against the
+exact float64 operator matvec (Carson & Higham 2018): each O(n²)-solve +
+matvec correction contracts the error by ρ ≈ κ(N)·u₃₂, so a handful of steps
+reach `refine_tol`. The scheme is accuracy-preserving by construction: a
+refinement stall, or a positive-definiteness failure the exact matrix does not
+reproduce (both the signature of the late-barrier κ(N)·u₃₂ ≳ 1 regime),
+rebuilds the exact matrix and permanently returns that solver instance to
+native precision — the accuracy of the returned step is never traded, only
+accumulation cost. (The PD probe itself runs on the approximate matrix; the
+stall detector is what catches the masked-indefinite case, and the pair is
+pinned by a regression test.) The option applies to the inequality/bound
+**condensed** assembly — equality-constrained saddle systems currently
+assemble exactly and ignore it. `Result.routes` reports the engaged route as
+`dense (gram=float32)`, or `dense (gram=float32->native)` after a
+self-disable.
+
 !!! warning "Known limitation: matrix-free Krylov on equality saddles"
 
     On **equality-constrained** problems the matrix-free `KrylovSolver` borders

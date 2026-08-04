@@ -155,7 +155,7 @@ class LinearOperator(ABC):
         """
         raise NotImplementedError("operator does not expose a cheap Gram diagonal")
 
-    def gram(self, weights: Array) -> Array:
+    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
         """Return the full weighted Gram matrix ``Aᵀ diag(weights) A`` (dense ``n×n``).
 
         The matrix analogue of :meth:`gram_diagonal`: the condensed inequality term
@@ -167,7 +167,16 @@ class LinearOperator(ABC):
         a ``m×n`` Jacobian (gigabytes) to form an ``n×n`` matrix. Optional, like
         :meth:`gram_diagonal`; the dense KKT route falls back to densifying ``A`` when
         it is unavailable.
+
+        ``accumulate_dtype`` (dtype *name*, e.g. ``"float32"``) requests the
+        accumulation itself in reduced precision — the mixed-precision dense
+        route (``DenseOptions.gram_dtype``); the *returned* matrix keeps the
+        operator's native result dtype regardless. Best-effort: implementations
+        may ignore the request (returning the exact Gram is always valid), and
+        wrappers forwarding :meth:`gram` must forward it. Callers tolerate
+        pre-keyword implementations (``TypeError``) by retrying without it.
         """
+        del accumulate_dtype
         raise NotImplementedError("operator does not expose a full weighted Gram")
 
     def gram_capable(self) -> bool:
@@ -729,14 +738,16 @@ class VStack(LinearOperator):
         xp = array_namespace(result)
         return xp.asarray(result)
 
-    def gram(self, weights: Array) -> Array:
+    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
         # Jᵀ diag(w) J for J = [J1; …; Jk] is Σ_b Jbᵀ diag(w_b) Jb — the vertical
         # stack sums each block's Gram over its own row (weight) range. Propagates
         # NotImplementedError if any block cannot form its Gram.
         result = None
         offset = 0
         for op, rows in zip(self._ops, self._rows, strict=True):
-            piece = op.gram(weights[offset : offset + rows])
+            piece = op.gram(
+                weights[offset : offset + rows], accumulate_dtype=accumulate_dtype
+            )
             result = piece if result is None else result + piece
             offset += rows
         assert result is not None
@@ -956,8 +967,8 @@ class _SparseStructured(LinearOperator):
     def gram_diagonal(self, weights: Array) -> Array:
         return self._adapter_op().gram_diagonal(weights)
 
-    def gram(self, weights: Array) -> Array:
-        return self._adapter_op().gram(weights)
+    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
+        return self._adapter_op().gram(weights, accumulate_dtype=accumulate_dtype)
 
     def gram_capable(self) -> bool:
         # Capability lives in the backend adapter operator (e.g. scipy/cupy
