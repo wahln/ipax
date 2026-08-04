@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import scipy.sparse
 import scipy.sparse.linalg
+from scipy.linalg.blas import get_blas_funcs
 
 from ipax.backend.operators import LinearOperator
 from ipax.backend.sparse._canonical import CompiledCompressed, compile_compressed
@@ -418,14 +419,39 @@ class SparseOperator(LinearOperator):
         """``Aᵀ diag(w) A`` by BLAS over zero-copy row windows of ``a``.
 
         Each chunk densifies ``m_chunk × n`` rows (bounded by
-        ``_GRAM_DENSE_CHUNK_ELEMENTS``) and accumulates
-        ``blockᵀ @ (w_chunk ∘ block)`` — O(m·n²) FLOPs total, but at dense-GEMM
-        speed, with peak extra memory two chunk buffers regardless of ``m``.
+        ``_GRAM_DENSE_CHUNK_ELEMENTS``) — O(m·n²) FLOPs total at dense-BLAS
+        speed, peak extra memory two chunk buffers regardless of ``m``.
+
+        For finite nonnegative real weights (the IPM's Σ weights are positive
+        by construction) the chunk is scaled in place by ``√w`` and
+        accumulated with the *symmetric* rank-k update (``syrk``): one
+        triangle, so half the GEMM FLOPs, and no ``w ∘ block`` temporary. The
+        triangle is mirrored by pure copies at the end, making the result
+        bitwise symmetric as a side effect. Mixed-sign, non-finite, or
+        non-float weights fall back to the general
+        ``blockᵀ @ (w_chunk ∘ block)`` accumulation.
+
+        Numerical caveat: the two forms differ in their overflow/underflow
+        *envelope*, not just rounding — syrk multiplies ``fl(√w·a)·fl(√w·b)``
+        where GEMM computes ``a·fl(w·b)``. The symmetric split *halves the
+        dynamic range* of the intermediates (favorable for the common case),
+        but for extreme ``w`` paired with strongly asymmetric ``|a|, |b|`` it
+        can saturate where the asymmetric grouping does not; relevant mostly
+        for float32 data, whose exponent headroom is ~1e38.
         """
         m, n = a.shape
         dtype = np.result_type(a.dtype, w.dtype)
-        out = np.zeros((n, n), dtype=dtype)
         chunk = max(1, _GRAM_DENSE_CHUNK_ELEMENTS // max(int(n), 1))
+        use_syrk = dtype in (np.float32, np.float64) and bool(
+            np.all((w >= 0.0) & np.isfinite(w))
+        )
+        if use_syrk:
+            syrk = get_blas_funcs("syrk", dtype=dtype)
+            sqrt_w = np.sqrt(w.astype(dtype, copy=False))
+            # syrk accumulates in place into an F-ordered target.
+            out = np.zeros((n, n), dtype=dtype, order="F")
+        else:
+            out = np.zeros((n, n), dtype=dtype)
         for start in range(0, m, chunk):
             end = min(m, start + chunk)
             lo, hi = int(a.indptr[start]), int(a.indptr[end])
@@ -433,8 +459,25 @@ class SparseOperator(LinearOperator):
                 (a.data[lo:hi], a.indices[lo:hi], a.indptr[start : end + 1] - lo),
                 shape=(end - start, n),
             )
-            block = window.toarray()
-            out += block.T @ (w[start:end, None] * block)
+            block = np.asarray(window.toarray(), dtype=dtype)
+            if use_syrk:
+                block *= sqrt_w[start:end, None]  # in place — block is fresh
+                # ``block.T`` is an F-contiguous (n, m_chunk) view (no copy);
+                # syrk adds block.T @ block into ``out``'s lower triangle.
+                out = syrk(
+                    1.0, block.T, beta=1.0, c=out, trans=0, lower=1, overwrite_c=1
+                )
+            else:
+                out += block.T @ (w[start:end, None] * block)
+        if use_syrk:
+            # Mirror the computed lower triangle by row-slice copies — no
+            # arithmetic (bitwise-exact incl. -0.0, unlike `out += triu(out.T)`)
+            # and no n²-sized index temporaries (a `triu_indices` gather peaks
+            # at ~2.5× the output size, which can OOM at the top of the dense
+            # route's range).
+            out = np.ascontiguousarray(out)
+            for j in range(n):
+                out[j, j + 1 :] = out[j + 1 :, j]
         return out
 
     def row_gram_diagonal(self, weights: Array) -> Array:

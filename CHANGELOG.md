@@ -67,6 +67,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   problem (`ORTHRGDS` reaches IPOPT's objective on all three routes with it;
   `HS25` and `ELATTAR` also flip to `optimal`).
 
+### Changed
+- **The dense-accumulated Gram uses the symmetric rank-k BLAS update.** The
+  SciPy sparse adapter's chunked accumulation of `Aᵀ diag(w) A` — the dominant
+  per-iteration cost of the condensed route on tall dense-ish problems
+  (radiotherapy dose matrices: 80–90 % of wall time) — now scales each chunk
+  in place by `√w` and accumulates one triangle via `syrk` instead of a
+  general GEMM, mirroring the triangle once at the end. Half the FLOPs on the
+  hot kernel: **1.5–1.7×** measured on RT-shaped matrices
+  (`m=2e5, n≈1e3–8e3`), ~1.2× end-to-end on TROTS `Protons_01`. The result is
+  now *bitwise* symmetric (the GEMM form was only symmetric to rounding),
+  which the downstream Cholesky reads. Mixed-sign, non-finite, or non-float
+  weights keep the previous GEMM path; for finite weights the results differ
+  only at rounding level (the √w split also *halves* the dynamic range of the
+  intermediates — the caveat that its overflow envelope differs at float32
+  extremes is documented on the kernel).
+
 ### Fixed
 - **A run parked at an acceptable KKT point no longer reports failure because
   of multipliers the point never asked for.** The per-iteration convergence

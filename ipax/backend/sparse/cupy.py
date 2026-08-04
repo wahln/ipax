@@ -395,9 +395,14 @@ class SparseOperator(LinearOperator):
     def _gram_dense_accumulate(a: Any, w: Any) -> Any:
         """``Aᵀ diag(w) A`` by cuBLAS over zero-copy row windows of ``a``.
 
-        Mirror of the SciPy adapter's dense-accumulation strategy: densify
+        Same chunked dense strategy as the SciPy adapter: densify
         ``m_chunk × n`` row windows (bounded by ``_GRAM_DENSE_CHUNK_ELEMENTS``)
-        and accumulate ``blockᵀ @ (w_chunk ∘ block)``.
+        and accumulate ``blockᵀ @ (w_chunk ∘ block)``. Unlike the SciPy
+        adapter this stays a general GEMM (result symmetric only to
+        rounding): CuPy exposes no high-level ``syrk``, so the half-FLOP
+        symmetric update would need raw ``cupy.cuda.cublas`` calls —
+        a candidate follow-up, not a lost invariant (no consumer relies on
+        bitwise symmetry).
         """
         from cupyx.scipy import sparse as cupyx_sparse
 
