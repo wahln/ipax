@@ -40,6 +40,11 @@ import cupyx
 import cupyx.scipy.sparse
 import cupyx.scipy.sparse.linalg
 
+try:  # High-level cuBLAS wrappers (ship with CuPy; syrk since v9).
+    from cupy import cublas as _cublas
+except ImportError:  # pragma: no cover - degraded CuPy install
+    _cublas = None
+
 from ipax.backend.operators import LinearOperator
 from ipax.backend.sparse._canonical import (
     CompiledCompressed,
@@ -81,6 +86,36 @@ _CUDSS_STATUS_NOT_SUPPORTED = 4
 # model and TROTS measurements behind the values.
 _GRAM_DENSE_MIN_DENSITY = 0.05
 _GRAM_DENSE_CHUNK_ELEMENTS = 50_000_000
+# Row-block size for mirroring the syrk-computed lower triangle to the upper
+# one: bounded temporaries (block² indices) and O(n/block) kernel launches
+# instead of either a full-size n² index gather or n single-row copies.
+_GRAM_MIRROR_BLOCK = 1024
+
+
+def _mirror_lower_to_upper(out: Any) -> None:
+    """Mirror the lower triangle of square ``out`` onto the upper, in place.
+
+    Pure copies (bitwise-exact, incl. -0.0), blocked to ``_GRAM_MIRROR_BLOCK``
+    rows: each diagonal block mirrors internally via a block-sized index
+    gather (temporaries bounded by block², never n²), and the panel right of
+    it is a single transposed-slice copy — O(n/block) kernel launches total,
+    where a per-row copy loop would launch n times.
+    """
+    n = int(out.shape[0])
+    block = _GRAM_MIRROR_BLOCK
+    tri = None
+    for j0 in range(0, n, block):
+        j1 = min(n, j0 + block)
+        if j1 - j0 == block:
+            if tri is None:
+                tri = cupy.triu_indices(block, 1)
+            rows, cols = tri
+        else:
+            rows, cols = cupy.triu_indices(j1 - j0, 1)
+        diag = out[j0:j1, j0:j1]
+        diag[rows, cols] = diag[cols, rows]
+        if j1 < n:
+            out[j0:j1, j1:] = out[j1:, j0:j1].T
 
 
 class _CuDSSUnavailableError(ImportError):
@@ -396,23 +431,35 @@ class SparseOperator(LinearOperator):
         """``Aᵀ diag(w) A`` by cuBLAS over zero-copy row windows of ``a``.
 
         Same chunked dense strategy as the SciPy adapter: densify
-        ``m_chunk × n`` row windows (bounded by ``_GRAM_DENSE_CHUNK_ELEMENTS``)
-        and accumulate ``blockᵀ @ (w_chunk ∘ block)``. Unlike the SciPy
-        adapter this stays a general GEMM (result symmetric only to
-        rounding): CuPy exposes no high-level ``syrk``, so the half-FLOP
-        symmetric update would need raw ``cupy.cuda.cublas`` calls —
-        a candidate follow-up, not a lost invariant (no consumer relies on
-        bitwise symmetry).
+        ``m_chunk × n`` row windows (bounded by ``_GRAM_DENSE_CHUNK_ELEMENTS``).
+        For finite nonnegative weights the chunk is scaled in place by ``√w``
+        and accumulated with the *symmetric* rank-k update
+        (``cupy.cublas.syrk``): half the GEMM FLOPs and no ``w ∘ block``
+        temporary, with the lower triangle mirrored once at the end (bitwise
+        symmetric result). Mixed-sign or non-finite weights fall back to the
+        general ``blockᵀ @ (w_chunk ∘ block)`` accumulation — see the SciPy
+        adapter's docstring for the overflow-envelope caveat of the ``√w``
+        split (the two forms saturate differently at float32 extremes).
         """
         from cupyx.scipy import sparse as cupyx_sparse
 
         m, n = a.shape
+        dtype = cupy.result_type(a.dtype, w.dtype)
         chunk = max(1, _GRAM_DENSE_CHUNK_ELEMENTS // max(int(n), 1))
         # One consolidated host transfer of the chunk-boundary offsets instead
-        # of two 0-d syncs per chunk inside the loop.
+        # of two 0-d syncs per chunk inside the loop. The weight-gate reduction
+        # below is one more sync per gram call — same cost class as the memo
+        # compare in :meth:`gram`, negligible next to the accumulate.
         starts = [*range(0, m, chunk), m]
         bounds = [int(v) for v in cupy.asnumpy(a.indptr[cupy.asarray(starts)])]
-        out: Any = None
+        use_syrk = (
+            _cublas is not None
+            and dtype in (cupy.float32, cupy.float64)
+            and bool(cupy.all((w >= 0.0) & cupy.isfinite(w)))
+        )
+        out = cupy.zeros((n, n), dtype=dtype)
+        if use_syrk:
+            sqrt_w = cupy.sqrt(w.astype(dtype, copy=False))
         for i, start in enumerate(starts[:-1]):
             end = starts[i + 1]
             lo, hi = bounds[i], bounds[i + 1]
@@ -420,11 +467,16 @@ class SparseOperator(LinearOperator):
                 (a.data[lo:hi], a.indices[lo:hi], a.indptr[start : end + 1] - lo),
                 shape=(end - start, n),
             )
-            block = window.toarray()
-            piece = block.T @ (w[start:end, None] * block)
-            out = piece if out is None else out + piece
-        if out is None:
-            out = cupy.zeros((n, n), dtype=cupy.result_type(a.dtype, w.dtype))
+            block = cupy.asarray(window.toarray(), dtype=dtype)
+            if use_syrk:
+                block *= sqrt_w[start:end, None]  # in place — block is fresh
+                # out := blockᵀ @ block + out, lower triangle only (verified
+                # in-place on C-order ``out`` for float32/float64).
+                _cublas.syrk("T", block, out=out, alpha=1.0, beta=1.0, lower=True)
+            else:
+                out += block.T @ (w[start:end, None] * block)
+        if use_syrk:
+            _mirror_lower_to_upper(out)
         return out
 
     def row_gram_diagonal(self, weights: Array) -> Array:
