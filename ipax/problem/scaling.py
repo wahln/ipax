@@ -95,6 +95,11 @@ class _RowScaled(LinearOperator):
         # exactly the wrapped Jacobian's.
         return self._jac.gram_capable()
 
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        # The scale factors fold into the (working-precision) weights, so the
+        # data-precision hint is exactly the wrapped Jacobian's.
+        return self._jac.gram_accumulate_dtype_hint()
+
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         # (DJ)ᵀ diag(W) (DJ) = Jᵀ diag(d²·W) J — same folding as ``gram``, so
         # the sparse normal-equations route survives gradient-based scaling.

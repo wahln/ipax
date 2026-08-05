@@ -190,6 +190,23 @@ class LinearOperator(ABC):
         """
         return type(self).gram is not LinearOperator.gram
 
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        """Dtype name the Gram may be *accumulated* in without losing data
+        information, or ``None`` (no reduction opportunity — the default).
+
+        The discovery half of ``DenseOptions(gram_dtype="auto")``: an operator
+        whose stored values carry only float32 information — float32 storage,
+        or float64 values that are exact float32 upcasts *declared as such* by
+        their producer — answers ``"float32"``, and the mixed-precision dense
+        route then accumulates reduced with iterative-refinement
+        certification. Metadata only, never a value scan (a float64 matrix
+        that merely happens to be float32-representable must NOT hint — silent
+        heuristics would shift behavior across whole benchmark corpora).
+        Wrappers forwarding :meth:`gram` forward this too; a stack reports
+        reduced if any block does (its dominant blocks are why it is asked).
+        """
+        return None
+
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         """``Aᵀ diag(weights) A`` as *sparse* COO triplets (invariant #4).
 
@@ -321,6 +338,10 @@ class Dense(LinearOperator):
     @property
     def shape(self) -> tuple[int, int]:
         return int(self._A.shape[0]), int(self._A.shape[1])
+
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        xp = array_namespace(self._A)
+        return "float32" if self._A.dtype == xp.float32 else None
 
     def matvec(self, v: Array) -> Array:
         xp = array_namespace(self._A, v)
@@ -758,6 +779,16 @@ class VStack(LinearOperator):
         # The stacked Gram succeeds only when every block's does.
         return all(op.gram_capable() for op in self._ops)
 
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        # Reduced if ANY block carries only reduced-precision information —
+        # the dominant (large) blocks are what the hint exists for; small
+        # full-precision blocks alongside are covered by the refinement
+        # certificate like everything else.
+        for op in self._ops:
+            if op.gram_accumulate_dtype_hint() == "float32":
+                return "float32"
+        return None
+
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         # Σ_b Jbᵀ diag(w_b) Jb as concatenated n×n triplets: overlapping
         # entries across blocks are duplicates the consumer sums. Per-block
@@ -884,6 +915,7 @@ class _SparseStructured(LinearOperator):
         *,
         symmetric: bool | None = None,
         pattern_key: object | None = None,
+        values_dtype_hint: str | None = None,
     ) -> None:
         if len(rows.shape) != 1 or len(cols.shape) != 1 or len(values.shape) != 1:
             raise ValueError("COO rows, cols, and values must be rank-1 arrays")
@@ -897,12 +929,23 @@ class _SparseStructured(LinearOperator):
         self._shape = (int(shape[0]), int(shape[1]))
         self._symmetric = symmetric
         self._pattern_key = pattern_key
+        # Declared source precision of the values (see
+        # ``gram_accumulate_dtype_hint``): a producer whose float64 values are
+        # exact float32 upcasts (upcasting is lossless, so the reduced-data
+        # cache recovers the source bits exactly) passes "float32" here.
+        self._values_dtype_hint = values_dtype_hint
         # Lazily built, cached adapter operator for the heavy linear algebra.
         self._delegate: LinearOperator | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
         return self._shape
+
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        if self._values_dtype_hint is not None:
+            return self._values_dtype_hint
+        xp = array_namespace(self._values)
+        return "float32" if self._values.dtype == xp.float32 else None
 
     def _adapter_op(self) -> LinearOperator:
         """Resolve (and cache) the backend adapter operator for sparse algebra."""
@@ -1053,6 +1096,7 @@ class CSROperator(_SparseStructured):
         *,
         symmetric: bool | None = None,
         pattern_key: object | None = None,
+        values_dtype_hint: str | None = None,
     ) -> None:
         if len(shape) != 2:
             raise ValueError("shape must be a (rows, cols) pair")
@@ -1067,6 +1111,7 @@ class CSROperator(_SparseStructured):
             shape,
             symmetric=symmetric,
             pattern_key=pattern_key,
+            values_dtype_hint=values_dtype_hint,
         )
 
 
@@ -1088,6 +1133,7 @@ class CSCOperator(_SparseStructured):
         *,
         symmetric: bool | None = None,
         pattern_key: object | None = None,
+        values_dtype_hint: str | None = None,
     ) -> None:
         if len(shape) != 2:
             raise ValueError("shape must be a (rows, cols) pair")
@@ -1102,6 +1148,7 @@ class CSCOperator(_SparseStructured):
             shape,
             symmetric=symmetric,
             pattern_key=pattern_key,
+            values_dtype_hint=values_dtype_hint,
         )
 
 

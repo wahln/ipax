@@ -57,7 +57,8 @@ def _condensed(namespace, *, n=24, m=96, seed=0, scale=10.0):
 
 
 def test_gram_dtype_option_is_validated():
-    assert DenseOptions().gram_dtype == "native"
+    assert DenseOptions().gram_dtype == "auto"
+    assert DenseOptions(gram_dtype="native").gram_dtype == "native"
     assert DenseOptions(gram_dtype="float32").gram_dtype == "float32"
     with pytest.raises(ValueError, match="gram_dtype"):
         DenseOptions(gram_dtype="float16")
@@ -466,28 +467,34 @@ def test_sparse_fast_path_end_to_end_reduced():
     assert solver.refine_iterations >= 1
 
 
-def test_float32_working_dtype_does_not_burn_the_refinement_budget(namespace):
-    # DenseOptions.refine_tol assumes float64; on a float32 working dtype the
-    # tolerance is floored at a multiple of eps(float32) so refinement
-    # converges instead of exhausting its budget and permanently disabling
-    # the mixed route.
+def test_refine_tolerance_floors_on_the_working_dtype(namespace):
+    # refine_tol's default assumes float64. The narrower-than-working guard
+    # keeps float32 solves off the mixed route entirely, so this floor is a
+    # backstop for any future candidate narrower than a float32 working dtype
+    # — pinned directly on _refine so it cannot rot: with an exact factor, a
+    # float32 rhs must certify at iteration 0 rather than chase an
+    # unreachable 1e-10.
     xp = namespace
+    a = _spd(n=8)
+    op = _FakeMixedOperator(xp, a, err=0.0)
+
+    class _F32(_FakeMixedOperator):
+        def matvec(self, v):
+            return self._xp.asarray(self._a, dtype=self._xp.float32) @ v
+
+    op = _F32(xp, a.astype(np.float32).astype(np.float64), err=0.0)
     rng = np.random.default_rng(11)
-    n, m = 12, 40
-    op = _CondensedOperator(
-        Diagonal(xp.asarray(rng.uniform(1.0, 2.0, size=n), dtype=xp.float32)),
-        Diagonal(xp.asarray(rng.uniform(0.5, 1.5, size=n), dtype=xp.float32)),
-        Diagonal(xp.asarray(rng.uniform(0.1, 1.0, size=m), dtype=xp.float32)),
-        Dense(xp.asarray(rng.standard_normal((m, n)), dtype=xp.float32)),
-        0.0,
-    )
-    rhs = xp.asarray(rng.standard_normal(n), dtype=xp.float32)
+    rhs = xp.asarray(rng.standard_normal(a.shape[0]), dtype=xp.float32)
+
     solver = DenseSolver(DenseOptions(gram_dtype="float32"))
     solver.factor(op)
-    x = np.asarray(solver.solve(rhs))
+    solver._matrix = xp.asarray(op._a, dtype=xp.float32)
+    solver._mixed_engaged = True
+    x = xp.linalg.solve(solver._matrix, rhs)
 
-    assert np.all(np.isfinite(x))
-    assert not solver._mixed_disabled  # no spurious stall/exhaustion fallback
+    refined = solver._refine(x, rhs, xp)
+    assert refined is not None  # floored tolerance is reachable
+    assert solver.refine_iterations <= 1
 
 
 def test_equality_saddle_ignores_gram_dtype():
@@ -511,6 +518,200 @@ def test_equality_saddle_ignores_gram_dtype():
     )
     assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
     assert "float32" not in (result.linear_solver or "")
+
+
+def test_gram_accumulate_dtype_hint_protocol(namespace):
+    # The hint is how gram_dtype="auto" discovers that the constraint data
+    # carries only float32 information: storage-level metadata, forwarded by
+    # every wrapper. Absent evidence, the answer is None (native).
+    from ipax.backend.operators import CSROperator, VStack
+    from ipax.problem.scaling import _RowScaled
+
+    xp = namespace
+    dense64 = Dense(xp.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=xp.float64))
+    dense32 = Dense(xp.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=xp.float32))
+    assert dense64.gram_accumulate_dtype_hint() is None
+    assert dense32.gram_accumulate_dtype_hint() == "float32"
+
+    indptr = xp.asarray([0, 1, 2])
+    indices = xp.asarray([0, 1])
+    values64 = xp.asarray([1.0, 2.0], dtype=xp.float64)
+    csr64 = CSROperator(indptr, indices, values64, (2, 2))
+    assert csr64.gram_accumulate_dtype_hint() is None
+    # Declared source precision: fp64 storage whose values are exact upcasts
+    # of float32 data (the TROTS situation) hints without storing fp32.
+    hinted = CSROperator(
+        indptr,
+        indices,
+        values64,
+        (2, 2),
+        values_dtype_hint="float32",
+    )
+    assert hinted.gram_accumulate_dtype_hint() == "float32"
+    csr32 = CSROperator(
+        indptr, indices, xp.asarray([1.0, 2.0], dtype=xp.float32), (2, 2)
+    )
+    assert csr32.gram_accumulate_dtype_hint() == "float32"
+
+    # Wrappers: VStack reports reduced if ANY block does; row scaling forwards.
+    assert VStack((csr64, hinted)).gram_accumulate_dtype_hint() == "float32"
+    assert VStack((csr64, csr64)).gram_accumulate_dtype_hint() is None
+    d = xp.ones(2, dtype=xp.float64)
+    assert _RowScaled(hinted, d).gram_accumulate_dtype_hint() == "float32"
+    assert _RowScaled(csr64, d).gram_accumulate_dtype_hint() is None
+
+    # The condensed operator forwards its inequality Jacobian's hint.
+    op = _CondensedOperator(
+        Diagonal(xp.ones(2, dtype=xp.float64)),
+        Diagonal(xp.ones(2, dtype=xp.float64)),
+        Diagonal(xp.ones(2, dtype=xp.float64)),
+        hinted,
+        0.0,
+    )
+    assert op.gram_accumulate_dtype_hint() == "float32"
+
+
+def test_auto_engages_only_on_reduced_hint(namespace):
+    # Default options (gram_dtype="auto"): a hinted operator engages the
+    # mixed route; an unhinted fp64 operator is a strict no-op (no mixed
+    # materialization, no refinement) — auto must never regress pure-fp64
+    # problems.
+    xp = namespace
+    a = _spd()
+    rng = np.random.default_rng(12)
+    rhs = xp.asarray(rng.standard_normal(a.shape[0]), dtype=xp.float64)
+
+    class _HintedExact(_FakeMixedOperator):
+        def gram_accumulate_dtype_hint(self):
+            return "float32"
+
+        def dense_matrix_mixed(self, like, gram_dtype):
+            assert gram_dtype == "float32"  # auto resolves to a concrete dtype
+            self.mixed_calls += 1
+            return self._xp.asarray(self._a, dtype=self._xp.float64)
+
+    hinted = _HintedExact(xp, a, err=0.0)
+    solver = DenseSolver(DenseOptions())  # auto
+    solver.factor(hinted)
+    x = np.asarray(solver.solve(rhs))
+    np.testing.assert_allclose(x, np.linalg.solve(a, np.asarray(rhs)), rtol=1e-8)
+    assert hinted.mixed_calls == 1
+    assert "float32" in solver.describe()
+
+    plain = _FakeMixedOperator(xp, a, err=0.05)  # no hint ⇒ native
+    solver2 = DenseSolver(DenseOptions())
+    solver2.factor(plain)
+    np.asarray(solver2.solve(rhs))
+    assert plain.mixed_calls == 0
+    assert solver2.refine_iterations == 0
+    assert solver2.describe() == "dense"
+
+
+def test_reduction_is_skipped_when_working_precision_is_not_wider(namespace):
+    # "Prefer the precision the input comes in" cuts both ways: on a float32
+    # WORKING dtype, accumulating the Gram in float32 is not mixed precision —
+    # it is the native arithmetic plus a pointless refinement pass. Both the
+    # auto hint and an explicit float32 request must resolve to native.
+    xp = namespace
+    rng = np.random.default_rng(14)
+    n, m = 10, 40
+
+    class _Hinted(Dense):
+        def gram_accumulate_dtype_hint(self):
+            return "float32"
+
+    op = _CondensedOperator(
+        Diagonal(xp.asarray(rng.uniform(1.0, 2.0, size=n), dtype=xp.float32)),
+        Diagonal(xp.asarray(rng.uniform(0.5, 1.5, size=n), dtype=xp.float32)),
+        Diagonal(xp.asarray(rng.uniform(0.1, 1.0, size=m), dtype=xp.float32)),
+        _Hinted(xp.asarray(rng.standard_normal((m, n)), dtype=xp.float32)),
+        0.0,
+    )
+    rhs = xp.asarray(rng.standard_normal(n), dtype=xp.float32)
+
+    for options in (DenseOptions(), DenseOptions(gram_dtype="float32")):
+        solver = DenseSolver(options)
+        solver.factor(op)
+        x = solver.solve(rhs)
+        assert np.all(np.isfinite(np.asarray(x)))
+        assert solver.describe() == "dense"  # native: no reduction, no refine
+        assert solver.refine_iterations == 0
+
+    # The same operator family in float64 *does* reduce (the hint is real).
+    op64 = _CondensedOperator(
+        Diagonal(xp.asarray(rng.uniform(1.0, 2.0, size=n), dtype=xp.float64)),
+        Diagonal(xp.asarray(rng.uniform(0.5, 1.5, size=n), dtype=xp.float64)),
+        Diagonal(xp.asarray(rng.uniform(0.1, 1.0, size=m), dtype=xp.float64)),
+        _Hinted(xp.asarray(rng.standard_normal((m, n)), dtype=xp.float64)),
+        0.0,
+    )
+    solver = DenseSolver(DenseOptions())
+    solver.factor(op64)
+    solver.solve(xp.asarray(rng.standard_normal(n), dtype=xp.float64))
+    assert "float32" in solver.describe()
+
+
+def test_auto_is_native_on_fp64_condensed_system(namespace):
+    # The realistic no-op check: a fully-fp64 condensed operator under the
+    # auto default materializes the exact matrix and never refines.
+    op, rhs = _condensed(namespace)
+    solver = DenseSolver(DenseOptions())
+    solver.factor(op)
+    x = np.asarray(solver.solve(rhs))
+
+    native = DenseSolver(DenseOptions(gram_dtype="native"))
+    native.factor(op)
+    np.testing.assert_array_equal(x, np.asarray(native.solve(rhs)))
+    assert solver.refine_iterations == 0
+    assert solver.describe() == "dense"
+
+
+def test_auto_end_to_end_with_hinted_sparse_jacobian():
+    # The TROTS shape: fp64-stored CSR values that are exact float32 upcasts,
+    # declared via values_dtype_hint — default options engage the reduced
+    # accumulate and refinement certifies the solve.
+    import array_api_compat.numpy as xp
+    import scipy.sparse as sp
+
+    from ipax.backend.operators import CSROperator
+
+    rng = np.random.default_rng(13)
+    n, m = 10, 60
+    dense = rng.standard_normal((m, n)) * (rng.random((m, n)) < 0.6) * 1e3
+    jac = sp.csr_matrix(dense.astype(np.float32).astype(np.float64))
+    jac.eliminate_zeros()
+    jac.sort_indices()
+    J = CSROperator(
+        xp.asarray(np.asarray(jac.indptr, dtype=np.int64)),
+        xp.asarray(np.asarray(jac.indices, dtype=np.int64)),
+        xp.asarray(jac.data),
+        (m, n),
+        values_dtype_hint="float32",
+    )
+    op = _CondensedOperator(
+        Diagonal(xp.asarray(rng.uniform(1.0, 2.0, size=n))),
+        Diagonal(xp.asarray(rng.uniform(0.5, 1.5, size=n))),
+        Diagonal(xp.asarray(rng.uniform(1e-3, 1.0, size=m))),
+        J,
+        0.0,
+    )
+    rhs = xp.asarray(rng.standard_normal(n))
+
+    native = DenseSolver(DenseOptions(gram_dtype="native"))
+    native.factor(op)
+    x_native = np.asarray(native.solve(rhs))
+
+    solver = DenseSolver(DenseOptions())  # auto
+    solver.factor(op)
+    x_auto = np.asarray(solver.solve(rhs))
+
+    np.testing.assert_allclose(x_auto, x_native, rtol=1e-6, atol=1e-9)
+    assert "float32" in solver.describe()
+    # The materialized matrix really came from the reduced accumulate.
+    exact = np.asarray(op.dense_matrix(rhs))
+    mixed = np.asarray(op.dense_matrix_mixed(rhs, "float32"))
+    rel = np.max(np.abs(mixed - exact)) / np.max(np.abs(exact))
+    assert 1e-12 < rel < 1e-3
 
 
 def test_gram_accumulate_dtype_forwards_through_wrappers(namespace):

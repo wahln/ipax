@@ -121,6 +121,11 @@ class TROTSMatrix:
     matrix: Any  # scipy.sparse matrix (voxels × vars) or (vars × vars) for type 2
     b: Any  # offset vector (NumPy), possibly all-zero
     c: float  # scalar for the quadratic form
+    # Dtype of the matrix values AS STORED IN THE FILE (TROTS dose matrices
+    # are float32 at the source). Any later float64 promotion is an exact
+    # upcast, so this is the precision the data actually carries — the
+    # metadata behind ``DenseOptions(gram_dtype="auto")``.
+    source_dtype: str = "float64"
 
 
 @dataclass
@@ -209,14 +214,24 @@ def _load_matrix(path: str, j: int) -> TROTSMatrix:
             else:
                 data = np.zeros(0)
                 ir = np.zeros(0, dtype=np.int64)
+            source_dtype = str(data.dtype)
             jc = np.asarray(obj["jc"][()]).ravel().astype(np.int64)
             nrows = int(obj.attrs["MATLAB_sparse"])
             ncols = jc.size - 1
             matrix: Any = sp.csc_matrix((data, ir, jc), shape=(nrows, ncols))
         else:
             # Dense matrices are stored transposed (vars × voxels): un-transpose.
-            matrix = sp.csr_matrix(np.asarray(obj[()], dtype=float).T)
-    return TROTSMatrix(name=name, mtype=mtype, matrix=matrix, b=b, c=c)
+            raw = np.asarray(obj[()])
+            source_dtype = str(raw.dtype)
+            matrix = sp.csr_matrix(np.asarray(raw, dtype=float).T)
+    return TROTSMatrix(
+        name=name,
+        mtype=mtype,
+        matrix=matrix,
+        b=b,
+        c=c,
+        source_dtype=source_dtype,
+    )
 
 
 @functools.lru_cache(maxsize=8)
@@ -474,6 +489,7 @@ class TROTSProblem(Problem):
         lin_rows: list[Any] = []  # scipy rows over x (padded later)
         lin_lo: list[float] = []
         lin_hi: list[float] = []
+        lin_sources: list[str] = []  # file dtypes of the lin-block matrices
 
         for e in instance.entries:
             factor = 1.0 if e.minimise else -1.0
@@ -506,6 +522,7 @@ class TROTSProblem(Problem):
                     A = mat.matrix
                     off = mat.b if mat.b.size == A.shape[0] else 0.0
                     # minimise ⇒ maximum constraint (A x + off ≤ bound); else minimum.
+                    lin_sources.append(mat.source_dtype)
                     if e.minimise:
                         lin_rows.append(A)
                         lin_lo.extend([-np.inf] * A.shape[0])
@@ -548,6 +565,7 @@ class TROTSProblem(Problem):
                 )
             )
         for k, (mat, _w, minimise) in enumerate(self._minimax):
+            lin_sources.append(mat.source_dtype)
             A = sp.csr_matrix(mat.matrix)
             m = A.shape[0]
             e_k = sp.csr_matrix(
@@ -593,6 +611,16 @@ class TROTSProblem(Problem):
         self._h = np.concatenate(h_parts) if h_parts else np.zeros((0,), dtype=float)
         self._n_lin_ineq = int(self._G.shape[0])
         self._n_nl_ineq = len(self._nl_con) + len(self._quad_con)
+        # The lin-block values are the source matrices' entries times ±1 (plus
+        # the ±1 minimax links), so when every contributing matrix is float32
+        # in the file the assembled float64 ``G`` carries only float32
+        # information — declared to the operator so the solver's
+        # ``gram_dtype="auto"`` default can engage the reduced accumulate.
+        self._lin_source_hint: str | None = (
+            "float32"
+            if lin_sources and all(s == "float32" for s in lin_sources)
+            else None
+        )
         self._G_op: LinearOperator | None = None  # cached constant sparse operator
 
         # Objective linear coefficient over z (mean terms on x; minimax on t).
@@ -805,7 +833,9 @@ class TROTSProblem(Problem):
     # up with them (the trailing linear multipliers carry no curvature).
     def _linear_ineq_operator(self) -> LinearOperator:
         if self._G_op is None:
-            self._G_op = self._csr_operator(self._G, symmetric=False)
+            self._G_op = self._csr_operator(
+                self._G, symmetric=False, values_dtype_hint=self._lin_source_hint
+            )
         return self._G_op
 
     def ineq_constraints(self, z: Array) -> Array:
@@ -867,7 +897,13 @@ class TROTSProblem(Problem):
         return VStack((nl_op, lin_op))
 
     # -- sparse-operator helper --------------------------------------------
-    def _csr_operator(self, csr: Any, *, symmetric: bool) -> LinearOperator:
+    def _csr_operator(
+        self,
+        csr: Any,
+        *,
+        symmetric: bool,
+        values_dtype_hint: str | None = None,
+    ) -> LinearOperator:
         """Wrap a host SciPy (or device cupyx) CSR as an Array-API ``CSROperator``."""
         import numpy as np
 
@@ -884,6 +920,7 @@ class TROTSProblem(Problem):
                 xp.asarray(csr.data, dtype=xp.float64),
                 (int(csr.shape[0]), int(csr.shape[1])),
                 symmetric=symmetric,
+                values_dtype_hint=values_dtype_hint,
             )
         return CSROperator(
             xp.asarray(np.asarray(csr.indptr, dtype=np.int64)),
@@ -891,6 +928,7 @@ class TROTSProblem(Problem):
             _from_numpy(xp, csr.data),
             (int(csr.shape[0]), int(csr.shape[1])),
             symmetric=symmetric,
+            values_dtype_hint=values_dtype_hint,
         )
 
 

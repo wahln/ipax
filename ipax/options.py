@@ -447,11 +447,20 @@ class DenseOptions:
     assembled size would exceed this bound the solver silently falls back to
     the condensed route (losing only the inertia diagnostic, not correctness).
 
-    ``gram_dtype="float32"`` (opt-in; default ``"native"``) accumulates the
-    FLOP-dominant condensed inequality Gram term ``∇gᵀ Σ_s ∇g`` in float32 —
-    ~2× on CPUs and up to the fp32/fp64 rate ratio on consumer GPUs, and the
-    natural fit when the constraint data is float32 at the source (e.g. the
-    TROTS dose matrices) — then restores working accuracy with fixed-precision
+    ``gram_dtype`` controls the precision of the FLOP-dominant condensed
+    inequality Gram accumulation ``∇gᵀ Σ_s ∇g`` — ~2× on CPUs and up to the
+    fp32/fp64 rate ratio on consumer GPUs when reduced. The default
+    ``"auto"`` prefers the precision the constraint data actually carries:
+    it engages float32 accumulation exactly when the inequality Jacobian
+    *declares* float32-grade data (``gram_accumulate_dtype_hint`` — e.g. the
+    TROTS dose matrices, float32 in their source files) and is a strict
+    no-op otherwise, so fully-float64 problems are untouched. ``"float32"``
+    forces the reduction; ``"native"`` disables it. Either way the requested
+    dtype must be strictly narrower than the working dtype the solve runs in
+    — a float32 solve of float32 data is just a float32 solve, and reducing
+    to the working precision would cost a refinement pass for bit-identical
+    arithmetic. When reduced, working
+    accuracy is restored with fixed-precision
     iterative refinement against the exact float64 operator matvec (Carson &
     Higham 2018, SIAM J. Sci. Comput. 40(2)): up to ``refine_max_iters``
     correction steps, targeting a relative residual of ``refine_tol``. When
@@ -478,7 +487,7 @@ class DenseOptions:
 
     kkt_route: DenseKKTRoute = "condensed"
     augmented_max_size: int = 20_000
-    gram_dtype: str = "native"
+    gram_dtype: str = "auto"
     refine_tol: float = 1e-10
     refine_accept_tol: float = 1e-6
     refine_max_iters: int = 15
@@ -490,8 +499,8 @@ class DenseOptions:
             raise ValueError("dense kkt_route must be 'condensed' or 'augmented'")
         if self.augmented_max_size < 1:
             raise ValueError("augmented_max_size must be a positive integer")
-        if self.gram_dtype not in ("native", "float32"):
-            raise ValueError("gram_dtype must be 'native' or 'float32'")
+        if self.gram_dtype not in ("auto", "native", "float32"):
+            raise ValueError("gram_dtype must be 'auto', 'native' or 'float32'")
         if self.refine_tol <= 0.0:
             raise ValueError("refine_tol must be positive")
         if not self.refine_tol <= self.refine_accept_tol < 1.0:

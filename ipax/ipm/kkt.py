@@ -340,6 +340,17 @@ class _CondensedOperator(LinearOperator):
         """Materialize the condensed dense block from explicit operator pieces."""
         return self._dense_matrix_impl(like, None)
 
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        """The inequality Jacobian's data-precision hint (``gram_dtype="auto"``).
+
+        The Gram term is the only reduced-precision candidate in the condensed
+        block, so the operator's hint is exactly its Jacobian's; no inequality
+        rows means nothing to reduce.
+        """
+        if self._ineq_jac.shape[0] == 0:
+            return None
+        return self._ineq_jac.gram_accumulate_dtype_hint()
+
     def dense_matrix_mixed(self, like: Array | None, gram_dtype: str) -> Array:
         """:meth:`dense_matrix` with the Gram term accumulated in ``gram_dtype``.
 

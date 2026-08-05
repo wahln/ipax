@@ -7,12 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
-- **Mixed-precision condensed Gram (opt-in): `DenseOptions(gram_dtype="float32")`.**
+- **Mixed-precision condensed Gram: `DenseOptions(gram_dtype)`, default `"auto"`.**
   The dense condensed route's dominant kernel — accumulating `∇gᵀ Σ_s ∇g`,
   80–90% of per-iteration wall at radiotherapy scale — can now run in float32
   (the TROTS dose matrices are float32 in the source files; scoped in by
   explicit decision, with AGENTS.md updated), while every other block stays
-  float64. Working accuracy is restored per solve by fixed-precision iterative
+  float64. The `"auto"` default prefers the precision the constraint data
+  actually carries: it engages exactly when the inequality Jacobian declares
+  float32-grade data via the new `gram_accumulate_dtype_hint()` operator hook
+  (float32 storage, or float64 values that are exact float32 upcasts declared
+  by their producer — declared metadata, never a value scan) and is a strict
+  no-op for fully-float64 problems; `"float32"` forces the reduction,
+  `"native"` disables it. Working accuracy is restored per solve by fixed-precision iterative
   refinement against the exact float64 operator matvec (Carson & Higham 2018);
   every returned step carries a measured exact-residual certificate:
   refinement targets `refine_tol`, budget-exhausted/plateaued solves are

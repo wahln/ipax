@@ -24,14 +24,24 @@ Selection is automatic (size, constraint shape, Jacobian density, estimated
 Gram fill, namespace capabilities) and user-overridable via `Options.linsolve`.
 Adding a solver never touches `ipm/driver.py` (invariant #3).
 
-### Mixed-precision Gram accumulation (dense route, opt-in)
+### Mixed-precision Gram accumulation (dense route)
 
 For tall inequality problems the dense condensed route spends 80–90% of its
-per-iteration wall forming the Gram term `∇gᵀ Σ_s ∇g` (O(m·n²) FLOPs). With
-`DenseOptions(gram_dtype="float32")` that accumulation runs in float32 —
-~2× on CPUs (twice the SIMD width), up to the fp32/fp64 rate ratio on GPUs,
-and the natural choice when the constraint data is float32 at the source, as
-radiotherapy dose matrices are — while everything else stays float64. Full
+per-iteration wall forming the Gram term `∇gᵀ Σ_s ∇g` (O(m·n²) FLOPs). The
+default `DenseOptions(gram_dtype="auto")` prefers the precision the
+constraint data actually carries: when the inequality Jacobian *declares*
+float32-grade data (`gram_accumulate_dtype_hint()` — float32 storage, or
+float64 values that are exact float32 upcasts declared by their producer, as
+the TROTS loader does for the file-float32 dose matrices), the accumulation
+runs in float32 — ~2× on CPUs (twice the SIMD width), up to the fp32/fp64
+rate ratio on GPUs — while everything else stays float64. Fully-float64
+problems are untouched: the hint is declared metadata, never a value scan,
+so behavior only changes where the data provably carries no float64
+information. `gram_dtype="float32"` forces the reduction, `"native"`
+disables it. Both respect the working precision the solve actually runs in —
+the reduced dtype must be strictly narrower than it, so a float32 solve of
+float32 data stays a plain float32 solve rather than paying a refinement
+pass for bit-identical arithmetic. Full
 working accuracy is restored per solve by **iterative refinement** against the
 exact float64 operator matvec (Carson & Higham 2018): each O(n²)-solve +
 matvec correction contracts the error by ρ ≈ κ(N)·u₃₂, so a handful of steps

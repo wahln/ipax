@@ -428,6 +428,10 @@ class SparseOperator(LinearOperator):
     def gram_coo_capable(self) -> bool:
         return True
 
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        # Storage-level metadata only — mirror of the SciPy adapter.
+        return "float32" if self._matrix.dtype == cupy.float32 else None
+
     def gram_fill_estimate(self) -> float | None:
         """Estimated Gram-pattern density — the SciPy adapter's sampled
         column-overlap estimate on the host-transferred index structure.

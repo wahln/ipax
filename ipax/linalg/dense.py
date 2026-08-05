@@ -64,11 +64,13 @@ if TYPE_CHECKING:
 
 # Floor for the refinement stopping tolerance, in units of the rhs dtype's
 # machine epsilon: ``DenseOptions.refine_tol`` assumes float64 working
-# precision, so on a float32 working dtype the absolute default (1e-10) would
-# be unreachable and every solve would burn the whole refinement budget before
-# falling back. The achievable limiting residual of fixed-precision refinement
-# is a small multiple of u·‖N‖‖x‖ (Carson & Higham 2018), hence a small
-# constant times eps.
+# precision, so at a coarser working dtype the absolute default (1e-10) would
+# be unreachable and every solve would burn the whole refinement budget. The
+# achievable limiting residual of fixed-precision refinement is a small
+# multiple of u·‖N‖‖x‖ (Carson & Higham 2018), hence a small constant times
+# eps. A backstop today — ``_resolved_gram_dtype`` already refuses to reduce
+# to anything not strictly narrower than the working dtype, so a float32
+# solve never engages the mixed route in the first place.
 _REFINE_TOL_EPS_FACTOR = 16.0
 
 
@@ -142,6 +144,7 @@ class DenseSolver:
         # ``refine_failure_limit`` failures in a row flip the kill switch.
         # Any certified mixed solve resets the counter.
         self._mixed_failures = 0
+        self._mixed_label = ""  # resolved reduced dtype of the engaged route
         self.refine_iterations = 0  # corrections applied by the last solve()
 
     def describe(self) -> str:
@@ -155,9 +158,9 @@ class DenseSolver:
         if self._inertia is not None:
             return "dense (augmented)"
         if self._mixed_engaged:
-            return f"dense (gram={self._options.gram_dtype})"
+            return f"dense (gram={self._mixed_label})"
         if self._mixed_disabled and self._mixed_ever_engaged:
-            return f"dense (gram={self._options.gram_dtype}->native)"
+            return f"dense (gram={self._mixed_label}->native)"
         return "dense"
 
     def kkt_form(self) -> str:
@@ -277,13 +280,14 @@ class DenseSolver:
         ``test_masked_indefinite_exact_matrix_still_escalates``).
         """
         mixed_hook = getattr(self._operator, "dense_matrix_mixed", None)
+        gram_dtype = self._resolved_gram_dtype(rhs, xp)
         if (
-            self._options.gram_dtype != "native"
+            gram_dtype is not None
             and not self._mixed_disabled
             and mixed_hook is not None
         ):
             try:
-                matrix = mixed_hook(rhs, self._options.gram_dtype)
+                matrix = mixed_hook(rhs, gram_dtype)
             except NotImplementedError:
                 matrix = None
             except Exception as exc:
@@ -306,6 +310,48 @@ class DenseSolver:
         self._mixed_engaged = False
         self._matrix = self._materialize_dense_matrix(rhs, xp, n)
         self._guard_positive_definite(self._matrix, xp)
+
+    def _resolved_gram_dtype(self, rhs: Array, xp: Any) -> str | None:
+        """The concrete reduced dtype to accumulate the Gram in, or ``None``.
+
+        ``"native"`` never reduces; ``"float32"`` forces it; ``"auto"`` (the
+        default) asks the operator whether its constraint data carries only
+        reduced-precision information (``gram_accumulate_dtype_hint`` —
+        declared metadata, e.g. float32 dose matrices upcast at load) and is
+        a strict no-op when it does not, so fully-float64 problems never pay
+        a refinement pass. Resolution happens once, here: everything
+        downstream sees a concrete dtype name.
+
+        Either way the candidate must be *strictly narrower* than the working
+        dtype the solve runs in. Reducing to the working precision is the
+        native arithmetic bit-for-bit, so engaging the mixed route there
+        would buy nothing and cost a refinement pass — a float32 solve of
+        float32 data is simply a float32 solve.
+        """
+        mode = self._options.gram_dtype
+        if mode == "native":
+            return None
+        if mode == "float32":
+            candidate = "float32"
+        else:
+            hint_fn = getattr(self._operator, "gram_accumulate_dtype_hint", None)
+            if hint_fn is None:
+                return None
+            try:
+                candidate = hint_fn()
+            except NotImplementedError:
+                return None
+            if candidate is None:
+                return None
+        reduced = getattr(xp, candidate, None)
+        if reduced is None:
+            return None
+        # Coarser precision ⇔ wider eps, so a real reduction needs the
+        # candidate's eps strictly above the working dtype's.
+        if float(xp.finfo(reduced).eps) <= float(xp.finfo(rhs.dtype).eps):
+            return None
+        self._mixed_label = candidate if mode == "float32" else f"auto:{candidate}"
+        return candidate
 
     def _solve_factored(self, matrix: Array, rhs: Array, xp: Any) -> Array:
         """Back-substitute the kept Cholesky factor, falling back to LU."""

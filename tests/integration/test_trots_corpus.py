@@ -174,6 +174,16 @@ def test_initial_point_warm_start_beats_uniform_objective():
     assert warm_err < uniform_err
 
 
+def test_linear_block_declares_float32_source():
+    # The dose matrices are float32 in the TROTS files: the assembled linear
+    # inequality block must declare that source precision so the dense
+    # route's gram_dtype="auto" default engages the reduced accumulate.
+    instance = trots.load_trots_file(f"{_ROOT}/Prostate_BT_01.mat")
+    problem = trots.TROTSProblem(instance, np, sparse=True)
+    op = problem._linear_ineq_operator()
+    assert op.gram_accumulate_dtype_hint() == "float32"
+
+
 def test_device_evaluation_matches_host():
     # GPU-gated: with a CuPy namespace the problem callbacks must evaluate
     # device-side (no per-call host round-trip of the dose products) and agree

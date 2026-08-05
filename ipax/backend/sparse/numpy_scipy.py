@@ -436,6 +436,12 @@ class SparseOperator(LinearOperator):
     def gram_coo_capable(self) -> bool:
         return True
 
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        # Storage-level metadata only (see the LinearOperator docstring):
+        # float32-stored data may be accumulated reduced without losing data
+        # information.
+        return "float32" if self._matrix.dtype == np.float32 else None
+
     def gram_fill_estimate(self) -> float | None:
         """Estimated Gram-pattern density (sampled column overlap; see
         :func:`_estimate_gram_fill`). One-time selection probe, never on the

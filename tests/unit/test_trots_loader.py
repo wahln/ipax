@@ -89,3 +89,24 @@ def test_ordinary_sparse_matrix_still_loads(tmp_path):
     assert mat.matrix.shape == (2, 2)
     assert mat.matrix.nnz == 2
     assert mat.matrix[0, 0] == 5.0 and mat.matrix[1, 1] == 7.0
+    assert mat.source_dtype == "float64"
+
+
+def test_float32_stored_matrix_records_source_dtype(tmp_path):
+    # TROTS dose matrices are float32 in the files; the loader records that
+    # source precision so the assembled (float64-promoted) constraint block
+    # can declare it — the metadata behind DenseOptions(gram_dtype="auto").
+    path = str(tmp_path / "sparse32.mat")
+
+    def csc32(refs):
+        g = refs.create_group("a")
+        g.create_dataset("data", data=np.array([5.0, 7.0], dtype=np.float32))
+        g.create_dataset("ir", data=np.array([0, 1], dtype=np.uint64))
+        g.create_dataset("jc", data=np.array([0, 1, 2], dtype=np.uint64))
+        g.attrs["MATLAB_sparse"] = np.uint64(2)
+        return g
+
+    _write_case(path, csc32)
+    mat = trots._load_matrix(path, 0)
+
+    assert mat.source_dtype == "float32"
