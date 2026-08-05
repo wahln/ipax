@@ -72,6 +72,31 @@ converge the optimality tail within a 30-minute budget; ipax's stacked arm
 reaches feasibility at 43 with a peak of 104 and certifies at KKT 1e-7.
 (Compare **iteration counts**, never wall-clock, against compiled solvers.)
 
+### Mixed-precision Gram (`gram_dtype="auto"`, the default)
+
+The Gram accumulation is 80–93% of RT wall time, and much of the TROTS dose
+data is float32 in the file — so the default reduces that accumulation exactly
+where the data carries no float64 information, certifying every step by
+iterative refinement against the exact operator (see
+[the linalg concepts page](../concepts/linalg.md#mixed-precision-gram-accumulation-dense-route)).
+What each case gets is a property of *its own data*, not a tuning choice:
+
+| case | float32 share (by nnz) | engages | effect |
+| --- | ---: | --- | --- |
+| Prostate_VMAT_101 | 95.9% | yes, per block | **1.25×** end-to-end |
+| Protons_01 | 0.07% | yes, ~nothing to reduce | +0.8% (noise) |
+| Head-and-Neck_01 | 0% | no (correctly inert) | — |
+
+Single-thread CPU, 16 iterations for VMAT and 21 for Protons, `auto` vs
+`native`. VMAT is the mixed case the per-block reduction exists for: it is
+96% float32 held back by a single float64 constraint matrix, so an
+all-or-nothing rule reduced *nothing* there. Protons is the honest cost —
+45 of its 369 445 rows are float32, so it engages for no real gain; the
+objective is bit-identical because 99.93% of that Gram is still accumulated
+exactly. VMAT's objective agrees with the native run to 8 significant figures
+at identical KKT error (a trajectory difference within the refinement
+certificate, not an accuracy loss).
+
 ## Why these levers
 
 - **`slack_init_scale=0.1`** (the universal lever): the flat slack floor
