@@ -153,7 +153,7 @@ class _FakeMixedOperator(LinearOperator):
         self.exact_calls += 1
         return self._xp.asarray(self._a, dtype=self._xp.float64)
 
-    def dense_matrix_mixed(self, like, gram_dtype):
+    def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
         assert gram_dtype == "float32"
         self.mixed_calls += 1
         rng = np.random.default_rng(0)
@@ -180,7 +180,7 @@ class _HopelessMixed(_FakeMixedOperator):
 
     broken = True
 
-    def dense_matrix_mixed(self, like, gram_dtype):
+    def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
         self.mixed_calls += 1
         if not self.broken:
             return self._xp.asarray(self._a, dtype=self._xp.float64)
@@ -279,7 +279,7 @@ def test_precision_caused_pd_failure_falls_back_to_exact(namespace):
     a = _spd()
 
     class _NonPDMixed(_FakeMixedOperator):
-        def dense_matrix_mixed(self, like, gram_dtype):
+        def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
             self.mixed_calls += 1
             # Indefinite by construction — a precision-noise PD failure.
             return self._xp.asarray(
@@ -315,7 +315,7 @@ def test_genuine_non_pd_still_raises(namespace):
             self.exact_calls += 1
             return self._xp.asarray(indefinite, dtype=self._xp.float64)
 
-        def dense_matrix_mixed(self, like, gram_dtype):
+        def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
             self.mixed_calls += 1
             return self._xp.asarray(indefinite, dtype=self._xp.float64)
 
@@ -368,7 +368,7 @@ def test_masked_indefinite_exact_matrix_still_escalates(namespace):
             self.exact_calls += 1
             return self._xp.asarray(indefinite, dtype=self._xp.float64)
 
-        def dense_matrix_mixed(self, like, gram_dtype):
+        def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
             self.mixed_calls += 1
             # PD "masking" of the indefinite exact block.
             return self._xp.asarray(a, dtype=self._xp.float64)
@@ -553,11 +553,11 @@ def test_gram_accumulate_dtype_hint_protocol(namespace):
     )
     assert csr32.gram_accumulate_dtype_hint() == "float32"
 
-    # Wrappers: a stack hints only when EVERY block does (one full-precision
-    # block makes "no data information lost" false for the stack); row
-    # scaling forwards its inner operator's hint unchanged.
+    # A stack hints when ANY block does, because it honors the request
+    # per block (see test_stack_reduces_only_the_hinted_blocks); row scaling
+    # forwards its inner operator's hint unchanged.
     assert VStack((hinted, csr32)).gram_accumulate_dtype_hint() == "float32"
-    assert VStack((csr64, hinted)).gram_accumulate_dtype_hint() is None
+    assert VStack((csr64, hinted)).gram_accumulate_dtype_hint() == "float32"
     assert VStack((csr64, csr64)).gram_accumulate_dtype_hint() is None
     d = xp.ones(2, dtype=xp.float64)
     assert _RowScaled(hinted, d).gram_accumulate_dtype_hint() == "float32"
@@ -574,6 +574,107 @@ def test_gram_accumulate_dtype_hint_protocol(namespace):
     assert op.gram_accumulate_dtype_hint() == "float32"
 
 
+def _spy_stack(xp, n=4):
+    """A VStack of a float32-hinting block and a plain float64 block, each
+    recording the ``accumulate_dtype`` it is actually asked for."""
+    from ipax.backend.operators import VStack
+
+    seen: dict[str, object] = {}
+
+    class _Block(LinearOperator):
+        def __init__(self, label, rows, hint):
+            self._label, self._rows, self._hint = label, rows, hint
+
+        @property
+        def shape(self):
+            return (self._rows, n)
+
+        def matvec(self, v):
+            # Consistent zero operator: matches the zero Gram below, so the
+            # condensed block is well defined and refinement can certify.
+            return xp.zeros((self._rows,), dtype=xp.float64)
+
+        def rmatvec(self, v):
+            return xp.zeros((n,), dtype=xp.float64)
+
+        def gram_accumulate_dtype_hint(self):
+            return self._hint
+
+        def gram(self, weights, *, accumulate_dtype=None, hinted_only=False):
+            if (
+                hinted_only
+                and accumulate_dtype is not None
+                and self.gram_accumulate_dtype_hint() != accumulate_dtype
+            ):
+                accumulate_dtype = None
+            seen[self._label] = accumulate_dtype
+            return xp.zeros((n, n), dtype=xp.float64)
+
+    stack = VStack((_Block("f32", 3, "float32"), _Block("f64", 5, None)))
+    return stack, seen
+
+
+def test_stack_reduces_only_the_hinted_blocks(namespace):
+    # The VMAT shape: a block assembled from mixed-precision sources. The
+    # float32-sourced block accumulates reduced; the genuinely-float64 block
+    # must stay exact rather than being silently reduced along with it.
+    xp = namespace
+    stack, seen = _spy_stack(xp)
+
+    stack.gram(
+        xp.ones(8, dtype=xp.float64), accumulate_dtype="float32", hinted_only=True
+    )
+    assert seen == {"f32": "float32", "f64": None}
+
+    # A user-FORCED reduction still applies everywhere (hinted_only=False) —
+    # that is what makes gram_dtype="float32" meaningful on data that carries
+    # no float32 hint at all (e.g. TROTS Protons, genuinely float64).
+    seen.clear()
+    stack.gram(xp.ones(8, dtype=xp.float64), accumulate_dtype="float32")
+    assert seen == {"f32": "float32", "f64": "float32"}
+
+
+def test_row_scaling_forwards_per_block_request(namespace):
+    from ipax.problem.scaling import _RowScaled
+
+    xp = namespace
+    stack, seen = _spy_stack(xp)
+    scaled = _RowScaled(stack, xp.ones(8, dtype=xp.float64))
+
+    scaled.gram(
+        xp.ones(8, dtype=xp.float64), accumulate_dtype="float32", hinted_only=True
+    )
+
+    assert seen == {"f32": "float32", "f64": None}
+    assert scaled.gram_accumulate_dtype_hint() == "float32"
+
+
+def test_auto_uses_per_block_and_forced_uses_everything(namespace):
+    # End-to-end through the condensed operator: "auto" must request the
+    # per-block form, an explicit "float32" the blanket form.
+    xp = namespace
+    stack, seen = _spy_stack(xp)
+    op = _CondensedOperator(
+        Diagonal(xp.ones(4, dtype=xp.float64)),
+        Diagonal(xp.ones(4, dtype=xp.float64)),
+        Diagonal(xp.ones(8, dtype=xp.float64)),
+        stack,
+        0.0,
+    )
+    like = xp.ones(4, dtype=xp.float64)
+
+    solver = DenseSolver(DenseOptions())  # auto
+    solver.factor(op)
+    solver.solve(like)
+    assert seen == {"f32": "float32", "f64": None}
+
+    seen.clear()
+    forced = DenseSolver(DenseOptions(gram_dtype="float32"))
+    forced.factor(op)
+    forced.solve(like)
+    assert seen == {"f32": "float32", "f64": "float32"}
+
+
 def test_auto_engages_only_on_reduced_hint(namespace):
     # Default options (gram_dtype="auto"): a hinted operator engages the
     # mixed route; an unhinted fp64 operator is a strict no-op (no mixed
@@ -588,7 +689,7 @@ def test_auto_engages_only_on_reduced_hint(namespace):
         def gram_accumulate_dtype_hint(self):
             return "float32"
 
-        def dense_matrix_mixed(self, like, gram_dtype):
+        def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
             assert gram_dtype == "float32"  # auto resolves to a concrete dtype
             self.mixed_calls += 1
             return self._xp.asarray(self._a, dtype=self._xp.float64)
@@ -738,7 +839,7 @@ def test_gram_accumulate_dtype_forwards_through_wrappers(namespace):
         def matvec(self, v):
             raise NotImplementedError
 
-        def gram(self, weights, *, accumulate_dtype=None):
+        def gram(self, weights, *, accumulate_dtype=None, hinted_only=False):
             seen.append(accumulate_dtype)
             return xp.zeros((self._n, self._n), dtype=xp.float64)
 

@@ -338,7 +338,7 @@ class _CondensedOperator(LinearOperator):
 
     def dense_matrix(self, like: Array | None = None) -> Array:
         """Materialize the condensed dense block from explicit operator pieces."""
-        return self._dense_matrix_impl(like, None)
+        return self._dense_matrix_impl(like, None, False)
 
     def gram_accumulate_dtype_hint(self) -> str | None:
         """The inequality Jacobian's data-precision hint (``gram_dtype="auto"``).
@@ -351,7 +351,9 @@ class _CondensedOperator(LinearOperator):
             return None
         return self._ineq_jac.gram_accumulate_dtype_hint()
 
-    def dense_matrix_mixed(self, like: Array | None, gram_dtype: str) -> Array:
+    def dense_matrix_mixed(
+        self, like: Array | None, gram_dtype: str, *, hinted_only: bool = False
+    ) -> Array:
         """:meth:`dense_matrix` with the Gram term accumulated in ``gram_dtype``.
 
         The mixed-precision dense route (``DenseOptions.gram_dtype``): the
@@ -361,9 +363,11 @@ class _CondensedOperator(LinearOperator):
         iterative refinement against this operator's exact :meth:`matvec`
         (Carson & Higham 2018).
         """
-        return self._dense_matrix_impl(like, gram_dtype)
+        return self._dense_matrix_impl(like, gram_dtype, hinted_only)
 
-    def _dense_matrix_impl(self, like: Array | None, gram_dtype: str | None) -> Array:
+    def _dense_matrix_impl(
+        self, like: Array | None, gram_dtype: str | None, hinted_only: bool
+    ) -> Array:
         dense = self.logical_dense_block(like)
 
         if self._ineq_jac.shape[0] > 0:
@@ -373,12 +377,17 @@ class _CondensedOperator(LinearOperator):
             # built by sparse arithmetic, never densifying the m×n Jacobian. Falls
             # back to the explicit densify-and-matmul when the operator has no
             # ``gram`` (e.g. a dense/matrix-free Jacobian) or Σ_s is non-diagonal.
-            gram = self._sparse_gram(dense, gram_dtype)
+            gram = self._sparse_gram(dense, gram_dtype, hinted_only)
             if gram is not None:
                 dense = dense + xp.astype(gram, dense.dtype, copy=False)
             else:
                 jac = self._ineq_jac.dense_matrix(dense)
-                if gram_dtype is not None:
+                reduce_densified = gram_dtype is not None and (
+                    not hinted_only
+                    or self._ineq_jac.gram_accumulate_dtype_hint() == gram_dtype
+                )
+                if reduce_densified:
+                    assert gram_dtype is not None
                     # Generic reduced-precision path (any Array-API backend):
                     # cast the densified Jacobian and weights down, accumulate
                     # the Gram product in reduced precision, upcast only the
@@ -405,7 +414,12 @@ class _CondensedOperator(LinearOperator):
 
         return dense
 
-    def _sparse_gram(self, like: Array, gram_dtype: str | None = None) -> Array | None:
+    def _sparse_gram(
+        self,
+        like: Array,
+        gram_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array | None:
         """``∇gᵀ Σ_s ∇g`` via the Jacobian's sparse Gram, or ``None`` to densify.
 
         Available only when Σ_s is diagonal (the standard slack scaling) and the
@@ -422,7 +436,9 @@ class _CondensedOperator(LinearOperator):
             if gram_dtype is None:
                 return self._ineq_jac.gram(weights)
             try:
-                return self._ineq_jac.gram(weights, accumulate_dtype=gram_dtype)
+                return self._ineq_jac.gram(
+                    weights, accumulate_dtype=gram_dtype, hinted_only=hinted_only
+                )
             except TypeError:
                 return self._ineq_jac.gram(weights)
         except NotImplementedError:

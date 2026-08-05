@@ -327,7 +327,19 @@ class SparseOperator(LinearOperator):
         out = self._squared_csr.T @ _to_cupy(weights)
         return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
 
-    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        if (
+            hinted_only
+            and accumulate_dtype is not None
+            and self.gram_accumulate_dtype_hint() != accumulate_dtype
+        ):
+            accumulate_dtype = None  # this matrix's data does not support it
         # Aᵀ diag(w) A as a dense n×n matrix via sparse arithmetic (row-scale then
         # sparse Gram), densifying only the small n×n result — mirror of the SciPy
         # adapter's cached ``gram`` (see its comment for the caching rationale).

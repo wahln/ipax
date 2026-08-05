@@ -155,7 +155,13 @@ class LinearOperator(ABC):
         """
         raise NotImplementedError("operator does not expose a cheap Gram diagonal")
 
-    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
         """Return the full weighted Gram matrix ``Aᵀ diag(weights) A`` (dense ``n×n``).
 
         The matrix analogue of :meth:`gram_diagonal`: the condensed inequality term
@@ -175,8 +181,16 @@ class LinearOperator(ABC):
         may ignore the request (returning the exact Gram is always valid), and
         wrappers forwarding :meth:`gram` must forward it. Callers tolerate
         pre-keyword implementations (``TypeError``) by retrying without it.
+
+        ``hinted_only`` restricts the reduction to the parts of the operator
+        whose own data supports it (:meth:`gram_accumulate_dtype_hint`): a
+        composite honors the request block by block, leaving
+        full-precision blocks exact. That is what makes the reduction safe on
+        a block assembled from mixed-precision sources. With
+        ``hinted_only=False`` (an explicit user request) the reduction applies
+        throughout, hint or not.
         """
-        del accumulate_dtype
+        del accumulate_dtype, hinted_only
         raise NotImplementedError("operator does not expose a full weighted Gram")
 
     def gram_capable(self) -> bool:
@@ -202,8 +216,11 @@ class LinearOperator(ABC):
         certification. Metadata only, never a value scan (a float64 matrix
         that merely happens to be float32-representable must NOT hint — silent
         heuristics would shift behavior across whole benchmark corpora).
-        Wrappers forwarding :meth:`gram` forward this too; a stack reports
-        reduced if any block does (its dominant blocks are why it is asked).
+        Wrappers forwarding :meth:`gram` forward this too. A *stack* reports
+        reduced when **any** block does, because it honors the request per
+        block (see ``hinted_only`` in :meth:`gram`) — its float64 blocks stay
+        exact, so a block assembled from mixed-precision sources still gets
+        the reduction where its data justifies it.
         """
         return None
 
@@ -759,7 +776,13 @@ class VStack(LinearOperator):
         xp = array_namespace(result)
         return xp.asarray(result)
 
-    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
         # Jᵀ diag(w) J for J = [J1; …; Jk] is Σ_b Jbᵀ diag(w_b) Jb — the vertical
         # stack sums each block's Gram over its own row (weight) range. Propagates
         # NotImplementedError if any block cannot form its Gram.
@@ -767,7 +790,9 @@ class VStack(LinearOperator):
         offset = 0
         for op, rows in zip(self._ops, self._rows, strict=True):
             piece = op.gram(
-                weights[offset : offset + rows], accumulate_dtype=accumulate_dtype
+                weights[offset : offset + rows],
+                accumulate_dtype=accumulate_dtype,
+                hinted_only=hinted_only,
             )
             result = piece if result is None else result + piece
             offset += rows
@@ -780,18 +805,19 @@ class VStack(LinearOperator):
         return all(op.gram_capable() for op in self._ops)
 
     def gram_accumulate_dtype_hint(self) -> str | None:
-        # Every block must agree: the hint asserts that reducing loses no
-        # *data* information, and one full-precision block makes that false
-        # for the stack. Deliberately not a size-weighted "dominant blocks
-        # decide" rule — the core has no cost model, and silently reducing a
-        # genuinely-float64 block is exactly the surprise this hint exists to
-        # avoid. A producer that knows its own cost structure can still
-        # declare the reduction explicitly (``values_dtype_hint``) or the
-        # user can force it with ``gram_dtype="float32"``.
-        if not self._ops:
-            return None
-        hints = {op.gram_accumulate_dtype_hint() for op in self._ops}
-        return hints.pop() if len(hints) == 1 else None
+        # Any block suffices, because ``gram(hinted_only=True)`` applies the
+        # reduction per block: the float32-sourced blocks accumulate reduced
+        # and the genuinely-float64 ones stay exact. That is strictly better
+        # than the two alternatives — requiring unanimity forfeits the
+        # reduction on a block that is overwhelmingly float32 (radiotherapy
+        # VMAT plans are 96% float32 by nonzero, held back by one float64
+        # constraint), and a size-weighted rule would silently reduce
+        # declared-float64 data.
+        for op in self._ops:
+            hint = op.gram_accumulate_dtype_hint()
+            if hint is not None:
+                return hint
+        return None
 
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         # Σ_b Jbᵀ diag(w_b) Jb as concatenated n×n triplets: overlapping
@@ -1014,7 +1040,21 @@ class _SparseStructured(LinearOperator):
     def gram_diagonal(self, weights: Array) -> Array:
         return self._adapter_op().gram_diagonal(weights)
 
-    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        if (
+            hinted_only
+            and accumulate_dtype is not None
+            and self.gram_accumulate_dtype_hint() != accumulate_dtype
+        ):
+            # This operator's data does not support the reduction; the caller
+            # asked for it only where it does, so accumulate exactly.
+            accumulate_dtype = None
         return self._adapter_op().gram(weights, accumulate_dtype=accumulate_dtype)
 
     def gram_capable(self) -> bool:

@@ -315,7 +315,19 @@ class SparseOperator(LinearOperator):
         out = self._squared_csr.T @ _to_numpy(weights)
         return to_xp_array(np.asarray(out).reshape(-1), self._xp)
 
-    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        if (
+            hinted_only
+            and accumulate_dtype is not None
+            and self.gram_accumulate_dtype_hint() != accumulate_dtype
+        ):
+            accumulate_dtype = None  # this matrix's data does not support it
         # Aᵀ diag(w) A as a dense n×n matrix, formed by sparse arithmetic: scale
         # rows by w (still sparse) then a sparse Aᵀ·(diag(w)A) product, densifying
         # only the small n×n result — never the m×n matrix A itself (the point at

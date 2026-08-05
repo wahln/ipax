@@ -82,12 +82,20 @@ class _RowScaled(LinearOperator):
         # diag((DJ)ᵀ W (DJ))_k = Σ_i W_i d_i² J_ik² = J.gram_diagonal(d²·W).
         return self._jac.gram_diagonal(self._d * self._d * weights)
 
-    def gram(self, weights: Array, *, accumulate_dtype: str | None = None) -> Array:
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
         # (DJ)ᵀ diag(W) (DJ) = Jᵀ diag(d²·W) J = J.gram(d²·W): the row scaling folds
         # into the weights, so the condensed dense route keeps the sparse-Gram fast
         # path through gradient-based scaling instead of densifying the Jacobian.
         return self._jac.gram(
-            self._d * self._d * weights, accumulate_dtype=accumulate_dtype
+            self._d * self._d * weights,
+            accumulate_dtype=accumulate_dtype,
+            hinted_only=hinted_only,
         )
 
     def gram_capable(self) -> bool:

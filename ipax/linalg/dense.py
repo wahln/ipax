@@ -287,7 +287,9 @@ class DenseSolver:
             and mixed_hook is not None
         ):
             try:
-                matrix = mixed_hook(rhs, gram_dtype)
+                matrix = mixed_hook(
+                    rhs, gram_dtype, hinted_only=self._options.gram_dtype == "auto"
+                )
             except NotImplementedError:
                 matrix = None
             except Exception as exc:
