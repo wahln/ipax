@@ -188,8 +188,166 @@ def _h5_vec(f: Any, struct: str, field_name: str, i: int) -> Any:
     return np.asarray(f[f[struct][field_name][i, 0]][()], dtype=float).ravel()
 
 
+# --------------------------------------------------------------------------- #
+# On-disk matrix cache
+# --------------------------------------------------------------------------- #
+# Parsing the MATLAB v7.3 dose matrices dominates a TROTS run's startup (tens of
+# seconds per case; ``Prostate_CK_01`` measured 35-56 s), and every benchmark
+# invocation re-pays it. Each parsed matrix is therefore mirrored to a plain
+# ``.npz`` beside the dataset and reloaded from there on later runs. The cache is
+# keyed by the source file's size and mtime plus a format version, so editing or
+# replacing a ``.mat`` misses rather than serving a stale matrix, and it is
+# strictly an optimization: any failure to read or write it falls back to
+# parsing. Set ``IPAX_TROTS_CACHE`` to a directory to relocate it, or to
+# ``off`` to disable it.
+_CACHE_FORMAT = 1
+_CACHE_DIRNAME = ".ipax_trots_cache"
+_CACHE_OFF = frozenset({"", "0", "off", "no", "none", "false"})
+
+
+def _cache_dir_for(path: str) -> str | None:
+    """Cache directory for ``path``'s parsed matrices, or ``None`` if disabled."""
+    setting = os.environ.get("IPAX_TROTS_CACHE")
+    if setting is not None:
+        if setting.strip().lower() in _CACHE_OFF:
+            return None
+        root = setting
+    else:
+        root = os.path.join(os.path.dirname(os.path.abspath(path)), _CACHE_DIRNAME)
+    try:
+        stat = os.stat(path)
+        key = (
+            f"{os.path.basename(path)}"
+            f".{stat.st_size}.{stat.st_mtime_ns}.v{_CACHE_FORMAT}"
+        )
+    except OSError:
+        return None
+    return os.path.join(root, key)
+
+
+def _compact_indices(matrix: Any) -> Any:
+    """Narrow a sparse matrix's index arrays to int32 when they fit.
+
+    The MATLAB reader hands SciPy int64 ``ir``/``jc``, which SciPy then keeps —
+    8 bytes per stored entry for dose matrices whose indices never approach
+    2³¹. Narrowing halves index memory (~330 MB on ``Prostate_VMAT_101``'s
+    82 M nonzeros), shrinks the on-disk cache by the same amount, and is what
+    SciPy would have chosen had the arrays arrived as int32. Applied on both
+    the parse and cache-read paths so a cold and a warm load are identical.
+    """
+    import numpy as np
+
+    limit = np.iinfo(np.int32).max
+    if matrix.nnz > limit or max(matrix.shape, default=0) > limit:
+        return matrix
+    if matrix.indices.dtype != np.int32:
+        matrix.indices = matrix.indices.astype(np.int32, copy=False)
+    if matrix.indptr.dtype != np.int32:
+        matrix.indptr = matrix.indptr.astype(np.int32, copy=False)
+    return matrix
+
+
+def _read_cached_matrix(cache_file: str) -> TROTSMatrix | None:
+    """Load a cached :class:`TROTSMatrix`, or ``None`` on any miss/corruption."""
+    import numpy as np
+    import scipy.sparse as sp
+
+    try:
+        with np.load(cache_file) as z:  # allow_pickle stays off by default
+            builder = sp.csc_matrix if str(z["fmt"]) == "csc" else sp.csr_matrix
+            values = z["data"]
+            # Values may be stored narrowed (see the writer); widening back is
+            # exact, so the rebuilt matrix equals the parsed one bit for bit.
+            if "value_dtype" in z.files and str(z["value_dtype"]) != str(values.dtype):
+                values = values.astype(str(z["value_dtype"]))
+            matrix = _compact_indices(
+                builder(
+                    (values, z["indices"], z["indptr"]),
+                    shape=tuple(int(v) for v in z["shape"]),
+                )
+            )
+            return TROTSMatrix(
+                name=str(z["name"]),
+                mtype=int(z["mtype"]),
+                matrix=matrix,
+                b=z["b"],
+                c=float(z["c"]),
+                source_dtype=str(z["source_dtype"]),
+            )
+    except (OSError, ValueError, KeyError, EOFError):
+        # Absent, truncated (a run killed mid-write), or written by an
+        # incompatible NumPy: re-parse instead of failing the load.
+        return None
+
+
+def _write_cached_matrix(cache_file: str, mat: TROTSMatrix) -> None:
+    """Mirror a parsed matrix to ``cache_file`` (atomically; best effort)."""
+    import numpy as np
+
+    compressed = _compact_indices(
+        mat.matrix.tocsc() if mat.matrix.format == "csc" else mat.matrix.tocsr()
+    )
+    # The dense-stored matrices are widened to float64 at parse time even
+    # though the file holds float32 (``source_dtype`` records that), which
+    # would otherwise double their footprint here — the corpus caches into
+    # gigabytes. Store the narrow values when the widening is provably
+    # lossless (checked, not assumed) and widen again on read.
+    values = compressed.data
+    stored = values
+    if values.dtype == np.float64 and mat.source_dtype == "float32":
+        narrowed = values.astype(np.float32)
+        if np.array_equal(narrowed.astype(np.float64), values):
+            stored = narrowed
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    # Write-then-rename so a concurrent reader never observes a partial file
+    # (the benchmark runners load the same case from several processes).
+    tmp = f"{cache_file}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "wb") as fh:
+            np.savez(
+                fh,
+                fmt=np.asarray(compressed.format),
+                data=stored,
+                value_dtype=np.asarray(str(values.dtype)),
+                indices=compressed.indices,
+                indptr=compressed.indptr,
+                shape=np.asarray(compressed.shape, dtype=np.int64),
+                b=np.asarray(mat.b),
+                c=np.asarray(mat.c),
+                name=np.asarray(mat.name),
+                mtype=np.asarray(mat.mtype),
+                source_dtype=np.asarray(mat.source_dtype),
+            )
+        os.replace(tmp, cache_file)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def _load_matrix(path: str, j: int) -> TROTSMatrix:
-    """Read ``data.matrix[j]`` (0-based) into a :class:`TROTSMatrix`."""
+    """Read ``data.matrix[j]`` (0-based) into a :class:`TROTSMatrix`.
+
+    Served from the on-disk cache when possible (see :func:`_cache_dir_for`).
+    """
+    cache_dir = _cache_dir_for(path)
+    cache_file = os.path.join(cache_dir, f"m{j:05d}.npz") if cache_dir else None
+    if cache_file is not None:
+        cached = _read_cached_matrix(cache_file)
+        if cached is not None:
+            return cached
+
+    mat = _parse_matrix(path, j)
+
+    if cache_file is not None:
+        try:
+            _write_cached_matrix(cache_file, mat)
+        except OSError:
+            pass  # read-only location, full disk, ... — the parse still stands
+    return mat
+
+
+def _parse_matrix(path: str, j: int) -> TROTSMatrix:
+    """Read ``data.matrix[j]`` (0-based) straight from the HDF5 file."""
     import h5py
     import numpy as np
     import scipy.sparse as sp
@@ -218,12 +376,14 @@ def _load_matrix(path: str, j: int) -> TROTSMatrix:
             jc = np.asarray(obj["jc"][()]).ravel().astype(np.int64)
             nrows = int(obj.attrs["MATLAB_sparse"])
             ncols = jc.size - 1
-            matrix: Any = sp.csc_matrix((data, ir, jc), shape=(nrows, ncols))
+            matrix: Any = _compact_indices(
+                sp.csc_matrix((data, ir, jc), shape=(nrows, ncols))
+            )
         else:
             # Dense matrices are stored transposed (vars × voxels): un-transpose.
             raw = np.asarray(obj[()])
             source_dtype = str(raw.dtype)
-            matrix = sp.csr_matrix(np.asarray(raw, dtype=float).T)
+            matrix = _compact_indices(sp.csr_matrix(np.asarray(raw, dtype=float).T))
     return TROTSMatrix(
         name=name,
         mtype=mtype,

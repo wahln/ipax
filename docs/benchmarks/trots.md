@@ -133,6 +133,18 @@ Run one case per process at scale (the big `.mat` files do not co-reside in
 memory), and keep BLAS threads on — the dominant per-iteration cost (the
 condensed Gram + Cholesky) parallelizes.
 
+**Matrix cache.** Parsing the MATLAB v7.3 dose matrices dominates startup, and
+every run re-paid it. Parsed matrices are now mirrored to `.npz` files in a
+`.ipax_trots_cache/` directory beside the dataset, keyed by the source file's
+size, mtime and a format version — so editing a `.mat` misses rather than
+serving a stale matrix. Measured warm vs cold: `Prostate_CK_01` 7.3 s → 3.1 s,
+`Prostate_VMAT_101` 12.5 s → 4.5 s, with the assembled constraint block
+identical either way. The cache trades disk for time — roughly twice the
+`.mat` size, since HDF5 stores the values gzip-compressed (~1.1 GB for those
+two cases; values whose float64 widening is provably lossless are stored
+narrow to halve that). Point `IPAX_TROTS_CACHE` at another directory to
+relocate it, or set it to `off` to disable it.
+
 **Provenance.** Measured 2026-08-04 on `develop` (post-0.9.0, including the
 then-unreleased terminal-certificate change), NumPy backend, 32-core desktop,
 threaded BLAS. Exploration budget 900 s/400 iters; validation budget

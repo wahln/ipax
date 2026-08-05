@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **TROTS matrix cache (benchmarks).** Parsing the MATLAB v7.3 dose matrices
+  dominated every TROTS run's startup; parsed matrices are now mirrored to
+  `.npz` beside the dataset, keyed by the source file's size, mtime and a
+  format version (an edited `.mat` misses rather than serving a stale
+  matrix). Warm vs cold: `Prostate_CK_01` 7.3 s → 3.1 s, `Prostate_VMAT_101`
+  12.5 s → 4.5 s, assembled constraint block identical either way. Values
+  whose float64 widening is provably lossless are stored narrow (checked, not
+  assumed), and sparse indices are narrowed to int32 where they fit — which
+  also halves index memory at runtime, ~330 MB on VMAT's 82 M nonzeros. The
+  cache is strictly an optimization: any read/write failure falls back to
+  parsing. `IPAX_TROTS_CACHE` relocates it, or `off` disables it.
 - **Mixed-precision condensed Gram: `DenseOptions(gram_dtype)`, default `"auto"`.**
   The dense condensed route's dominant kernel — accumulating `∇gᵀ Σ_s ∇g`,
   80–90% of per-iteration wall at radiotherapy scale — can now run in float32
