@@ -349,6 +349,126 @@ def test_native_default_never_calls_mixed(namespace):
     assert solver.refine_iterations == 0
 
 
+def test_operator_without_a_mixed_materialization_falls_back(namespace):
+    # gram_dtype only *requests* the reduced assembly. An operator that cannot
+    # provide one (NotImplementedError) must silently get the exact route, not
+    # an error — the keyword is best-effort by design.
+    xp = namespace
+    a = _spd()
+
+    class _NoMixed(_FakeMixedOperator):
+        def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
+            self.mixed_calls += 1
+            raise NotImplementedError
+
+    op = _NoMixed(xp, a, err=0.0)
+    rng = np.random.default_rng(21)
+    rhs = xp.asarray(rng.standard_normal(a.shape[0]), dtype=xp.float64)
+
+    solver = DenseSolver(DenseOptions(gram_dtype="float32"))
+    solver.factor(op)
+    x = np.asarray(solver.solve(rhs))
+
+    np.testing.assert_allclose(a @ x, np.asarray(rhs), rtol=1e-8, atol=1e-10)
+    assert op.mixed_calls == 1 and op.exact_calls >= 1
+    assert "gram=" not in solver.describe()  # never claims a route it did not take
+
+
+def test_mixed_materialization_failure_is_a_linear_solve_error(namespace):
+    # A mixed hook that fails for a non-capability reason is a real fault and
+    # must surface as LinearSolveError (so δ_w escalation sees it), not escape
+    # as an arbitrary backend exception.
+    xp = namespace
+
+    class _BrokenMixed(_FakeMixedOperator):
+        def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
+            raise RuntimeError("backend blew up")
+
+    op = _BrokenMixed(xp, _spd(), err=0.0)
+    rhs = xp.asarray(np.random.default_rng(22).standard_normal(12), dtype=xp.float64)
+
+    solver = DenseSolver(DenseOptions(gram_dtype="float32"))
+    solver.factor(op)
+    with pytest.raises(LinearSolveError):
+        solver.solve(rhs)
+
+
+def test_refinement_accepts_a_degenerate_right_hand_side(namespace):
+    # A zero rhs has no relative residual to certify against; refinement must
+    # return the step as-is instead of dividing by a zero norm.
+    xp = namespace
+    a = _spd()
+    op = _FakeMixedOperator(xp, a, err=1e-4)
+    rhs = xp.zeros((a.shape[0],), dtype=xp.float64)
+
+    solver = DenseSolver(DenseOptions(gram_dtype="float32"))
+    solver.factor(op)
+    x = np.asarray(solver.solve(rhs))
+
+    np.testing.assert_allclose(x, np.zeros(a.shape[0]), atol=0.0)
+    assert solver.refine_iterations == 0  # returned before the first residual
+
+
+def test_operator_without_an_exact_matvec_cannot_certify(namespace):
+    # Refinement's certificate *is* the exact operator matvec. An operator that
+    # cannot supply one leaves the mixed factor uncertifiable, so the solve must
+    # be answered from the exact rebuild rather than returned on trust.
+    xp = namespace
+    a = _spd()
+
+    class _NoMatvec(_FakeMixedOperator):
+        def matvec(self, v):
+            raise NotImplementedError("matrix-free apply unavailable")
+
+    op = _NoMatvec(xp, a, err=1e-3)
+    rng = np.random.default_rng(23)
+    rhs = xp.asarray(rng.standard_normal(a.shape[0]), dtype=xp.float64)
+
+    solver = DenseSolver(DenseOptions(gram_dtype="float32"))
+    solver.factor(op)
+    x = np.asarray(solver.solve(rhs))
+
+    # Exact-quality answer despite the mixed materialization being perturbed.
+    np.testing.assert_allclose(a @ x, np.asarray(rhs), rtol=1e-8, atol=1e-10)
+    assert op.exact_calls >= 1
+
+
+@pytest.mark.parametrize("mode", ["raises", "missing"])
+def test_auto_falls_back_when_the_hint_is_unusable(namespace, mode):
+    # "auto" trusts a declared hint, but must survive a producer that cannot
+    # answer the probe at all, or that names a dtype *this* namespace does not
+    # provide. The latter is real rather than hypothetical: hints are declared
+    # metadata that travel with an operator across backends, and only float32
+    # is guaranteed by the Array API main namespace.
+    xp = namespace
+    a = _spd()
+    absent = next(
+        name
+        for name in ("bfloat16", "float16", "float8_e4m3fn", "posit16")
+        if not hasattr(xp, name)
+    )
+
+    class _OddHint(_FakeMixedOperator):
+        def gram_accumulate_dtype_hint(self):
+            if mode == "raises":
+                raise NotImplementedError
+            return absent
+
+        def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
+            raise AssertionError("must not reach the mixed route")
+
+    op = _OddHint(xp, a, err=0.0)
+    rng = np.random.default_rng(24)
+    rhs = xp.asarray(rng.standard_normal(a.shape[0]), dtype=xp.float64)
+
+    solver = DenseSolver(DenseOptions())  # gram_dtype="auto"
+    solver.factor(op)
+    x = np.asarray(solver.solve(rhs))
+
+    np.testing.assert_allclose(a @ x, np.asarray(rhs), rtol=1e-8, atol=1e-10)
+    assert "gram=" not in solver.describe()
+
+
 def test_masked_indefinite_exact_matrix_still_escalates(namespace):
     # The PD probe runs on the *approximate* matrix, so an indefinite exact N
     # whose mixed materialization is PD passes the guard. The stall detector
@@ -632,6 +752,117 @@ def test_stack_reduces_only_the_hinted_blocks(namespace):
     seen.clear()
     stack.gram(xp.ones(8, dtype=xp.float64), accumulate_dtype="float32")
     assert seen == {"f32": "float32", "f64": "float32"}
+
+
+def _hinted_csr(xp, rows, cols, values, *, hint):
+    import scipy.sparse as sp
+
+    from ipax.backend.operators import CSROperator
+
+    mat = sp.csr_matrix(values)
+    mat.sort_indices()
+    return CSROperator(
+        xp.asarray(np.asarray(mat.indptr, dtype=np.int64)),
+        xp.asarray(np.asarray(mat.indices, dtype=np.int64)),
+        xp.asarray(mat.data),
+        (rows, cols),
+        values_dtype_hint=hint,
+    )
+
+
+def test_real_sparse_operator_declines_a_per_block_reduction_it_cannot_support():
+    # The per-block tests above use a spy that re-implements the filter, so they
+    # cannot catch the *production* wrapper getting it wrong. This drives the
+    # real _SparseStructured.gram: an unhinted operator asked to reduce "only
+    # where the data allows" must accumulate exactly, while the same operator
+    # under a user-forced reduction must not. NumPy-only (SciPy adapter path).
+    import array_api_compat.numpy as xp
+
+    rng = np.random.default_rng(4)
+    m, n = 40, 6
+    # Values needing more than float32's ~7 significant digits, so a reduced
+    # accumulate is *detectable* rather than coincidentally equal.
+    values = (1.0 + 1e-9 * rng.standard_normal((m, n))) * 1e3
+    weights = xp.asarray(rng.uniform(0.5, 1.5, size=m))
+
+    unhinted = _hinted_csr(xp, m, n, values, hint=None)
+    exact = np.asarray(unhinted.gram(weights))
+
+    per_block = np.asarray(
+        unhinted.gram(weights, accumulate_dtype="float32", hinted_only=True)
+    )
+    np.testing.assert_array_equal(per_block, exact)  # declined: bit-identical
+
+    forced = np.asarray(unhinted.gram(weights, accumulate_dtype="float32"))
+    assert np.max(np.abs(forced - exact)) > 0.0  # forced: really reduced
+
+    # And an operator whose data *does* support it reduces under the same request.
+    hinted = _hinted_csr(xp, m, n, values, hint="float32")
+    accepted = np.asarray(
+        hinted.gram(weights, accumulate_dtype="float32", hinted_only=True)
+    )
+    np.testing.assert_array_equal(accepted, forced)
+
+
+def test_mixed_stack_of_real_sparse_operators_reduces_only_its_hinted_block():
+    # The assembled VMAT shape, end to end through production operators rather
+    # than spies: Σ_b Jbᵀ diag(w_b) Jb where one block is float32-sourced and
+    # the other is genuinely float64.
+    import array_api_compat.numpy as xp
+
+    from ipax.backend.operators import VStack
+
+    rng = np.random.default_rng(5)
+    n = 6
+    v32 = (1.0 + 1e-9 * rng.standard_normal((20, n))) * 1e3
+    v64 = (1.0 + 1e-9 * rng.standard_normal((15, n))) * 1e3
+    f32 = _hinted_csr(xp, 20, n, v32, hint="float32")
+    f64 = _hinted_csr(xp, 15, n, v64, hint=None)
+    stack = VStack((f32, f64))
+    w = xp.asarray(rng.uniform(0.5, 1.5, size=35))
+
+    assert stack.gram_accumulate_dtype_hint() == "float32"
+    per_block = np.asarray(stack.gram(w, accumulate_dtype="float32", hinted_only=True))
+
+    # Exactly: reduced first block + exact second block.
+    expected = np.asarray(f32.gram(w[:20], accumulate_dtype="float32")) + np.asarray(
+        f64.gram(w[20:])
+    )
+    np.testing.assert_array_equal(per_block, expected)
+
+    # Not the same as reducing everything, nor as reducing nothing.
+    blanket = np.asarray(stack.gram(w, accumulate_dtype="float32"))
+    exact = np.asarray(stack.gram(w))
+    assert np.max(np.abs(per_block - blanket)) > 0.0
+    assert np.max(np.abs(per_block - exact)) > 0.0
+
+
+def test_reduced_densify_handles_a_non_diagonal_sigma(namespace):
+    # The generic densify path (Jacobian with no sparse ``gram``) has a second
+    # branch for a non-diagonal Σ_s — the only reduced-accumulate branch that
+    # forms Σ_s explicitly. Exercised here against the exact assembly.
+    xp = namespace
+    n, m = 5, 9
+    rng = np.random.default_rng(6)
+    jac = Dense(xp.asarray(rng.standard_normal((m, n)) * 1e2, dtype=xp.float64))
+    # A genuinely non-diagonal (symmetric PD) Σ_s: Diagonal/Identity take the
+    # other branch.
+    root = rng.standard_normal((m, m))
+    sigma_s = Dense(xp.asarray(root @ root.T + m * np.eye(m), dtype=xp.float64))
+    op = _CondensedOperator(
+        Diagonal(xp.asarray(rng.uniform(1.0, 2.0, size=n), dtype=xp.float64)),
+        Diagonal(xp.asarray(rng.uniform(0.5, 1.5, size=n), dtype=xp.float64)),
+        sigma_s,
+        jac,
+        0.0,
+    )
+    like = xp.asarray(rng.standard_normal(n), dtype=xp.float64)
+
+    exact = np.asarray(op.dense_matrix(like))
+    mixed = np.asarray(op.dense_matrix_mixed(like, "float32"))
+
+    rel = np.max(np.abs(mixed - exact)) / np.max(np.abs(exact))
+    assert 1e-12 < rel < 1e-3  # really accumulated in float32, and still close
 
 
 def test_row_scaling_forwards_per_block_request(namespace):

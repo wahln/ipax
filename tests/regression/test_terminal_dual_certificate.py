@@ -386,3 +386,32 @@ def test_stall_returning_a_best_iterate_within_relaxed_tol(namespace, monkeypatc
     assert "certificate" not in result.message
     assert result.kkt_error <= 1e-6
     assert abs(float(result.x[0])) < 1e-12  # the best iterate is x0, not the tail
+
+
+def test_enabled_relative_change_tolerance_declines_the_certificate(
+    namespace, monkeypatch
+):
+    # ``f_rel_change_tol`` compares CONSECUTIVE iterates; it has no one-shot
+    # terminal analogue, so a caller who enabled it has asked for a test the
+    # certificate cannot evaluate. Declining is the honest answer — quietly
+    # dropping the component would certify against a weaker acceptance rule
+    # than the one the caller configured.
+    _always_fail_line_search(monkeypatch)
+    result = solve(
+        _asymmetric_box_problem(namespace),
+        array(namespace, [0.5, 0.5]),
+        options=Options(
+            hessian="exact",
+            linsolve="dense",
+            max_iter=100,
+            max_stall_iter=10,
+            acceptable=AcceptableStoppingOptions(
+                dual_inf_tol=1e6,  # loose enough that the point WOULD certify
+                constr_viol_tol=None,
+                compl_inf_tol=None,
+                f_rel_change_tol=1e-8,
+            ),
+        ),
+    )
+
+    assert result.status is Status.STALLED

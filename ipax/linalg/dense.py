@@ -427,7 +427,10 @@ class DenseSolver:
                 return best if best_rnorm <= accept_tol * bnorm else None
             previous = rnorm
             x = x + self._solve_factored(self._matrix, residual, xp)
-        return None
+        # Unreachable: the final sweep (``iteration == max_iters``) always
+        # returns above. Kept because the type checker cannot see that the loop
+        # is exhaustive.
+        return None  # pragma: no cover
 
     def _solve_lu(self, matrix: Array, rhs: Array, xp: Any) -> Array:
         try:
