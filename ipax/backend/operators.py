@@ -780,14 +780,18 @@ class VStack(LinearOperator):
         return all(op.gram_capable() for op in self._ops)
 
     def gram_accumulate_dtype_hint(self) -> str | None:
-        # Reduced if ANY block carries only reduced-precision information —
-        # the dominant (large) blocks are what the hint exists for; small
-        # full-precision blocks alongside are covered by the refinement
-        # certificate like everything else.
-        for op in self._ops:
-            if op.gram_accumulate_dtype_hint() == "float32":
-                return "float32"
-        return None
+        # Every block must agree: the hint asserts that reducing loses no
+        # *data* information, and one full-precision block makes that false
+        # for the stack. Deliberately not a size-weighted "dominant blocks
+        # decide" rule — the core has no cost model, and silently reducing a
+        # genuinely-float64 block is exactly the surprise this hint exists to
+        # avoid. A producer that knows its own cost structure can still
+        # declare the reduction explicitly (``values_dtype_hint``) or the
+        # user can force it with ``gram_dtype="float32"``.
+        if not self._ops:
+            return None
+        hints = {op.gram_accumulate_dtype_hint() for op in self._ops}
+        return hints.pop() if len(hints) == 1 else None
 
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         # Σ_b Jbᵀ diag(w_b) Jb as concatenated n×n triplets: overlapping

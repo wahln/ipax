@@ -32,7 +32,8 @@ default `DenseOptions(gram_dtype="auto")` prefers the precision the
 constraint data actually carries: when the inequality Jacobian *declares*
 float32-grade data (`gram_accumulate_dtype_hint()` — float32 storage, or
 float64 values that are exact float32 upcasts declared by their producer, as
-the TROTS loader does for the file-float32 dose matrices), the accumulation
+the TROTS loader does for cases whose dose matrices are float32 in the file),
+the accumulation
 runs in float32 — ~2× on CPUs (twice the SIMD width), up to the fp32/fp64
 rate ratio on GPUs — while everything else stays float64. Fully-float64
 problems are untouched: the hint is declared metadata, never a value scan,

@@ -10,7 +10,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Mixed-precision condensed Gram: `DenseOptions(gram_dtype)`, default `"auto"`.**
   The dense condensed route's dominant kernel — accumulating `∇gᵀ Σ_s ∇g`,
   80–90% of per-iteration wall at radiotherapy scale — can now run in float32
-  (the TROTS dose matrices are float32 in the source files; scoped in by
+  (many radiotherapy dose matrices are stored float32 — measured across the
+  TROTS corpus: the brachytherapy cases are float32 throughout, `Prostate_VMAT_101`
+  is 96% float32 by nnz, while `Protons_01` is genuinely float64; scoped in by
   explicit decision, with AGENTS.md updated), while every other block stays
   float64. The `"auto"` default prefers the precision the constraint data
   actually carries: it engages exactly when the inequality Jacobian declares

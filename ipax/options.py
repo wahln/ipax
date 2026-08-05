@@ -453,7 +453,7 @@ class DenseOptions:
     ``"auto"`` prefers the precision the constraint data actually carries:
     it engages float32 accumulation exactly when the inequality Jacobian
     *declares* float32-grade data (``gram_accumulate_dtype_hint`` — e.g. the
-    TROTS dose matrices, float32 in their source files) and is a strict
+    float32-stored radiotherapy dose matrices) and is a strict
     no-op otherwise, so fully-float64 problems are untouched. ``"float32"``
     forces the reduction; ``"native"`` disables it. Either way the requested
     dtype must be strictly narrower than the working dtype the solve runs in

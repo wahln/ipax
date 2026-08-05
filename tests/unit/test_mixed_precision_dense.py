@@ -553,8 +553,11 @@ def test_gram_accumulate_dtype_hint_protocol(namespace):
     )
     assert csr32.gram_accumulate_dtype_hint() == "float32"
 
-    # Wrappers: VStack reports reduced if ANY block does; row scaling forwards.
-    assert VStack((csr64, hinted)).gram_accumulate_dtype_hint() == "float32"
+    # Wrappers: a stack hints only when EVERY block does (one full-precision
+    # block makes "no data information lost" false for the stack); row
+    # scaling forwards its inner operator's hint unchanged.
+    assert VStack((hinted, csr32)).gram_accumulate_dtype_hint() == "float32"
+    assert VStack((csr64, hinted)).gram_accumulate_dtype_hint() is None
     assert VStack((csr64, csr64)).gram_accumulate_dtype_hint() is None
     d = xp.ones(2, dtype=xp.float64)
     assert _RowScaled(hinted, d).gram_accumulate_dtype_hint() == "float32"
