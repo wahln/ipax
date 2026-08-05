@@ -106,9 +106,13 @@ reaches feasibility at 43 with a peak of 104 and certifies at KKT 1e-7.
   budget than 30 min.
 - **Head-and-Neck scale** (`n ≈ 10⁴`, `m ≈ 10⁵`): ~45 s/iteration on 32
   threads — a practical-budget scale limit of the generic routes. The
-  RT-specific dose-matrix kernels (tiling, mixed precision) that close the
-  remaining per-iteration gap to Breedveld's tuned solver are deliberately
-  out of scope (see `AGENTS.md`).
+  RT-specific dose-matrix kernels (graph tiling, custom mixed-precision tiled
+  BLAS) that close the remaining per-iteration gap to Breedveld's tuned solver
+  are deliberately out of scope (see `AGENTS.md`); the *generic*
+  mixed-precision Gram accumulation is in, and engages by itself wherever the
+  dose matrices are float32 in the file — this case is not one of them
+  (`Head-and-Neck_01` is float64 throughout, so `gram_dtype="auto"` correctly
+  does nothing for it).
 - **Prostate_BT_02** shows the slack lever's basin effect: the plain default
   certifies `optimal` at objective ≈0 in 13 iterations, the recipe takes 401
   iterations (9 s) to a strictly better optimum at −0.75 — same signature as

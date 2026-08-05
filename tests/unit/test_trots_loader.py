@@ -240,6 +240,118 @@ def test_matrix_cache_failure_is_not_fatal(tmp_path, monkeypatch):
     assert mat.matrix[0, 0] == 5.0
 
 
+def _linear_instance(sources, *, n=3):
+    """Instance whose lin-block rows come from matrices of the given source dtypes.
+
+    Matrices are injected into the instance cache, so no HDF5 file is involved:
+    entry ``i`` contributes two rows carrying the value ``i + 1``.
+    """
+    import scipy.sparse as sp
+
+    entries, cache = [], {}
+    for i, src in enumerate(sources):
+        cache[i + 1] = trots.TROTSMatrix(
+            name=f"m{i}",
+            mtype=0,
+            matrix=sp.csr_matrix(np.full((2, n), float(i + 1))),
+            b=np.zeros(2),
+            c=0.0,
+            source_dtype=src,
+        )
+        entries.append(
+            trots.TROTSEntry(
+                name=f"c{i}",
+                is_constraint=True,
+                minimise=True,  # upper-bounded: A x ≤ bound
+                ctype=1,
+                data_id=i + 1,
+                params=None,
+                bound=float(10 * (i + 1)),
+                weight=1.0,
+                priority=1,
+                active=True,
+            )
+        )
+    inst = trots.TROTSInstance(
+        identifier="synthetic", n=n, real=n, entries=entries, solution=None
+    )
+    inst._matrix_cache = cache
+    return inst
+
+
+def _lin_problem(sources, *, n=3):
+    from ipax.backend.namespace import array_namespace
+
+    return trots.TROTSProblem(
+        _linear_instance(sources, n=n), array_namespace(np.zeros(1))
+    )
+
+
+@pytest.mark.parametrize(
+    ("sources", "hint"),
+    [
+        (["float32", "float32"], "float32"),  # uniformly float32 → hint the block
+        (["float64", "float64"], None),  # genuinely float64 → no hint
+        (["float64", "float32"], "float32"),  # mixed → hint via the float32 group
+    ],
+)
+def test_linear_block_declares_its_source_precision(sources, hint):
+    # gram_dtype="auto" reduces the Gram accumulate only where the operator says
+    # the data permits it, so the lowered G z + h ≤ 0 block must declare the
+    # precision its rows actually carry — including when the plan mixes the two.
+    op = _lin_problem(sources)._linear_ineq_operator()
+
+    assert op.gram_accumulate_dtype_hint() == hint
+
+
+def test_mixed_source_block_is_split_so_only_float32_rows_reduce():
+    # Radiotherapy plans are routinely mixed (a VMAT plan is ~96% float32 by
+    # nonzero, held back by one float64 matrix). All-or-nothing would forfeit
+    # the reduction entirely; the block is stacked instead, so the float32 rows
+    # reduce while the float64 rows stay exact.
+    from ipax.backend.operators import VStack
+
+    op = _lin_problem(["float64", "float32"])._linear_ineq_operator()
+
+    assert isinstance(op, VStack)
+    f32_block, f64_block = op._ops
+    assert f32_block.gram_accumulate_dtype_hint() == "float32"
+    assert f64_block.gram_accumulate_dtype_hint() is None
+    # The float32-sourced rows lead the block: entry 1 carries the value 2.0.
+    np.testing.assert_array_equal(np.asarray(f32_block.dense_matrix()), 2.0)
+    np.testing.assert_array_equal(np.asarray(f64_block.dense_matrix()), 1.0)
+
+
+def test_grouping_preserves_the_constraints_it_reorders():
+    # Grouping permutes rows, so the guarantee is that the block still describes
+    # the same feasible set and that values and Jacobian rows stay aligned.
+    mixed = _lin_problem(["float64", "float32"])
+    plain = _lin_problem(["float64", "float64"])  # same data, ungrouped
+    z = np.asarray([0.5, -1.0, 2.0])
+
+    g_mixed = np.asarray(mixed.ineq_constraints(z))
+    g_plain = np.asarray(plain.ineq_constraints(z))
+    np.testing.assert_allclose(np.sort(g_mixed), np.sort(g_plain), rtol=0, atol=0)
+
+    # Row alignment: the block is linear, so J @ v must be its exact increment.
+    v = np.asarray([1.0, -0.25, 0.5])
+    jac = mixed.ineq_jacobian(z)
+    step = np.asarray(mixed.ineq_constraints(z + v)) - g_mixed
+    np.testing.assert_allclose(np.asarray(jac.matvec(v)), step, rtol=1e-12, atol=0)
+
+
+def test_split_block_gram_matches_the_unsplit_one():
+    # A vertical stack's Gram is the sum of its blocks' Grams, so splitting must
+    # be exactly neutral when no reduction is requested.
+    mixed = _lin_problem(["float64", "float32"])._linear_ineq_operator()
+    plain = _lin_problem(["float64", "float64"])._linear_ineq_operator()
+    w = np.asarray([1.0, 2.0, 3.0, 4.0])
+
+    np.testing.assert_allclose(
+        np.asarray(mixed.gram(w)), np.asarray(plain.gram(w[[2, 3, 0, 1]])), rtol=0
+    )
+
+
 def test_float32_stored_matrix_records_source_dtype(tmp_path):
     # TROTS dose matrices are float32 in the files; the loader records that
     # source precision so the assembled (float64-promoted) constraint block

@@ -31,7 +31,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (float32 storage, or float64 values that are exact float32 upcasts declared
   by their producer — declared metadata, never a value scan) and is a strict
   no-op for fully-float64 problems; `"float32"` forces the reduction,
-  `"native"` disables it. Working accuracy is restored per solve by fixed-precision iterative
+  `"native"` disables it. A Jacobian assembled from sources of differing
+  precision is reduced **per block**: `"auto"` asks a stacked operator to
+  accumulate reduced only in the blocks whose own data permits it, leaving the
+  genuinely-float64 blocks exact — so a plan that is overwhelmingly float32 but
+  held back by a single float64 matrix keeps the reduction rather than
+  forfeiting it (`Prostate_VMAT_101`: 96% of nonzeros reduce, 0% before).
+  Working accuracy is restored per solve by fixed-precision iterative
   refinement against the exact float64 operator matvec (Carson & Higham 2018);
   every returned step carries a measured exact-residual certificate:
   refinement targets `refine_tol`, budget-exhausted/plateaued solves are
@@ -47,7 +53,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   and row scaling; honored by the SciPy and CuPy adapters via a cast-once
   reduced-data CSR), `_CondensedOperator.dense_matrix_mixed` covers
   gram-capable and generic (pure Array-API `float32`) Jacobians alike, and
-  `Result.routes` reports the engaged route as `dense (gram=float32)`.
+  `Result.routes` reports the engaged route as `dense (gram=float32)` (or
+  `dense (gram=auto:float32)` when the hint chose it). On the benchmark side
+  the TROTS loader now tracks source precision per *row* and groups its lowered
+  `G z + h ≤ 0` block so each precision forms a contiguous operator — the
+  assembly the per-block reduction needs.
 - **Routing-hints registry + report section.** `benchmarks/routing_hints.py`
   is a curated registry of *measured* per-problem wins for the opt-in levers
   (recipe, metrics, failure signature, budget), and the S2MPJ sweep report

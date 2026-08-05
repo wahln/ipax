@@ -649,7 +649,10 @@ class TROTSProblem(Problem):
         lin_rows: list[Any] = []  # scipy rows over x (padded later)
         lin_lo: list[float] = []
         lin_hi: list[float] = []
-        lin_sources: list[str] = []  # file dtypes of the lin-block matrices
+        # Per-row "is this row's data float32 in the file?" flags, appended in the
+        # same order as the rows themselves so the lowered block below can be
+        # grouped by source precision.
+        lin_f32: list[Any] = []
 
         for e in instance.entries:
             factor = 1.0 if e.minimise else -1.0
@@ -682,7 +685,9 @@ class TROTSProblem(Problem):
                     A = mat.matrix
                     off = mat.b if mat.b.size == A.shape[0] else 0.0
                     # minimise ⇒ maximum constraint (A x + off ≤ bound); else minimum.
-                    lin_sources.append(mat.source_dtype)
+                    lin_f32.append(
+                        np.full(A.shape[0], mat.source_dtype == "float32", dtype=bool)
+                    )
                     if e.minimise:
                         lin_rows.append(A)
                         lin_lo.extend([-np.inf] * A.shape[0])
@@ -725,9 +730,9 @@ class TROTSProblem(Problem):
                 )
             )
         for k, (mat, _w, minimise) in enumerate(self._minimax):
-            lin_sources.append(mat.source_dtype)
             A = sp.csr_matrix(mat.matrix)
             m = A.shape[0]
+            lin_f32.append(np.full(m, mat.source_dtype == "float32", dtype=bool))
             e_k = sp.csr_matrix(
                 (np.full(m, -1.0 if minimise else 1.0), (np.arange(m), np.full(m, k))),
                 shape=(m, self._n_aux),
@@ -754,15 +759,32 @@ class TROTSProblem(Problem):
         # scale, so we lower the sparse block ourselves and keep it sparse.
         hi_fin = np.isfinite(self._lin_hi)
         lo_fin = np.isfinite(self._lin_lo)
+        row_f32 = (
+            np.concatenate(lin_f32)
+            if lin_f32
+            else np.zeros((self._A_lin.shape[0],), dtype=bool)
+        )
         g_blocks: list[Any] = []
         h_parts: list[Any] = []
+        n_f32 = 0
         A_csr = self._A_lin.tocsr()
-        if bool(hi_fin.any()):
-            g_blocks.append(A_csr[hi_fin])
-            h_parts.append(-self._lin_hi[hi_fin])
-        if bool(lo_fin.any()):
-            g_blocks.append(-A_csr[lo_fin])
-            h_parts.append(self._lin_lo[lo_fin])
+        # Emit the float32-sourced rows first, so that group is *contiguous* in the
+        # lowered ``G`` and can be handed to the solver as an operator of its own
+        # carrying its own accumulate hint (see ``_linear_ineq_operator``). Row
+        # order within a group — and hence the whole block whenever the plan is not
+        # mixed — is unchanged from the ungrouped assembly.
+        for is_f32 in (True, False):
+            group = row_f32 == is_f32
+            sel_hi = hi_fin & group
+            sel_lo = lo_fin & group
+            if bool(sel_hi.any()):
+                g_blocks.append(A_csr[sel_hi])
+                h_parts.append(-self._lin_hi[sel_hi])
+                n_f32 += int(sel_hi.sum()) if is_f32 else 0
+            if bool(sel_lo.any()):
+                g_blocks.append(-A_csr[sel_lo])
+                h_parts.append(self._lin_lo[sel_lo])
+                n_f32 += int(sel_lo.sum()) if is_f32 else 0
         self._G = (
             sp.vstack(g_blocks, format="csr")
             if g_blocks
@@ -771,16 +793,15 @@ class TROTSProblem(Problem):
         self._h = np.concatenate(h_parts) if h_parts else np.zeros((0,), dtype=float)
         self._n_lin_ineq = int(self._G.shape[0])
         self._n_nl_ineq = len(self._nl_con) + len(self._quad_con)
-        # The lin-block values are the source matrices' entries times ±1 (plus
-        # the ±1 minimax links), so when every contributing matrix is float32
-        # in the file the assembled float64 ``G`` carries only float32
-        # information — declared to the operator so the solver's
-        # ``gram_dtype="auto"`` default can engage the reduced accumulate.
-        self._lin_source_hint: str | None = (
-            "float32"
-            if lin_sources and all(s == "float32" for s in lin_sources)
-            else None
-        )
+        # The lin-block values are the source matrices' entries times ±1 (plus the
+        # ±1 minimax links), so a row drawn from a matrix that is float32 in the
+        # file carries only float32 information even though the assembled ``G`` is
+        # float64. Those rows lead the block (grouped above), and the count is what
+        # ``_linear_ineq_operator`` splits on so the solver's ``gram_dtype="auto"``
+        # default can reduce their accumulate while the genuinely-float64 rows stay
+        # exact. Radiotherapy plans are routinely mixed: a VMAT plan measures ~96%
+        # float32 by nonzero, held back by a single float64 constraint matrix.
+        self._n_lin_f32 = n_f32
         self._G_op: LinearOperator | None = None  # cached constant sparse operator
 
         # Objective linear coefficient over z (mean terms on x; minimax on t).
@@ -993,9 +1014,28 @@ class TROTSProblem(Problem):
     # up with them (the trailing linear multipliers carry no curvature).
     def _linear_ineq_operator(self) -> LinearOperator:
         if self._G_op is None:
-            self._G_op = self._csr_operator(
-                self._G, symmetric=False, values_dtype_hint=self._lin_source_hint
-            )
+            k = self._n_lin_f32
+            if k in (0, self._n_lin_ineq):
+                self._G_op = self._csr_operator(
+                    self._G,
+                    symmetric=False,
+                    values_dtype_hint="float32" if k else None,
+                )
+            else:
+                from ipax.backend.operators import VStack
+
+                # Mixed sources: hand the two groups over separately, so a reduced
+                # Gram accumulate applies to the float32-sourced rows alone. The
+                # stack is equivalent row-for-row to the single operator — a
+                # vertical stack's Gram is the sum of its blocks' Grams.
+                self._G_op = VStack(
+                    (
+                        self._csr_operator(
+                            self._G[:k], symmetric=False, values_dtype_hint="float32"
+                        ),
+                        self._csr_operator(self._G[k:], symmetric=False),
+                    )
+                )
         return self._G_op
 
     def ineq_constraints(self, z: Array) -> Array:

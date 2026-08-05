@@ -39,7 +39,21 @@ rate ratio on GPUs — while everything else stays float64. Fully-float64
 problems are untouched: the hint is declared metadata, never a value scan,
 so behavior only changes where the data provably carries no float64
 information. `gram_dtype="float32"` forces the reduction, `"native"`
-disables it. Both respect the working precision the solve actually runs in —
+disables it.
+
+A Jacobian assembled from sources of differing precision does not have to
+choose between reducing everything and reducing nothing: `"auto"` applies the
+reduction **per block**, so a stacked operator accumulates reduced in the
+blocks whose own data permits it and exactly in the rest. This is what makes
+the hint usable on real plans — a radiotherapy VMAT case is 96% float32 by
+nonzero, held back by a single float64 constraint matrix, and an
+all-or-nothing rule would forfeit the whole reduction to that one block. A
+size-weighted rule would be the opposite error, silently reducing data its
+producer declared float64. Producers that can group their rows by source
+precision should do so (the TROTS loader groups its lowered inequality block
+that way), since the split is what gives each precision a block of its own.
+
+Both settings respect the working precision the solve actually runs in —
 the reduced dtype must be strictly narrower than it, so a float32 solve of
 float32 data stays a plain float32 solve rather than paying a refinement
 pass for bit-identical arithmetic. Full
@@ -61,7 +75,8 @@ approximate matrix; the refinement rejection is what catches the
 masked-indefinite case, and the pair is pinned by a regression test.) The
 option applies to the inequality/bound **condensed** assembly —
 equality-constrained saddle systems currently assemble exactly and ignore it.
-`Result.routes` reports the engaged route as `dense (gram=float32)`, or
+`Result.routes` reports the engaged route as `dense (gram=float32)` — or
+`dense (gram=auto:float32)` when the hint chose the dtype, and
 `dense (gram=float32->native)` after a self-disable.
 
 !!! warning "Known limitation: matrix-free Krylov on equality saddles"
