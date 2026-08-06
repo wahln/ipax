@@ -97,6 +97,33 @@ exactly. VMAT's objective agrees with the native run to 8 significant figures
 at identical KKT error (a trajectory difference within the refinement
 certificate, not an accuracy loss).
 
+**The speedup is CPU-side; do not read it as cross-platform.** On CUDA
+(RTX 4070 Laptop, CuPy) the same VMAT reduction is a *wash* — interleaved
+Gram timings with clocks verified stable give 0.96× for the per-block form and
+1.12× for reducing everything, and the refinement overhead is negligible
+(1.15 s across 7 iterations). At `n ≈ 2·10³` the Gram is bound by the
+sparse→dense chunk expansion rather than the GEMM, so halving the accumulate
+width changes little; the same signature as the syrk result (1.00× at
+`n = 1080`, 1.80× at `n = 5000`). Correctness *is* verified on device: the
+per-block filter fires (per-block and blanket results differ bitwise, with
+per-block carrying the smaller error), the rank-k update leaves the Gram
+exactly symmetric, and the objective matches the native run.
+
+Whether the reduction pays on GPU at Head-and-Neck scale (`n ≈ 10⁴`) is
+**unmeasured**: that case saturates an 8 GB card's memory pool and drives it
+into clock throttling (2535 → 765 MHz), and repeat runs disagreed by more than
+an order of magnitude in both the absolute times and the ratio. It needs
+hardware with the headroom to answer it. Note also that `auto` would not engage
+there in any case — Head-and-Neck's data is genuinely float64, so the
+reduction would have to be user-forced.
+
+Two measurement notes for anyone repeating this. The sparse adapters memoize
+the Gram per `accumulate_dtype`, keyed on weight equality (it serves `δ_w`
+retries within an iteration), so a timing loop reusing one weight vector
+measures a cache hit rather than the kernel. And on a laptop GPU, arms run
+back-to-back drift enough to invert the result — interleave the variants and
+log the clocks.
+
 ## Why these levers
 
 - **`slack_init_scale=0.1`** (the universal lever): the flat slack floor
