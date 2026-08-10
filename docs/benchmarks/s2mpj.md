@@ -47,11 +47,11 @@ from every problem file:
 
 | | |
 | --- | --- |
-| date | 2026-08-01 (v20) |
+| date | 2026-08-07 (v22) |
 | CPU | 13th Gen Intel Core i9-13900HX (32 logical CPUs) |
 | OS | Windows 11 (10.0.26200), AMD64 |
 | Python | 3.14.6 |
-| ipax | 0.9.0 + the terminal KKT certificate (develop @ `2e7f3a1`) |
+| ipax | 0.9.0 + the 0.10.0 linalg work (develop @ `990432e`) |
 | NumPy / SciPy | 2.4.6 / 1.17.1 |
 | PyTorch | 2.12.0+cpu |
 | sparse factorization | Feral LDLᵀ (CPU) |
@@ -59,18 +59,30 @@ from every problem file:
 ### Methodology
 
 The full `{lbfgs, exact} × {dense, krylov, sparse}` matrix was swept in one run
-(`--all`), **six problems concurrently** (`--jobs 6`) with single-threaded
+(`--all`), **ten problems concurrently** (`--jobs 10`) with single-threaded
 BLAS. Gradient-based scaling (the solver default), NumPy backend. Per-solve
 budget: `max_iter = 10000`, `max_time = 300 s`.
 
-!!! warning "`--jobs` moves one column"
+!!! warning "`max_time` verdicts are wall-clock, and concurrency moves them"
 
-    v20 ran at `--jobs 6`, matching the v19 baseline, so the delta below is
-    jobs-clean. Concurrency cannot change which point a solve converges to, but
-    `max_time` is a wall-clock verdict and machine load still moves it: v20's
-    objective-free rows ran in a resumed second session against a lighter
-    queue, so read `max_time` transitions on that subset as load, not code.
-    Prefer iteration counts when comparing across runs with different load.
+    Concurrency cannot change which point a solve converges to, but `max_time`
+    is a wall-clock verdict, so a memory-bandwidth-heavy problem sharing the
+    machine with nine others can cross the cap that it cleared before.
+    **Prefer iteration counts when comparing across runs.**
+
+    v22 ran at `--jobs 10` against v20's `--jobs 6`, and that difference owns
+    three of its five regressions: `CHANDHEU` on the `exact/*` routes solves in
+    **15 iterations either way**, but took 174 s in v20, 308–345 s in v22 — and
+    ~100 s when re-run alone at the same commit. Its own `lbfgs/*` rows are the
+    control: identical 15 iterations in both sweeps, 2.4–4× the wall time, so
+    the cost is per-evaluation contention, not a trajectory change. Corpus-wide
+    the machine was, if anything, *faster* in v22 (median `solve_time` ratio
+    0.965 on rows with identical `n_iter`), which is what localises the effect
+    to CHANDHEU's scheduling slot.
+
+    The general check, worth reusing: compare `solve_time` only across rows
+    with identical `n_iter` — same work — and treat the median as the machine
+    factor before attributing anything to code.
 Each route is gated by a **per-route variable cap** (dense 2000, Krylov 10000,
 sparse 25000) so a single full-corpus run stays tractable — three problems exceed
 the dense cap and are reported as oversized for the two dense routes. The
@@ -95,20 +107,78 @@ terminal states.
 
 | config | correct | converged | optimal | acceptable | infeasible | stalled | rest.failed | max_iter | max_time | unbounded | num.err |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `lbfgs/dense`  | 774 / 1098 | 917 | 790 | 126 | 58 | 37 | 64 | 15 | 7  | 1 | 0 |
-| `lbfgs/krylov` | 752 / 1101 | 894 | 769 | 124 | 58 | 26 | 61 | 12 | 50 | 1 | 0 |
-| `lbfgs/sparse` | 780 / 1101 | 924 | 782 | 141 | 59 | 30 | 63 | 18 | 6  | 1 | 1 |
-| `exact/dense`  | 768 / 1098 | 898 | 806 | 91  | 58 | 27 | 62 | 16 | 37 | 1 | 0 |
-| `exact/krylov` | 706 / 1101 | 852 | 795 | 56  | 58 | 41 | 54 | 20 | 77 | 0 | 0 |
-| `exact/sparse` | **797 / 1101** | **935** | **877** | 57 | 59 | 22 | 59 | 13 | 12 | 1 | 1 |
+| `lbfgs/dense`  | 774 / 1098 | 918 | 788 | 129 | 58 | 38 | 64 | 14 | 6  | 1 | 0 |
+| `lbfgs/krylov` | 752 / 1101 | 894 | 769 | 124 | 58 | 26 | 62 | 14 | 47 | 1 | 0 |
+| `lbfgs/sparse` | 780 / 1101 | 924 | 782 | 141 | 59 | 30 | 63 | 20 | 4  | 1 | 1 |
+| `exact/dense`  | 770 / 1098 | 900 | 806 | 93  | 58 | 26 | 65 | 30 | 19 | 1 | 0 |
+| `exact/krylov` | 706 / 1101 | 852 | 794 | 57  | 58 | 41 | 53 | 22 | 76 | 0 | 0 |
+| `exact/sparse` | **796 / 1101** | **934** | **876** | 57 | 59 | 22 | 59 | 14 | 12 | 1 | 1 |
 
 Solved-correct by **at least one route: 828 / 1101**; converged by at least one
 route: **963 / 1101**.
 
-### Changes since the v19 baseline
+!!! note "Reading the two budget columns together"
 
-**+46 correct across the six configs (4531 → 4577), every config positive** —
-46 fixed against **zero** broken, with zero linear-solver route changes.
+    `max_iter` and `max_time` are one quantity split by which cap a
+    non-converging run happens to reach first, so they must be read as a pair.
+    On `exact/dense` v20 → v22, `max_iter` rose 16 → 30 while `max_time` fell
+    37 → 19: **13 of the 14 new `max_iter` rows were already incorrect in both
+    sweeps** (`AVION2`, `CLNLBEAM`, `ERRINBAR`, `HS68`, `LUKVLE14`, `NCVXQP3`/
+    `6`/`8`/`9`, `ORTHREGA`, `ORTHREGE`, `TRAINH`, `TRO6X2`) and had previously
+    run out of *wall clock* at 3 000–9 000 iterations. Reaching 10 001
+    iterations inside the same 300 s means they got faster, not worse. The one
+    correct-affecting row is `COSHFUN`, covered below.
+
+### Changes since the v20 baseline
+
+**+1 correct across the six configs (4577 → 4578)** — 6 fixed against 5 broken,
+with **zero linear-solver route changes**. The intervening work was the
+`0.10.0` linear-algebra arc (symmetric rank-k Gram update on both the SciPy and
+CuPy adapters, the fill-certified tall sparse-NE routing gate, and
+opt-in-then-default mixed-precision Gram accumulation), none of which is
+expected to move a float64 corpus — and it did not.
+
+| config | v20 | v21 | v22 | Δ |
+| --- | --- | --- | --- | --- |
+| `lbfgs/dense`  | 774 | 774 | 774 | ±0 |
+| `lbfgs/krylov` | 752 | 752 | 752 | ±0 |
+| `lbfgs/sparse` | 780 | 780 | 780 | ±0 |
+| `exact/dense`  | 768 | 771 | 770 | **+2** |
+| `exact/krylov` | 706 | 707 | 706 | ±0 |
+| `exact/sparse` | 797 | 797 | 796 | **−1** |
+
+**Why mixed precision cannot move this corpus.** `gram_dtype="auto"` engages
+only where an operator *declares* reduced-precision data through
+`gram_accumulate_dtype_hint()`. Nothing in S2MPJ does — the corpus is float64
+throughout, and the only producer that declares a hint is the TROTS loader — so
+`_resolved_gram_dtype` returns `None` and the mixed branch is never entered.
+Verified rather than argued: a 612-row probe across all six configs reported
+zero rows on a reduced route.
+
+All five regressions are **cap-boundary cases**, none a correctness change:
+
+- **`CHANDHEU`** (`exact/dense`, `exact/krylov`, `exact/sparse`) — the `--jobs`
+  contention case dissected above; re-running the same commit alone gives
+  `optimal` in 15 iterations at ~100 s, faster than the v20 baseline row.
+- **`COSHFUN`** (`exact/dense`) — converged in v20 at iteration **9974** of a
+  10000 cap, i.e. 26 iterations of headroom. Any trajectory perturbation, down
+  to a change in floating-point summation order, tips it over.
+- **`CORE2`** (`lbfgs/dense`) — flips `optimal ↔ stalled` on **BLAS thread count
+  alone**, at the baseline commit as well as at HEAD (optimal at 4 and 16
+  threads, stalled at 1 and 8, iteration count swinging 40 ↔ 148). Attributing
+  it to any commit is meaningless. Its stall lands at constraint violation
+  6.7e3, which is a robustness cliff worth investigating on its own terms.
+
+The six fixed rows are mostly the mirror image — `max_time → optimal/acceptable`
+on `KISSING2`, `TWIRIMD1`, `ZAMB2m11`, `FBRAIN3LS` — plus two genuine
+trajectory improvements: `VANDERM4` (`stalled` at 2437 iterations →
+`acceptable` at 206) and `HALDMADS`, which now converges to the documented
+optimum rather than a different local one.
+
+#### Changes in the v20 baseline (2026-08-01), since v19
+
+Retained for provenance: **+46 correct (4531 → 4577), every config positive** —
+46 fixed against **zero** broken, zero route changes.
 
 | config | v19 | v20 | Δ |
 | --- | --- | --- | --- |
@@ -119,7 +189,7 @@ route: **963 / 1101**.
 | `exact/krylov` | 700 | 706 | **+6** |
 | `exact/sparse` | 793 | 797 | **+4** |
 
-The gain is the **terminal KKT certificate**: a run ending
+The gain was the **terminal KKT certificate**: a run ending
 `stalled`/`max_iter`/`max_time` now re-judges its returned best iterate — with
 repaired candidate multipliers where the recorded ones drifted — and reports
 `acceptable` when the full scaled residual passes the acceptable-stopping
@@ -151,21 +221,28 @@ the optimization rate. The optimization column shows `correct` (`converged`).
 
 | config | optimization (896) | feasibility (205) |
 | --- | --- | --- |
-| `lbfgs/dense`  | 685 / 893* (828) | 89 / 205 |
+| `lbfgs/dense`  | 685 / 893* (829) | 89 / 205 |
 | `lbfgs/krylov` | 665 / 896  (807) | 87 / 205 |
 | `lbfgs/sparse` | 690 / 896  (834) | 90 / 205 |
-| `exact/dense`  | 685 / 893* (815) | 83 / 205 |
-| `exact/krylov` | 619 / 896  (765) | 87 / 205 |
-| `exact/sparse` | 705 / 896  (843) | **92 / 205** |
+| `exact/dense`  | 687 / 893* (817) | 83 / 205 |
+| `exact/krylov` | 620 / 896  (766) | 86 / 205 |
+| `exact/sparse` | **705 / 896**  (843) | **91 / 205** |
 
 <small>* dense routes ran 893 of the 896 optimization problems; three exceed the
 dense variable cap.</small>
 
-Both columns gain from the terminal certificate: the feasibility side because
-the equation systems' recorded residuals were drifted-multiplier noise at
-points that were in fact acceptably feasible (79–89 → 83–92), the optimization
-side through the least-squares family. The split itself is derived by
-inspecting each built problem for a constant objective (205/896).
+Both columns were lifted by the v20 terminal certificate: the feasibility side
+because the equation systems' recorded residuals were drifted-multiplier noise
+at points that were in fact acceptably feasible (79–89 → 83–92 at v20, 83–91
+here), the optimization side through the least-squares family.
+
+The split is derived by building each problem and asking whether it has an
+objective at all — the same gate the runner applies when `--include-objective-free`
+is absent. Do this by *constructing the problem*, not by re-deriving the
+predicate: instantiating with an explicit `size=0` rather than `None` silently
+builds a degenerate `n = 0` instance for every *scalable* problem, which then
+has no objective groups and is miscounted as objective-free (it inflates the
+count 205 → 326, with `ARGLINA` collapsing from n=200 to n=0).
 
 ### Observations
 
@@ -230,7 +307,7 @@ inspecting each built problem for a constant objective (205/896).
   `stalled` exits, and a **terminal KKT certificate** additionally repairs
   drifted multipliers at the returned iterate before giving up on it — a
   genuinely active constraint's certificate fails, so it under-certifies at
-  worst (see *Changes since the v19 baseline*).
+  worst (see *Changes in the v20 baseline*).
 - **`unbounded` is now a certified verdict**: it requires the objective to
   diverge below `−diverging_iterates_tol`, not just a large iterate norm.
   KOEBHELB — whose iterate wanders past 1e22 and then converges to f = 112 —
@@ -439,11 +516,31 @@ python -m benchmarks.runners.s2mpj --all --config exact/sparse --jobs 5 \
     --out benchmarks/reports/s2mpj_exact_sparse
 ```
 
+The full release gate is the whole matrix in one run. **Pass the budget
+explicitly** — the runner defaults (`--max-iter 1000 --max-time 60`) are far
+below what every tracked baseline was run at, and silently capping
+long-but-converging solves manufactures a corpus-wide regression that looks
+like a real one:
+
+```bash
+IPAX_S2MPJ_DIR=<checkout> PYTHONUTF8=1 OMP_NUM_THREADS=1 \
+python -m benchmarks.runners.s2mpj --all --include-objective-free \
+    --max-iter 10000 --max-time 300 --jobs 10 --resume \
+    --out benchmarks/reports/s2mpj_vNN
+```
+
+`--include-objective-free` is load-bearing, not optional: without it the 205
+feasibility problems are skipped and the totals are not comparable to any
+baseline here. Any report's budget is recoverable from its own data — every
+`max_iter` row's `n_iter` equals the cap plus one, and every `max_time` row's
+`solve_time` sits at the cap — which is worth checking on a partial report
+before committing hours to a run.
+
 A sweep is only meaningful against a baseline, so A/B two reports with:
 
 ```bash
 python -m benchmarks.runners.compare \
-    benchmarks/reports/s2mpj_v19.json benchmarks/reports/s2mpj_v20.json \
+    benchmarks/reports/s2mpj_v20.json benchmarks/reports/s2mpj_v22.json \
     --config lbfgs/sparse
 ```
 
