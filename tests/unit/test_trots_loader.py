@@ -352,6 +352,41 @@ def test_split_block_gram_matches_the_unsplit_one():
     )
 
 
+def test_the_lowered_block_is_retained_exactly_once():
+    # The loader used to keep the lowered block twice — once as an evaluation
+    # matrix and once inside the constraint operator — which on a CUDA namespace
+    # meant two device copies of the largest array in the problem, and it also
+    # held on to the pre-lowering two-sided assembly. The operator is now the
+    # single representation and the assembly is a local.
+    import scipy.sparse as sp
+
+    problem = _lin_problem(["float64", "float32"])
+    problem._linear_ineq_operator()
+
+    held = [
+        value
+        for value in vars(problem).values()
+        if sp.issparse(value) and value.shape == problem._G.shape
+    ]
+    assert len(held) == 1
+    assert held[0] is problem._G
+
+
+@pytest.mark.parametrize("sources", [["float64", "float64"], ["float64", "float32"]])
+def test_operator_evaluation_matches_the_direct_product(sources):
+    # With the second copy gone, the device path evaluates the linear rows
+    # through the constraint operator. That is only equivalent to the product it
+    # replaces if the operator's rows are G's rows in G's order — which the mixed
+    # case, where the operator is a stack of the two contiguous groups, has to
+    # earn. Verified here on the host, where both routes are available.
+    problem = _lin_problem(sources)
+    z = np.asarray([0.5, -1.0, 2.0])
+
+    through_operator = np.asarray(problem._linear_ineq_operator().matvec(z))
+
+    np.testing.assert_allclose(through_operator, problem._G @ z, rtol=1e-14, atol=0)
+
+
 def test_float32_stored_matrix_records_source_dtype(tmp_path):
     # TROTS dose matrices are float32 in the files; the loader records that
     # source precision so the assembled (float64-promoted) constraint block

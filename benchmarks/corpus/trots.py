@@ -753,7 +753,11 @@ class TROTSProblem(Problem):
             off = mat.b if mat.b.size == m else np.zeros(m)
             lo.extend([-np.inf] * m)
             hi.extend((-sgn * off).tolist())
-        self._A_lin = (
+        # Deliberately a local, not an attribute: the two-sided block is consumed
+        # by the lowering below and never referenced again, so letting it fall out
+        # of scope at the end of ``__init__`` halves the host residency of the
+        # linear block (it is the same order of nonzeros as the lowered ``G``).
+        A_lin = (
             sp.vstack(blocks, format="csr")
             if blocks
             else sp.csr_matrix((0, self._n_vars))
@@ -772,12 +776,12 @@ class TROTSProblem(Problem):
         row_f32 = (
             np.concatenate(lin_f32)
             if lin_f32
-            else np.zeros((self._A_lin.shape[0],), dtype=bool)
+            else np.zeros((A_lin.shape[0],), dtype=bool)
         )
         g_blocks: list[Any] = []
         h_parts: list[Any] = []
         n_f32 = 0
-        A_csr = self._A_lin.tocsr()
+        A_csr = A_lin.tocsr()
         # Emit the float32-sourced rows first, so that group is *contiguous* in the
         # lowered ``G`` and can be handed to the solver as an operator of its own
         # carrying its own accumulate hint (see ``_linear_ineq_operator``). Row
@@ -820,18 +824,19 @@ class TROTSProblem(Problem):
         for k, (_mat, w, minimise) in enumerate(self._minimax):
             self._c_obj[self._n + k] = (1.0 if minimise else -1.0) * w
 
-        # Device-side evaluation (CuPy namespaces): keep z and the evaluation
-        # matrices on the device so the per-callback dose products (incl. the
-        # big constant G spmv) run on the GPU instead of round-tripping to
-        # SciPy. The elementwise cost math (`_cost_value` & friends) is written
-        # against NumPy's public functions, which dispatch to CuPy via the
-        # NEP-18/ufunc protocols, so the same code serves both spaces. Host
-        # NumPy/SciPy remains the path for every non-CUDA namespace.
+        # Device-side evaluation (CuPy namespaces): keep z and the dose matrices
+        # on the device so the per-callback products run on the GPU instead of
+        # round-tripping to SciPy. The big constant ``G`` spmv runs on the device
+        # too, but through the constraint operator, which already holds it there
+        # — mirroring it a second time would double the residency of the largest
+        # array in the problem. The elementwise cost math (`_cost_value` &
+        # friends) is written against NumPy's public functions, which dispatch to
+        # CuPy via the NEP-18/ufunc protocols, so the same code serves both
+        # spaces. Host NumPy/SciPy remains the path for every non-CUDA namespace.
         self._eval_device = False
         self._cxs: Any = None  # cupyx.scipy.sparse, when active
         self._dev_mats: dict[int, Any] = {}  # id(TROTSMatrix) -> device CSR
         self._dev_vecs: dict[int, Any] = {}  # id(TROTSMatrix) -> device b
-        self._G_eval: Any = self._G
         self._h_eval: Any = self._h
         self._c_obj_eval: Any = self._c_obj
         try:
@@ -846,7 +851,10 @@ class TROTSProblem(Problem):
             if cxs is not None:
                 self._cxs = cxs
                 self._eval_device = True
-                self._G_eval = cxs.csr_matrix(self._G)
+                # ``G`` itself is deliberately *not* mirrored here: the operator
+                # handed to the solver already carries a device copy, and the
+                # constraint values are evaluated through it (see
+                # ``ineq_constraints``). One device residency, not two.
                 self._h_eval = xp.asarray(self._h)
                 self._c_obj_eval = xp.asarray(self._c_obj)
 
@@ -1067,9 +1075,16 @@ class TROTSProblem(Problem):
         nl = np.asarray(vals, dtype=float)
         if self._n_lin_ineq == 0:
             return _from_numpy(self.xp, nl)
-        lin_vals = self._G_eval @ zc + self._h_eval
         if self._eval_device:
+            # Device: go through the constraint operator rather than a second
+            # device copy of ``G``. Its adapter holds a device CSR of exactly
+            # these rows, so this is the same spmv on the same data — and in the
+            # mixed-source case the operator is a ``VStack`` whose blocks are the
+            # contiguous row groups, so the concatenated result is in ``G`` row
+            # order and lines up with ``_h_eval``.
+            lin_vals = self._linear_ineq_operator().matvec(zc) + self._h_eval
             return np.concatenate([self.xp.asarray(nl), lin_vals])
+        lin_vals = self._G @ zc + self._h_eval
         return _from_numpy(self.xp, np.concatenate([nl, lin_vals]))
 
     def ineq_jacobian(self, z: Array) -> Array | LinearOperator:

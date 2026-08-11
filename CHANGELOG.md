@@ -146,6 +146,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   only at rounding level (the √w split also *halves* the dynamic range of the
   intermediates — the caveat that its overflow envelope differs at float32
   extremes is documented on the kernel).
+- **The TROTS loader holds the lowered constraint block once (benchmarks).**
+  The constant `G z + h ≤ 0` block is by far the largest array in a
+  radiotherapy problem — 86 M nonzeros on `Prostate_VMAT_101` — and on a CuPy
+  namespace the loader mirrored it to the device a second time to evaluate the
+  constraint values, on top of the copy inside the operator it hands the
+  solver. Those rows are now evaluated through that operator (whose backend
+  adapter already holds exactly them on the device), and the pre-lowering
+  two-sided assembly is released once lowering is done rather than retained
+  for the problem's lifetime. Measured on `Prostate_VMAT_101`: 4040 → 3057 MiB
+  in the CuPy pool, constraint values identical to the host route.
 
 ### Fixed
 - **A run parked at an acceptable KKT point no longer reports failure because
