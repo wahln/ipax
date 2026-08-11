@@ -21,14 +21,17 @@ from ipax.options import BarrierOptions
 
 # Universal first move at RT scale:
 opts = ipax.Options(
-    max_iter=800, max_time=1800.0,          # realistic budget, see below
+    max_iter=800,
+    max_time=1800.0,  # realistic budget, see below
     barrier=BarrierOptions(slack_init_scale=0.1),
 )
 
 # Proton-signature cases additionally want the μ-raising stack:
 opts_protons = ipax.Options(
-    max_iter=800, max_time=1800.0,
-    mu_schedule="quality", globalization="breedveld",
+    max_iter=800,
+    max_time=1800.0,
+    mu_schedule="quality",
+    globalization="breedveld",
     barrier=BarrierOptions(slack_init_scale=0.1, kappa_centrality=1e-4),
 )
 ```
@@ -116,6 +119,17 @@ an order of magnitude in both the absolute times and the ratio. It needs
 hardware with the headroom to answer it. Note also that `auto` would not engage
 there in any case — Head-and-Neck's data is genuinely float64, so the
 reduction would have to be user-forced.
+
+**Device residency of the constant block.** The lowered `G z + h ≤ 0` block is
+by far the largest array in an RT problem — 86 M nonzeros on
+`Prostate_VMAT_101` — and the loader keeps exactly one device copy of it: the
+constraint operator it hands the solver. Evaluating the linear constraint rows
+through that operator, rather than mirroring `G` to the device a second time,
+measures 3057 MiB in the CuPy pool instead of 4040 MiB on that case (the host
+side drops the pre-lowering two-sided assembly for a comparable saving). What
+remains is the Array-API COO triplets the core holds (24 B/nnz) plus the
+adapter's device CSR (12 B/nnz) — invariant #4's cost, paid once. The
+Head-and-Neck saturation above was measured before that saving.
 
 Two measurement notes for anyone repeating this. The sparse adapters memoize
 the Gram per `accumulate_dtype`, keyed on weight equality (it serves `δ_w`

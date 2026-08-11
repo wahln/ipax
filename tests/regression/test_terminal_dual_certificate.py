@@ -415,3 +415,44 @@ def test_enabled_relative_change_tolerance_declines_the_certificate(
     )
 
     assert result.status is Status.STALLED
+
+
+def test_a_failing_residual_declines_the_certificate_instead_of_raising(
+    namespace, monkeypatch
+):
+    # The certificate's contract is that it can only ever *decline* — never
+    # make a run worse. kkt_error() applies the Jacobians (rmatvec on a
+    # possibly lazy or user-supplied operator), so it can fail for the same
+    # reasons the gradient/Jacobian evaluation can. Outside a guard that would
+    # turn an ordinary stall into an exception.
+    import inspect
+
+    from ipax.ipm.driver import IPMDriver
+
+    _always_fail_line_search(monkeypatch)
+    original = IPMDriver.kkt_error
+    state = {"terminal": False}
+
+    def failing(self, **kwargs):
+        # Fail *only* the certificate's own residual. Several call sites pass
+        # mu=0.0 (the in-loop convergence check among them), and those must
+        # keep working or nothing would converge — so discriminate on the
+        # caller, not the arguments.
+        if any(f.function == "_terminal_certificate" for f in inspect.stack()[:4]):
+            state["terminal"] = True
+            raise RuntimeError("operator apply failed")
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(IPMDriver, "kkt_error", failing)
+
+    result = solve(
+        _asymmetric_box_problem(namespace),
+        array(namespace, [5e-7, 5e-7]),
+        options=Options(
+            hessian="exact", linsolve="dense", max_iter=100, max_stall_iter=10
+        ),
+    )
+
+    assert state["terminal"], "the terminal certificate path must have been taken"
+    # Declined, not crashed: the run still returns its ordinary stalled verdict.
+    assert result.status is Status.STALLED, result.message

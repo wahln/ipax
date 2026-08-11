@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-11
+
 ### Added
 - **TROTS matrix cache (benchmarks).** Parsing the MATLAB v7.3 dose matrices
   dominated every TROTS run's startup; parsed matrices are now mirrored to
@@ -23,7 +25,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   80–90% of per-iteration wall at radiotherapy scale — can now run in float32
   (many radiotherapy dose matrices are stored float32 — measured across the
   TROTS corpus: the brachytherapy cases are float32 throughout, `Prostate_VMAT_101`
-  is 96% float32 by nnz, while `Protons_01` is genuinely float64; scoped in by
+  is 96% float32 by nnz, while `Protons_01` is 99.93% float64 and so gains
+  essentially nothing; scoped in by
   explicit decision, with AGENTS.md updated), while every other block stays
   float64. The `"auto"` default prefers the precision the constraint data
   actually carries: it engages exactly when the inequality Jacobian declares
@@ -50,8 +53,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (CPU, 32-thread BLAS): the Gram kernel 11.7 → 5.4 s per compute (2.15×).
   Plumbing: `LinearOperator.gram` gains an optional best-effort
   `accumulate_dtype` keyword (forwarded by `VStack`, the CSR routing wrapper
-  and row scaling; honored by the SciPy and CuPy adapters via a cast-once
-  reduced-data CSR), `_CondensedOperator.dense_matrix_mixed` covers
+  and row scaling — through the new `forward_gram`, which falls back to the
+  pre-keyword `gram(weights)` so a user operator written against 0.9.x keeps
+  working when the solver stacks or row-scales it; honored by the SciPy and
+  CuPy adapters via a cast-once reduced-data CSR), `_CondensedOperator.dense_matrix_mixed` covers
   gram-capable and generic (pure Array-API `float32`) Jacobians alike, and
   `Result.routes` reports the engaged route as `dense (gram=float32)` (or
   `dense (gram=auto:float32)` when the hint chose it). On the benchmark side
@@ -145,6 +150,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   only at rounding level (the √w split also *halves* the dynamic range of the
   intermediates — the caveat that its overflow envelope differs at float32
   extremes is documented on the kernel).
+- **The TROTS loader holds the lowered constraint block once (benchmarks).**
+  The constant `G z + h ≤ 0` block is by far the largest array in a
+  radiotherapy problem — 86 M nonzeros on `Prostate_VMAT_101` — and on a CuPy
+  namespace the loader mirrored it to the device a second time to evaluate the
+  constraint values, on top of the copy inside the operator it hands the
+  solver. Those rows are now evaluated through that operator (whose backend
+  adapter already holds exactly them on the device), and the pre-lowering
+  two-sided assembly is released once lowering is done rather than retained
+  for the problem's lifetime. Measured on `Prostate_VMAT_101`: 4040 → 3057 MiB
+  in the CuPy pool, constraint values identical to the host route.
 
 ### Fixed
 - **A run parked at an acceptable KKT point no longer reports failure because
@@ -1615,7 +1630,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/wahln/ipax/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/wahln/ipax/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/wahln/ipax/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/wahln/ipax/compare/v0.6.1...v0.7.0

@@ -103,3 +103,40 @@ def test_one_hint_row_per_problem_config_and_lever():
 
     section = markdown.split("## Routing hints", 1)[1]
     assert section.count("slack_init_scale=0.1") == 2
+
+
+def test_a_lever_that_cannot_act_in_this_config_is_not_offered():
+    # GASOIL's win is an LBFGSOptions seed; under hessian="exact" that setting
+    # is inert, so recommending it next to an exact/* row would advertise a
+    # no-op AND quote a win measured on a different route.
+    lbfgs_row = _row("s2mpj/GASOIL", correct=False)
+    exact_row = replace(lbfgs_row, config="exact/dense", hessian_source="exact")
+
+    lbfgs_md = format_markdown([lbfgs_row], {})
+    exact_md = format_markdown([exact_row], {})
+
+    assert "seed_formula" in lbfgs_md
+    assert "## Routing hints" not in exact_md
+
+
+def test_a_hessian_agnostic_lever_is_offered_to_every_config():
+    # mu_schedule is an Options-level lever: it acts under either Hessian mode,
+    # so restricting the LBFGS-only hints must not suppress these too.
+    lbfgs_row = _row("s2mpj/AGG", correct=False)
+    exact_row = replace(lbfgs_row, config="exact/sparse", hessian_source="exact")
+
+    for md in (format_markdown([lbfgs_row], {}), format_markdown([exact_row], {})):
+        assert "## Routing hints" in md
+        assert "mu_schedule" in md
+
+
+def test_every_lbfgs_only_hint_declares_its_hessian():
+    # A new LBFGSOptions entry added without `hessian="lbfgs"` would silently
+    # be offered to exact rows again; pin the invariant at the registry.
+    for name, hints in HINTS.items():
+        for hint in hints:
+            if "LBFGSOptions" in hint.options:
+                assert hint.hessian == "lbfgs", (
+                    f"{name}: an LBFGSOptions lever is inert under exact "
+                    "Hessians and must declare hessian='lbfgs'"
+                )

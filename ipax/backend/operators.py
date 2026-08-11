@@ -180,7 +180,9 @@ class LinearOperator(ABC):
         operator's native result dtype regardless. Best-effort: implementations
         may ignore the request (returning the exact Gram is always valid), and
         wrappers forwarding :meth:`gram` must forward it. Callers tolerate
-        pre-keyword implementations (``TypeError``) by retrying without it.
+        pre-keyword implementations (``TypeError``) by retrying without it —
+        a wrapper is also a caller, so it owes the same retry:
+        :func:`forward_gram` is that call, ready-made.
 
         ``hinted_only`` restricts the reduction to the parts of the operator
         whose own data supports it (:meth:`gram_accumulate_dtype_hint`): a
@@ -690,6 +692,33 @@ class Composite(LinearOperator):
         return result
 
 
+def forward_gram(
+    op: LinearOperator,
+    weights: Array,
+    *,
+    accumulate_dtype: str | None,
+    hinted_only: bool,
+) -> Array:
+    """``op.gram(weights, …)`` honoring the pre-keyword fallback.
+
+    A wrapper that forwards the accumulation keywords is itself a *caller* of
+    them, so it carries the same compatibility duty as any other caller (see
+    :meth:`LinearOperator.gram`): an operator written against the pre-0.10
+    ``gram(weights)`` signature must keep working when it is stacked or scaled.
+    Forwarding unconditionally would also defeat the retry the top-level caller
+    already performs, because that retry comes back in through this same
+    wrapper and forwards the keywords again.
+    """
+    if accumulate_dtype is None and not hinted_only:
+        return op.gram(weights)  # nothing to forward — no compatibility risk
+    try:
+        return op.gram(
+            weights, accumulate_dtype=accumulate_dtype, hinted_only=hinted_only
+        )
+    except TypeError:
+        return op.gram(weights)
+
+
 class VStack(LinearOperator):
     """Vertical stack of operators sharing the variable (column) dimension.
 
@@ -789,7 +818,8 @@ class VStack(LinearOperator):
         result = None
         offset = 0
         for op, rows in zip(self._ops, self._rows, strict=True):
-            piece = op.gram(
+            piece = forward_gram(
+                op,
                 weights[offset : offset + rows],
                 accumulate_dtype=accumulate_dtype,
                 hinted_only=hinted_only,
@@ -1220,4 +1250,5 @@ __all__ = [
     "MatrixFreeJacobian",
     "VStack",
     "as_operator",
+    "forward_gram",
 ]

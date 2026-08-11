@@ -717,26 +717,35 @@ class IPMDriver:
             return None
         lam_c = xp.zeros((m,), dtype=dtype)
         z_zero = xp.zeros_like(x)
-        residuals = self.kkt_error(
-            mu=0.0,
-            grad=grad,
-            ineq_jac=ineq_jac,
-            m=m,
-            g=g,
-            s=s,
-            y_ineq=lam_c,
-            z_lower=z_zero,
-            z_upper=z_zero,
-            x_minus_l=x_minus_l,
-            u_minus_x=u_minus_x,
-            mask_l=mask_l,
-            mask_u=mask_u,
-            n_bounds=n_bounds,
-            c=c,
-            eq_jac=eq_jac,
-            m_eq=m_eq,
-            y_eq=y_c,
-        )
+        try:
+            # Also best-effort: ``kkt_error`` applies the Jacobians (``rmatvec``
+            # on a possibly lazy or user-supplied operator), so it can fail for
+            # exactly the reasons the evaluation above can. Outside a guard it
+            # would turn an ordinary STALLED/budget exit into an exception —
+            # the certificate declining must never be worse than not having one.
+            residuals = self.kkt_error(
+                mu=0.0,
+                grad=grad,
+                ineq_jac=ineq_jac,
+                m=m,
+                g=g,
+                s=s,
+                y_ineq=lam_c,
+                z_lower=z_zero,
+                z_upper=z_zero,
+                x_minus_l=x_minus_l,
+                u_minus_x=u_minus_x,
+                mask_l=mask_l,
+                mask_u=mask_u,
+                n_bounds=n_bounds,
+                c=c,
+                eq_jac=eq_jac,
+                m_eq=m_eq,
+                y_eq=y_c,
+            )
+        except Exception:
+            logger.debug("terminal certificate: residual failed", exc_info=True)
+            return None
         checks = (
             (opts.dual_inf_tol, residuals.dual_infeasibility),
             (opts.constr_viol_tol, residuals.primal_infeasibility),

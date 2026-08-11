@@ -837,6 +837,87 @@ def test_mixed_stack_of_real_sparse_operators_reduces_only_its_hinted_block():
     assert np.max(np.abs(per_block - exact)) > 0.0
 
 
+class _PreKeywordGram(LinearOperator):
+    """An operator written against the pre-0.10 ``gram(weights)`` signature.
+
+    What a third-party ``LinearOperator`` implemented before the accumulation
+    keywords existed looks like. It must keep working when the solver wraps it.
+    """
+
+    def __init__(self, matrix):
+        self._m = matrix
+
+    @property
+    def shape(self):
+        return (int(self._m.shape[0]), int(self._m.shape[1]))
+
+    def matvec(self, v):
+        return self._m @ v
+
+    def rmatvec(self, v):
+        return self._m.T @ v
+
+    def gram(self, weights):  # deliberately no accumulate_dtype / hinted_only
+        return self._m.T @ (weights[:, None] * self._m)
+
+
+def test_a_stack_tolerates_a_block_predating_the_accumulation_keywords():
+    # LinearOperator.gram's contract: wrappers forward the keywords, and callers
+    # retry without them on TypeError. A wrapper is both — forwarding blindly
+    # would break a pre-0.10 block *and* defeat the retry the top-level caller
+    # already does, because that retry comes back in through the wrapper.
+    import array_api_compat.numpy as xp
+
+    from ipax.backend.operators import VStack
+
+    rng = np.random.default_rng(11)
+    a, b = rng.standard_normal((7, 4)), rng.standard_normal((5, 4))
+    stack = VStack((_PreKeywordGram(xp.asarray(a)), _PreKeywordGram(xp.asarray(b))))
+    w = xp.asarray(rng.uniform(0.5, 1.5, size=12))
+
+    got = np.asarray(stack.gram(w, accumulate_dtype="float32", hinted_only=True))
+
+    expected = a.T @ (np.asarray(w)[:7, None] * a) + b.T @ (np.asarray(w)[7:, None] * b)
+    np.testing.assert_allclose(got, expected, rtol=1e-13, atol=0)
+
+
+def test_row_scaling_tolerates_a_jacobian_predating_the_accumulation_keywords():
+    # The most exposed wrapper: gradient-based scaling wraps *whatever* Jacobian
+    # the user's problem returned, so a pre-0.10 operator meets the keywords here
+    # on an ordinary scaled solve.
+    import array_api_compat.numpy as xp
+
+    from ipax.problem.scaling import _RowScaled
+
+    rng = np.random.default_rng(12)
+    jac = rng.standard_normal((6, 3))
+    d = rng.uniform(0.5, 2.0, size=6)
+    scaled = _RowScaled(_PreKeywordGram(xp.asarray(jac)), xp.asarray(d))
+    w = xp.asarray(rng.uniform(0.5, 1.5, size=6))
+
+    got = np.asarray(scaled.gram(w, accumulate_dtype="float32", hinted_only=True))
+
+    expected = jac.T @ ((d * d * np.asarray(w))[:, None] * jac)
+    np.testing.assert_allclose(got, expected, rtol=1e-13, atol=0)
+
+
+def test_a_type_error_from_inside_gram_is_not_swallowed_by_the_fallback():
+    # The fallback retries without the keywords, so it must not turn a genuine
+    # TypeError raised *by* a compliant gram into a silently different result.
+    import array_api_compat.numpy as xp
+
+    from ipax.backend.operators import VStack
+
+    class _Broken(_PreKeywordGram):
+        def gram(self, weights, *, accumulate_dtype=None, hinted_only=False):
+            raise TypeError("something inside gram is wrong")
+
+    stack = VStack((_Broken(xp.asarray(np.eye(3))),))
+
+    with pytest.raises(TypeError, match="something inside gram is wrong"):
+        stack.gram(xp.asarray(np.ones(3)), accumulate_dtype="float32")
+
+
 def test_reduced_densify_handles_a_non_diagonal_sigma(namespace):
     # The generic densify path (Jacobian with no sparse ``gram``) has a second
     # branch for a non-diagonal Σ_s — the only reduced-accumulate branch that
