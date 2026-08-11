@@ -370,3 +370,35 @@ def test_float32_stored_matrix_records_source_dtype(tmp_path):
     mat = trots._load_matrix(path, 0)
 
     assert mat.source_dtype == "float32"
+
+
+def test_cache_key_distinguishes_same_named_files_in_a_shared_cache(
+    tmp_path, monkeypatch
+):
+    # IPAX_TROTS_CACHE can point several datasets at one directory. Two
+    # distinct sources sharing a basename, size and mtime would then alias and
+    # a load could silently return a matrix from the wrong dataset.
+    import os
+
+    shared = tmp_path / "shared-cache"
+    monkeypatch.setenv("IPAX_TROTS_CACHE", str(shared))
+
+    paths = []
+    for i, value in enumerate((5.0, 9.0)):
+        d = tmp_path / f"dataset{i}"
+        d.mkdir()
+        p = str(d / "Same.mat")  # identical basename in both datasets
+        _write_case(p, _sparse_writer(np.array([value, value]), [0, 1], [0, 1, 2], 2))
+        paths.append(p)
+
+    # Force identical size and mtime so only the path can disambiguate them.
+    st = os.stat(paths[0])
+    os.utime(paths[1], ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert os.stat(paths[1]).st_size == st.st_size
+
+    first = trots._load_matrix(paths[0], 0)
+    second = trots._load_matrix(paths[1], 0)
+
+    assert first.matrix[0, 0] == 5.0
+    assert second.matrix[0, 0] == 9.0, "cache key aliased two distinct datasets"
+    assert trots._cache_dir_for(paths[0]) != trots._cache_dir_for(paths[1])

@@ -277,8 +277,8 @@ count 205 → 326, with `ARGLINA` collapsing from n=200 to n=0).
     visible in the ±count. Pass `kkt_route="augmented"` to restore the previous
     form.
 
-- **`exact/sparse` is the strongest route** — most correct (797) and most
-  optimal (877). Exact-Hessian Newton steps factored by the sparse-direct route
+- **`exact/sparse` is the strongest route** — most correct (796) and most
+  optimal (876). Exact-Hessian Newton steps factored by the sparse-direct route
   (Feral LDLᵀ with inertia control) is the most robust combination here.
 - **`numerical_error` is essentially gone** (51 → 0 on `exact/dense`, and 0–1
   on every route). A Newton step the δ_w regularization ladder cannot complete
@@ -289,7 +289,7 @@ count 205 → 326, with `ARGLINA` collapsing from n=200 to n=0).
   `infeasible`/`restoration_failed`/`stalled` — the same verdict the L-BFGS
   routes already gave — and DEMBO7/KISSING recover to `optimal`.
 - **False infeasibility claims are largely gone.** The per-route `infeasible`
-  counts dropped from 110–156 to 51–63: a local-infeasibility verdict now
+  counts dropped from 110–156 to 58–59: a local-infeasibility verdict now
   requires a *stationarity certificate* from the restoration phase (projected
   gradient ≈ 0, or no descent at the Levenberg–Marquardt ceiling), gets one
   x0-anchored second-chance probe before it is believed, and is vetoed when
@@ -298,7 +298,7 @@ count 205 → 326, with `ARGLINA` collapsing from n=200 to n=0).
   new status columns — and dozens of the ex-`infeasible` rows now finish
   `optimal` outright (SNAKE, CATENARY, BT9, HS39, CRESC4, SSEBNLN, ALJAZZAF…).
 - **Budget statuses are down sharply** (`max_iter` + `max_time`: 69–182 →
-  22–97 per route). Two mechanisms: a run whose returned best iterate already
+  20–98 per route). Two mechanisms: a run whose returned best iterate already
   satisfies the relaxed (acceptable-level) KKT tolerance now reports
   `acceptable` instead of `max_time`/`max_iter` (the DIAMON2DLS/DMN
   least-squares family — oscillating at KKT ~1e-7 without ever holding it for

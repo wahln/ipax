@@ -351,10 +351,34 @@ def test_gram_memo_is_keyed_by_accumulate_dtype(monkeypatch):
     assert op._gram_compute_count == 2  # native slot survived the alternation
 
 
-def test_reduced_data_csr_is_released_on_native_fallback(monkeypatch):
-    # After the mixed route permanently falls back, requests are all-native:
-    # the fp32 data copy (4 bytes/nnz — multi-GB at RT scale) must be freed on
-    # the first native request rather than pinned for the rest of the run.
+def test_reduced_data_csr_survives_a_single_native_rebuild(monkeypatch):
+    # A lone native request is NOT a permanent fallback: DenseSolver answers a
+    # failed refinement from an exact rebuild, then re-engages mixed on the
+    # next factorization (only refine_failure_limit *consecutive* failures
+    # disable it). Freeing the fp32 copy there would recast every nnz on each
+    # intermittent hard iteration — the cast-once optimization defeated
+    # precisely where it is most needed.
+    import ipax.backend.sparse.numpy_scipy as adapter
+
+    monkeypatch.setattr(adapter, "_GRAM_DENSE_MIN_DENSITY", 0.0)
+
+    op = _operator()
+    weights = np.asarray([0.5, 2.0, 1.0, 0.25, 3.0, 0.75])
+    op.gram(xp_numpy.asarray(weights), accumulate_dtype="float32")
+    reduced = op._reduced_csr
+    assert reduced is not None
+
+    op.gram(xp_numpy.asarray(weights))  # the exact rebuild
+    assert op._reduced_csr is reduced, "one native request must not free it"
+
+    op.gram(xp_numpy.asarray(weights), accumulate_dtype="float32")  # re-engaged
+    assert op._reduced_csr is reduced, "and the retry must reuse the same cast"
+
+
+def test_reduced_data_csr_is_released_once_the_mixed_route_stops_asking(monkeypatch):
+    # Two consecutive native requests mean no mixed consumer came back, so the
+    # fp32 data copy (4 bytes/nnz — multi-GB at RT scale) must not stay pinned
+    # for the rest of the run.
     import ipax.backend.sparse.numpy_scipy as adapter
 
     monkeypatch.setattr(adapter, "_GRAM_DENSE_MIN_DENSITY", 0.0)
@@ -363,7 +387,9 @@ def test_reduced_data_csr_is_released_on_native_fallback(monkeypatch):
     weights = np.asarray([0.5, 2.0, 1.0, 0.25, 3.0, 0.75])
     op.gram(xp_numpy.asarray(weights), accumulate_dtype="float32")
     assert op._reduced_csr is not None
+
     op.gram(xp_numpy.asarray(weights))
+    op.gram(xp_numpy.asarray(weights * 2.0))  # fresh weights: a real second call
     assert op._reduced_csr is None
 
 

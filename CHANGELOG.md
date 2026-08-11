@@ -23,7 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   80–90% of per-iteration wall at radiotherapy scale — can now run in float32
   (many radiotherapy dose matrices are stored float32 — measured across the
   TROTS corpus: the brachytherapy cases are float32 throughout, `Prostate_VMAT_101`
-  is 96% float32 by nnz, while `Protons_01` is genuinely float64; scoped in by
+  is 96% float32 by nnz, while `Protons_01` is 99.93% float64 and so gains
+  essentially nothing; scoped in by
   explicit decision, with AGENTS.md updated), while every other block stays
   float64. The `"auto"` default prefers the precision the constraint data
   actually carries: it engages exactly when the inequality Jacobian declares

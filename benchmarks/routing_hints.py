@@ -47,11 +47,18 @@ class RoutingHint:
     outcome including metrics and the default-configuration result it beats;
     ``signature`` the failure pattern this lever addresses (what to look for
     on problems *outside* this registry).
+
+    ``hessian`` restricts the hint to configurations where the lever is
+    *observable at all*: an ``LBFGSOptions`` knob does nothing under
+    ``hessian="exact"``, so offering it next to an ``exact/*`` row would
+    recommend a no-op and quote a win measured on a different route. ``None``
+    (the default) means the lever applies to any Hessian mode.
     """
 
     options: str
     win: str
     signature: str
+    hessian: str | None = None
 
 
 # Keyed by the bare problem name (report rows use "s2mpj/<name>").
@@ -85,6 +92,7 @@ HINTS: dict[str, tuple[RoutingHint, ...]] = {
             signature="an L-BFGS run creeping at a KKT plateau while the "
             "exact-Hessian routes solve the problem — the direct ξ seed "
             "inflated by δ–γ misalignment",
+            hessian="lbfgs",  # seeds the L-BFGS operator; inert with exact
         ),
     ),
     "HS59": (
@@ -113,6 +121,7 @@ HINTS: dict[str, tuple[RoutingHint, ...]] = {
             signature="an L-BFGS run grinding at a worse objective on a "
             "nonconvex problem — Powell damping fabricating curvature from "
             "strongly-contradicted pairs",
+            hessian="lbfgs",  # a Powell-damping threshold; inert with exact
         ),
     ),
     "PALMER1E": (

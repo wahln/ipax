@@ -308,18 +308,28 @@ def _routing_hint_lines(results: list[CaseResult]) -> list[str]:
     """The *Routing hints* section: measured wins next to rows that missed.
 
     A row qualifies when the curated registry (:mod:`benchmarks.routing_hints`)
-    records a lever win for its problem **and** this run's default
-    configuration did not score ``correct`` on it — a correct row needs no
-    hint. Returns no lines at all when nothing qualifies, so the section
+    records a lever win for its problem, this run's default configuration did
+    not score ``correct`` on it (a correct row needs no hint), **and** the
+    lever is observable in that row's configuration. The last condition
+    matters: a hint recorded on ``lbfgs/dense`` for an ``LBFGSOptions`` knob is
+    a no-op under ``hessian="exact"``, so printing it next to an ``exact/*``
+    row would recommend a setting that cannot act and quote a win measured
+    elsewhere. Returns no lines at all when nothing qualifies, so the section
     simply does not exist in a clean report.
     """
     from benchmarks.routing_hints import hints_for
+
+    def _applies(hint: object, config: str) -> bool:
+        # Config labels are "<hessian>/<linsolve>", e.g. "exact/sparse".
+        wanted = getattr(hint, "hessian", None)
+        return wanted is None or config.split("/", 1)[0] == wanted
 
     hinted = [
         (r, hint)
         for r in sorted(results, key=lambda r: (r.problem, r.backend, r.config))
         if not r.correct
         for hint in hints_for(r.problem)
+        if _applies(hint, r.config)
     ]
     if not hinted:
         return []

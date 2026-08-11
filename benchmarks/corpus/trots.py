@@ -65,6 +65,7 @@ it serves the accuracy tests, not the RT performance runs).
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -195,8 +196,9 @@ def _h5_vec(f: Any, struct: str, field_name: str, i: int) -> Any:
 # seconds per case; ``Prostate_CK_01`` measured 35-56 s), and every benchmark
 # invocation re-pays it. Each parsed matrix is therefore mirrored to a plain
 # ``.npz`` beside the dataset and reloaded from there on later runs. The cache is
-# keyed by the source file's size and mtime plus a format version, so editing or
-# replacing a ``.mat`` misses rather than serving a stale matrix, and it is
+# keyed by the source file's absolute-path digest, size and mtime plus a format
+# version, so editing or replacing a ``.mat`` misses rather than serving a stale
+# matrix (and two datasets sharing one cache directory cannot alias), and it is
 # strictly an optimization: any failure to read or write it falls back to
 # parsing. Set ``IPAX_TROTS_CACHE`` to a directory to relocate it, or to
 # ``off`` to disable it.
@@ -216,8 +218,16 @@ def _cache_dir_for(path: str) -> str | None:
         root = os.path.join(os.path.dirname(os.path.abspath(path)), _CACHE_DIRNAME)
     try:
         stat = os.stat(path)
+        # The absolute path's digest disambiguates same-named files: pointing
+        # IPAX_TROTS_CACHE at one shared directory for several datasets would
+        # otherwise let two "Protons_01.mat" with equal size and mtime alias,
+        # and a load could silently return a matrix from the wrong dataset.
+        # basename stays in the key so the directory remains human-readable.
+        source = hashlib.sha256(
+            os.path.abspath(path).encode("utf-8", "surrogatepass")
+        ).hexdigest()[:16]
         key = (
-            f"{os.path.basename(path)}"
+            f"{os.path.basename(path)}.{source}"
             f".{stat.st_size}.{stat.st_mtime_ns}.v{_CACHE_FORMAT}"
         )
     except OSError:

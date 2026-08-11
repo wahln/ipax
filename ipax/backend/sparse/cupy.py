@@ -262,6 +262,7 @@ class SparseOperator(LinearOperator):
         self._gram_memo: dict[str | None, tuple[Any, Any]] = {}
         self._gram_compute_count = 0  # observability/testing: actual SpGEMM runs
         self._reduced_csr: Any = None  # cast-once reduced-precision data CSR
+        self._native_streak = False  # last gram() request was native (see gram)
         self._squared: Any = None  # A∘A (shared by the Gram diagonals)
         # Sparse-Gram (COO) memo for the sparse normal-equations route.
         self._gram_coo_weights: Any = None
@@ -346,10 +347,18 @@ class SparseOperator(LinearOperator):
         # The memo compare costs one device reduction + host sync per call; the
         # SpGEMM it skips is orders of magnitude more work at n ≪ m scale.
         w = _to_cupy(weights).reshape(-1)
-        if accumulate_dtype is None and self._reduced_csr is not None:
-            # Native request after reduced ones: the mixed route has fallen
-            # back — free the reduced-data device copy (multi-GB at RT nnz).
-            self._reduced_csr = None
+        if accumulate_dtype is None:
+            # Free the reduced-data device copy (multi-GB at RT nnz) only on the
+            # SECOND consecutive native request — mirror of the SciPy adapter.
+            # One native request is an exact rebuild after a failed refinement,
+            # after which ``DenseSolver`` re-engages mixed on the next
+            # factorization; freeing then would force a multi-GB device recast
+            # on every intermittent hard iteration.
+            if self._native_streak:
+                self._reduced_csr = None
+            self._native_streak = True
+        else:
+            self._native_streak = False
         memo = self._gram_memo.get(accumulate_dtype)
         if memo is not None and bool(cupy.array_equal(w, memo[0])):
             return cast("Array", to_xp_array(memo[1], self._xp))

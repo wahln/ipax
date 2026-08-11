@@ -237,6 +237,7 @@ class SparseOperator(LinearOperator):
         self._gram_memo: dict[str | None, tuple[np.ndarray, np.ndarray]] = {}
         self._gram_compute_count = 0  # observability/testing: actual SpGEMM runs
         self._reduced_csr: scipy.sparse.csr_matrix | None = None  # cast-once data
+        self._native_streak = False  # last gram() request was native (see gram)
         self._squared: scipy.sparse.csr_matrix | None = None  # A∘A (Gram diagonals)
         # Sparse-Gram (COO) memo for the sparse normal-equations route.
         self._gram_coo_weights: np.ndarray | None = None
@@ -342,11 +343,20 @@ class SparseOperator(LinearOperator):
         # besides the product itself. Callers must treat the returned array as
         # read-only; the condensed route only ever adds it out-of-place.
         w = _to_numpy(weights).reshape(-1)
-        if accumulate_dtype is None and self._reduced_csr is not None:
-            # A native request after reduced ones means the mixed route has
-            # (permanently) fallen back — release the fp32 data copy rather
-            # than pinning nnz·4 bytes with no remaining consumer.
-            self._reduced_csr = None
+        if accumulate_dtype is None:
+            # Release the reduced-data copy only on the SECOND consecutive
+            # native request. A single one does *not* mean the mixed route is
+            # done: ``DenseSolver`` answers a failed refinement from an exact
+            # rebuild but re-engages mixed on the next factorization, until
+            # ``refine_failure_limit`` *consecutive* failures disable it. Freeing
+            # on the first would force a full nnz recast on every intermittent
+            # hard iteration — the cast-once optimization defeated exactly where
+            # it is most needed. Two in a row means no consumer came back.
+            if self._native_streak:
+                self._reduced_csr = None
+            self._native_streak = True
+        else:
+            self._native_streak = False
         memo = self._gram_memo.get(accumulate_dtype)
         if memo is not None and np.array_equal(w, memo[0]):
             return to_xp_array(memo[1], self._xp)
