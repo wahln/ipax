@@ -95,7 +95,10 @@ lint = [
     "codespell>=2.3",
     "mypy>=1.11",
     "pre-commit>=3.7",
-    "ruff>=0.16",
+    # Keep the floor at the version whose formatting the tree conforms to, and
+    # in step with .pre-commit-config.yaml: 0.16 began formatting Python code
+    # blocks inside Markdown, so an older resolve silently under-checks the docs.
+    "ruff>=0.16.2",
 ]
 # Convenience meta-extra for a full local dev environment (NumPy + Torch CI set).
 dev = [
