@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-11
+
 ### Added
 - **TROTS matrix cache (benchmarks).** Parsing the MATLAB v7.3 dose matrices
   dominated every TROTS run's startup; parsed matrices are now mirrored to
@@ -1628,7 +1630,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/wahln/ipax/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/wahln/ipax/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/wahln/ipax/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/wahln/ipax/compare/v0.6.1...v0.7.0
