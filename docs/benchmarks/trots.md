@@ -21,14 +21,17 @@ from ipax.options import BarrierOptions
 
 # Universal first move at RT scale:
 opts = ipax.Options(
-    max_iter=800, max_time=1800.0,          # realistic budget, see below
+    max_iter=800,
+    max_time=1800.0,  # realistic budget, see below
     barrier=BarrierOptions(slack_init_scale=0.1),
 )
 
 # Proton-signature cases additionally want the μ-raising stack:
 opts_protons = ipax.Options(
-    max_iter=800, max_time=1800.0,
-    mu_schedule="quality", globalization="breedveld",
+    max_iter=800,
+    max_time=1800.0,
+    mu_schedule="quality",
+    globalization="breedveld",
     barrier=BarrierOptions(slack_init_scale=0.1, kappa_centrality=1e-4),
 )
 ```
