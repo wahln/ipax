@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ipax.backend.namespace import array_namespace
-from ipax.backend.operators import LinearOperator, as_operator
+from ipax.backend.operators import LinearOperator, as_operator, forward_gram
 from ipax.problem.base import Problem
 
 if TYPE_CHECKING:
@@ -92,7 +92,8 @@ class _RowScaled(LinearOperator):
         # (DJ)ᵀ diag(W) (DJ) = Jᵀ diag(d²·W) J = J.gram(d²·W): the row scaling folds
         # into the weights, so the condensed dense route keeps the sparse-Gram fast
         # path through gradient-based scaling instead of densifying the Jacobian.
-        return self._jac.gram(
+        return forward_gram(
+            self._jac,
             self._d * self._d * weights,
             accumulate_dtype=accumulate_dtype,
             hinted_only=hinted_only,

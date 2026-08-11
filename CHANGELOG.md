@@ -51,8 +51,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (CPU, 32-thread BLAS): the Gram kernel 11.7 → 5.4 s per compute (2.15×).
   Plumbing: `LinearOperator.gram` gains an optional best-effort
   `accumulate_dtype` keyword (forwarded by `VStack`, the CSR routing wrapper
-  and row scaling; honored by the SciPy and CuPy adapters via a cast-once
-  reduced-data CSR), `_CondensedOperator.dense_matrix_mixed` covers
+  and row scaling — through the new `forward_gram`, which falls back to the
+  pre-keyword `gram(weights)` so a user operator written against 0.9.x keeps
+  working when the solver stacks or row-scales it; honored by the SciPy and
+  CuPy adapters via a cast-once reduced-data CSR), `_CondensedOperator.dense_matrix_mixed` covers
   gram-capable and generic (pure Array-API `float32`) Jacobians alike, and
   `Result.routes` reports the engaged route as `dense (gram=float32)` (or
   `dense (gram=auto:float32)` when the hint chose it). On the benchmark side
