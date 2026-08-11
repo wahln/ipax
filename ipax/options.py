@@ -333,11 +333,39 @@ class BreedveldOptions:
 
 @dataclass(frozen=True, slots=True)
 class LBFGSOptions:
-    """Limited-memory Hessian (compact, Powell-damped) — invariant of PD (§4.3)."""
+    """Limited-memory Hessian (compact, Powell-damped) — invariant of PD (§4.3).
+
+    ``damping_skip_ratio`` bounds how much a curvature pair may *contradict*
+    positive curvature before it is dropped instead of damped: a pair with
+    ``δᵀγ < −ratio · δᵀBδ`` is skipped, anything milder gets the usual Powell
+    blend. Powell damping keeps ``B`` PD by fabricating positive curvature out
+    of the pair — on strongly indefinite stretches that fabricated evidence
+    redirects the search (S2MPJ ``ORTHRGDS``: ratios down to −25 damped ⇒
+    1000+ iterations at a worse optimum; skipped ⇒ ~20 to IPOPT's). Blanket
+    skipping (``powell_damping=False``, IPOPT's limited-memory policy) lost
+    the full-corpus A/B by −31 — mild indefiniteness is where damping genuinely
+    helps — hence a threshold rather than a switch. ``None`` (default) keeps
+    pure Powell damping bit-for-bit.
+    """
 
     memory: int = 10  # m ∈ [5, 20]
     powell_damping: bool = True
-    initial_scaling: bool = True  # direct-Hessian seed ξ = γᵀγ / δᵀγ
+    initial_scaling: bool = True  # ξ seed from the newest pair (see seed_formula)
+    damping_skip_ratio: float | None = None
+    # ξ estimate when ``initial_scaling`` is on. Both are standard Rayleigh
+    # seeds, but they diverge by the δ–γ misalignment factor 1/cos²∠(δ,γ):
+    # "direct" (N&W eq. 7.20 inverted, γᵀγ/δᵀγ) is always ≥ "scalar1"
+    # (IPOPT ``limited_memory_initialization``, δᵀγ/δᵀδ) — catastrophically so
+    # on badly-scaled least squares (S2MPJ NELSONLS: median ξ 1e20 vs 6e3,
+    # freezing every step; GASOIL: 508 stalled iterations vs optimal in 25).
+    seed_formula: Literal["direct", "scalar1"] = "direct"
+
+    def __post_init__(self) -> None:
+        ratio = self.damping_skip_ratio
+        if ratio is not None and not (math.isfinite(ratio) and ratio > 0.0):
+            raise ValueError("damping_skip_ratio must be a positive finite float")
+        if self.seed_formula not in ("direct", "scalar1"):
+            raise ValueError("seed_formula must be 'direct' or 'scalar1'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,16 +446,71 @@ class DenseOptions:
     gigabytes for a system whose condensed form is only ``n × n``. When the
     assembled size would exceed this bound the solver silently falls back to
     the condensed route (losing only the inertia diagnostic, not correctness).
+
+    ``gram_dtype`` controls the precision of the FLOP-dominant condensed
+    inequality Gram accumulation ``∇gᵀ Σ_s ∇g`` — ~2× on CPUs and up to the
+    fp32/fp64 rate ratio on consumer GPUs when reduced. The default
+    ``"auto"`` prefers the precision the constraint data actually carries:
+    it engages float32 accumulation exactly when the inequality Jacobian
+    *declares* float32-grade data (``gram_accumulate_dtype_hint`` — e.g. the
+    float32-stored radiotherapy dose matrices) and is a strict
+    no-op otherwise, so fully-float64 problems are untouched. ``"float32"``
+    forces the reduction; ``"native"`` disables it. Either way the requested
+    dtype must be strictly narrower than the working dtype the solve runs in
+    — a float32 solve of float32 data is just a float32 solve, and reducing
+    to the working precision would cost a refinement pass for bit-identical
+    arithmetic. When reduced, working
+    accuracy is restored with fixed-precision
+    iterative refinement against the exact float64 operator matvec (Carson &
+    Higham 2018, SIAM J. Sci. Comput. 40(2)): up to ``refine_max_iters``
+    correction steps, targeting a relative residual of ``refine_tol``. When
+    the budget runs out, the contraction plateaus, or the sequence diverges
+    (fp32 rounding concentrated in the small-eigenvalue subspace makes the
+    *first* iterate the best one), the best iterate seen is still accepted if
+    its *measured exact residual* is within ``refine_accept_tol`` — an
+    honest, looser certificate, and still far tighter than the inexact-Newton
+    forcing the Krylov route solves the same systems with (Dembo, Eisenstat &
+    Steihaug 1982); only a solve missing even that level fails.
+    A failed solve — or a positive-definiteness failure the exact matrix does
+    not reproduce — rebuilds the exact matrix for that factorization, and
+    ``refine_failure_limit`` *consecutive* failures switch the instance back
+    to native precision for good (conditioning along an IPM run is not
+    monotone, so one hard stretch must not forfeit the savings everywhere
+    else). The accuracy of every returned step is certified by a measured
+    exact residual — only accumulation cost is traded. (The PD probe runs on
+    the approximate matrix and relies on the refinement rejection to catch a
+    masked-indefinite exact block — see
+    ``DenseSolver._materialize_and_guard``.) Applies to the inequality/bound
+    **condensed** assembly; equality-constrained saddle systems currently
+    assemble exactly and ignore the request.
     """
 
     kkt_route: DenseKKTRoute = "condensed"
     augmented_max_size: int = 20_000
+    gram_dtype: str = "auto"
+    refine_tol: float = 1e-10
+    refine_accept_tol: float = 1e-6
+    refine_max_iters: int = 15
+    refine_stall_ratio: float = 0.9
+    refine_failure_limit: int = 3
 
     def __post_init__(self) -> None:
         if self.kkt_route not in ("condensed", "augmented"):
             raise ValueError("dense kkt_route must be 'condensed' or 'augmented'")
         if self.augmented_max_size < 1:
             raise ValueError("augmented_max_size must be a positive integer")
+        if self.gram_dtype not in ("auto", "native", "float32"):
+            raise ValueError("gram_dtype must be 'auto', 'native' or 'float32'")
+        if self.refine_tol <= 0.0:
+            raise ValueError("refine_tol must be positive")
+        if not self.refine_tol <= self.refine_accept_tol < 1.0:
+            raise ValueError("refine_accept_tol must be in [refine_tol, 1)")
+        if self.refine_max_iters < 1:
+            raise ValueError("refine_max_iters must be a positive integer")
+        if not 0.0 < self.refine_stall_ratio <= 1.0:
+            raise ValueError("refine_stall_ratio must be in (0, 1]")
+        if self.refine_failure_limit < 1:
+            raise ValueError("refine_failure_limit must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)

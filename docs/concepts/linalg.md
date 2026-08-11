@@ -24,6 +24,61 @@ Selection is automatic (size, constraint shape, Jacobian density, estimated
 Gram fill, namespace capabilities) and user-overridable via `Options.linsolve`.
 Adding a solver never touches `ipm/driver.py` (invariant #3).
 
+### Mixed-precision Gram accumulation (dense route)
+
+For tall inequality problems the dense condensed route spends 80–90% of its
+per-iteration wall forming the Gram term `∇gᵀ Σ_s ∇g` (O(m·n²) FLOPs). The
+default `DenseOptions(gram_dtype="auto")` prefers the precision the
+constraint data actually carries: when the inequality Jacobian *declares*
+float32-grade data (`gram_accumulate_dtype_hint()` — float32 storage, or
+float64 values that are exact float32 upcasts declared by their producer, as
+the TROTS loader does for cases whose dose matrices are float32 in the file),
+the accumulation
+runs in float32 — ~2× on CPUs (twice the SIMD width), up to the fp32/fp64
+rate ratio on GPUs — while everything else stays float64. Fully-float64
+problems are untouched: the hint is declared metadata, never a value scan,
+so behavior only changes where the data provably carries no float64
+information. `gram_dtype="float32"` forces the reduction, `"native"`
+disables it.
+
+A Jacobian assembled from sources of differing precision does not have to
+choose between reducing everything and reducing nothing: `"auto"` applies the
+reduction **per block**, so a stacked operator accumulates reduced in the
+blocks whose own data permits it and exactly in the rest. This is what makes
+the hint usable on real plans — a radiotherapy VMAT case is 96% float32 by
+nonzero, held back by a single float64 constraint matrix, and an
+all-or-nothing rule would forfeit the whole reduction to that one block. A
+size-weighted rule would be the opposite error, silently reducing data its
+producer declared float64. Producers that can group their rows by source
+precision should do so (the TROTS loader groups its lowered inequality block
+that way), since the split is what gives each precision a block of its own.
+
+Both settings respect the working precision the solve actually runs in —
+the reduced dtype must be strictly narrower than it, so a float32 solve of
+float32 data stays a plain float32 solve rather than paying a refinement
+pass for bit-identical arithmetic. Full
+working accuracy is restored per solve by **iterative refinement** against the
+exact float64 operator matvec (Carson & Higham 2018): each O(n²)-solve +
+matvec correction contracts the error by ρ ≈ κ(N)·u₃₂, so a handful of steps
+reach `refine_tol` — and a solve that runs out of budget or plateaus is still
+accepted when its *measured exact residual* clears the looser
+`refine_accept_tol` certificate (mid-barrier Newton steps need nowhere near
+direct-solve accuracy). A solve missing even that level — or a
+positive-definiteness failure the exact matrix does not reproduce (both the
+signature of a κ(N)·u₃₂ ≳ 1 stretch) — rebuilds the exact matrix for that
+factorization; `refine_failure_limit` *consecutive* failures return the
+instance to native precision for good. Conditioning along an IPM run is not
+monotone (μ jumps, δ_w, re-centering), which is why one hard iteration is not
+terminal. Every returned step carries a measured exact-residual certificate —
+only accumulation cost is ever traded. (The PD probe itself runs on the
+approximate matrix; the refinement rejection is what catches the
+masked-indefinite case, and the pair is pinned by a regression test.) The
+option applies to the inequality/bound **condensed** assembly —
+equality-constrained saddle systems currently assemble exactly and ignore it.
+`Result.routes` reports the engaged route as `dense (gram=float32)` — or
+`dense (gram=auto:float32)` when the hint chose the dtype, and
+`dense (gram=float32->native)` after a self-disable.
+
 !!! warning "Known limitation: matrix-free Krylov on equality saddles"
 
     On **equality-constrained** problems the matrix-free `KrylovSolver` borders

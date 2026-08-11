@@ -64,6 +64,7 @@ from benchmarks.harness import (
 from ipax.options import (
     BarrierOptions,
     KrylovOptions,
+    LBFGSOptions,
     LineSearchOptions,
     RegularizationOptions,
 )
@@ -104,6 +105,9 @@ def default_configs(
     free_mode_acceptance: str | None = None,
     slack_init_scale: float | None = None,
     equality_dual_repair: float | None = None,
+    powell_damping: bool | None = None,
+    damping_skip_ratio: float | None = None,
+    lbfgs_seed: str | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -152,6 +156,22 @@ def default_configs(
         # which is off). Only observable on equality-constrained problems.
         common["regularization"] = RegularizationOptions(
             equality_dual_repair=equality_dual_repair
+        )
+    if (
+        powell_damping is not None
+        or damping_skip_ratio is not None
+        or lbfgs_seed is not None
+    ):
+        # L-BFGS A/B levers (LBFGSOptions; the solver defaults damp every
+        # non-PD pair with the "direct" ξ seed): `--powell-damping off` skips
+        # all non-PD pairs like IPOPT's limited-memory update,
+        # `--damping-skip-ratio C` skips only pairs with s·y < −C·s·Bs, and
+        # `--lbfgs-seed scalar1` switches the ξ estimate to IPOPT's
+        # δᵀγ/δᵀδ. Only observable on the L-BFGS configs.
+        common["lbfgs"] = LBFGSOptions(
+            powell_damping=True if powell_damping is None else powell_damping,
+            damping_skip_ratio=damping_skip_ratio,
+            seed_formula="direct" if lbfgs_seed is None else lbfgs_seed,  # type: ignore[arg-type]
         )
     krylov_common = dict(common)
     if krylov_preconditioner is not None:
@@ -514,6 +534,32 @@ def main(argv: list[str] | None = None) -> int:
         "least-squares estimate's.",
     )
     parser.add_argument(
+        "--powell-damping",
+        choices=("on", "off"),
+        default=None,
+        help="override LBFGSOptions.powell_damping on every config (default: the "
+        "solver default, which damps non-PD curvature pairs) — the lever for "
+        "the damp-vs-skip A/B ('off' skips non-PD pairs like IPOPT's "
+        "limited-memory update); only observable on the L-BFGS configs.",
+    )
+    parser.add_argument(
+        "--damping-skip-ratio",
+        type=float,
+        default=None,
+        help="override LBFGSOptions.damping_skip_ratio on every config (default: "
+        "the solver default None = damp every non-PD pair) — the hybrid lever: "
+        "a curvature pair with s·y < −RATIO·s·Bs is skipped instead of "
+        "Powell-damped; only observable on the L-BFGS configs.",
+    )
+    parser.add_argument(
+        "--lbfgs-seed",
+        choices=("direct", "scalar1"),
+        default=None,
+        help="override LBFGSOptions.seed_formula on every config (default: the "
+        "solver default 'direct' = γᵀγ/δᵀγ) — the lever for the ξ-seed A/B; "
+        "'scalar1' is IPOPT's δᵀγ/δᵀδ; only observable on the L-BFGS configs.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -582,6 +628,11 @@ def main(argv: list[str] | None = None) -> int:
         free_mode_acceptance=args.free_mode_acceptance,
         slack_init_scale=args.slack_init_scale,
         equality_dual_repair=args.equality_dual_repair,
+        powell_damping=(
+            None if args.powell_damping is None else args.powell_damping == "on"
+        ),
+        damping_skip_ratio=args.damping_skip_ratio,
+        lbfgs_seed=args.lbfgs_seed,
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}

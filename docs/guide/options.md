@@ -205,21 +205,30 @@ bounds, so they never hurt there. Tune Gondzio via
 - `"breedveld"` — a lighter Markov-filter + ratio-control step controller tuned
   for convex/RT-like problems ([`BreedveldOptions`](../reference.md#ipax.options.BreedveldOptions)).
 
-!!! tip "Radiotherapy-scale planning: prefer `\"breedveld\"`"
+!!! tip "Radiotherapy-scale planning: start from `slack_init_scale=0.1`"
     On large, deeply-infeasible-at-start dose-optimization problems (TROTS-scale:
     `n≈10³`, hundreds of thousands of dose constraints, a warm start that is
-    objective-good but far outside the feasible region), the default filter mode
-    grinds: the primal step is clipped by fraction-to-boundary to `≈10⁻³` while
-    the constraint violation is reduced, so feasibility — and thus convergence —
-    takes many iterations. The `"breedveld"` controller's non-monotone Markov
-    filter makes better use of those clipped steps and reduces the infeasibility
-    **≈3× faster** on the same iterates; it was the strongest route across the
-    TROTS Prostate_BT set (this `≈3×` is a reduction in *iteration count*, not
-    per-iteration cost). Pair it with `mu_schedule="breedveld"`. Budget
-    realistically: these cases still need on the order of 10²–10³ iterations at
-    seconds-per-iteration on a threaded BLAS (keep the default `linsolve="auto"`,
-    above), so set `max_iter`/`max_time` accordingly rather than expecting the
-    sub-second convergence of small problems.
+    objective-good but far outside the feasible region), the first lever is
+    **not** the globalization mode but the
+    [slack initialization](#slack-initialization): with the stock
+    filter/monotone defaults plus `BarrierOptions(slack_init_scale=0.1)`, the
+    TROTS Liver and Prostate-CK cases converge to their published reference
+    objectives (`optimal`, KKT ≈ 1e-8) and VMAT gets within ~1 % of its
+    reference in a 30-minute budget — where the flat slack floor left the same
+    solves clipped at `α ≈ 10⁻³` or livelocked. See the
+    [TROTS benchmark page](../benchmarks/trots.md) for the measured table and
+    the per-signature routing (the proton cases additionally want a μ-raising
+    schedule; the other groups punish one). Budget realistically: these cases
+    need on the order of 10²–10³ iterations at seconds-per-iteration on a
+    threaded BLAS (keep the default `linsolve="auto"`, above), so set
+    `max_iter`/`max_time` accordingly rather than expecting the sub-second
+    convergence of small problems. The `"breedveld"` controller remains a
+    reasonable alternative step controller on convex RT problems (it was the
+    strongest route across the small Prostate-BT cases), but at TROTS scale do
+    **not** pair a μ-raising oracle (`"quality"`/`"breedveld"`) with it as a
+    blanket setting — on three of the four at-scale TROTS groups that
+    combination drives the objective into a large barrier-dominated excursion
+    it cannot recover from within any practical budget.
 
 The filter constants
 ([`LineSearchOptions`](../reference.md#ipax.options.LineSearchOptions)) and the
@@ -299,11 +308,14 @@ ipax.Options(barrier=BarrierOptions(slack_init_scale=0.1))
 ```
 
 It is **opt-in** because the benefit is specific to badly-infeasible,
-many-constraint starts (radiotherapy-scale problems are the motivating case,
-where it reaches feasibility in roughly half the iterations); on the general
-corpus it is net-neutral, so the default leaves the solver unchanged. A value in
-`[0.05, 0.5]` matches the constraint scale on such problems; `0.0` keeps the flat
-floor.
+many-constraint starts; on the general corpus it is net-neutral, so the default
+leaves the solver unchanged. Radiotherapy-scale problems are the motivating
+case, and there the lever is decisive, not incremental: with `0.1` the TROTS
+Liver and Prostate-CK cases go from grinding/livelocked to `optimal` at their
+published reference objectives, VMAT reaches feasibility in ~120 instead of
+~180 iterations, and the proton cases unclip from the `α ≈ 10⁻³` grind (see
+the [TROTS benchmark page](../benchmarks/trots.md)). A value in `[0.05, 0.5]`
+matches the constraint scale on such problems; `0.0` keeps the flat floor.
 
 ## Equality-multiplier repair
 

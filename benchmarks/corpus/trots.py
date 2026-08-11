@@ -51,15 +51,21 @@ Because these problems have far more constraints than variables (``n ≈ 1e3``,
 dose matrices through matvecs and forms only the ``n×n`` system — is far cheaper
 per iteration than factoring the full ``(n+m)`` saddle with ``linsolve="sparse"``.
 
-Like the S2MPJ bridge, evaluation runs in NumPy/SciPy on the host and converts
-to/from the target namespace, so ipax's linear algebra runs on any CPU backend
-while the (large, host-resident) dose matrices stay in SciPy. This forces a host
-sync per evaluation — it is for accuracy/cross-backend work, not GPU performance.
+Like the S2MPJ bridge, evaluation runs in NumPy/SciPy on the host by default and
+converts to/from the target namespace, so ipax's linear algebra runs on any CPU
+backend while the (large, host-resident) dose matrices stay in SciPy. For **CuPy
+namespaces** the evaluation matrices are mirrored to the device once and the
+callbacks evaluate device-side (the elementwise cost math dispatches from NumPy's
+functions to CuPy via NEP-18), so a GPU solve no longer pays a host round-trip
+per callback — only scalar reductions sync. The exact Lagrangian Hessian
+(:class:`TROTSExactProblem`) still assembles host-side (per-term sparse SpGEMM;
+it serves the accuracy tests, not the RT performance runs).
 """
 
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -78,11 +84,19 @@ if TYPE_CHECKING:
 # Host bridge helpers
 # --------------------------------------------------------------------------- #
 def _to_numpy(x: Array) -> Any:
-    """Array-API array → 1-D NumPy array (host bridge)."""
+    """Array-API array → 1-D NumPy array (host bridge).
+
+    Device arrays (CuPy) refuse implicit host conversion; ``.get()`` is the
+    explicit device→host copy. The problem callbacks evaluate host-side with
+    SciPy regardless of the solve namespace — at ``n ≈ 10³`` the per-iteration
+    transfer is ~16 kB, negligible next to the device-side KKT solve.
+    """
     import numpy as np
 
     if isinstance(x, np.ndarray):
         return np.reshape(x, (-1,))
+    if hasattr(x, "__cuda_array_interface__") and hasattr(x, "get"):
+        return np.reshape(np.asarray(x.get()), (-1,))
     try:
         return np.reshape(np.from_dlpack(x), (-1,))
     except (TypeError, RuntimeError, BufferError, ValueError):
@@ -108,6 +122,11 @@ class TROTSMatrix:
     matrix: Any  # scipy.sparse matrix (voxels × vars) or (vars × vars) for type 2
     b: Any  # offset vector (NumPy), possibly all-zero
     c: float  # scalar for the quadratic form
+    # Dtype of the matrix values AS STORED IN THE FILE (TROTS dose matrices
+    # are float32 at the source). Any later float64 promotion is an exact
+    # upcast, so this is the precision the data actually carries — the
+    # metadata behind ``DenseOptions(gram_dtype="auto")``.
+    source_dtype: str = "float64"
 
 
 @dataclass
@@ -170,8 +189,175 @@ def _h5_vec(f: Any, struct: str, field_name: str, i: int) -> Any:
     return np.asarray(f[f[struct][field_name][i, 0]][()], dtype=float).ravel()
 
 
+# --------------------------------------------------------------------------- #
+# On-disk matrix cache
+# --------------------------------------------------------------------------- #
+# Parsing the MATLAB v7.3 dose matrices dominates a TROTS run's startup (tens of
+# seconds per case; ``Prostate_CK_01`` measured 35-56 s), and every benchmark
+# invocation re-pays it. Each parsed matrix is therefore mirrored to a plain
+# ``.npz`` beside the dataset and reloaded from there on later runs. The cache is
+# keyed by the source file's absolute-path digest, size and mtime plus a format
+# version, so editing or replacing a ``.mat`` misses rather than serving a stale
+# matrix (and two datasets sharing one cache directory cannot alias), and it is
+# strictly an optimization: any failure to read or write it falls back to
+# parsing. Set ``IPAX_TROTS_CACHE`` to a directory to relocate it, or to
+# ``off`` to disable it.
+_CACHE_FORMAT = 1
+_CACHE_DIRNAME = ".ipax_trots_cache"
+_CACHE_OFF = frozenset({"", "0", "off", "no", "none", "false"})
+
+
+def _cache_dir_for(path: str) -> str | None:
+    """Cache directory for ``path``'s parsed matrices, or ``None`` if disabled."""
+    setting = os.environ.get("IPAX_TROTS_CACHE")
+    if setting is not None:
+        if setting.strip().lower() in _CACHE_OFF:
+            return None
+        root = setting
+    else:
+        root = os.path.join(os.path.dirname(os.path.abspath(path)), _CACHE_DIRNAME)
+    try:
+        stat = os.stat(path)
+        # The absolute path's digest disambiguates same-named files: pointing
+        # IPAX_TROTS_CACHE at one shared directory for several datasets would
+        # otherwise let two "Protons_01.mat" with equal size and mtime alias,
+        # and a load could silently return a matrix from the wrong dataset.
+        # basename stays in the key so the directory remains human-readable.
+        source = hashlib.sha256(
+            os.path.abspath(path).encode("utf-8", "surrogatepass")
+        ).hexdigest()[:16]
+        key = (
+            f"{os.path.basename(path)}.{source}"
+            f".{stat.st_size}.{stat.st_mtime_ns}.v{_CACHE_FORMAT}"
+        )
+    except OSError:
+        return None
+    return os.path.join(root, key)
+
+
+def _compact_indices(matrix: Any) -> Any:
+    """Narrow a sparse matrix's index arrays to int32 when they fit.
+
+    The MATLAB reader hands SciPy int64 ``ir``/``jc``, which SciPy then keeps —
+    8 bytes per stored entry for dose matrices whose indices never approach
+    2³¹. Narrowing halves index memory (~330 MB on ``Prostate_VMAT_101``'s
+    82 M nonzeros), shrinks the on-disk cache by the same amount, and is what
+    SciPy would have chosen had the arrays arrived as int32. Applied on both
+    the parse and cache-read paths so a cold and a warm load are identical.
+    """
+    import numpy as np
+
+    limit = np.iinfo(np.int32).max
+    if matrix.nnz > limit or max(matrix.shape, default=0) > limit:
+        return matrix
+    if matrix.indices.dtype != np.int32:
+        matrix.indices = matrix.indices.astype(np.int32, copy=False)
+    if matrix.indptr.dtype != np.int32:
+        matrix.indptr = matrix.indptr.astype(np.int32, copy=False)
+    return matrix
+
+
+def _read_cached_matrix(cache_file: str) -> TROTSMatrix | None:
+    """Load a cached :class:`TROTSMatrix`, or ``None`` on any miss/corruption."""
+    import numpy as np
+    import scipy.sparse as sp
+
+    try:
+        with np.load(cache_file) as z:  # allow_pickle stays off by default
+            builder = sp.csc_matrix if str(z["fmt"]) == "csc" else sp.csr_matrix
+            values = z["data"]
+            # Values may be stored narrowed (see the writer); widening back is
+            # exact, so the rebuilt matrix equals the parsed one bit for bit.
+            if "value_dtype" in z.files and str(z["value_dtype"]) != str(values.dtype):
+                values = values.astype(str(z["value_dtype"]))
+            matrix = _compact_indices(
+                builder(
+                    (values, z["indices"], z["indptr"]),
+                    shape=tuple(int(v) for v in z["shape"]),
+                )
+            )
+            return TROTSMatrix(
+                name=str(z["name"]),
+                mtype=int(z["mtype"]),
+                matrix=matrix,
+                b=z["b"],
+                c=float(z["c"]),
+                source_dtype=str(z["source_dtype"]),
+            )
+    except (OSError, ValueError, KeyError, EOFError):
+        # Absent, truncated (a run killed mid-write), or written by an
+        # incompatible NumPy: re-parse instead of failing the load.
+        return None
+
+
+def _write_cached_matrix(cache_file: str, mat: TROTSMatrix) -> None:
+    """Mirror a parsed matrix to ``cache_file`` (atomically; best effort)."""
+    import numpy as np
+
+    compressed = _compact_indices(
+        mat.matrix.tocsc() if mat.matrix.format == "csc" else mat.matrix.tocsr()
+    )
+    # The dense-stored matrices are widened to float64 at parse time even
+    # though the file holds float32 (``source_dtype`` records that), which
+    # would otherwise double their footprint here — the corpus caches into
+    # gigabytes. Store the narrow values when the widening is provably
+    # lossless (checked, not assumed) and widen again on read.
+    values = compressed.data
+    stored = values
+    if values.dtype == np.float64 and mat.source_dtype == "float32":
+        narrowed = values.astype(np.float32)
+        if np.array_equal(narrowed.astype(np.float64), values):
+            stored = narrowed
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    # Write-then-rename so a concurrent reader never observes a partial file
+    # (the benchmark runners load the same case from several processes).
+    tmp = f"{cache_file}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "wb") as fh:
+            np.savez(
+                fh,
+                fmt=np.asarray(compressed.format),
+                data=stored,
+                value_dtype=np.asarray(str(values.dtype)),
+                indices=compressed.indices,
+                indptr=compressed.indptr,
+                shape=np.asarray(compressed.shape, dtype=np.int64),
+                b=np.asarray(mat.b),
+                c=np.asarray(mat.c),
+                name=np.asarray(mat.name),
+                mtype=np.asarray(mat.mtype),
+                source_dtype=np.asarray(mat.source_dtype),
+            )
+        os.replace(tmp, cache_file)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def _load_matrix(path: str, j: int) -> TROTSMatrix:
-    """Read ``data.matrix[j]`` (0-based) into a :class:`TROTSMatrix`."""
+    """Read ``data.matrix[j]`` (0-based) into a :class:`TROTSMatrix`.
+
+    Served from the on-disk cache when possible (see :func:`_cache_dir_for`).
+    """
+    cache_dir = _cache_dir_for(path)
+    cache_file = os.path.join(cache_dir, f"m{j:05d}.npz") if cache_dir else None
+    if cache_file is not None:
+        cached = _read_cached_matrix(cache_file)
+        if cached is not None:
+            return cached
+
+    mat = _parse_matrix(path, j)
+
+    if cache_file is not None:
+        try:
+            _write_cached_matrix(cache_file, mat)
+        except OSError:
+            pass  # read-only location, full disk, ... — the parse still stands
+    return mat
+
+
+def _parse_matrix(path: str, j: int) -> TROTSMatrix:
+    """Read ``data.matrix[j]`` (0-based) straight from the HDF5 file."""
     import h5py
     import numpy as np
     import scipy.sparse as sp
@@ -196,14 +382,26 @@ def _load_matrix(path: str, j: int) -> TROTSMatrix:
             else:
                 data = np.zeros(0)
                 ir = np.zeros(0, dtype=np.int64)
+            source_dtype = str(data.dtype)
             jc = np.asarray(obj["jc"][()]).ravel().astype(np.int64)
             nrows = int(obj.attrs["MATLAB_sparse"])
             ncols = jc.size - 1
-            matrix: Any = sp.csc_matrix((data, ir, jc), shape=(nrows, ncols))
+            matrix: Any = _compact_indices(
+                sp.csc_matrix((data, ir, jc), shape=(nrows, ncols))
+            )
         else:
             # Dense matrices are stored transposed (vars × voxels): un-transpose.
-            matrix = sp.csr_matrix(np.asarray(obj[()], dtype=float).T)
-    return TROTSMatrix(name=name, mtype=mtype, matrix=matrix, b=b, c=c)
+            raw = np.asarray(obj[()])
+            source_dtype = str(raw.dtype)
+            matrix = _compact_indices(sp.csr_matrix(np.asarray(raw, dtype=float).T))
+    return TROTSMatrix(
+        name=name,
+        mtype=mtype,
+        matrix=matrix,
+        b=b,
+        c=c,
+        source_dtype=source_dtype,
+    )
 
 
 @functools.lru_cache(maxsize=8)
@@ -461,6 +659,10 @@ class TROTSProblem(Problem):
         lin_rows: list[Any] = []  # scipy rows over x (padded later)
         lin_lo: list[float] = []
         lin_hi: list[float] = []
+        # Per-row "is this row's data float32 in the file?" flags, appended in the
+        # same order as the rows themselves so the lowered block below can be
+        # grouped by source precision.
+        lin_f32: list[Any] = []
 
         for e in instance.entries:
             factor = 1.0 if e.minimise else -1.0
@@ -493,6 +695,9 @@ class TROTSProblem(Problem):
                     A = mat.matrix
                     off = mat.b if mat.b.size == A.shape[0] else 0.0
                     # minimise ⇒ maximum constraint (A x + off ≤ bound); else minimum.
+                    lin_f32.append(
+                        np.full(A.shape[0], mat.source_dtype == "float32", dtype=bool)
+                    )
                     if e.minimise:
                         lin_rows.append(A)
                         lin_lo.extend([-np.inf] * A.shape[0])
@@ -537,6 +742,7 @@ class TROTSProblem(Problem):
         for k, (mat, _w, minimise) in enumerate(self._minimax):
             A = sp.csr_matrix(mat.matrix)
             m = A.shape[0]
+            lin_f32.append(np.full(m, mat.source_dtype == "float32", dtype=bool))
             e_k = sp.csr_matrix(
                 (np.full(m, -1.0 if minimise else 1.0), (np.arange(m), np.full(m, k))),
                 shape=(m, self._n_aux),
@@ -547,7 +753,11 @@ class TROTSProblem(Problem):
             off = mat.b if mat.b.size == m else np.zeros(m)
             lo.extend([-np.inf] * m)
             hi.extend((-sgn * off).tolist())
-        self._A_lin = (
+        # Deliberately a local, not an attribute: the two-sided block is consumed
+        # by the lowering below and never referenced again, so letting it fall out
+        # of scope at the end of ``__init__`` halves the host residency of the
+        # linear block (it is the same order of nonzeros as the lowered ``G``).
+        A_lin = (
             sp.vstack(blocks, format="csr")
             if blocks
             else sp.csr_matrix((0, self._n_vars))
@@ -563,15 +773,32 @@ class TROTSProblem(Problem):
         # scale, so we lower the sparse block ourselves and keep it sparse.
         hi_fin = np.isfinite(self._lin_hi)
         lo_fin = np.isfinite(self._lin_lo)
+        row_f32 = (
+            np.concatenate(lin_f32)
+            if lin_f32
+            else np.zeros((A_lin.shape[0],), dtype=bool)
+        )
         g_blocks: list[Any] = []
         h_parts: list[Any] = []
-        A_csr = self._A_lin.tocsr()
-        if bool(hi_fin.any()):
-            g_blocks.append(A_csr[hi_fin])
-            h_parts.append(-self._lin_hi[hi_fin])
-        if bool(lo_fin.any()):
-            g_blocks.append(-A_csr[lo_fin])
-            h_parts.append(self._lin_lo[lo_fin])
+        n_f32 = 0
+        A_csr = A_lin.tocsr()
+        # Emit the float32-sourced rows first, so that group is *contiguous* in the
+        # lowered ``G`` and can be handed to the solver as an operator of its own
+        # carrying its own accumulate hint (see ``_linear_ineq_operator``). Row
+        # order within a group — and hence the whole block whenever the plan is not
+        # mixed — is unchanged from the ungrouped assembly.
+        for is_f32 in (True, False):
+            group = row_f32 == is_f32
+            sel_hi = hi_fin & group
+            sel_lo = lo_fin & group
+            if bool(sel_hi.any()):
+                g_blocks.append(A_csr[sel_hi])
+                h_parts.append(-self._lin_hi[sel_hi])
+                n_f32 += int(sel_hi.sum()) if is_f32 else 0
+            if bool(sel_lo.any()):
+                g_blocks.append(-A_csr[sel_lo])
+                h_parts.append(self._lin_lo[sel_lo])
+                n_f32 += int(sel_lo.sum()) if is_f32 else 0
         self._G = (
             sp.vstack(g_blocks, format="csr")
             if g_blocks
@@ -580,6 +807,15 @@ class TROTSProblem(Problem):
         self._h = np.concatenate(h_parts) if h_parts else np.zeros((0,), dtype=float)
         self._n_lin_ineq = int(self._G.shape[0])
         self._n_nl_ineq = len(self._nl_con) + len(self._quad_con)
+        # The lin-block values are the source matrices' entries times ±1 (plus the
+        # ±1 minimax links), so a row drawn from a matrix that is float32 in the
+        # file carries only float32 information even though the assembled ``G`` is
+        # float64. Those rows lead the block (grouped above), and the count is what
+        # ``_linear_ineq_operator`` splits on so the solver's ``gram_dtype="auto"``
+        # default can reduce their accumulate while the genuinely-float64 rows stay
+        # exact. Radiotherapy plans are routinely mixed: a VMAT plan measures ~96%
+        # float32 by nonzero, held back by a single float64 constraint matrix.
+        self._n_lin_f32 = n_f32
         self._G_op: LinearOperator | None = None  # cached constant sparse operator
 
         # Objective linear coefficient over z (mean terms on x; minimax on t).
@@ -587,6 +823,40 @@ class TROTSProblem(Problem):
         self._c_obj[: self._n] = self._lin_obj_coef
         for k, (_mat, w, minimise) in enumerate(self._minimax):
             self._c_obj[self._n + k] = (1.0 if minimise else -1.0) * w
+
+        # Device-side evaluation (CuPy namespaces): keep z and the dose matrices
+        # on the device so the per-callback products run on the GPU instead of
+        # round-tripping to SciPy. The big constant ``G`` spmv runs on the device
+        # too, but through the constraint operator, which already holds it there
+        # — mirroring it a second time would double the residency of the largest
+        # array in the problem. The elementwise cost math (`_cost_value` &
+        # friends) is written against NumPy's public functions, which dispatch to
+        # CuPy via the NEP-18/ufunc protocols, so the same code serves both
+        # spaces. Host NumPy/SciPy remains the path for every non-CUDA namespace.
+        self._eval_device = False
+        self._cxs: Any = None  # cupyx.scipy.sparse, when active
+        self._dev_mats: dict[int, Any] = {}  # id(TROTSMatrix) -> device CSR
+        self._dev_vecs: dict[int, Any] = {}  # id(TROTSMatrix) -> device b
+        self._h_eval: Any = self._h
+        self._c_obj_eval: Any = self._c_obj
+        try:
+            probe = xp.asarray(0.0)
+        except Exception:  # namespace probing only — any failure means "host"
+            probe = None
+        if probe is not None and hasattr(probe, "__cuda_array_interface__"):
+            try:
+                import cupyx.scipy.sparse as cxs
+            except ImportError:
+                cxs = None
+            if cxs is not None:
+                self._cxs = cxs
+                self._eval_device = True
+                # ``G`` itself is deliberately *not* mirrored here: the operator
+                # handed to the solver already carries a device copy, and the
+                # constraint values are evaluated through it (see
+                # ``ineq_constraints``). One device residency, not two.
+                self._h_eval = xp.asarray(self._h)
+                self._c_obj_eval = xp.asarray(self._c_obj)
 
     # -- dimensions & bounds ------------------------------------------------
     @property
@@ -682,19 +952,55 @@ class TROTSProblem(Problem):
             x = np.full((self._n,), scale, dtype=float)
         return _from_numpy(self.xp, self._pad_aux(x))
 
+    # -- evaluation-space accessors -----------------------------------------
+    # Host (default): NumPy vectors + the SciPy matrices as loaded. Device
+    # (CuPy namespaces): the same objects mirrored once to the GPU, keyed by
+    # the TROTSMatrix identity (matrices are immutable for the problem's
+    # lifetime). The evaluation loops below are written once against these
+    # accessors; NumPy's functions dispatch to CuPy on device arrays.
+    def _eval_z(self, z: Array) -> Any:
+        if self._eval_device:
+            return self.xp.reshape(self.xp.asarray(z), (-1,))
+        return _to_numpy(z)
+
+    def _eval_mat(self, mat: TROTSMatrix) -> Any:
+        if not self._eval_device:
+            return mat.matrix
+        dev = self._dev_mats.get(id(mat))
+        if dev is None:
+            dev = self._cxs.csr_matrix(mat.matrix.tocsr())
+            self._dev_mats[id(mat)] = dev
+        return dev
+
+    def _eval_b(self, mat: TROTSMatrix) -> Any:
+        if not self._eval_device:
+            return mat.b
+        dev = self._dev_vecs.get(id(mat))
+        if dev is None:
+            dev = self.xp.asarray(mat.b)
+            self._dev_vecs[id(mat)] = dev
+        return dev
+
+    def _dose(self, mat: TROTSMatrix, x: Any) -> Any:
+        """``d = A x (+ b)`` in evaluation space (offset only when per-row)."""
+        d = self._eval_mat(mat) @ x
+        if mat.b.size == mat.matrix.shape[0]:
+            d = d + self._eval_b(mat)
+        return d
+
     # -- objective ----------------------------------------------------------
     def objective(self, z: Array) -> Scalar:
         import numpy as np
 
-        zc = _to_numpy(z)
+        zc = self._eval_z(z)
         x = zc[: self._n]
-        total = float(self._c_obj @ zc) + self._lin_obj_const
+        total = float(self._c_obj_eval @ zc) + self._lin_obj_const
         for mat, coef in self._quad_obj:
-            ax = mat.matrix @ x
-            lin = float(mat.b @ x) if mat.b.size == x.size else 0.0
+            ax = self._eval_mat(mat) @ x
+            lin = float(self._eval_b(mat) @ x) if mat.b.size == self._n else 0.0
             total += coef * (0.5 * float(x @ ax) + lin + mat.c)
         for mat, coef, ctype, par in self._nl_obj:
-            d = mat.matrix @ x + (mat.b if mat.b.size == mat.matrix.shape[0] else 0.0)
+            d = self._dose(mat, x)
             try:
                 total += coef * _cost_value(ctype, d, par)
             except (OverflowError, FloatingPointError):
@@ -702,20 +1008,20 @@ class TROTSProblem(Problem):
         return _from_numpy(self.xp, np.asarray(total))
 
     def gradient(self, z: Array) -> Array:
-        import numpy as np
-
-        zc = _to_numpy(z)
+        zc = self._eval_z(z)
         x = zc[: self._n]
-        g = np.array(self._c_obj, dtype=float)
+        g = self._c_obj_eval.copy()
         for mat, coef in self._quad_obj:
-            gx = mat.matrix @ x
-            if mat.b.size == x.size:
-                gx = gx + mat.b
+            gx = self._eval_mat(mat) @ x
+            if mat.b.size == self._n:
+                gx = gx + self._eval_b(mat)
             g[: self._n] += coef * gx
         for mat, coef, ctype, par in self._nl_obj:
-            d = mat.matrix @ x + (mat.b if mat.b.size == mat.matrix.shape[0] else 0.0)
+            d = self._dose(mat, x)
             gd = _cost_grad_d(ctype, d, par)
-            g[: self._n] += coef * (mat.matrix.T @ gd)
+            g[: self._n] += coef * (self._eval_mat(mat).T @ gd)
+        if self._eval_device:
+            return g
         return _from_numpy(self.xp, g)
 
     # -- inequality constraints (nonlinear cost rows first, then linear) ----
@@ -726,7 +1032,28 @@ class TROTSProblem(Problem):
     # up with them (the trailing linear multipliers carry no curvature).
     def _linear_ineq_operator(self) -> LinearOperator:
         if self._G_op is None:
-            self._G_op = self._csr_operator(self._G, symmetric=False)
+            k = self._n_lin_f32
+            if k in (0, self._n_lin_ineq):
+                self._G_op = self._csr_operator(
+                    self._G,
+                    symmetric=False,
+                    values_dtype_hint="float32" if k else None,
+                )
+            else:
+                from ipax.backend.operators import VStack
+
+                # Mixed sources: hand the two groups over separately, so a reduced
+                # Gram accumulate applies to the float32-sourced rows alone. The
+                # stack is equivalent row-for-row to the single operator — a
+                # vertical stack's Gram is the sum of its blocks' Grams.
+                self._G_op = VStack(
+                    (
+                        self._csr_operator(
+                            self._G[:k], symmetric=False, values_dtype_hint="float32"
+                        ),
+                        self._csr_operator(self._G[k:], symmetric=False),
+                    )
+                )
         return self._G_op
 
     def ineq_constraints(self, z: Array) -> Array:
@@ -734,21 +1061,30 @@ class TROTSProblem(Problem):
 
         if self._n_nl_ineq == 0 and self._n_lin_ineq == 0:
             raise NotImplementedError
-        zc = _to_numpy(z)
+        zc = self._eval_z(z)
         x = zc[: self._n]
         vals: list[float] = []
         for mat, sign, ctype, par, bound in self._nl_con:
-            d = mat.matrix @ x + (mat.b if mat.b.size == mat.matrix.shape[0] else 0.0)
+            d = self._dose(mat, x)
             vals.append(sign * (_cost_value(ctype, d, par) - bound))
         for mat, sign, bound in self._quad_con:
-            ax = mat.matrix @ x
-            lin = float(mat.b @ x) if mat.b.size == x.size else 0.0
+            ax = self._eval_mat(mat) @ x
+            lin = float(self._eval_b(mat) @ x) if mat.b.size == self._n else 0.0
             f = 0.5 * float(x @ ax) + lin + mat.c
             vals.append(sign * (f - bound))
         nl = np.asarray(vals, dtype=float)
         if self._n_lin_ineq == 0:
             return _from_numpy(self.xp, nl)
-        lin_vals = self._G @ zc + self._h
+        if self._eval_device:
+            # Device: go through the constraint operator rather than a second
+            # device copy of ``G``. Its adapter holds a device CSR of exactly
+            # these rows, so this is the same spmv on the same data — and in the
+            # mixed-source case the operator is a ``VStack`` whose blocks are the
+            # contiguous row groups, so the concatenated result is in ``G`` row
+            # order and lines up with ``_h_eval``.
+            lin_vals = self._linear_ineq_operator().matvec(zc) + self._h_eval
+            return np.concatenate([self.xp.asarray(nl), lin_vals])
+        lin_vals = self._G @ zc + self._h_eval
         return _from_numpy(self.xp, np.concatenate([nl, lin_vals]))
 
     def ineq_jacobian(self, z: Array) -> Array | LinearOperator:
@@ -763,20 +1099,22 @@ class TROTSProblem(Problem):
         if self._n_nl_ineq == 0:
             assert lin_op is not None
             return lin_op
-        x = _to_numpy(z)[: self._n]
+        x = self._eval_z(z)[: self._n]
         rows: list[Any] = []
         for mat, sign, ctype, par, _bound in self._nl_con:
-            d = mat.matrix @ x + (mat.b if mat.b.size == mat.matrix.shape[0] else 0.0)
+            d = self._dose(mat, x)
             gd = _cost_grad_d(ctype, d, par)
-            rows.append(sign * (mat.matrix.T @ gd))
+            rows.append(sign * (self._eval_mat(mat).T @ gd))
         for mat, sign, _bound in self._quad_con:
-            gx = mat.matrix @ x
-            if mat.b.size == x.size:
-                gx = gx + mat.b
+            gx = self._eval_mat(mat) @ x
+            if mat.b.size == self._n:
+                gx = gx + self._eval_b(mat)
             rows.append(sign * gx)
+        spx = self._cxs if self._eval_device else sp
         J_x = np.stack(rows) if rows else np.zeros((0, self._n))
-        J = sp.hstack(
-            [sp.csr_matrix(J_x), sp.csr_matrix((len(rows), self._n_aux))], format="csr"
+        J = spx.hstack(
+            [spx.csr_matrix(J_x), spx.csr_matrix((len(rows), self._n_aux))],
+            format="csr",
         )
         nl_op = self._csr_operator(J, symmetric=False)
         if lin_op is None:
@@ -784,8 +1122,14 @@ class TROTSProblem(Problem):
         return VStack((nl_op, lin_op))
 
     # -- sparse-operator helper --------------------------------------------
-    def _csr_operator(self, csr: Any, *, symmetric: bool) -> LinearOperator:
-        """Wrap a host ``scipy.csr_matrix`` as an Array-API ``CSROperator``."""
+    def _csr_operator(
+        self,
+        csr: Any,
+        *,
+        symmetric: bool,
+        values_dtype_hint: str | None = None,
+    ) -> LinearOperator:
+        """Wrap a host SciPy (or device cupyx) CSR as an Array-API ``CSROperator``."""
         import numpy as np
 
         from ipax.backend.operators import CSROperator
@@ -793,12 +1137,23 @@ class TROTSProblem(Problem):
         csr = csr.tocsr()
         csr.sort_indices()
         xp = self.xp
+        if hasattr(csr.data, "__cuda_array_interface__"):
+            # Already device-resident (device evaluation path): no host bounce.
+            return CSROperator(
+                xp.asarray(csr.indptr, dtype=xp.int64),
+                xp.asarray(csr.indices, dtype=xp.int64),
+                xp.asarray(csr.data, dtype=xp.float64),
+                (int(csr.shape[0]), int(csr.shape[1])),
+                symmetric=symmetric,
+                values_dtype_hint=values_dtype_hint,
+            )
         return CSROperator(
             xp.asarray(np.asarray(csr.indptr, dtype=np.int64)),
             xp.asarray(np.asarray(csr.indices, dtype=np.int64)),
             _from_numpy(xp, csr.data),
             (int(csr.shape[0]), int(csr.shape[1])),
             symmetric=symmetric,
+            values_dtype_hint=values_dtype_hint,
         )
 
 

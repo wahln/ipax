@@ -174,6 +174,84 @@ def test_initial_point_warm_start_beats_uniform_objective():
     assert warm_err < uniform_err
 
 
+def test_linear_block_declares_float32_source():
+    # The dose matrices are float32 in the TROTS files: the assembled linear
+    # inequality block must declare that source precision so the dense
+    # route's gram_dtype="auto" default engages the reduced accumulate.
+    instance = trots.load_trots_file(f"{_ROOT}/Prostate_BT_01.mat")
+    problem = trots.TROTSProblem(instance, np, sparse=True)
+    op = problem._linear_ineq_operator()
+    assert op.gram_accumulate_dtype_hint() == "float32"
+
+
+def test_device_evaluation_matches_host():
+    # GPU-gated: with a CuPy namespace the problem callbacks must evaluate
+    # device-side (no per-call host round-trip of the dose products) and agree
+    # with the host NumPy/SciPy path to reduction-order rounding.
+    pytest.importorskip("cupy")
+    import cupy
+
+    try:
+        cupy.cuda.runtime.getDeviceCount()
+        cupy.asarray(0.0)
+    except Exception:
+        pytest.skip("no usable CUDA device")
+    from ipax.testing.backends import import_namespace
+
+    xp = import_namespace("cupy")
+    instance = trots.load_trots_file(f"{_ROOT}/Prostate_BT_01.mat")
+    host = trots.TROTSProblem(instance, np, sparse=True)
+    dev = trots.TROTSProblem(instance, xp, sparse=True)
+    assert host._eval_device is False
+    assert dev._eval_device is True
+
+    rng = np.random.default_rng(7)
+    x = rng.uniform(0.5, 2.0, size=instance.n)
+    z = np.concatenate([x, np.zeros(host._n_aux)])
+    for k, (mat, _w, mini) in enumerate(host._minimax):
+        d = mat.matrix @ x
+        z[instance.n + k] = np.max(d) if mini else np.min(d)
+    z_dev = xp.asarray(z)
+
+    # Objective / gradient / constraints agree and stay on the device.
+    assert float(dev.objective(z_dev)) == pytest.approx(
+        float(host.objective(z)), rel=1e-10, abs=1e-12
+    )
+    g_dev = dev.gradient(z_dev)
+    assert hasattr(g_dev, "__cuda_array_interface__")
+    np.testing.assert_allclose(
+        cupy.asnumpy(g_dev), np.asarray(host.gradient(z)), rtol=1e-9, atol=1e-11
+    )
+    c_dev = dev.ineq_constraints(z_dev)
+    assert hasattr(c_dev, "__cuda_array_interface__")
+    np.testing.assert_allclose(
+        cupy.asnumpy(c_dev),
+        np.asarray(host.ineq_constraints(z)),
+        rtol=1e-9,
+        atol=1e-9,
+    )
+
+    # Jacobian parity through matvec/rmatvec probes (the operator itself must
+    # be device-resident, so no dense m×n materialisation here).
+    J_host = host.ineq_jacobian(z)
+    J_dev = dev.ineq_jacobian(z_dev)
+    m = J_host.shape[0]
+    v = rng.standard_normal(host.n_vars)
+    u = rng.standard_normal(m)
+    np.testing.assert_allclose(
+        cupy.asnumpy(J_dev.matvec(xp.asarray(v))),
+        np.asarray(J_host.matvec(v)),
+        rtol=1e-9,
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        cupy.asnumpy(J_dev.rmatvec(xp.asarray(u))),
+        np.asarray(J_host.rmatvec(u)),
+        rtol=1e-9,
+        atol=1e-9,
+    )
+
+
 def test_list_and_reference_parsing():
     cases = trots.list_trots_cases()
     assert cases == sorted(cases)

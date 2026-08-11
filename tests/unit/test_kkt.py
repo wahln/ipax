@@ -1129,3 +1129,123 @@ def test_saddle_block_preconditioner_without_equalities(namespace, tol):
     apply = saddle.lbfgs_block_preconditioner_apply()
     r = array(namespace, [1.0, -2.0])
     assert_allclose(namespace, apply(r), condensed.lbfgs_inverse_apply()(r), **tol)
+
+
+# --- assembly guards and symmetric adjoints ------------------------------- #
+# The KKT operators are assembled from separately-derived blocks, so a shape
+# mismatch is a plausible integration bug rather than a theoretical one. These
+# pin the constructors' rejection messages, and the adjoint shortcut both
+# operators take by virtue of being symmetric.
+
+
+@pytest.mark.parametrize(
+    ("w_shape", "sx_shape", "ss_shape", "jac_shape", "message"),
+    [
+        ((3, 2), (2, 2), (4, 4), (4, 2), "W must be square"),
+        ((2, 2), (3, 3), (4, 4), (4, 2), "sigma_x must match W"),
+        ((2, 2), (2, 2), (4, 4), (4, 3), "ineq_jac has incompatible"),
+        ((2, 2), (2, 2), (5, 5), (4, 2), "sigma_s must match"),
+    ],
+)
+def test_condensed_assembly_rejects_mismatched_blocks(
+    namespace, w_shape, sx_shape, ss_shape, jac_shape, message
+):
+    dtype = array(namespace, [0.0]).dtype
+    with pytest.raises(ValueError, match=message):
+        build_condensed_operator(
+            Dense(namespace.zeros(w_shape, dtype=dtype)),
+            Dense(namespace.zeros(sx_shape, dtype=dtype)),
+            Dense(namespace.zeros(ss_shape, dtype=dtype)),
+            Dense(namespace.zeros(jac_shape, dtype=dtype)),
+            RegularizationState(delta_w=0.0),
+        )
+
+
+@pytest.mark.parametrize(
+    ("n_shape", "eq_shape", "message"),
+    [
+        ((2, 3), (1, 2), "condensed block must be square"),
+        ((2, 2), (1, 3), "eq_jac has incompatible"),
+    ],
+)
+def test_saddle_assembly_rejects_mismatched_blocks(
+    namespace, n_shape, eq_shape, message
+):
+    dtype = array(namespace, [0.0]).dtype
+    with pytest.raises(ValueError, match=message):
+        build_saddle_operator(
+            Dense(namespace.zeros(n_shape, dtype=dtype)),
+            Dense(namespace.zeros(eq_shape, dtype=dtype)),
+            1e-8,
+        )
+
+
+def test_condensed_and_saddle_adjoints_are_the_operators_themselves(namespace, tol):
+    # Both are symmetric by construction (Friedlander-Orban: N on (1,1), the
+    # eq-Jacobian border, -delta_c on (2,2)), so rmatvec must agree with matvec
+    # exactly rather than assembling a separate transpose.
+    condensed = build_condensed_operator(
+        Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        Diagonal(array(namespace, [0.25, 0.5])),
+        Diagonal(array(namespace, [2.0])),
+        Dense(array(namespace, [[1.0, -1.0]])),
+        RegularizationState(delta_w=1e-6),
+    )
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, 2.0]])), 0.5
+    )
+
+    v = array(namespace, [1.0, -2.0])
+    assert_allclose(namespace, condensed.rmatvec(v), condensed.matvec(v), **tol)
+    w = array(namespace, [1.0, -2.0, 0.75])
+    assert_allclose(namespace, saddle.rmatvec(w), saddle.matvec(w), **tol)
+
+
+def test_normal_equations_signature_is_none_without_a_stable_pattern(namespace):
+    # The sparse-NE route may only reuse symbolic analysis when the caller
+    # promised a stable pattern. Pattern reuse is opt-in, so a sparse Jacobian
+    # constructed without a ``pattern_key`` declares none — and the NE tag must
+    # propagate that rather than inventing a key of its own.
+    from ipax.backend.operators import CSROperator
+
+    dtype = array(namespace, [0.0]).dtype
+    ineq = CSROperator(
+        namespace.asarray([0, 1, 2]),
+        namespace.asarray([0, 1]),
+        namespace.ones((2,), dtype=dtype),
+        (2, 2),  # no pattern_key: the caller promised nothing
+    )
+    condensed = build_condensed_operator(
+        Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        Diagonal(array(namespace, [0.25, 0.5])),
+        Diagonal(array(namespace, [2.0, 2.0])),
+        ineq,
+        RegularizationState(delta_w=1e-6),
+    )
+
+    assert ineq.coo_pattern_signature() is None
+    assert condensed.coo_pattern_signature() is None
+    assert condensed.normal_equations_pattern_signature() is None
+
+
+def test_saddle_augmented_dense_matrix_without_equalities_is_the_condensed_block(
+    namespace, tol
+):
+    # m == 0: with no equality border the bordered saddle degenerates to the
+    # condensed block's own augmented form, which the driver relies on when a
+    # problem carries inequalities and bounds only.
+    condensed = build_condensed_operator(
+        Dense(array(namespace, [[4.0, 0.5], [0.5, 3.0]])),
+        Diagonal(array(namespace, [0.25, 0.5])),
+        Diagonal(array(namespace, [2.0])),
+        Dense(array(namespace, [[1.0, -1.0]])),
+        RegularizationState(delta_w=1e-6),
+    )
+    saddle = build_saddle_operator(condensed, _empty_eq(namespace), 0.5)
+
+    assert_allclose(
+        namespace,
+        saddle.augmented_dense_matrix(),
+        condensed.augmented_dense_matrix(),
+        **tol,
+    )

@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import scipy.sparse
 import scipy.sparse.linalg
+from scipy.linalg.blas import get_blas_funcs
 
 from ipax.backend.operators import LinearOperator
 from ipax.backend.sparse._canonical import CompiledCompressed, compile_compressed
@@ -228,9 +229,15 @@ class SparseOperator(LinearOperator):
         self._gram_transpose: scipy.sparse.csr_matrix | None = None  # Aᵀ as CSR
         self._gram_scaled: scipy.sparse.csr_matrix | None = None  # diag(w)A buffer
         self._gram_row_index: np.ndarray | None = None  # nnz → row map for w
-        self._gram_weights: np.ndarray | None = None  # memo key (last weights)
-        self._gram_value: np.ndarray | None = None  # memoized dense n×n result
+        # One memo slot per accumulate_dtype: the mixed-precision dense route
+        # legitimately alternates reduced and exact requests with identical
+        # weights (e.g. a mixed PD failure re-materializing exactly inside a
+        # δ_w retry), and a single slot would evict on every alternation —
+        # exactly where the memo is meant to pay off. At most 2 keys × n².
+        self._gram_memo: dict[str | None, tuple[np.ndarray, np.ndarray]] = {}
         self._gram_compute_count = 0  # observability/testing: actual SpGEMM runs
+        self._reduced_csr: scipy.sparse.csr_matrix | None = None  # cast-once data
+        self._native_streak = False  # last gram() request was native (see gram)
         self._squared: scipy.sparse.csr_matrix | None = None  # A∘A (Gram diagonals)
         # Sparse-Gram (COO) memo for the sparse normal-equations route.
         self._gram_coo_weights: np.ndarray | None = None
@@ -309,7 +316,19 @@ class SparseOperator(LinearOperator):
         out = self._squared_csr.T @ _to_numpy(weights)
         return to_xp_array(np.asarray(out).reshape(-1), self._xp)
 
-    def gram(self, weights: Array) -> Array:
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        if (
+            hinted_only
+            and accumulate_dtype is not None
+            and self.gram_accumulate_dtype_hint() != accumulate_dtype
+        ):
+            accumulate_dtype = None  # this matrix's data does not support it
         # Aᵀ diag(w) A as a dense n×n matrix, formed by sparse arithmetic: scale
         # rows by w (still sparse) then a sparse Aᵀ·(diag(w)A) product, densifying
         # only the small n×n result — never the m×n matrix A itself (the point at
@@ -324,12 +343,23 @@ class SparseOperator(LinearOperator):
         # besides the product itself. Callers must treat the returned array as
         # read-only; the condensed route only ever adds it out-of-place.
         w = _to_numpy(weights).reshape(-1)
-        if (
-            self._gram_value is not None
-            and self._gram_weights is not None
-            and np.array_equal(w, self._gram_weights)
-        ):
-            return to_xp_array(self._gram_value, self._xp)
+        if accumulate_dtype is None:
+            # Release the reduced-data copy only on the SECOND consecutive
+            # native request. A single one does *not* mean the mixed route is
+            # done: ``DenseSolver`` answers a failed refinement from an exact
+            # rebuild but re-engages mixed on the next factorization, until
+            # ``refine_failure_limit`` *consecutive* failures disable it. Freeing
+            # on the first would force a full nnz recast on every intermittent
+            # hard iteration — the cast-once optimization defeated exactly where
+            # it is most needed. Two in a row means no consumer came back.
+            if self._native_streak:
+                self._reduced_csr = None
+            self._native_streak = True
+        else:
+            self._native_streak = False
+        memo = self._gram_memo.get(accumulate_dtype)
+        if memo is not None and np.array_equal(w, memo[0]):
+            return to_xp_array(memo[1], self._xp)
 
         a = self._csr_matrix
         m, n = a.shape
@@ -339,7 +369,20 @@ class SparseOperator(LinearOperator):
             # dense GEMM — SpGEMM's Σ nnz_row² hash arithmetic (plus its
             # per-call symbolic pass) is the wrong algorithm here (see
             # _GRAM_DENSE_MIN_DENSITY for the model and measurements).
-            gram = self._gram_dense_accumulate(a, w)
+            if accumulate_dtype is not None:
+                # Mixed-precision accumulate (``DenseOptions.gram_dtype``):
+                # run the chunked accumulation in the reduced dtype through a
+                # cached same-structure CSR (data cast once, indices shared),
+                # then upcast only the small n×n result. Only this dense
+                # strategy honors the request — the SpGEMM branch below is
+                # memory-bound, so reduced arithmetic buys little there.
+                acc = np.dtype(accumulate_dtype)
+                gram = self._gram_dense_accumulate(
+                    self._reduced_data_csr(acc), w.astype(acc, copy=False)
+                )
+                gram = gram.astype(np.result_type(a.dtype, w.dtype), copy=False)
+            else:
+                gram = self._gram_dense_accumulate(a, w)
         else:
             if self._gram_transpose is None:
                 # One-time symbolic work: the n×m transpose CSR (scipy would
@@ -355,10 +398,23 @@ class SparseOperator(LinearOperator):
             assert scaled is not None and self._gram_row_index is not None
             scaled.data = a.data * w[self._gram_row_index]
             gram = np.asarray((self._gram_transpose @ scaled).toarray())
-        self._gram_weights = np.array(w, copy=True)
-        self._gram_value = gram
+        self._gram_memo[accumulate_dtype] = (np.array(w, copy=True), gram)
         self._gram_compute_count += 1
         return to_xp_array(gram, self._xp)
+
+    def _reduced_data_csr(self, dtype: np.dtype) -> scipy.sparse.csr_matrix:
+        """Same-structure CSR with the data cast once to ``dtype``.
+
+        Index arrays are shared with the wrapped matrix (no copy); only the
+        value array is duplicated (e.g. +4 bytes/nnz for float32) — so every
+        later reduced-precision accumulate reads half the bytes instead of
+        paying a per-chunk cast."""
+        if self._reduced_csr is None or self._reduced_csr.dtype != dtype:
+            a = self._csr_matrix
+            self._reduced_csr = scipy.sparse.csr_matrix(
+                (a.data.astype(dtype), a.indices, a.indptr), shape=a.shape
+            )
+        return self._reduced_csr
 
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         # ``Aᵀ diag(w) A`` kept SPARSE: the sparse normal-equations route
@@ -402,6 +458,12 @@ class SparseOperator(LinearOperator):
     def gram_coo_capable(self) -> bool:
         return True
 
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        # Storage-level metadata only (see the LinearOperator docstring):
+        # float32-stored data may be accumulated reduced without losing data
+        # information.
+        return "float32" if self._matrix.dtype == np.float32 else None
+
     def gram_fill_estimate(self) -> float | None:
         """Estimated Gram-pattern density (sampled column overlap; see
         :func:`_estimate_gram_fill`). One-time selection probe, never on the
@@ -418,14 +480,39 @@ class SparseOperator(LinearOperator):
         """``Aᵀ diag(w) A`` by BLAS over zero-copy row windows of ``a``.
 
         Each chunk densifies ``m_chunk × n`` rows (bounded by
-        ``_GRAM_DENSE_CHUNK_ELEMENTS``) and accumulates
-        ``blockᵀ @ (w_chunk ∘ block)`` — O(m·n²) FLOPs total, but at dense-GEMM
-        speed, with peak extra memory two chunk buffers regardless of ``m``.
+        ``_GRAM_DENSE_CHUNK_ELEMENTS``) — O(m·n²) FLOPs total at dense-BLAS
+        speed, peak extra memory two chunk buffers regardless of ``m``.
+
+        For finite nonnegative real weights (the IPM's Σ weights are positive
+        by construction) the chunk is scaled in place by ``√w`` and
+        accumulated with the *symmetric* rank-k update (``syrk``): one
+        triangle, so half the GEMM FLOPs, and no ``w ∘ block`` temporary. The
+        triangle is mirrored by pure copies at the end, making the result
+        bitwise symmetric as a side effect. Mixed-sign, non-finite, or
+        non-float weights fall back to the general
+        ``blockᵀ @ (w_chunk ∘ block)`` accumulation.
+
+        Numerical caveat: the two forms differ in their overflow/underflow
+        *envelope*, not just rounding — syrk multiplies ``fl(√w·a)·fl(√w·b)``
+        where GEMM computes ``a·fl(w·b)``. The symmetric split *halves the
+        dynamic range* of the intermediates (favorable for the common case),
+        but for extreme ``w`` paired with strongly asymmetric ``|a|, |b|`` it
+        can saturate where the asymmetric grouping does not; relevant mostly
+        for float32 data, whose exponent headroom is ~1e38.
         """
         m, n = a.shape
         dtype = np.result_type(a.dtype, w.dtype)
-        out = np.zeros((n, n), dtype=dtype)
         chunk = max(1, _GRAM_DENSE_CHUNK_ELEMENTS // max(int(n), 1))
+        use_syrk = dtype in (np.float32, np.float64) and bool(
+            np.all((w >= 0.0) & np.isfinite(w))
+        )
+        if use_syrk:
+            syrk = get_blas_funcs("syrk", dtype=dtype)
+            sqrt_w = np.sqrt(w.astype(dtype, copy=False))
+            # syrk accumulates in place into an F-ordered target.
+            out = np.zeros((n, n), dtype=dtype, order="F")
+        else:
+            out = np.zeros((n, n), dtype=dtype)
         for start in range(0, m, chunk):
             end = min(m, start + chunk)
             lo, hi = int(a.indptr[start]), int(a.indptr[end])
@@ -433,8 +520,25 @@ class SparseOperator(LinearOperator):
                 (a.data[lo:hi], a.indices[lo:hi], a.indptr[start : end + 1] - lo),
                 shape=(end - start, n),
             )
-            block = window.toarray()
-            out += block.T @ (w[start:end, None] * block)
+            block = np.asarray(window.toarray(), dtype=dtype)
+            if use_syrk:
+                block *= sqrt_w[start:end, None]  # in place — block is fresh
+                # ``block.T`` is an F-contiguous (n, m_chunk) view (no copy);
+                # syrk adds block.T @ block into ``out``'s lower triangle.
+                out = syrk(
+                    1.0, block.T, beta=1.0, c=out, trans=0, lower=1, overwrite_c=1
+                )
+            else:
+                out += block.T @ (w[start:end, None] * block)
+        if use_syrk:
+            # Mirror the computed lower triangle by row-slice copies — no
+            # arithmetic (bitwise-exact incl. -0.0, unlike `out += triu(out.T)`)
+            # and no n²-sized index temporaries (a `triu_indices` gather peaks
+            # at ~2.5× the output size, which can OOM at the top of the dense
+            # route's range).
+            out = np.ascontiguousarray(out)
+            for j in range(n):
+                out[j, j + 1 :] = out[j + 1 :, j]
         return out
 
     def row_gram_diagonal(self, weights: Array) -> Array:

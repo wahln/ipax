@@ -155,7 +155,13 @@ class LinearOperator(ABC):
         """
         raise NotImplementedError("operator does not expose a cheap Gram diagonal")
 
-    def gram(self, weights: Array) -> Array:
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
         """Return the full weighted Gram matrix ``Aᵀ diag(weights) A`` (dense ``n×n``).
 
         The matrix analogue of :meth:`gram_diagonal`: the condensed inequality term
@@ -167,7 +173,26 @@ class LinearOperator(ABC):
         a ``m×n`` Jacobian (gigabytes) to form an ``n×n`` matrix. Optional, like
         :meth:`gram_diagonal`; the dense KKT route falls back to densifying ``A`` when
         it is unavailable.
+
+        ``accumulate_dtype`` (dtype *name*, e.g. ``"float32"``) requests the
+        accumulation itself in reduced precision — the mixed-precision dense
+        route (``DenseOptions.gram_dtype``); the *returned* matrix keeps the
+        operator's native result dtype regardless. Best-effort: implementations
+        may ignore the request (returning the exact Gram is always valid), and
+        wrappers forwarding :meth:`gram` must forward it. Callers tolerate
+        pre-keyword implementations (``TypeError``) by retrying without it —
+        a wrapper is also a caller, so it owes the same retry:
+        :func:`forward_gram` is that call, ready-made.
+
+        ``hinted_only`` restricts the reduction to the parts of the operator
+        whose own data supports it (:meth:`gram_accumulate_dtype_hint`): a
+        composite honors the request block by block, leaving
+        full-precision blocks exact. That is what makes the reduction safe on
+        a block assembled from mixed-precision sources. With
+        ``hinted_only=False`` (an explicit user request) the reduction applies
+        throughout, hint or not.
         """
+        del accumulate_dtype, hinted_only
         raise NotImplementedError("operator does not expose a full weighted Gram")
 
     def gram_capable(self) -> bool:
@@ -180,6 +205,26 @@ class LinearOperator(ABC):
         probe as well. Conservative: the default only reports the override.
         """
         return type(self).gram is not LinearOperator.gram
+
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        """Dtype name the Gram may be *accumulated* in without losing data
+        information, or ``None`` (no reduction opportunity — the default).
+
+        The discovery half of ``DenseOptions(gram_dtype="auto")``: an operator
+        whose stored values carry only float32 information — float32 storage,
+        or float64 values that are exact float32 upcasts *declared as such* by
+        their producer — answers ``"float32"``, and the mixed-precision dense
+        route then accumulates reduced with iterative-refinement
+        certification. Metadata only, never a value scan (a float64 matrix
+        that merely happens to be float32-representable must NOT hint — silent
+        heuristics would shift behavior across whole benchmark corpora).
+        Wrappers forwarding :meth:`gram` forward this too. A *stack* reports
+        reduced when **any** block does, because it honors the request per
+        block (see ``hinted_only`` in :meth:`gram`) — its float64 blocks stay
+        exact, so a block assembled from mixed-precision sources still gets
+        the reduction where its data justifies it.
+        """
+        return None
 
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         """``Aᵀ diag(weights) A`` as *sparse* COO triplets (invariant #4).
@@ -312,6 +357,10 @@ class Dense(LinearOperator):
     @property
     def shape(self) -> tuple[int, int]:
         return int(self._A.shape[0]), int(self._A.shape[1])
+
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        xp = array_namespace(self._A)
+        return "float32" if self._A.dtype == xp.float32 else None
 
     def matvec(self, v: Array) -> Array:
         xp = array_namespace(self._A, v)
@@ -643,6 +692,33 @@ class Composite(LinearOperator):
         return result
 
 
+def forward_gram(
+    op: LinearOperator,
+    weights: Array,
+    *,
+    accumulate_dtype: str | None,
+    hinted_only: bool,
+) -> Array:
+    """``op.gram(weights, …)`` honoring the pre-keyword fallback.
+
+    A wrapper that forwards the accumulation keywords is itself a *caller* of
+    them, so it carries the same compatibility duty as any other caller (see
+    :meth:`LinearOperator.gram`): an operator written against the pre-0.10
+    ``gram(weights)`` signature must keep working when it is stacked or scaled.
+    Forwarding unconditionally would also defeat the retry the top-level caller
+    already performs, because that retry comes back in through this same
+    wrapper and forwards the keywords again.
+    """
+    if accumulate_dtype is None and not hinted_only:
+        return op.gram(weights)  # nothing to forward — no compatibility risk
+    try:
+        return op.gram(
+            weights, accumulate_dtype=accumulate_dtype, hinted_only=hinted_only
+        )
+    except TypeError:
+        return op.gram(weights)
+
+
 class VStack(LinearOperator):
     """Vertical stack of operators sharing the variable (column) dimension.
 
@@ -729,14 +805,25 @@ class VStack(LinearOperator):
         xp = array_namespace(result)
         return xp.asarray(result)
 
-    def gram(self, weights: Array) -> Array:
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
         # Jᵀ diag(w) J for J = [J1; …; Jk] is Σ_b Jbᵀ diag(w_b) Jb — the vertical
         # stack sums each block's Gram over its own row (weight) range. Propagates
         # NotImplementedError if any block cannot form its Gram.
         result = None
         offset = 0
         for op, rows in zip(self._ops, self._rows, strict=True):
-            piece = op.gram(weights[offset : offset + rows])
+            piece = forward_gram(
+                op,
+                weights[offset : offset + rows],
+                accumulate_dtype=accumulate_dtype,
+                hinted_only=hinted_only,
+            )
             result = piece if result is None else result + piece
             offset += rows
         assert result is not None
@@ -746,6 +833,21 @@ class VStack(LinearOperator):
     def gram_capable(self) -> bool:
         # The stacked Gram succeeds only when every block's does.
         return all(op.gram_capable() for op in self._ops)
+
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        # Any block suffices, because ``gram(hinted_only=True)`` applies the
+        # reduction per block: the float32-sourced blocks accumulate reduced
+        # and the genuinely-float64 ones stay exact. That is strictly better
+        # than the two alternatives — requiring unanimity forfeits the
+        # reduction on a block that is overwhelmingly float32 (radiotherapy
+        # VMAT plans are 96% float32 by nonzero, held back by one float64
+        # constraint), and a size-weighted rule would silently reduce
+        # declared-float64 data.
+        for op in self._ops:
+            hint = op.gram_accumulate_dtype_hint()
+            if hint is not None:
+                return hint
+        return None
 
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         # Σ_b Jbᵀ diag(w_b) Jb as concatenated n×n triplets: overlapping
@@ -873,6 +975,7 @@ class _SparseStructured(LinearOperator):
         *,
         symmetric: bool | None = None,
         pattern_key: object | None = None,
+        values_dtype_hint: str | None = None,
     ) -> None:
         if len(rows.shape) != 1 or len(cols.shape) != 1 or len(values.shape) != 1:
             raise ValueError("COO rows, cols, and values must be rank-1 arrays")
@@ -886,12 +989,23 @@ class _SparseStructured(LinearOperator):
         self._shape = (int(shape[0]), int(shape[1]))
         self._symmetric = symmetric
         self._pattern_key = pattern_key
+        # Declared source precision of the values (see
+        # ``gram_accumulate_dtype_hint``): a producer whose float64 values are
+        # exact float32 upcasts (upcasting is lossless, so the reduced-data
+        # cache recovers the source bits exactly) passes "float32" here.
+        self._values_dtype_hint = values_dtype_hint
         # Lazily built, cached adapter operator for the heavy linear algebra.
         self._delegate: LinearOperator | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
         return self._shape
+
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        if self._values_dtype_hint is not None:
+            return self._values_dtype_hint
+        xp = array_namespace(self._values)
+        return "float32" if self._values.dtype == xp.float32 else None
 
     def _adapter_op(self) -> LinearOperator:
         """Resolve (and cache) the backend adapter operator for sparse algebra."""
@@ -956,8 +1070,22 @@ class _SparseStructured(LinearOperator):
     def gram_diagonal(self, weights: Array) -> Array:
         return self._adapter_op().gram_diagonal(weights)
 
-    def gram(self, weights: Array) -> Array:
-        return self._adapter_op().gram(weights)
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        if (
+            hinted_only
+            and accumulate_dtype is not None
+            and self.gram_accumulate_dtype_hint() != accumulate_dtype
+        ):
+            # This operator's data does not support the reduction; the caller
+            # asked for it only where it does, so accumulate exactly.
+            accumulate_dtype = None
+        return self._adapter_op().gram(weights, accumulate_dtype=accumulate_dtype)
 
     def gram_capable(self) -> bool:
         # Capability lives in the backend adapter operator (e.g. scipy/cupy
@@ -1042,6 +1170,7 @@ class CSROperator(_SparseStructured):
         *,
         symmetric: bool | None = None,
         pattern_key: object | None = None,
+        values_dtype_hint: str | None = None,
     ) -> None:
         if len(shape) != 2:
             raise ValueError("shape must be a (rows, cols) pair")
@@ -1056,6 +1185,7 @@ class CSROperator(_SparseStructured):
             shape,
             symmetric=symmetric,
             pattern_key=pattern_key,
+            values_dtype_hint=values_dtype_hint,
         )
 
 
@@ -1077,6 +1207,7 @@ class CSCOperator(_SparseStructured):
         *,
         symmetric: bool | None = None,
         pattern_key: object | None = None,
+        values_dtype_hint: str | None = None,
     ) -> None:
         if len(shape) != 2:
             raise ValueError("shape must be a (rows, cols) pair")
@@ -1091,6 +1222,7 @@ class CSCOperator(_SparseStructured):
             shape,
             symmetric=symmetric,
             pattern_key=pattern_key,
+            values_dtype_hint=values_dtype_hint,
         )
 
 
@@ -1118,4 +1250,5 @@ __all__ = [
     "MatrixFreeJacobian",
     "VStack",
     "as_operator",
+    "forward_gram",
 ]

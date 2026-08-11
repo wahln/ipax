@@ -35,7 +35,7 @@ match res.status:
 | Status | `success` | Meaning |
 |---|:---:|---|
 | `OPTIMAL` | ✅ | scaled-KKT optimality conditions met in one iteration |
-| `ACCEPTABLE` | ✅ | acceptable conditions held for the configured consecutive iterations |
+| `ACCEPTABLE` | ✅ | acceptable conditions held for the configured consecutive iterations — or a run that would have ended `stalled`/`max_iter`/`max_time` was salvaged terminally: its returned best iterate passes the acceptable test, either as recorded or under a terminal KKT certificate with repaired multipliers (the certified multipliers are the ones returned; `message` says which) |
 | `INFEASIBLE` | ❌ | restoration/feasibility detection concluded the problem is infeasible (or bounds with `x_L > x_U`) |
 | `UNBOUNDED` | ❌ | objective appears unbounded below |
 | `MAX_ITER` | ❌ | hit `Options.max_iter` |

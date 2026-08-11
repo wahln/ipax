@@ -60,6 +60,33 @@ def cupy_sparse_module(monkeypatch: pytest.MonkeyPatch):
     # Unbuffered scatter-add used by the canonical COO map (cupy.add.at is
     # the documented replacement for the deprecated cupyx.scatter_add).
     cupy.add = np.add
+    # Weight gating + √w scaling + triangle mirror for the syrk Gram path.
+    cupy.sqrt = np.sqrt
+    cupy.isfinite = np.isfinite
+    cupy.all = np.all
+    cupy.triu_indices = np.triu_indices
+
+    # ``cupy.cublas.syrk`` fake with real cuBLAS semantics: only the requested
+    # triangle of ``out`` is written; the other one keeps its stale contents —
+    # so a missing mirror step in the adapter corrupts the result visibly.
+    cublas = types.ModuleType("cupy.cublas")
+
+    def _syrk(
+        trans: str,
+        a: np.ndarray,
+        out: np.ndarray | None = None,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        lower: bool = False,
+    ) -> np.ndarray:
+        assert trans == "T" and lower and out is not None
+        full = alpha * (a.T @ a) + beta * out
+        tri = np.tril_indices(out.shape[0])
+        out[tri] = full[tri]
+        return out
+
+    cublas.syrk = _syrk
+    cupy.cublas = cublas
 
     class FakeRuntime:
         current_device = 0
@@ -106,6 +133,7 @@ def cupy_sparse_module(monkeypatch: pytest.MonkeyPatch):
     cupyx.scipy = cupyx_scipy
 
     monkeypatch.setitem(sys.modules, "cupy", cupy)
+    monkeypatch.setitem(sys.modules, "cupy.cublas", cublas)
     monkeypatch.setitem(sys.modules, "cupyx", cupyx)
     monkeypatch.setitem(sys.modules, "cupyx.scipy", cupyx_scipy)
     monkeypatch.setitem(sys.modules, "cupyx.scipy.sparse", cupyx_sparse)
@@ -810,3 +838,125 @@ def test_cupy_gram_memo_hits_for_equal_weights(
     third = np.asarray(operator.gram(w2))
     assert operator._gram_compute_count == 2
     np.testing.assert_allclose(third, dense.T @ (w2[:, None] * dense), rtol=1e-14)
+
+
+def _syrk_spy(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> list[str]:
+    """Count ``cublas.syrk`` calls to pin which accumulation branch ran."""
+    calls: list[str] = []
+    real = cupy_sparse_module._cublas.syrk
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append("syrk")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cupy_sparse_module._cublas, "syrk", spy)
+    return calls
+
+
+def _dense_gram_operator(cupy_sparse_module: types.ModuleType, matrix, weights):
+    coo = matrix.tocoo()
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    return adapter.from_coo(coo.row, coo.col, coo.data, shape=coo.shape)
+
+
+def test_cupy_gram_dense_strategy_uses_syrk_and_mirrors(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nonnegative finite weights take the cuBLAS syrk branch: half the GEMM
+    # FLOPs, and the mirrored result is *bitwise* symmetric. The fake syrk
+    # writes only the lower triangle, so this also proves the upper triangle
+    # comes from the adapter's mirror, not from the BLAS call.
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_MIN_DENSITY", 0.0)
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_CHUNK_ELEMENTS", 40)
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_MIRROR_BLOCK", 3)
+    calls = _syrk_spy(cupy_sparse_module, monkeypatch)
+
+    rng = np.random.default_rng(11)
+    matrix = scipy_sparse.csr_matrix(rng.standard_normal((23, 7)))
+    weights = rng.uniform(0.0, 1e3, size=23)  # includes the w == 0 boundary
+    weights[3] = 0.0
+    operator = _dense_gram_operator(cupy_sparse_module, matrix, weights)
+
+    actual = np.asarray(operator.gram(weights))
+
+    assert calls and all(c == "syrk" for c in calls)
+    assert len(calls) > 1  # chunked: the accumulation loop really ran
+    np.testing.assert_array_equal(actual, actual.T)
+    dense = matrix.toarray()
+    np.testing.assert_allclose(
+        actual, dense.T @ (weights[:, None] * dense), rtol=1e-12, atol=1e-12
+    )
+
+
+def test_cupy_gram_accumulate_dtype_float32(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Mirror of the SciPy adapter's reduced-precision accumulate: float32
+    # accumulation (the ~10x lever on consumer GPUs), float64 result.
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_MIN_DENSITY", 0.0)
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_CHUNK_ELEMENTS", 40)
+
+    rng = np.random.default_rng(15)
+    matrix = scipy_sparse.csr_matrix(rng.standard_normal((19, 5)) * 1e3)
+    weights = rng.uniform(1e-3, 1e2, size=19)
+    operator = _dense_gram_operator(cupy_sparse_module, matrix, weights)
+
+    exact = np.asarray(operator.gram(weights))
+    reduced = np.asarray(operator.gram(weights, accumulate_dtype="float32"))
+
+    assert reduced.dtype == np.float64
+    rel = np.max(np.abs(reduced - exact)) / np.max(np.abs(exact))
+    assert 1e-12 < rel < 1e-4
+    np.testing.assert_array_equal(reduced, reduced.T)
+    assert operator._gram_compute_count == 2  # memo keyed by dtype
+
+
+def test_cupy_gram_dense_strategy_negative_weights_fall_back(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Mixed-sign weights cannot take the √w route; the general GEMM
+    # accumulation must produce the same values with no syrk call.
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_MIN_DENSITY", 0.0)
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_CHUNK_ELEMENTS", 40)
+    calls = _syrk_spy(cupy_sparse_module, monkeypatch)
+
+    rng = np.random.default_rng(12)
+    matrix = scipy_sparse.csr_matrix(rng.standard_normal((17, 5)))
+    weights = rng.uniform(0.1, 2.0, size=17)
+    weights[2] = -1.5
+    operator = _dense_gram_operator(cupy_sparse_module, matrix, weights)
+
+    actual = np.asarray(operator.gram(weights))
+
+    assert calls == []
+    dense = matrix.toarray()
+    np.testing.assert_allclose(
+        actual, dense.T @ (weights[:, None] * dense), rtol=1e-12, atol=1e-12
+    )
+
+
+def test_cupy_gram_dense_strategy_nonfinite_weights_fall_back(
+    cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # +inf passes ``w >= 0`` but must not take the √w/syrk path (different
+    # overflow envelope) — same finiteness gate as the SciPy adapter.
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_MIN_DENSITY", 0.0)
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_CHUNK_ELEMENTS", 40)
+    calls = _syrk_spy(cupy_sparse_module, monkeypatch)
+
+    rng = np.random.default_rng(13)
+    matrix = scipy_sparse.csr_matrix(rng.standard_normal((9, 4)))
+    weights = rng.uniform(0.1, 2.0, size=9)
+    weights[5] = np.inf
+    operator = _dense_gram_operator(cupy_sparse_module, matrix, weights)
+
+    actual = np.asarray(operator.gram(weights))
+
+    assert calls == []
+    dense = matrix.toarray()
+    expected = dense.T @ (weights[:, None] * dense)
+    finite = np.isfinite(expected)
+    np.testing.assert_array_equal(np.isfinite(actual), finite)
+    np.testing.assert_allclose(actual[finite], expected[finite], rtol=1e-12)

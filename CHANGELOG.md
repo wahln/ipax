@@ -6,6 +6,201 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-11
+
+### Added
+- **TROTS matrix cache (benchmarks).** Parsing the MATLAB v7.3 dose matrices
+  dominated every TROTS run's startup; parsed matrices are now mirrored to
+  `.npz` beside the dataset, keyed by the source file's size, mtime and a
+  format version (an edited `.mat` misses rather than serving a stale
+  matrix). Warm vs cold: `Prostate_CK_01` 7.3 s → 3.1 s, `Prostate_VMAT_101`
+  12.5 s → 4.5 s, assembled constraint block identical either way. Values
+  whose float64 widening is provably lossless are stored narrow (checked, not
+  assumed), and sparse indices are narrowed to int32 where they fit — which
+  also halves index memory at runtime, ~330 MB on VMAT's 82 M nonzeros. The
+  cache is strictly an optimization: any read/write failure falls back to
+  parsing. `IPAX_TROTS_CACHE` relocates it, or `off` disables it.
+- **Mixed-precision condensed Gram: `DenseOptions(gram_dtype)`, default `"auto"`.**
+  The dense condensed route's dominant kernel — accumulating `∇gᵀ Σ_s ∇g`,
+  80–90% of per-iteration wall at radiotherapy scale — can now run in float32
+  (many radiotherapy dose matrices are stored float32 — measured across the
+  TROTS corpus: the brachytherapy cases are float32 throughout, `Prostate_VMAT_101`
+  is 96% float32 by nnz, while `Protons_01` is 99.93% float64 and so gains
+  essentially nothing; scoped in by
+  explicit decision, with AGENTS.md updated), while every other block stays
+  float64. The `"auto"` default prefers the precision the constraint data
+  actually carries: it engages exactly when the inequality Jacobian declares
+  float32-grade data via the new `gram_accumulate_dtype_hint()` operator hook
+  (float32 storage, or float64 values that are exact float32 upcasts declared
+  by their producer — declared metadata, never a value scan) and is a strict
+  no-op for fully-float64 problems; `"float32"` forces the reduction,
+  `"native"` disables it. A Jacobian assembled from sources of differing
+  precision is reduced **per block**: `"auto"` asks a stacked operator to
+  accumulate reduced only in the blocks whose own data permits it, leaving the
+  genuinely-float64 blocks exact — so a plan that is overwhelmingly float32 but
+  held back by a single float64 matrix keeps the reduction rather than
+  forfeiting it (`Prostate_VMAT_101`: 96% of nonzeros reduce, 0% before).
+  Working accuracy is restored per solve by fixed-precision iterative
+  refinement against the exact float64 operator matvec (Carson & Higham 2018);
+  every returned step carries a measured exact-residual certificate:
+  refinement targets `refine_tol`, budget-exhausted/plateaued solves are
+  still accepted within the looser `refine_accept_tol`, and a solve missing
+  even that — or a positive-definiteness failure the exact matrix does not
+  reproduce (a `κ(N)·u32 ≳ 1` stretch) — answers from an exact rebuild, with
+  `refine_failure_limit` *consecutive* failures returning the instance to
+  native precision for good (conditioning along an IPM run is not monotone,
+  so one hard factorization is not terminal). Measured on TROTS Protons_01
+  (CPU, 32-thread BLAS): the Gram kernel 11.7 → 5.4 s per compute (2.15×).
+  Plumbing: `LinearOperator.gram` gains an optional best-effort
+  `accumulate_dtype` keyword (forwarded by `VStack`, the CSR routing wrapper
+  and row scaling — through the new `forward_gram`, which falls back to the
+  pre-keyword `gram(weights)` so a user operator written against 0.9.x keeps
+  working when the solver stacks or row-scales it; honored by the SciPy and
+  CuPy adapters via a cast-once reduced-data CSR), `_CondensedOperator.dense_matrix_mixed` covers
+  gram-capable and generic (pure Array-API `float32`) Jacobians alike, and
+  `Result.routes` reports the engaged route as `dense (gram=float32)` (or
+  `dense (gram=auto:float32)` when the hint chose it). On the benchmark side
+  the TROTS loader now tracks source precision per *row* and groups its lowered
+  `G z + h ≤ 0` block so each precision forms a contiguous operator — the
+  assembly the per-block reduction needs.
+- **Routing-hints registry + report section.** `benchmarks/routing_hints.py`
+  is a curated registry of *measured* per-problem wins for the opt-in levers
+  (recipe, metrics, failure signature, budget), and the S2MPJ sweep report
+  gained a *Routing hints* section that prints the known win next to any
+  default-configuration row that missed a hinted problem — omitted entirely
+  when nothing applies. The new docs page *Routing hints* maps each failure
+  signature to its lever (quality-μ for the `AGG` class, `slack_init_scale`
+  for the `HS59` class, `damping_skip_ratio` for the `ORTHRGDS` class,
+  `seed_formula="scalar1"` for the `GASOIL` class).
+- **`LBFGSOptions.seed_formula`** — which Rayleigh estimate seeds the L-BFGS
+  identity block ξ. `"direct"` (the default, Nocedal & Wright eq. 7.20
+  inverted for the direct Hessian: `ξ = γᵀγ/δᵀγ`) and `"scalar1"` (IPOPT's
+  `limited_memory_initialization`: `ξ = δᵀγ/δᵀδ`) differ by exactly the δ–γ
+  misalignment factor `1/cos²∠(δ,γ)` — and badly-scaled least squares drives
+  that factor to ~1e15: S2MPJ `NELSONLS` runs the direct seed at a median
+  `ξ ≈ 1e20` (steps frozen, KKT pinned at 4.8 for 1000 iterations) where
+  scalar1 sits at 6e3. The over-stiff seed also feeds the Powell-damping test
+  an inflated `δᵀBδ`, so every pair looks damping-worthy — the mechanism
+  behind part of the L-BFGS-vs-IPOPT quality gap. Probed under scalar1:
+  `GASOIL` goes from 508 stalled iterations to **optimal in 25 (IPOPT
+  parity)** on both routes, `ORTHRGDS` to optimal in 24 without the
+  damping-skip knob, `SINROSNB` to its documented optimum.
+
+  As a blanket default, scalar1 **loses decisively** — the full-corpus
+  characterization sweep scores net **−140** over the three L-BFGS routes
+  (29 fixed / 169 broken, ≈−45 on each route): the direct seed's extra
+  stiffness is load-bearing for the globalization machinery on most of the
+  corpus, and the softer seed lets steps overshoot. So the option stays
+  opt-in, documented as the routing hint for the frozen-KKT-plateau
+  signature.
+- **`LBFGSOptions.damping_skip_ratio`** — opt-in threshold on how much a
+  curvature pair may *contradict* positive curvature before the L-BFGS update
+  drops it instead of Powell-damping it: a pair with `δᵀγ < −ratio·δᵀBδ` is
+  skipped, anything milder gets the usual blend. Powell damping keeps `B`
+  positive definite by θ-mixing `γ` toward `Bδ`, which on a strongly
+  indefinite stretch *fabricates* curvature evidence the function actively
+  contradicts — and that fabricated pair then steers every step for the next
+  `m` updates. On S2MPJ `ORTHRGDS` a handful of such pairs (`δᵀγ/δᵀBδ` down to
+  −25, only 12 of 996 updates damped at all) cost 1000+ iterations at a worse
+  optimum; with them skipped the solve reaches IPOPT's objective in ~20.
+
+  It is a threshold, not a switch, because the full-corpus damp-vs-skip A/B
+  refuted blanket skipping (IPOPT's limited-memory policy,
+  `powell_damping=False`): net **−31** over the three L-BFGS routes — mild
+  indefiniteness is exactly where the blend genuinely helps. The hybrid at
+  `ratio=1.0`, probed on the A/B's fourteen decisive cells, keeps five of the
+  six skip-arm wins (`ORTHRGDS`, `DEMBO7`, `CRESC4`, `SPIRAL`) while avoiding
+  seven of its eight losses (`DRCAVTY2`, `FLOSP2TM`, `HS116`, `LAUNCH`,
+  `HAHN1LS`, `DRUGDIS` all recover). The default (`None`) keeps pure Powell
+  damping bit-for-bit.
+
+  The full-corpus characterization sweep at `ratio=1.0` is **corpus-neutral
+  with two-way churn** — net −1 over the three L-BFGS routes (21 fixed / 22
+  broken; dense +6, krylov −2, sparse −5) — so, per the project's standing
+  precedent for neutral-with-churn acceptance changes, it **stays opt-in**.
+  It is the lever to reach for on the diagnosed signature: an L-BFGS run that
+  stalls or grinds at a worse objective than a reference on a nonconvex
+  problem (`ORTHRGDS` reaches IPOPT's objective on all three routes with it;
+  `HS25` and `ELATTAR` also flip to `optimal`).
+
+### Changed
+- **The tall sparse-Gram gate now outranks the small-`n` dense rule in
+  `linsolve="auto"`.** A tall problem (`m ≥ 10n`) whose Gram *pattern* is
+  provably sparse (banded/localized rows, fill ≤ 1 %) previously routed to the
+  dense solver whenever `n < 10 000` — forming the condensed block and then
+  densely factoring a matrix it certifiably knew was sparse. The sparse
+  normal-equations route is measured **16–49× faster per iteration at every
+  `n` from 250 to 9000** on banded tall QPs (`m = 10n`), so the fill-certified
+  gate is now consulted first. Dense-rowed tall problems (the radiotherapy
+  dose-matrix regime, density past the dense-GEMM crossover) are unaffected —
+  the fill probe is not even consulted there, and TROTS routing is verified
+  unchanged. The fill certificate (`gram_fill_estimate`) is conservative, so
+  problems without provable Gram sparsity keep their previous routes.
+- **The dense-accumulated Gram uses the symmetric rank-k BLAS update.** The
+  SciPy sparse adapter's chunked accumulation of `Aᵀ diag(w) A` — the dominant
+  per-iteration cost of the condensed route on tall dense-ish problems
+  (radiotherapy dose matrices: 80–90 % of wall time) — now scales each chunk
+  in place by `√w` and accumulates one triangle via `syrk` instead of a
+  general GEMM, mirroring the triangle once at the end. Half the FLOPs on the
+  hot kernel: **1.5–1.7×** measured on RT-shaped matrices
+  (`m=2e5, n≈1e3–8e3`), ~1.2× end-to-end on TROTS `Protons_01`. The result is
+  now *bitwise* symmetric (the GEMM form was only symmetric to rounding),
+  which the downstream Cholesky reads. Mixed-sign, non-finite, or non-float
+  weights keep the previous GEMM path; for finite weights the results differ
+  only at rounding level (the √w split also *halves* the dynamic range of the
+  intermediates — the caveat that its overflow envelope differs at float32
+  extremes is documented on the kernel).
+- **The TROTS loader holds the lowered constraint block once (benchmarks).**
+  The constant `G z + h ≤ 0` block is by far the largest array in a
+  radiotherapy problem — 86 M nonzeros on `Prostate_VMAT_101` — and on a CuPy
+  namespace the loader mirrored it to the device a second time to evaluate the
+  constraint values, on top of the copy inside the operator it hands the
+  solver. Those rows are now evaluated through that operator (whose backend
+  adapter already holds exactly them on the device), and the pre-lowering
+  two-sided assembly is released once lowering is done rather than retained
+  for the problem's lifetime. Measured on `Prostate_VMAT_101`: 4040 → 3057 MiB
+  in the CuPy pool, constraint values identical to the host route.
+
+### Fixed
+- **A run parked at an acceptable KKT point no longer reports failure because
+  of multipliers the point never asked for.** The per-iteration convergence
+  test evaluates the KKT residual with whatever duals the trajectory happens
+  to carry — but KKT satisfaction is an existence claim over the multipliers.
+  Two ways the carried duals lie about a certifiable point, both from the
+  IPOPT-triage "class B" backlog ("reached the answer, won't certify"): a
+  rank-deficient `∇c` under-determines `y`, so S2MPJ `NONSCOMPNE` ends
+  `stalled` reporting KKT 6.8e-5 at a point whose least-squares multipliers
+  give dual infeasibility *exactly zero* (its objective is identically zero,
+  forcing `y* = 0`); and a frozen line search strands the μ-complementarity
+  bound duals where initialization put them, so `WEEDS` reports `stalled`
+  while the best iterate it *returns* sits at KKT 3.8e-7 — inside the
+  acceptable band — because the in-loop check only ever saw the frozen tail
+  iterate at 6.2e-6.
+
+  Runs ending `stalled` / `max_iter` / `max_time` now re-judge the returned
+  best iterate. First against the relaxed KKT tolerance as the budget exits
+  already did (`stalled` was the one failure status missing from that check);
+  then, if the recorded residual still fails, with a **terminal KKT
+  certificate**: candidate multipliers the point itself justifies —
+  least-squares equality duals, inequality/bound duals at the zero that the
+  `E_0` complementarity term demands at an interior point — re-evaluated
+  through the full scaled residual. Passing every enabled acceptable-stopping
+  tolerance upgrades the run to `acceptable` and returns the certified
+  multipliers. Exhibited duals can only *upper-bound* the achievable dual
+  infeasibility, so the certificate under-certifies at worst — a genuinely
+  active constraint's dropped dual leaves the raw gradient in the residual
+  and the certificate declines. It is terminal-only: the loop, restoration
+  and rescue paths are untouched, and disabling acceptable stopping (all
+  tolerances `None`) disables it.
+
+  `WEEDS`, `NONSCOMPNE` and `VANDERM1` now certify `acceptable` at the
+  IPOPT-agreeing answers they already returned. The other four class-B rows
+  are genuine trajectory gaps the certificate correctly declines (`CURLY30`
+  floors at 1.3e-6, just outside the band; `POWELLBSLS`/`ORTHREGA` are
+  parked at non-stationary points — verified against exact least-squares
+  duals at both solvers' returned iterates; `GAUSS3LS` is an IPOPT "win" at
+  a 1000× worse objective on an underflow plateau).
+
 ## [0.9.0] - 2026-07-31
 
 ### Added
@@ -1435,7 +1630,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/wahln/ipax/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/wahln/ipax/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/wahln/ipax/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/wahln/ipax/compare/v0.6.1...v0.7.0

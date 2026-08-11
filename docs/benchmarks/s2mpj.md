@@ -47,11 +47,11 @@ from every problem file:
 
 | | |
 | --- | --- |
-| date | 2026-07-31 (v19) |
+| date | 2026-08-07 (v22) |
 | CPU | 13th Gen Intel Core i9-13900HX (32 logical CPUs) |
 | OS | Windows 11 (10.0.26200), AMD64 |
 | Python | 3.14.6 |
-| ipax | 0.8.0 + the class-A feasibility fix (develop @ `13813f4`) |
+| ipax | 0.9.0 + the 0.10.0 linalg work (develop @ `990432e`) |
 | NumPy / SciPy | 2.4.6 / 1.17.1 |
 | PyTorch | 2.12.0+cpu |
 | sparse factorization | Feral LDLᵀ (CPU) |
@@ -59,17 +59,30 @@ from every problem file:
 ### Methodology
 
 The full `{lbfgs, exact} × {dense, krylov, sparse}` matrix was swept in one run
-(`--all`), **six problems concurrently** (`--jobs 6`) with single-threaded
+(`--all`), **ten problems concurrently** (`--jobs 10`) with single-threaded
 BLAS. Gradient-based scaling (the solver default), NumPy backend. Per-solve
 budget: `max_iter = 10000`, `max_time = 300 s`.
 
-!!! warning "`--jobs` moves one column"
+!!! warning "`max_time` verdicts are wall-clock, and concurrency moves them"
 
-    v19 ran at `--jobs 6` where the v15 baseline used `--jobs 4`. Concurrency
-    cannot change which point a solve converges to, so `correct`/`converged` and
-    the delta below are comparable — but `max_time` is a wall-clock verdict, and
-    more workers make it stricter. Read that one column as an upper bound, and
-    prefer iteration counts when comparing across runs with different `--jobs`.
+    Concurrency cannot change which point a solve converges to, but `max_time`
+    is a wall-clock verdict, so a memory-bandwidth-heavy problem sharing the
+    machine with nine others can cross the cap that it cleared before.
+    **Prefer iteration counts when comparing across runs.**
+
+    v22 ran at `--jobs 10` against v20's `--jobs 6`, and that difference owns
+    three of its five regressions: `CHANDHEU` on the `exact/*` routes solves in
+    **15 iterations either way**, but took 174 s in v20, 308–345 s in v22 — and
+    ~100 s when re-run alone at the same commit. Its own `lbfgs/*` rows are the
+    control: identical 15 iterations in both sweeps, 2.4–4× the wall time, so
+    the cost is per-evaluation contention, not a trajectory change. Corpus-wide
+    the machine was, if anything, *faster* in v22 (median `solve_time` ratio
+    0.965 on rows with identical `n_iter`), which is what localises the effect
+    to CHANDHEU's scheduling slot.
+
+    The general check, worth reusing: compare `solve_time` only across rows
+    with identical `n_iter` — same work — and treat the median as the machine
+    factor before attributing anything to code.
 Each route is gated by a **per-route variable cap** (dense 2000, Krylov 10000,
 sparse 25000) so a single full-corpus run stays tractable — three problems exceed
 the dense cap and are reported as oversized for the two dense routes. The
@@ -94,47 +107,110 @@ terminal states.
 
 | config | correct | converged | optimal | acceptable | infeasible | stalled | rest.failed | max_iter | max_time | unbounded | num.err |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `lbfgs/dense`  | 764 / 1098 | 905 | 790 | 114 | 58 | 48 | 64 | 17 | 6  | 1 | 0 |
-| `lbfgs/krylov` | 740 / 1101 | 881 | 770 | 110 | 58 | 38 | 64 | 13 | 47 | 1 | 0 |
-| `lbfgs/sparse` | 772 / 1101 | 913 | 782 | 130 | 59 | 41 | 63 | 21 | 3  | 1 | 1 |
-| `exact/dense`  | 762 / 1098 | 891 | 807 | 83  | 58 | 31 | 63 | 18 | 37 | 1 | 0 |
-| `exact/krylov` | 700 / 1101 | 846 | 794 | 51  | 58 | 43 | 53 | 19 | 83 | 0 | 0 |
-| `exact/sparse` | **793 / 1101** | **928** | **876** | 51 | 59 | 28 | 59 | 14 | 13 | 1 | 0 |
+| `lbfgs/dense`  | 774 / 1098 | 918 | 788 | 129 | 58 | 38 | 64 | 14 | 6  | 1 | 0 |
+| `lbfgs/krylov` | 752 / 1101 | 894 | 769 | 124 | 58 | 26 | 62 | 14 | 47 | 1 | 0 |
+| `lbfgs/sparse` | 780 / 1101 | 924 | 782 | 141 | 59 | 30 | 63 | 20 | 4  | 1 | 1 |
+| `exact/dense`  | 770 / 1098 | 900 | 806 | 93  | 58 | 26 | 65 | 30 | 19 | 1 | 0 |
+| `exact/krylov` | 706 / 1101 | 852 | 794 | 57  | 58 | 41 | 53 | 22 | 76 | 0 | 0 |
+| `exact/sparse` | **796 / 1101** | **934** | **876** | 57 | 59 | 22 | 59 | 14 | 12 | 1 | 1 |
 
-Solved-correct by **at least one route: 822 / 1101**; converged by at least one
-route: **957 / 1101**.
+Solved-correct by **at least one route: 828 / 1101**; converged by at least one
+route: **963 / 1101**.
 
-### Changes since the v15 baseline
+!!! note "Reading the two budget columns together"
 
-**+147 correct across the six configs (4384 → 4531), every config positive** —
-157 fixed against 10 broken.
+    `max_iter` and `max_time` are one quantity split by which cap a
+    non-converging run happens to reach first, so they must be read as a pair.
+    On `exact/dense` v20 → v22, `max_iter` rose 16 → 30 while `max_time` fell
+    37 → 19: **13 of the 14 new `max_iter` rows were already incorrect in both
+    sweeps** (`AVION2`, `CLNLBEAM`, `ERRINBAR`, `HS68`, `LUKVLE14`, `NCVXQP3`/
+    `6`/`8`/`9`, `ORTHREGA`, `ORTHREGE`, `TRAINH`, `TRO6X2`) and had previously
+    run out of *wall clock* at 3 000–9 000 iterations. Reaching 10 001
+    iterations inside the same 300 s means they got faster, not worse. The one
+    correct-affecting row is `COSHFUN`, covered below.
 
-| config | v15 | v19 | Δ |
+### Changes since the v20 baseline
+
+**+1 correct across the six configs (4577 → 4578)** — 6 fixed against 5 broken,
+with **zero linear-solver route changes**. The intervening work was the
+`0.10.0` linear-algebra arc (symmetric rank-k Gram update on both the SciPy and
+CuPy adapters, the fill-certified tall sparse-NE routing gate, and
+opt-in-then-default mixed-precision Gram accumulation), none of which is
+expected to move a float64 corpus — and it did not.
+
+| config | v20 | v21 | v22 | Δ |
+| --- | --- | --- | --- | --- |
+| `lbfgs/dense`  | 774 | 774 | 774 | ±0 |
+| `lbfgs/krylov` | 752 | 752 | 752 | ±0 |
+| `lbfgs/sparse` | 780 | 780 | 780 | ±0 |
+| `exact/dense`  | 768 | 771 | 770 | **+2** |
+| `exact/krylov` | 706 | 707 | 706 | ±0 |
+| `exact/sparse` | 797 | 797 | 796 | **−1** |
+
+**Why mixed precision cannot move this corpus.** `gram_dtype="auto"` engages
+only where an operator *declares* reduced-precision data through
+`gram_accumulate_dtype_hint()`. Nothing in S2MPJ does — the corpus is float64
+throughout, and the only producer that declares a hint is the TROTS loader — so
+`_resolved_gram_dtype` returns `None` and the mixed branch is never entered.
+Verified rather than argued: a 612-row probe across all six configs reported
+zero rows on a reduced route.
+
+All five regressions are **cap-boundary cases**, none a correctness change:
+
+- **`CHANDHEU`** (`exact/dense`, `exact/krylov`, `exact/sparse`) — the `--jobs`
+  contention case dissected above; re-running the same commit alone gives
+  `optimal` in 15 iterations at ~100 s, faster than the v20 baseline row.
+- **`COSHFUN`** (`exact/dense`) — converged in v20 at iteration **9974** of a
+  10000 cap, i.e. 26 iterations of headroom. Any trajectory perturbation, down
+  to a change in floating-point summation order, tips it over.
+- **`CORE2`** (`lbfgs/dense`) — flips `optimal ↔ stalled` on **BLAS thread count
+  alone**, at the baseline commit as well as at HEAD (optimal at 4 and 16
+  threads, stalled at 1 and 8, iteration count swinging 40 ↔ 148). Attributing
+  it to any commit is meaningless. Its stall lands at constraint violation
+  6.7e3, which is a robustness cliff worth investigating on its own terms.
+
+The six fixed rows are mostly the mirror image — `max_time → optimal/acceptable`
+on `KISSING2`, `TWIRIMD1`, `ZAMB2m11`, `FBRAIN3LS` — plus two genuine
+trajectory improvements: `VANDERM4` (`stalled` at 2437 iterations →
+`acceptable` at 206) and `HALDMADS`, which now converges to the documented
+optimum rather than a different local one.
+
+#### Changes in the v20 baseline (2026-08-01), since v19
+
+Retained for provenance: **+46 correct (4531 → 4577), every config positive** —
+46 fixed against **zero** broken, zero route changes.
+
+| config | v19 | v20 | Δ |
 | --- | --- | --- | --- |
-| `lbfgs/dense`  | 734 | 764 | **+30** |
-| `lbfgs/krylov` | 716 | 740 | **+24** |
-| `lbfgs/sparse` | 745 | 772 | **+27** |
-| `exact/dense`  | 732 | 762 | **+30** |
-| `exact/krylov` | 681 | 700 | **+19** |
-| `exact/sparse` | 776 | 793 | **+17** |
+| `lbfgs/dense`  | 764 | 774 | **+10** |
+| `lbfgs/krylov` | 740 | 752 | **+12** |
+| `lbfgs/sparse` | 772 | 780 | **+8** |
+| `exact/dense`  | 762 | 768 | **+6** |
+| `exact/krylov` | 700 | 706 | **+6** |
+| `exact/sparse` | 793 | 797 | **+4** |
 
-The gain is one coherent family: `stalled → optimal` on the CUTEst
-**nonlinear-equation systems** (`BEALENE`, `BIGGS6NE`, `CYCLOOCF`, `CYCLOOCT`,
-`DEVGLA1NE`/`2NE`, `HYDCAR6`, `METHANL8`, `ROBOT`, `SEMICON1`/`2`, `VARDIMNE`, …)
-— the class-A feasibility fix, which turns out to reach every route rather than
-just the L-BFGS ones. `stalled` drops on all six configs (86 → 48 on
-`lbfgs/dense`, 69 → 31 on `exact/dense`).
+The gain was the **terminal KKT certificate**: a run ending
+`stalled`/`max_iter`/`max_time` now re-judges its returned best iterate — with
+repaired candidate multipliers where the recorded ones drifted — and reports
+`acceptable` when the full scaled residual passes the acceptable-stopping
+tolerances. Nearly every fixed row is the certificate signature
+`stalled → acceptable`, in two families the per-iteration test structurally
+missed: the objective-free **nonlinear-equation systems**, whose rank-deficient
+`∇c` under-determines the multipliers so the recorded KKT is drifted-dual noise
+(`NONSCOMPNE`, `VANDERM1`–`4`, `WATSONNE`, `DECONVBNE`, `CYCLOOCT`,
+`DRCAVTY1`), and **least-squares valleys** whose best iterate sits inside the
+acceptable band while the line search froze at a worse tail iterate (`WEEDS`,
+`MGH09LS`, `ROSZMAN1LS`, `GAUSS1LS`/`3LS`, `HAHN1LS`, `FBRAIN3LS`, `LSC2LS`,
+`HADAMALS`). `stalled` drops on every config (48 → 37 on `lbfgs/dense`,
+28 → 22 on `exact/sparse`); the handful of `max_time → acceptable`/`optimal`
+flips (`ZAMB2*`, `OET4`, `KISSING2`, `TARGUS`) are wall-clock luck under the
+`--jobs` caveat, not the certificate.
 
-Nine of the ten breakages are `max_time`/`max_iter` and fall under the `--jobs`
-caveat above rather than the code. The tenth is `lbfgs/sparse ELATTAR`,
-`optimal → optimal`: an unchanged status at a **different local optimum**, the
-basin sensitivity this corpus shows on nonconvex problems.
-
-171 objectives drifted, 110 of them on problems with no documented optimum — the
-class the correct-count structurally cannot see. Most pair with a status change
-and are not comparable point-to-point (`ROBOT`'s `0 → 6.59` compares a stalled
-non-solution against a converged one). The largest genuine moves are
-improvements: `DIAMON2DLS` `431731 → 84185`, `DIAMON3DLS` `732815 → 68452`.
+All 85 objective drifts are on runs that were wall-clock-bounded (`max_time`)
+in **both** sweeps — the iterate a budget cut lands on moves with machine load
+— and 61 of the 85 are unscored. A terminal-only change cannot move a
+trajectory, and the zero-drift result on every non-budget-bounded row confirms
+it didn't.
 
 ### Results — optimization vs. feasibility problems
 
@@ -145,20 +221,28 @@ the optimization rate. The optimization column shows `correct` (`converged`).
 
 | config | optimization (896) | feasibility (205) |
 | --- | --- | --- |
-| `lbfgs/dense`  | 681 / 893* (822) | 83 / 205 |
-| `lbfgs/krylov` | 658 / 896  (799) | 82 / 205 |
-| `lbfgs/sparse` | 688 / 896  (829) | 84 / 205 |
-| `exact/dense`  | 683 / 893* (812) | 79 / 205 |
-| `exact/krylov` | 615 / 896  (761) | 85 / 205 |
-| `exact/sparse` | 704 / 896  (839) | **89 / 205** |
+| `lbfgs/dense`  | 685 / 893* (829) | 89 / 205 |
+| `lbfgs/krylov` | 665 / 896  (807) | 87 / 205 |
+| `lbfgs/sparse` | 690 / 896  (834) | 90 / 205 |
+| `exact/dense`  | 687 / 893* (817) | 83 / 205 |
+| `exact/krylov` | 620 / 896  (766) | 86 / 205 |
+| `exact/sparse` | **705 / 896**  (843) | **91 / 205** |
 
 <small>* dense routes ran 893 of the 896 optimization problems; three exceed the
 dense variable cap.</small>
 
-The feasibility column is where the class-A fix lands: **63–64 → 82–84** on the
-L-BFGS routes and 53 → 79 on `exact/dense`. The split itself was re-derived for
-this run by inspecting each built problem for a constant objective — 205/896,
-correcting the 207/894 carried by earlier revisions.
+Both columns were lifted by the v20 terminal certificate: the feasibility side
+because the equation systems' recorded residuals were drifted-multiplier noise
+at points that were in fact acceptably feasible (79–89 → 83–92 at v20, 83–91
+here), the optimization side through the least-squares family.
+
+The split is derived by building each problem and asking whether it has an
+objective at all — the same gate the runner applies when `--include-objective-free`
+is absent. Do this by *constructing the problem*, not by re-deriving the
+predicate: instantiating with an explicit `size=0` rather than `None` silently
+builds a degenerate `n = 0` instance for every *scalable* problem, which then
+has no objective groups and is miscounted as objective-free (it inflates the
+count 205 → 326, with `ARGLINA` collapsing from n=200 to n=0).
 
 ### Observations
 
@@ -193,7 +277,7 @@ correcting the 207/894 carried by earlier revisions.
     visible in the ±count. Pass `kkt_route="augmented"` to restore the previous
     form.
 
-- **`exact/sparse` is the strongest route** — most correct (793) and most
+- **`exact/sparse` is the strongest route** — most correct (796) and most
   optimal (876). Exact-Hessian Newton steps factored by the sparse-direct route
   (Feral LDLᵀ with inertia control) is the most robust combination here.
 - **`numerical_error` is essentially gone** (51 → 0 on `exact/dense`, and 0–1
@@ -205,7 +289,7 @@ correcting the 207/894 carried by earlier revisions.
   `infeasible`/`restoration_failed`/`stalled` — the same verdict the L-BFGS
   routes already gave — and DEMBO7/KISSING recover to `optimal`.
 - **False infeasibility claims are largely gone.** The per-route `infeasible`
-  counts dropped from 110–156 to 51–63: a local-infeasibility verdict now
+  counts dropped from 110–156 to 58–59: a local-infeasibility verdict now
   requires a *stationarity certificate* from the restoration phase (projected
   gradient ≈ 0, or no descent at the Levenberg–Marquardt ceiling), gets one
   x0-anchored second-chance probe before it is believed, and is vetoed when
@@ -214,18 +298,22 @@ correcting the 207/894 carried by earlier revisions.
   new status columns — and dozens of the ex-`infeasible` rows now finish
   `optimal` outright (SNAKE, CATENARY, BT9, HS39, CRESC4, SSEBNLN, ALJAZZAF…).
 - **Budget statuses are down sharply** (`max_iter` + `max_time`: 69–182 →
-  23–90 per route). Two mechanisms: a run whose returned best iterate already
+  20–98 per route). Two mechanisms: a run whose returned best iterate already
   satisfies the relaxed (acceptable-level) KKT tolerance now reports
   `acceptable` instead of `max_time`/`max_iter` (the DIAMON2DLS/DMN
   least-squares family — oscillating at KKT ~1e-7 without ever holding it for
   the acceptable window — is now scored *correct*), and the stall detector
-  ends frozen-iterate grinds early.
+  ends frozen-iterate grinds early. As of v20 the same re-judging extends to
+  `stalled` exits, and a **terminal KKT certificate** additionally repairs
+  drifted multipliers at the returned iterate before giving up on it — a
+  genuinely active constraint's certificate fails, so it under-certifies at
+  worst (see *Changes in the v20 baseline*).
 - **`unbounded` is now a certified verdict**: it requires the objective to
   diverge below `−diverging_iterates_tol`, not just a large iterate norm.
   KOEBHELB — whose iterate wanders past 1e22 and then converges to f = 112 —
   flipped from `unbounded` to `optimal` on the exact routes, while genuinely
   unbounded problems (INDEF) are still detected.
-- **The RT-typical `lbfgs/sparse`** route is solid (745 correct, 0
+- **The RT-typical `lbfgs/sparse`** route is solid (780 correct, a single
   `numerical_error`), validating the L-BFGS + sparse-direct path used for
   radiotherapy-scale problems.
 - **Documented-infeasible detection works**: `BURKEHAN` and the rest of the
@@ -234,38 +322,25 @@ correcting the 207/894 carried by earlier revisions.
 - **No crashes**: the `solve_error` column is zero everywhere for the first
   time (the LINSPANH and HS9 crashes of the previous run are gone).
 
-#### Changes in the v15 baseline (2026-07-15), since the 2026-07-13 run
+#### Changes in the v19 baseline (2026-07-31), since v15
 
-Retained for provenance: these are the deltas that produced the **v15** numbers
+Retained for provenance: these are the deltas that produced the **v19** numbers
 the section above is measured against, not the current run.
 
-Every route improved on `correct`: net **+46** over the previous (2026-07-13)
-baseline (4338 → 4384 across the six configs), with **every config positive** —
-`exact/sparse` led at 776 (was 769), `lbfgs/sparse` gained most (729 → 745).
-Solved-correct by ≥1 route rose to 809 (was 807; converged 942). The deltas map
-to the barrier-μ / line-search arc landed since the correctness-hardening
-release:
-
-- **The W&B filter is re-initialized whenever μ changes.** The filter's
-  `(θ, φ_μ)` entries carry a barrier objective that is meaningful only for the
-  μ they were recorded at; ipax previously kept one filter for the whole solve,
-  so stale old-μ entries gated new-μ trials as a spurious rejection that
-  tightened as μ shrank. Matching Wächter & Biegler / IPOPT (the filter is
-  reset at every barrier update) removed that drag.
-- **A repeated feasible-point re-center now raises μ instead of treadmilling.**
-  When a line search fails at an already-feasible iterate and re-centering the
-  barrier at the *same* μ fails again, the barrier parameter is now raised to
-  the scale of the stall's KKT error (Nocedal, Wächter & Waltz §5.1) and the
-  free-mode μ oracle is suspended until progress resumes — clearing several
-  stalled power-flow (`ACOPP`/`ACOPR`) and least-squares runs.
-- **The L-BFGS Hessian route gained inertia-guided δ_w.** The compact
-  quasi-Newton middle-block signature now folds into the expected-inertia
-  target (Haynsworth additivity), so a genuinely nonconvex L-BFGS-route problem
-  gets the same inertia correction the sparse-direct route already had, instead
-  of relying on Powell damping alone.
-- **OET7 — a long-standing basin-flip limitation — is now `optimal`** on three
-  routes. The one remaining non-blocking limitation is **AGG** — a feasible
-  netlib LP the solver fails to converge (verified feasible vs HiGHS).
+**+147 correct across the six configs (4384 → 4531), every config positive**
+(157 fixed / 10 broken; nine of the ten breakages were `max_time`/`max_iter`
+under a `--jobs` 4 → 6 change, the tenth an `ELATTAR` basin flip). The gain was
+one coherent family: `stalled → optimal` on the CUTEst **nonlinear-equation
+systems** (`BEALENE`, `BIGGS6NE`, `CYCLOOCF`, `CYCLOOCT`, `DEVGLA1NE`/`2NE`,
+`HYDCAR6`, `METHANL8`, `ROBOT`, `SEMICON1`/`2`, `VARDIMNE`, …) — the class-A
+feasibility fix: the feasible-point re-center guard required inequality
+constraints to exist, so on equality-only systems a globalization failure at a
+feasible iterate walked into a no-op restoration livelock. Three changes
+together (guard on any constraints, restoration's own ℓ∞ measure, least-squares
+equality-dual repair) cleared it on every route, not just the L-BFGS ones.
+Earlier provenance (the v15 barrier-μ / line-search arc: per-μ filter reset,
+re-center μ-escalation, L-BFGS inertia-guided δ_w) lives in the repository
+history and the v15 report.
 
 !!! note "Adaptive-μ line-search acceptance"
     Two acceptance heuristics from this arc target the adaptive-barrier /
@@ -441,11 +516,31 @@ python -m benchmarks.runners.s2mpj --all --config exact/sparse --jobs 5 \
     --out benchmarks/reports/s2mpj_exact_sparse
 ```
 
+The full release gate is the whole matrix in one run. **Pass the budget
+explicitly** — the runner defaults (`--max-iter 1000 --max-time 60`) are far
+below what every tracked baseline was run at, and silently capping
+long-but-converging solves manufactures a corpus-wide regression that looks
+like a real one:
+
+```bash
+IPAX_S2MPJ_DIR=<checkout> PYTHONUTF8=1 OMP_NUM_THREADS=1 \
+python -m benchmarks.runners.s2mpj --all --include-objective-free \
+    --max-iter 10000 --max-time 300 --jobs 10 --resume \
+    --out benchmarks/reports/s2mpj_vNN
+```
+
+`--include-objective-free` is load-bearing, not optional: without it the 205
+feasibility problems are skipped and the totals are not comparable to any
+baseline here. Any report's budget is recoverable from its own data — every
+`max_iter` row's `n_iter` equals the cap plus one, and every `max_time` row's
+`solve_time` sits at the cap — which is worth checking on a partial report
+before committing hours to a run.
+
 A sweep is only meaningful against a baseline, so A/B two reports with:
 
 ```bash
 python -m benchmarks.runners.compare \
-    benchmarks/reports/s2mpj_v17.json benchmarks/reports/s2mpj_v18.json \
+    benchmarks/reports/s2mpj_v20.json benchmarks/reports/s2mpj_v22.json \
     --config lbfgs/sparse
 ```
 

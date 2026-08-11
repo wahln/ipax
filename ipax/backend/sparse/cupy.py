@@ -40,6 +40,11 @@ import cupyx
 import cupyx.scipy.sparse
 import cupyx.scipy.sparse.linalg
 
+try:  # High-level cuBLAS wrappers (ship with CuPy; syrk since v9).
+    from cupy import cublas as _cublas
+except ImportError:  # pragma: no cover - degraded CuPy install
+    _cublas = None
+
 from ipax.backend.operators import LinearOperator
 from ipax.backend.sparse._canonical import (
     CompiledCompressed,
@@ -81,6 +86,36 @@ _CUDSS_STATUS_NOT_SUPPORTED = 4
 # model and TROTS measurements behind the values.
 _GRAM_DENSE_MIN_DENSITY = 0.05
 _GRAM_DENSE_CHUNK_ELEMENTS = 50_000_000
+# Row-block size for mirroring the syrk-computed lower triangle to the upper
+# one: bounded temporaries (block² indices) and O(n/block) kernel launches
+# instead of either a full-size n² index gather or n single-row copies.
+_GRAM_MIRROR_BLOCK = 1024
+
+
+def _mirror_lower_to_upper(out: Any) -> None:
+    """Mirror the lower triangle of square ``out`` onto the upper, in place.
+
+    Pure copies (bitwise-exact, incl. -0.0), blocked to ``_GRAM_MIRROR_BLOCK``
+    rows: each diagonal block mirrors internally via a block-sized index
+    gather (temporaries bounded by block², never n²), and the panel right of
+    it is a single transposed-slice copy — O(n/block) kernel launches total,
+    where a per-row copy loop would launch n times.
+    """
+    n = int(out.shape[0])
+    block = _GRAM_MIRROR_BLOCK
+    tri = None
+    for j0 in range(0, n, block):
+        j1 = min(n, j0 + block)
+        if j1 - j0 == block:
+            if tri is None:
+                tri = cupy.triu_indices(block, 1)
+            rows, cols = tri
+        else:
+            rows, cols = cupy.triu_indices(j1 - j0, 1)
+        diag = out[j0:j1, j0:j1]
+        diag[rows, cols] = diag[cols, rows]
+        if j1 < n:
+            out[j0:j1, j1:] = out[j1:, j0:j1].T
 
 
 class _CuDSSUnavailableError(ImportError):
@@ -222,9 +257,12 @@ class SparseOperator(LinearOperator):
         self._gram_transpose: Any = None  # Aᵀ as CSR
         self._gram_scaled: Any = None  # diag(w)A same-pattern buffer
         self._gram_row_index: Any = None  # nnz → row map for w expansion
-        self._gram_weights: Any = None  # memo key (last weights, device)
-        self._gram_value: Any = None  # memoized dense n×n result (device)
+        # One memo slot per accumulate_dtype (see the SciPy adapter's comment:
+        # mixed/exact alternation with identical weights must not evict).
+        self._gram_memo: dict[str | None, tuple[Any, Any]] = {}
         self._gram_compute_count = 0  # observability/testing: actual SpGEMM runs
+        self._reduced_csr: Any = None  # cast-once reduced-precision data CSR
+        self._native_streak = False  # last gram() request was native (see gram)
         self._squared: Any = None  # A∘A (shared by the Gram diagonals)
         # Sparse-Gram (COO) memo for the sparse normal-equations route.
         self._gram_coo_weights: Any = None
@@ -290,17 +328,40 @@ class SparseOperator(LinearOperator):
         out = self._squared_csr.T @ _to_cupy(weights)
         return cast("Array", to_xp_array(cupy.asarray(out).reshape(-1), self._xp))
 
-    def gram(self, weights: Array) -> Array:
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        if (
+            hinted_only
+            and accumulate_dtype is not None
+            and self.gram_accumulate_dtype_hint() != accumulate_dtype
+        ):
+            accumulate_dtype = None  # this matrix's data does not support it
         # Aᵀ diag(w) A as a dense n×n matrix via sparse arithmetic (row-scale then
         # sparse Gram), densifying only the small n×n result — mirror of the SciPy
         # adapter's cached ``gram`` (see its comment for the caching rationale).
         # The memo compare costs one device reduction + host sync per call; the
         # SpGEMM it skips is orders of magnitude more work at n ≪ m scale.
         w = _to_cupy(weights).reshape(-1)
-        if self._gram_value is not None and bool(
-            cupy.array_equal(w, self._gram_weights)
-        ):
-            return cast("Array", to_xp_array(self._gram_value, self._xp))
+        if accumulate_dtype is None:
+            # Free the reduced-data device copy (multi-GB at RT nnz) only on the
+            # SECOND consecutive native request — mirror of the SciPy adapter.
+            # One native request is an exact rebuild after a failed refinement,
+            # after which ``DenseSolver`` re-engages mixed on the next
+            # factorization; freeing then would force a multi-GB device recast
+            # on every intermittent hard iteration.
+            if self._native_streak:
+                self._reduced_csr = None
+            self._native_streak = True
+        else:
+            self._native_streak = False
+        memo = self._gram_memo.get(accumulate_dtype)
+        if memo is not None and bool(cupy.array_equal(w, memo[0])):
+            return cast("Array", to_xp_array(memo[1], self._xp))
 
         a = self._matrix
         m, n = a.shape
@@ -309,7 +370,19 @@ class SparseOperator(LinearOperator):
             # Dense-ish rows: chunked dense GEMM (cuBLAS) beats SpGEMM — the
             # CPU-calibrated crossover of the SciPy adapter, if anything more
             # pronounced on GPU tensor pipelines.
-            gram = self._gram_dense_accumulate(a, w)
+            if accumulate_dtype is not None:
+                # Mixed-precision accumulate — mirror of the SciPy adapter:
+                # cast-once reduced-data CSR, reduced-dtype cuBLAS
+                # accumulation (the fp32/fp64 rate ratio is the whole point
+                # on consumer GPUs), upcast only the n×n result. Dense
+                # strategy only; the SpGEMM branch ignores the request.
+                acc = cupy.dtype(accumulate_dtype)
+                gram = self._gram_dense_accumulate(
+                    self._reduced_data_csr(acc), w.astype(acc, copy=False)
+                )
+                gram = gram.astype(cupy.result_type(a.dtype, w.dtype), copy=False)
+            else:
+                gram = self._gram_dense_accumulate(a, w)
         else:
             if self._gram_transpose is None:
                 self._gram_transpose = a.T.tocsr()
@@ -324,10 +397,22 @@ class SparseOperator(LinearOperator):
             scaled = self._gram_scaled
             scaled.data = a.data * w[self._gram_row_index]
             gram = cupy.asarray((self._gram_transpose @ scaled).toarray())
-        self._gram_weights = w.copy()
-        self._gram_value = gram
+        self._gram_memo[accumulate_dtype] = (w.copy(), gram)
         self._gram_compute_count += 1
         return cast("Array", to_xp_array(gram, self._xp))
+
+    def _reduced_data_csr(self, dtype: Any) -> Any:
+        """Same-structure CSR with the data cast once to ``dtype`` (device).
+
+        Index arrays are shared with the wrapped matrix; only the value array
+        is duplicated, so reduced-precision accumulates read half the bytes
+        with no per-chunk cast."""
+        if self._reduced_csr is None or self._reduced_csr.dtype != dtype:
+            a = self._matrix
+            self._reduced_csr = cupyx.scipy.sparse.csr_matrix(
+                (a.data.astype(dtype), a.indices, a.indptr), shape=a.shape
+            )
+        return self._reduced_csr
 
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         # ``Aᵀ diag(w) A`` kept SPARSE for the sparse normal-equations route —
@@ -364,6 +449,10 @@ class SparseOperator(LinearOperator):
     def gram_coo_capable(self) -> bool:
         return True
 
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        # Storage-level metadata only — mirror of the SciPy adapter.
+        return "float32" if self._matrix.dtype == cupy.float32 else None
+
     def gram_fill_estimate(self) -> float | None:
         """Estimated Gram-pattern density — the SciPy adapter's sampled
         column-overlap estimate on the host-transferred index structure.
@@ -395,19 +484,36 @@ class SparseOperator(LinearOperator):
     def _gram_dense_accumulate(a: Any, w: Any) -> Any:
         """``Aᵀ diag(w) A`` by cuBLAS over zero-copy row windows of ``a``.
 
-        Mirror of the SciPy adapter's dense-accumulation strategy: densify
-        ``m_chunk × n`` row windows (bounded by ``_GRAM_DENSE_CHUNK_ELEMENTS``)
-        and accumulate ``blockᵀ @ (w_chunk ∘ block)``.
+        Same chunked dense strategy as the SciPy adapter: densify
+        ``m_chunk × n`` row windows (bounded by ``_GRAM_DENSE_CHUNK_ELEMENTS``).
+        For finite nonnegative weights the chunk is scaled in place by ``√w``
+        and accumulated with the *symmetric* rank-k update
+        (``cupy.cublas.syrk``): half the GEMM FLOPs and no ``w ∘ block``
+        temporary, with the lower triangle mirrored once at the end (bitwise
+        symmetric result). Mixed-sign or non-finite weights fall back to the
+        general ``blockᵀ @ (w_chunk ∘ block)`` accumulation — see the SciPy
+        adapter's docstring for the overflow-envelope caveat of the ``√w``
+        split (the two forms saturate differently at float32 extremes).
         """
         from cupyx.scipy import sparse as cupyx_sparse
 
         m, n = a.shape
+        dtype = cupy.result_type(a.dtype, w.dtype)
         chunk = max(1, _GRAM_DENSE_CHUNK_ELEMENTS // max(int(n), 1))
         # One consolidated host transfer of the chunk-boundary offsets instead
-        # of two 0-d syncs per chunk inside the loop.
+        # of two 0-d syncs per chunk inside the loop. The weight-gate reduction
+        # below is one more sync per gram call — same cost class as the memo
+        # compare in :meth:`gram`, negligible next to the accumulate.
         starts = [*range(0, m, chunk), m]
         bounds = [int(v) for v in cupy.asnumpy(a.indptr[cupy.asarray(starts)])]
-        out: Any = None
+        use_syrk = (
+            _cublas is not None
+            and dtype in (cupy.float32, cupy.float64)
+            and bool(cupy.all((w >= 0.0) & cupy.isfinite(w)))
+        )
+        out = cupy.zeros((n, n), dtype=dtype)
+        if use_syrk:
+            sqrt_w = cupy.sqrt(w.astype(dtype, copy=False))
         for i, start in enumerate(starts[:-1]):
             end = starts[i + 1]
             lo, hi = bounds[i], bounds[i + 1]
@@ -415,11 +521,16 @@ class SparseOperator(LinearOperator):
                 (a.data[lo:hi], a.indices[lo:hi], a.indptr[start : end + 1] - lo),
                 shape=(end - start, n),
             )
-            block = window.toarray()
-            piece = block.T @ (w[start:end, None] * block)
-            out = piece if out is None else out + piece
-        if out is None:
-            out = cupy.zeros((n, n), dtype=cupy.result_type(a.dtype, w.dtype))
+            block = cupy.asarray(window.toarray(), dtype=dtype)
+            if use_syrk:
+                block *= sqrt_w[start:end, None]  # in place — block is fresh
+                # out := blockᵀ @ block + out, lower triangle only (verified
+                # in-place on C-order ``out`` for float32/float64).
+                _cublas.syrk("T", block, out=out, alpha=1.0, beta=1.0, lower=True)
+            else:
+                out += block.T @ (w[start:end, None] * block)
+        if use_syrk:
+            _mirror_lower_to_upper(out)
         return out
 
     def row_gram_diagonal(self, weights: Array) -> Array:

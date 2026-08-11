@@ -193,13 +193,17 @@ is a no-op in CI until GPU CI exists; run it locally on a CUDA backend.
 
 **In:** equality + inequality + bound constraints; L-BFGS + exact Hessian; dense,
 matrix-free, and sparse-direct solver routes; filter line-search + restoration;
-optional Mehrotra–Gondzio higher-order corrections; multi-backend.
+optional Mehrotra–Gondzio higher-order corrections; multi-backend; opt-in
+mixed-precision Gram accumulation with float64 iterative refinement
+(`DenseOptions.gram_dtype`; scoped in 2026-08-04 — generic, accuracy-preserving
+by construction: a refinement stall falls back to native precision).
 
 **Out (do not add without discussion):** Breedveld's dose-matrix `N=AᵀDA+Q+T`
-condensation, graph permutation/tiling, mixed-precision tiled BLAS, chained
-dose-influence products; hard-coded RT cost-functions (LTCP/gEUD/dose-volume);
-multi-criteria / Pareto / beam-angle layers. Keep dimensionality & sparsity in
-mind, but the RT-specific kernels belong in a separate downstream layer.
+condensation, graph permutation/tiling, custom mixed-precision *tiled BLAS
+kernels*, chained dose-influence products; hard-coded RT cost-functions
+(LTCP/gEUD/dose-volume); multi-criteria / Pareto / beam-angle layers. Keep
+dimensionality & sparsity in mind, but the RT-specific kernels belong in a
+separate downstream layer.
 
 ---
 
@@ -318,3 +322,7 @@ Steps:
   correctors for interior point methods." *Computational Optimization and
   Applications* 41(3), 277–305. <https://doi.org/10.1007/s10589-007-9106-0>
   (symmetric-neighbourhood clipping of corrector targets)
+- Carson, E. & Higham, N. J. (2018). "Accelerating the solution of linear systems
+  by iterative refinement in three precisions." *SIAM Journal on Scientific
+  Computing* 40(2), A817–A847. <https://doi.org/10.1137/17M1140819>
+  (mixed-precision Gram accumulation + refinement in the dense condensed route)
