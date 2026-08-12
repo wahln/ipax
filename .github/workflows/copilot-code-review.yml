@@ -1,0 +1,40 @@
+name: "Copilot Code Review Setup"
+
+# Configures the ephemeral environment Copilot's code-review agent runs in,
+# independent of copilot-setup-steps.yml (which configures the cloud coding
+# agent). Mirrors the `lint` + `test` install matrix in ci.yml so the review
+# agent can run the same commands as CI (ruff, mypy, scripts/check_purity.py,
+# pytest) against a pull request instead of reviewing the diff statically.
+#
+# The job id below MUST stay exactly `copilot-setup-steps` — that is the name
+# GitHub's Copilot agents look for, regardless of this file's name.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-code-review.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-code-review.yml
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ipax (lint + numpy/torch + array-api-strict + test extras)
+        run: pip install -e ".[lint,numpy,torch,strict,sparse-cpu,test]"
+
+      - name: Export the multi-backend test matrix used by CI
+        run: echo "IPAX_BACKENDS=numpy,torch,array_api_strict" >> "$GITHUB_ENV"
