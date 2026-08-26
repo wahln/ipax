@@ -64,6 +64,8 @@ def recover_eliminated(
     comp_l: Array | float | None = None,
     comp_u: Array | float | None = None,
     dy_eq: Array | None = None,
+    has_lower: bool = True,
+    has_upper: bool = True,
 ) -> NewtonStep:
     """Back-substitute slack / bound-dual increments after the condensed solve.
 
@@ -94,9 +96,19 @@ def recover_eliminated(
         ds = xp.zeros((0,), dtype=dtype)
         dy_ineq = xp.zeros((0,), dtype=dtype)
 
+    # ``has_lower``/``has_upper`` let a bound-free problem skip the masked
+    # arithmetic (the masks are all-False there, so the result is zero anyway).
     zero = xp.zeros_like(dx)
-    dz_lower = xp.where(mask_l, -sigma_l * dx - z_lower + target_l / x_minus_l, zero)
-    dz_upper = xp.where(mask_u, sigma_u * dx - z_upper + target_u / u_minus_x, zero)
+    dz_lower = (
+        xp.where(mask_l, -sigma_l * dx - z_lower + target_l / x_minus_l, zero)
+        if has_lower
+        else zero
+    )
+    dz_upper = (
+        xp.where(mask_u, sigma_u * dx - z_upper + target_u / u_minus_x, zero)
+        if has_upper
+        else zero
+    )
 
     return NewtonStep(
         dx=dx,

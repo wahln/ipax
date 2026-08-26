@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+- **Problem callbacks are evaluated once per point.** The driver memoizes
+  objective, gradient, constraint and Jacobian values at recently visited
+  primal points (keyed by array identity, no device sync) and adopts the
+  line search's accepted trial array as the next iterate, so the loop-top
+  evaluation, the `phi0`/`theta0` merit re-evaluation, the L-BFGS overshoot
+  gradient guard and the second-order correction all reuse what was already
+  computed. On 100-d Rosenbrock this takes ipax from 3.15 `f` / 2.0 `∇f` per
+  iteration to 1.15 / 1.0 — SciPy L-BFGS-B parity at an identical iterate
+  sequence — and a small constrained NLP from 5.1 to 3.0 constraint
+  evaluations per iteration (the remainder are the corrector's own probe
+  points). Iterates are bitwise unchanged; regression tests pin the counts.
+- **Less per-iteration overhead in the IPM loop.** The inertia check asks the
+  linear solver for an inertia *before* computing the target (dense/Krylov
+  solvers never report one, so the L-BFGS middle-block eigensolve it cost every
+  step is gone); bound-free problems skip the masked bound arithmetic in the
+  merit function, its directional derivative, the KKT residual, the
+  fraction-to-boundary rule, the condensed RHS and the step recovery; and the
+  Lagrangian gradient is formed once per iteration for both the KKT residual
+  and the L-BFGS curvature pair instead of twice.
+
 ## [0.10.0] - 2026-08-11
 
 ### Added
