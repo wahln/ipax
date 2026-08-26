@@ -26,6 +26,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   fraction-to-boundary rule, the condensed RHS and the step recovery; and the
   Lagrangian gradient is formed once per iteration for both the KKT residual
   and the L-BFGS curvature pair instead of twice.
+- **Fewer host syncs per IPM iteration.** The merit function, its directional
+  derivative, the feasibility measures, the KKT residual and the
+  fraction-to-boundary rule now reduce their per-block scalars on the device
+  and read back once (`ipax.ipm.barrier.boundary_ratio` is the device-side
+  half of `fraction_to_boundary`), and the descent-enforcement probe's
+  directional derivative is reused by the line search. Measured on Torch:
+  60 → 29 host syncs per iteration on HS71 (equalities, inequalities and
+  bounds), 15 → 12 on unconstrained Rosenbrock; a regression test pins the
+  budgets.
+- **L-BFGS Gram blocks are maintained incrementally.** `SᵀS` and `SᵀY` are
+  bordered by the new pair (O(n·k)) and sliced when a pair drops, instead of
+  being recomputed from scratch (O(n·k²)) on every update; the compact `M`
+  is assembled from the cached blocks. Round-off differs at machine precision
+  from the from-scratch product, so iterate sequences may change in the last
+  digits.
 
 ## [0.10.0] - 2026-08-11
 

@@ -201,3 +201,35 @@ def test_lbfgs_run_matches_exact_optimum_with_bounded_overhead(namespace):
         namespace, lbfgs.x, exact_problem.known_solution(), rtol=1e-6, atol=1e-6
     )
     assert lbfgs.n_iter <= 3 * exact.n_iter + 10
+
+
+def test_lbfgs_incremental_gram_blocks_match_from_scratch(namespace, tol):
+    """The compact ``M`` is assembled from incrementally bordered ``SᵀS``/``SᵀY``
+    blocks (appended per pair, sliced on drop); it must equal the from-scratch
+    construction at every window size, including after pairs fall out."""
+    xp = namespace
+    n, memory = 6, 3
+    op = LBFGSOperator(n, LBFGSOptions(memory=memory))
+    for k in range(2 * memory + 1):
+        delta = array(xp, [1.0 + 0.1 * (i + k) for i in range(n)])
+        gamma = array(xp, [2.0 + 0.3 * (i * k % 5) for i in range(n)])
+        op.update(delta, gamma)
+        s, y = op._s, op._y
+        assert s is not None and y is not None
+        assert int(s.shape[1]) == min(k + 1, memory)
+        s_t = xp.permute_dims(s, (1, 0))
+        assert_allclose(xp, op._ss, xp.matmul(s_t, s), **tol)
+        assert_allclose(xp, op._sy, xp.matmul(s_t, y), **tol)
+        kk = int(s.shape[1])
+        xi = op._xi
+        s_y = xp.matmul(s_t, y)
+        lower = xp.tril(s_y, k=-1)
+        d_mat = xp.eye(kk, dtype=s.dtype) * xp.sum(s * y, axis=0)
+        expected_m = xp.concat(
+            (
+                xp.concat((xi * xp.matmul(s_t, s), lower), axis=1),
+                xp.concat((xp.permute_dims(lower, (1, 0)), -d_mat), axis=1),
+            ),
+            axis=0,
+        )
+        assert_allclose(xp, op._m, expected_m, **tol)

@@ -58,10 +58,10 @@ from ipax.backend.operators import (
 from ipax.ipm.barrier import (
     FreeModeMonitor,
     adaptive_mu,
+    boundary_ratio,
     breedveld_mu,
     complementarity_measures,
     fallback_mu,
-    fraction_to_boundary,
     update_mu,
 )
 from ipax.ipm.breedveld_ls import BreedveldController
@@ -209,6 +209,33 @@ def _norm1(xp: Namespace, v: Array) -> float:
     if int(v.shape[0]) == 0:
         return 0.0
     return float(xp.sum(xp.abs(v)))
+
+
+def _clamped_min(xp: Namespace, ratios: list[Array]) -> float:
+    """Fraction-to-boundary step from per-block ratios: ``min(1, min ratios)``,
+    floored at zero, in a single host sync (1.0 when nothing can block)."""
+    if not ratios:
+        return 1.0
+    alpha = float(ratios[0]) if len(ratios) == 1 else float(xp.min(xp.stack(ratios)))
+    return max(0.0, min(1.0, alpha))
+
+
+def _max_of(xp: Namespace, parts: list[Array]) -> float:
+    """``max`` of device-side scalars with a single host sync (0.0 if empty)."""
+    if not parts:
+        return 0.0
+    if len(parts) == 1:
+        return float(parts[0])
+    return float(xp.max(xp.stack(parts)))
+
+
+def _sum_of(xp: Namespace, parts: list[Array]) -> float:
+    """``sum`` of device-side scalars with a single host sync (0.0 if empty)."""
+    if not parts:
+        return 0.0
+    if len(parts) == 1:
+        return float(parts[0])
+    return float(xp.sum(xp.stack(parts)))
 
 
 def _within_relaxed_tol(
@@ -691,31 +718,41 @@ class IPMDriver:
             r_d = r_d + z_upper
         dual_inf = _norm_inf(xp, r_d)
 
-        prim = _norm_inf(xp, g + s) if m > 0 else 0.0
-        if m_eq > 0:
-            prim = max(prim, _norm_inf(xp, c))
-
-        compl = 0.0
+        # Each block's reduction stays on the device; one sync per quantity.
+        prim_parts: list[Array] = []
         if m > 0:
-            compl = max(compl, _norm_inf(xp, s * y_ineq - mu))
+            prim_parts.append(xp.max(xp.abs(g + s)))
+        if m_eq > 0:
+            prim_parts.append(xp.max(xp.abs(c)))
+        prim = _max_of(xp, prim_parts)
+
+        compl_parts: list[Array] = []
+        if m > 0:
+            compl_parts.append(xp.max(xp.abs(s * y_ineq - mu)))
         if self._has_lower:
             zero = xp.zeros_like(x_minus_l)
-            compl = max(
-                compl, _norm_inf(xp, xp.where(mask_l, x_minus_l * z_lower - mu, zero))
+            compl_parts.append(
+                xp.max(xp.abs(xp.where(mask_l, x_minus_l * z_lower - mu, zero)))
             )
         if self._has_upper:
             zero = xp.zeros_like(u_minus_x)
-            compl = max(
-                compl, _norm_inf(xp, xp.where(mask_u, u_minus_x * z_upper - mu, zero))
+            compl_parts.append(
+                xp.max(xp.abs(xp.where(mask_u, u_minus_x * z_upper - mu, zero)))
             )
+        compl = _max_of(xp, compl_parts)
 
         n_dual = m + n_bounds + m_eq
         if n_dual > 0:
-            sum_dual = _norm1(xp, y_ineq) + _norm1(xp, y_eq)
+            dual_parts: list[Array] = []
+            if m > 0:
+                dual_parts.append(xp.sum(xp.abs(y_ineq)))
+            if m_eq > 0:
+                dual_parts.append(xp.sum(xp.abs(y_eq)))
             if self._has_lower:
-                sum_dual += _norm1(xp, z_lower)
+                dual_parts.append(xp.sum(xp.abs(z_lower)))
             if self._has_upper:
-                sum_dual += _norm1(xp, z_upper)
+                dual_parts.append(xp.sum(xp.abs(z_upper)))
+            sum_dual = _sum_of(xp, dual_parts)
             s_d = max(_S_MAX, sum_dual / n_dual) / _S_MAX
             s_c = max(_S_MAX, sum_dual / n_dual) / _S_MAX
         else:
@@ -1481,6 +1518,10 @@ class IPMDriver:
             # prescribe when the (1,1) block is not positive definite.
             theta0 = self._theta_l1(x, s, m, m_eq)
             phi0 = self._phi(x, s, mu, m, mask_l, mask_u, lower_safe, upper_safe)
+            # The probe's directional derivative is the line search's ``dphi``
+            # whenever the loop leaves the step unchanged; keep it to avoid a
+            # second evaluation (and host sync).
+            dphi_probe: float | None = None
             if theta0 == 0.0:
                 ascent_noise = _DESCENT_NOISE_FACTOR * max(1.0, abs(phi0))
                 descent_floor = reg_applied
@@ -1490,6 +1531,7 @@ class IPMDriver:
                     )
                     if dphi_probe <= ascent_noise:
                         break
+                    dphi_probe = None
                     descent_floor = (
                         opts.regularization.delta_w_init
                         if descent_floor <= 0.0
@@ -1723,8 +1765,12 @@ class IPMDriver:
 
             # θ0/φ0 were computed above for the descent enforcement; x, s and
             # μ are unchanged since.
-            dphi = self._dphi(
-                x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
+            dphi = (
+                dphi_probe
+                if dphi_probe is not None
+                else self._dphi(
+                    x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
+                )
             )
 
             used_soc = False
@@ -2109,24 +2155,19 @@ class IPMDriver:
     ) -> float:
         """Original-problem violation: ``c``, ``max(g, 0)`` and bound overshoot."""
         xp = self._xp
-        viol = 0.0
+        parts: list[Array] = []
         if m > 0:
-            viol = max(viol, _norm_inf(xp, xp.maximum(g, xp.zeros_like(g))))
+            parts.append(xp.max(xp.maximum(g, xp.zeros_like(g))))
         if m_eq > 0:
-            viol = max(viol, _norm_inf(xp, c))
+            parts.append(xp.max(xp.abs(c)))
         if self._has_lower or self._has_upper:
             zero = xp.zeros_like(x)
         if self._has_lower:
-            viol = max(
-                viol,
-                _norm_inf(xp, xp.maximum(xp.where(mask_l, lower_safe - x, zero), zero)),
-            )
+            parts.append(xp.max(xp.where(mask_l, lower_safe - x, zero)))
         if self._has_upper:
-            viol = max(
-                viol,
-                _norm_inf(xp, xp.maximum(xp.where(mask_u, x - upper_safe, zero), zero)),
-            )
-        return viol
+            parts.append(xp.max(xp.where(mask_u, x - upper_safe, zero)))
+        # Bound overshoots are clamped at zero by the max with the empty case.
+        return max(0.0, _max_of(xp, parts))
 
     def _next_mu(
         self,
@@ -2528,18 +2569,18 @@ class IPMDriver:
         tau: float,
     ) -> float:
         xp = self._xp
-        alpha = 1.0
+        parts: list[Array] = []
         if m > 0:
-            alpha = min(alpha, fraction_to_boundary(s, step.ds, tau))
+            parts.append(boundary_ratio(s, step.ds, tau))
         if self._has_lower:
             v_l = xp.where(mask_l, x_minus_l, xp.ones_like(x_minus_l))
             dv_l = xp.where(mask_l, step.dx, xp.zeros_like(x_minus_l))
-            alpha = min(alpha, fraction_to_boundary(v_l, dv_l, tau))
+            parts.append(boundary_ratio(v_l, dv_l, tau))
         if self._has_upper:
             v_u = xp.where(mask_u, u_minus_x, xp.ones_like(u_minus_x))
             dv_u = xp.where(mask_u, -step.dx, xp.zeros_like(u_minus_x))
-            alpha = min(alpha, fraction_to_boundary(v_u, dv_u, tau))
-        return alpha
+            parts.append(boundary_ratio(v_u, dv_u, tau))
+        return _clamped_min(xp, parts)
 
     def _alpha_dual(
         self,
@@ -2553,18 +2594,18 @@ class IPMDriver:
         tau: float,
     ) -> float:
         xp = self._xp
-        alpha = 1.0
+        parts: list[Array] = []
         if m > 0:
-            alpha = min(alpha, fraction_to_boundary(y_ineq, step.dy_ineq, tau))
+            parts.append(boundary_ratio(y_ineq, step.dy_ineq, tau))
         if self._has_lower:
             v_l = xp.where(mask_l, z_lower, xp.ones_like(z_lower))
             dv_l = xp.where(mask_l, step.dz_lower, xp.zeros_like(z_lower))
-            alpha = min(alpha, fraction_to_boundary(v_l, dv_l, tau))
+            parts.append(boundary_ratio(v_l, dv_l, tau))
         if self._has_upper:
             v_u = xp.where(mask_u, z_upper, xp.ones_like(z_upper))
             dv_u = xp.where(mask_u, step.dz_upper, xp.zeros_like(z_upper))
-            alpha = min(alpha, fraction_to_boundary(v_u, dv_u, tau))
-        return alpha
+            parts.append(boundary_ratio(v_u, dv_u, tau))
+        return _clamped_min(xp, parts)
 
     def _phi(
         self,
@@ -2580,28 +2621,26 @@ class IPMDriver:
         """Barrier objective ``φ_μ`` (Wächter & Biegler 2006, §2)."""
         xp = self._xp
         val = self._objective(x)
+        parts: list[Array] = []
         if m > 0:
-            val = val - mu * float(xp.sum(xp.log(s)))
+            parts.append(xp.sum(xp.log(s)))
         if self._has_lower:
             x_minus_l = xp.where(mask_l, x - lower_safe, xp.ones_like(x))
-            val = val - mu * float(
-                xp.sum(xp.where(mask_l, xp.log(x_minus_l), xp.zeros_like(x)))
-            )
+            parts.append(xp.sum(xp.where(mask_l, xp.log(x_minus_l), xp.zeros_like(x))))
         if self._has_upper:
             u_minus_x = xp.where(mask_u, upper_safe - x, xp.ones_like(x))
-            val = val - mu * float(
-                xp.sum(xp.where(mask_u, xp.log(u_minus_x), xp.zeros_like(x)))
-            )
-        return val
+            parts.append(xp.sum(xp.where(mask_u, xp.log(u_minus_x), xp.zeros_like(x))))
+        return val - mu * _sum_of(xp, parts)
 
     def _theta_l1(self, x: Array, s: Array, m: int, m_eq: int) -> float:
         """Constraint violation ``θ = ‖(c, g+s)‖₁`` used by the filter."""
         xp = self._xp
-        val = 0.0
+        parts: list[Array] = []
         if m > 0:
-            val += _norm1(xp, self._ineq(x) + s)
+            parts.append(xp.sum(xp.abs(self._ineq(x) + s)))
         if m_eq > 0:
-            val += _norm1(xp, self._eq(x))
+            parts.append(xp.sum(xp.abs(self._eq(x))))
+        val = _sum_of(xp, parts)
         return val
 
     def _theta_linf(self, x: Array, s: Array, m: int, m_eq: int) -> float:
@@ -2616,12 +2655,12 @@ class IPMDriver:
         declared it feasible and returned it unchanged.
         """
         xp = self._xp
-        val = 0.0
+        parts: list[Array] = []
         if m > 0:
-            val = max(val, float(xp.max(xp.abs(self._ineq(x) + s))))
+            parts.append(xp.max(xp.abs(self._ineq(x) + s)))
         if m_eq > 0:
-            val = max(val, float(xp.max(xp.abs(self._eq(x)))))
-        return val
+            parts.append(xp.max(xp.abs(self._eq(x))))
+        return _max_of(xp, parts)
 
     def _dphi(
         self,
@@ -2638,18 +2677,18 @@ class IPMDriver:
     ) -> float:
         """Directional derivative ``∇φ_μᵀ d`` along the step."""
         xp = self._xp
-        dd = float(xp.sum(grad * step.dx))
+        parts: list[Array] = [xp.sum(grad * step.dx)]
         if m > 0:
-            dd -= mu * float(xp.sum(step.ds / s))
+            parts.append(-mu * xp.sum(step.ds / s))
         if self._has_lower:
-            dd -= mu * float(
-                xp.sum(xp.where(mask_l, step.dx / x_minus_l, xp.zeros_like(x)))
+            parts.append(
+                -mu * xp.sum(xp.where(mask_l, step.dx / x_minus_l, xp.zeros_like(x)))
             )
         if self._has_upper:
-            dd += mu * float(
-                xp.sum(xp.where(mask_u, step.dx / u_minus_x, xp.zeros_like(x)))
+            parts.append(
+                mu * xp.sum(xp.where(mask_u, step.dx / u_minus_x, xp.zeros_like(x)))
             )
-        return dd
+        return _sum_of(xp, parts)
 
     def _repair_equality_duals(
         self, x: Array, y_eq: Array, m_eq: int, *, factor: float = 1.0
