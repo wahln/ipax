@@ -2521,7 +2521,12 @@ class IPMDriver:
 
         for _ in range(_MAX_REG_ATTEMPTS):
             condensed = build_condensed_operator(
-                w, sigma_x_op, sigma_s_op, ineq_jac, reg
+                w,
+                sigma_x_op,
+                sigma_s_op,
+                ineq_jac,
+                reg,
+                sigma_x_zero=not (self._has_lower or self._has_upper),
             )
             if m_eq > 0:
                 operator = build_saddle_operator(condensed, eq_jac, current_delta_c)

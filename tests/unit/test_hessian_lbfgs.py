@@ -233,3 +233,41 @@ def test_lbfgs_incremental_gram_blocks_match_from_scratch(namespace, tol):
             axis=0,
         )
         assert_allclose(xp, op._m, expected_m, **tol)
+
+
+def test_lbfgs_gram_blocks_match_from_scratch(namespace, tol):
+    """``gram_blocks()`` returns ``(SᵀS, SᵀY, YᵀY)`` maintained incrementally;
+    all three must equal the from-scratch products at every window size."""
+    xp = namespace
+    n, memory = 5, 3
+    op = LBFGSOperator(n, LBFGSOptions(memory=memory))
+    for k in range(2 * memory + 1):
+        delta = array(xp, [1.0 + 0.2 * (i + k) for i in range(n)])
+        gamma = array(xp, [1.5 + 0.4 * ((i + 2 * k) % 4) for i in range(n)])
+        op.update(delta, gamma)
+        s, y = op._s, op._y
+        assert s is not None and y is not None
+        s_t = xp.permute_dims(s, (1, 0))
+        y_t = xp.permute_dims(y, (1, 0))
+        ss, sy, yy = op.gram_blocks()
+        assert_allclose(xp, ss, xp.matmul(s_t, s), **tol)
+        assert_allclose(xp, sy, xp.matmul(s_t, y), **tol)
+        assert_allclose(xp, yy, xp.matmul(y_t, y), **tol)
+
+
+def test_lbfgs_apply_does_not_reresolve_namespace(namespace, monkeypatch):
+    """After the first pair the operator knows its namespace; applying it must
+    not call ``array_namespace`` again (one less Python round-trip per matvec)."""
+    from ipax.ipm import hessian as hessian_module
+
+    op = LBFGSOperator(3, LBFGSOptions(memory=2))
+    op.update(array(namespace, [1.0, 0.5, -0.5]), array(namespace, [2.0, 1.0, 0.5]))
+
+    def _forbidden(*arrays):
+        raise AssertionError("array_namespace re-resolved on apply")
+
+    monkeypatch.setattr(hessian_module, "array_namespace", _forbidden)
+    v = array(namespace, [0.3, -0.2, 0.1])
+    op.matvec(v)
+    op.diagonal()
+    op.compact_form()

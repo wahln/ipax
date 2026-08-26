@@ -41,6 +41,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   is assembled from the cached blocks. Round-off differs at machine precision
   from the from-scratch product, so iterate sequences may change in the last
   digits.
+- **Bound-free L-BFGS dense solves skip the `Uᵀ D⁻¹ U` product.** With no
+  bounds `Σ_x ≡ 0` (the driver now declares this via
+  `build_condensed_operator(..., sigma_x_zero=True)`), so `D = (ξ + δ_w)·I`
+  and the Woodbury inner factor is `M − UᵀU/D`; `UᵀU` is assembled in O(k²)
+  from the operator's incrementally maintained `SᵀS`/`SᵀY`/`YᵀY` blocks
+  (`LBFGSOperator.gram_blocks`) instead of the O(n·k²) product per solve. The
+  Woodbury/diagonal-solve helpers and `LBFGSOperator` also take the namespace
+  from the caller (or remember it from the first pair) rather than
+  re-resolving it from every intermediate array.
 
 ## [0.10.0] - 2026-08-11
 
