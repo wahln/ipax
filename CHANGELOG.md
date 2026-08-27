@@ -6,6 +6,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-27
+
+### Changed
+- **Problem callbacks are evaluated once per point.** The driver memoizes
+  objective, gradient, constraint and Jacobian values at recently visited
+  primal points (keyed by array identity, no device sync) and adopts the
+  line search's accepted trial array as the next iterate, so the loop-top
+  evaluation, the `phi0`/`theta0` merit re-evaluation, the L-BFGS overshoot
+  gradient guard and the second-order correction all reuse what was already
+  computed. On 100-d Rosenbrock this takes ipax from 3.15 `f` / 2.0 `∇f` per
+  iteration to 1.15 / 1.0 — SciPy L-BFGS-B parity at an identical iterate
+  sequence — and a small constrained NLP from 5.1 to 3.0 constraint
+  evaluations per iteration (the remainder are the corrector's own probe
+  points). Iterates are bitwise unchanged; regression tests pin the counts.
+  The cache retains only the current iterate when the loop advances, so no
+  stale Jacobians outlive their iteration.
+- **Less per-iteration overhead in the IPM loop.** The inertia check asks the
+  linear solver for an inertia *before* computing the target (dense/Krylov
+  solvers never report one, so the L-BFGS middle-block eigensolve it cost every
+  step is gone); bound-free problems skip the masked bound arithmetic in the
+  merit function, its directional derivative, the KKT residual, the
+  fraction-to-boundary rule, the condensed RHS and the step recovery; and the
+  Lagrangian gradient is formed once per iteration for both the KKT residual
+  and the L-BFGS curvature pair instead of twice.
+- **Fewer host syncs per IPM iteration.** The merit function, its directional
+  derivative, the feasibility measures, the KKT residual and the
+  fraction-to-boundary rule now reduce their per-block scalars on the device
+  and read back once (`ipax.ipm.barrier.boundary_ratio` is the device-side
+  half of `fraction_to_boundary`), and the descent-enforcement probe's
+  directional derivative is reused by the line search. Measured on Torch:
+  60 → 29 host syncs per iteration on HS71 (equalities, inequalities and
+  bounds), 15 → 12 on unconstrained Rosenbrock; a regression test pins the
+  budgets.
+- **L-BFGS Gram blocks are maintained incrementally.** `SᵀS` and `SᵀY` are
+  bordered by the new pair (O(n·k)) and sliced when a pair drops, instead of
+  being recomputed from scratch (O(n·k²)) on every update; the compact `M`
+  is assembled from the cached blocks. Round-off differs at machine precision
+  from the from-scratch product, so iterate sequences may change in the last
+  digits.
+- **Bound-free L-BFGS dense solves skip the `Uᵀ D⁻¹ U` product.** With no
+  bounds `Σ_x ≡ 0` (the driver now declares this via
+  `build_condensed_operator(..., sigma_x_zero=True)`), so `D = (ξ + δ_w)·I`
+  and the Woodbury inner factor is `M − UᵀU/D`; `UᵀU` is assembled in O(k²)
+  from the operator's incrementally maintained `SᵀS`/`SᵀY`/`YᵀY` blocks
+  (`LBFGSOperator.gram_blocks`) instead of the O(n·k²) product per solve. The
+  Woodbury/diagonal-solve helpers and `LBFGSOperator` also take the namespace
+  from the caller (or remember it from the first pair) rather than
+  re-resolving it from every intermediate array.
+
 ## [0.10.0] - 2026-08-11
 
 ### Added
@@ -1630,7 +1679,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/wahln/ipax/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/wahln/ipax/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/wahln/ipax/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/wahln/ipax/compare/v0.7.0...v0.8.0

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from ipax.linalg.regularize import RegularizationState
-    from ipax.typing import Array
+    from ipax.typing import Array, Namespace
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,31 +187,45 @@ def _logical_assembly(op: LinearOperator) -> _Assembly:
     return _Assembly(rows, cols, values, logical_size=shape[0])
 
 
-def _woodbury_factors(
-    d: Array, u: Array, m: Array
-) -> tuple[Array, Array, Array, Array]:
+_WoodburyFactors = tuple["Array | float", "Array", "Array", "Array"]
+
+
+def _woodbury_factors(d: Array, u: Array, m: Array, xp: Namespace) -> _WoodburyFactors:
     """Precompute the reusable pieces of ``(diag(d) − U M⁻¹ Uᵀ)⁻¹``.
 
     Returns ``(d, D⁻¹U, Uᵀ, M − Uᵀ D⁻¹ U)``. The inner ``r × r`` factor is the
     expensive part, so callers that apply the inverse repeatedly (the L-BFGS Krylov
     preconditioner) factor once and reuse across :func:`_woodbury_solve` applies.
     """
-    xp = array_namespace(d, u, m)
     inv_d_u = u / xp.expand_dims(d, axis=1)
     u_t = xp.permute_dims(u, (1, 0))
     inner = m - xp.matmul(u_t, inv_d_u)
     return d, inv_d_u, u_t, inner
 
 
-def _woodbury_solve(factors: tuple[Array, Array, Array, Array], rhs: Array) -> Array:
+def _woodbury_factors_scalar(
+    d: float, u: Array, m: Array, gram_u: Array, xp: Namespace
+) -> _WoodburyFactors:
+    """:func:`_woodbury_factors` for a *scalar* ``D = d·I`` with ``UᵀU`` known.
+
+    ``Uᵀ D⁻¹ U = UᵀU / d``, so the inner factor is assembled in O(r²) from the
+    cached Gram ``gram_u`` instead of the O(n·r²) product — the bound-free
+    L-BFGS case, where ``D = ξ + δ_w`` and ``UᵀU`` comes from the operator's
+    incrementally maintained blocks (:meth:`LBFGSOperator.gram_blocks`).
+    """
+    u_t = xp.permute_dims(u, (1, 0))
+    return d, u / d, u_t, m - gram_u / d
+
+
+def _woodbury_solve(factors: _WoodburyFactors, rhs: Array, xp: Namespace) -> Array:
     """Apply ``(diag(d) − U M⁻¹ Uᵀ)⁻¹`` to ``rhs`` from :func:`_woodbury_factors`.
 
     ``rhs`` may be a vector or a matrix (columns solved independently): one
     diagonal inverse plus one ``r × r`` solve, never forming the ``n × n`` operator.
+    ``d`` is a vector or, from :func:`_woodbury_factors_scalar`, a Python float.
     """
     d, inv_d_u, u_t, inner = factors
-    xp = array_namespace(rhs, inv_d_u)
-    if len(rhs.shape) == 1:
+    if len(rhs.shape) == 1 or isinstance(d, float):
         inv_d_rhs = rhs / d
     elif len(rhs.shape) == 2:
         inv_d_rhs = rhs / xp.expand_dims(d, axis=1)
@@ -221,9 +235,18 @@ def _woodbury_solve(factors: tuple[Array, Array, Array, Array], rhs: Array) -> A
     return inv_d_rhs + xp.matmul(inv_d_u, z)
 
 
-def _diagonal_solve(d: Array, rhs: Array) -> Array:
+def _lbfgs_gram_u(
+    xi: float, blocks: tuple[Array, Array, Array], xp: Namespace
+) -> Array:
+    """``UᵀU`` for the compact factor ``U = [ξS  Y]`` from ``(SᵀS, SᵀY, YᵀY)``."""
+    ss, sy, yy = blocks
+    top = xp.concat((xi * xi * ss, xi * sy), axis=1)
+    bottom = xp.concat((xi * xp.permute_dims(sy, (1, 0)), yy), axis=1)
+    return xp.concat((top, bottom), axis=0)
+
+
+def _diagonal_solve(d: Array, rhs: Array, xp: Namespace) -> Array:
     """Apply ``diag(d)^-1`` to a vector or columns of a matrix RHS."""
-    xp = array_namespace(d, rhs)
     if len(rhs.shape) == 1:
         return rhs / d
     if len(rhs.shape) == 2:
@@ -267,6 +290,8 @@ class _CondensedOperator(LinearOperator):
         sigma_s: LinearOperator,
         ineq_jac: LinearOperator,
         delta_w: float,
+        *,
+        sigma_x_zero: bool = False,
     ) -> None:
         if W.shape[0] != W.shape[1]:
             raise ValueError("W must be square")
@@ -281,6 +306,9 @@ class _CondensedOperator(LinearOperator):
         self._sigma_s = sigma_s
         self._ineq_jac = ineq_jac
         self._delta_w = delta_w
+        # Declared by the driver for bound-free problems (``Σ_x`` is then an
+        # all-zero diagonal); lets the structured solve treat ``D`` as scalar.
+        self._sigma_x_zero = sigma_x_zero
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -518,12 +546,13 @@ class _CondensedOperator(LinearOperator):
             raise NotImplementedError(
                 "structured dense solve requires a diagonal Sigma_x block"
             )
+        xp = array_namespace(rhs)
         sigma_x = self._sigma_x.diagonal()
         if isinstance(self._W, (Diagonal, Identity)):
             d = self._W.diagonal(sigma_x) + sigma_x
             if self._delta_w != 0.0:
                 d = d + self._delta_w
-            return _diagonal_solve(d, rhs)
+            return _diagonal_solve(d, rhs, xp)
 
         compact_form = getattr(self._W, "compact_form", None)
         if compact_form is None:
@@ -531,10 +560,20 @@ class _CondensedOperator(LinearOperator):
                 "structured dense solve requires an L-BFGS compact Hessian"
             )
         xi, u, m_lbfgs = compact_form()
+        gram_blocks = getattr(self._W, "gram_blocks", None)
+        if self._sigma_x_zero and gram_blocks is not None:
+            # Σ_x ≡ 0 ⇒ D = (ξ + δ_w)·I: the inner factor needs only UᵀU, which
+            # the L-BFGS operator maintains incrementally (O(k²) here instead
+            # of the O(n·k²) Uᵀ D⁻¹ U product).
+            gram_u = _lbfgs_gram_u(xi, gram_blocks(), xp)
+            factors = _woodbury_factors_scalar(
+                xi + self._delta_w, u, m_lbfgs, gram_u, xp
+            )
+            return _woodbury_solve(factors, rhs, xp)
         d = xi + sigma_x
         if self._delta_w != 0.0:
             d = d + self._delta_w
-        return _woodbury_solve(_woodbury_factors(d, u, m_lbfgs), rhs)
+        return _woodbury_solve(_woodbury_factors(d, u, m_lbfgs, xp), rhs, xp)
 
     def diagonal(self, like: Array | None = None) -> Array:
         """Cheap diagonal for Jacobi preconditioning.
@@ -877,8 +916,9 @@ class _CondensedOperator(LinearOperator):
 
         # Factor the 2k×2k inner block once (nonsingular for PD N); each apply is
         # then one diagonal inverse plus one small solve via Sherman–Morrison–Woodbury.
-        factors = _woodbury_factors(d_tilde, u, m_lbfgs)
-        return lambda r: _woodbury_solve(factors, r)
+        xp = array_namespace(d_tilde)
+        factors = _woodbury_factors(d_tilde, u, m_lbfgs, xp)
+        return lambda r: _woodbury_solve(factors, r, xp)
 
 
 def build_condensed_operator(
@@ -887,9 +927,17 @@ def build_condensed_operator(
     sigma_s: LinearOperator,
     ineq_jac: LinearOperator,
     reg: RegularizationState,
+    *,
+    sigma_x_zero: bool = False,
 ) -> LinearOperator:
-    """Assemble the condensed normal-equations operator."""
-    return _CondensedOperator(W, sigma_x, sigma_s, ineq_jac, reg.delta_w)
+    """Assemble the condensed normal-equations operator.
+
+    ``sigma_x_zero`` declares that ``sigma_x`` is identically zero (a problem
+    without bounds), which unlocks the cached-Gram structured solve.
+    """
+    return _CondensedOperator(
+        W, sigma_x, sigma_s, ineq_jac, reg.delta_w, sigma_x_zero=sigma_x_zero
+    )
 
 
 class _SaddleOperator(LinearOperator):

@@ -201,3 +201,73 @@ def test_lbfgs_run_matches_exact_optimum_with_bounded_overhead(namespace):
         namespace, lbfgs.x, exact_problem.known_solution(), rtol=1e-6, atol=1e-6
     )
     assert lbfgs.n_iter <= 3 * exact.n_iter + 10
+
+
+def test_lbfgs_incremental_gram_blocks_match_from_scratch(namespace, tol):
+    """The compact ``M`` is assembled from incrementally bordered ``SᵀS``/``SᵀY``
+    blocks (appended per pair, sliced on drop); it must equal the from-scratch
+    construction at every window size, including after pairs fall out."""
+    xp = namespace
+    n, memory = 6, 3
+    op = LBFGSOperator(n, LBFGSOptions(memory=memory))
+    for k in range(2 * memory + 1):
+        delta = array(xp, [1.0 + 0.1 * (i + k) for i in range(n)])
+        gamma = array(xp, [2.0 + 0.3 * (i * k % 5) for i in range(n)])
+        op.update(delta, gamma)
+        s, y = op._s, op._y
+        assert s is not None and y is not None
+        assert int(s.shape[1]) == min(k + 1, memory)
+        s_t = xp.permute_dims(s, (1, 0))
+        assert_allclose(xp, op._ss, xp.matmul(s_t, s), **tol)
+        assert_allclose(xp, op._sy, xp.matmul(s_t, y), **tol)
+        kk = int(s.shape[1])
+        xi = op._xi
+        s_y = xp.matmul(s_t, y)
+        lower = xp.tril(s_y, k=-1)
+        d_mat = xp.eye(kk, dtype=s.dtype) * xp.sum(s * y, axis=0)
+        expected_m = xp.concat(
+            (
+                xp.concat((xi * xp.matmul(s_t, s), lower), axis=1),
+                xp.concat((xp.permute_dims(lower, (1, 0)), -d_mat), axis=1),
+            ),
+            axis=0,
+        )
+        assert_allclose(xp, op._m, expected_m, **tol)
+
+
+def test_lbfgs_gram_blocks_match_from_scratch(namespace, tol):
+    """``gram_blocks()`` returns ``(SᵀS, SᵀY, YᵀY)`` maintained incrementally;
+    all three must equal the from-scratch products at every window size."""
+    xp = namespace
+    n, memory = 5, 3
+    op = LBFGSOperator(n, LBFGSOptions(memory=memory))
+    for k in range(2 * memory + 1):
+        delta = array(xp, [1.0 + 0.2 * (i + k) for i in range(n)])
+        gamma = array(xp, [1.5 + 0.4 * ((i + 2 * k) % 4) for i in range(n)])
+        op.update(delta, gamma)
+        s, y = op._s, op._y
+        assert s is not None and y is not None
+        s_t = xp.permute_dims(s, (1, 0))
+        y_t = xp.permute_dims(y, (1, 0))
+        ss, sy, yy = op.gram_blocks()
+        assert_allclose(xp, ss, xp.matmul(s_t, s), **tol)
+        assert_allclose(xp, sy, xp.matmul(s_t, y), **tol)
+        assert_allclose(xp, yy, xp.matmul(y_t, y), **tol)
+
+
+def test_lbfgs_apply_does_not_reresolve_namespace(namespace, monkeypatch):
+    """After the first pair the operator knows its namespace; applying it must
+    not call ``array_namespace`` again (one less Python round-trip per matvec)."""
+    from ipax.ipm import hessian as hessian_module
+
+    op = LBFGSOperator(3, LBFGSOptions(memory=2))
+    op.update(array(namespace, [1.0, 0.5, -0.5]), array(namespace, [2.0, 1.0, 0.5]))
+
+    def _forbidden(*arrays):
+        raise AssertionError("array_namespace re-resolved on apply")
+
+    monkeypatch.setattr(hessian_module, "array_namespace", _forbidden)
+    v = array(namespace, [0.3, -0.2, 0.1])
+    op.matvec(v)
+    op.diagonal()
+    op.compact_form()

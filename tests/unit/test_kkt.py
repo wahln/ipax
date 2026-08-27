@@ -662,10 +662,10 @@ def test_diagonal_solve_vector_and_bad_rank(namespace, tol):
     from ipax.ipm.kkt import _diagonal_solve
 
     d = array(namespace, [2.0, 4.0])
-    actual = _diagonal_solve(d, array(namespace, [1.0, 2.0]))
+    actual = _diagonal_solve(d, array(namespace, [1.0, 2.0]), namespace)
     assert_allclose(namespace, actual, array(namespace, [0.5, 0.5]), **tol)
     with pytest.raises(ValueError, match="vector or matrix"):
-        _diagonal_solve(d, namespace.zeros((2, 1, 1), dtype=d.dtype))
+        _diagonal_solve(d, namespace.zeros((2, 1, 1), dtype=d.dtype), namespace)
 
 
 def test_woodbury_solve_rejects_bad_rank(namespace):
@@ -674,9 +674,9 @@ def test_woodbury_solve_rejects_bad_rank(namespace):
     d = array(namespace, [2.0, 2.0])
     u = array(namespace, [[1.0], [0.5]])
     m = array(namespace, [[3.0]])
-    factors = _woodbury_factors(d, u, m)
+    factors = _woodbury_factors(d, u, m, namespace)
     with pytest.raises(ValueError, match="vector or matrix"):
-        _woodbury_solve(factors, namespace.zeros((2, 1, 1), dtype=d.dtype))
+        _woodbury_solve(factors, namespace.zeros((2, 1, 1), dtype=d.dtype), namespace)
 
 
 # --- batched transposes (symmetric blocks: A.T @ V == A @ V) ----------------
@@ -1249,3 +1249,70 @@ def test_saddle_augmented_dense_matrix_without_equalities_is_the_condensed_block
         condensed.augmented_dense_matrix(),
         **tol,
     )
+
+
+def test_condensed_dense_structured_solve_cached_gram_without_bounds(
+    namespace, tol, monkeypatch
+):
+    """Bound-free L-BFGS systems (``Σ_x ≡ 0``, declared by the driver via
+    ``sigma_x_zero``) have a scalar ``D = ξ + δ_w``, so the Woodbury inner
+    factor ``M − UᵀU/D`` comes from the operator's cached Gram blocks in O(k²)
+    — the O(n·k²) ``Uᵀ D⁻¹ U`` product must not be formed."""
+    from ipax.ipm import kkt as kkt_module
+
+    W = _lbfgs_operator(namespace)
+    zeros = namespace.zeros((3,), dtype=array(namespace, [0.0]).dtype)
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=zeros.dtype))
+    rhs = array(namespace, [1.0, -2.0, 0.5])
+    op = build_condensed_operator(
+        W,
+        Diagonal(zeros),
+        empty_sigma_s,
+        empty_jac,
+        RegularizationState(delta_w=1e-3),
+        sigma_x_zero=True,
+    )
+    dense = op.matmat(namespace.eye(3, dtype=rhs.dtype))
+    expected = namespace.linalg.solve(dense, rhs)
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("Uᵀ D⁻¹ U must come from the cached Gram blocks")
+
+    monkeypatch.setattr(kkt_module, "_woodbury_factors", _forbidden)
+    assert_allclose(namespace, op.dense_structured_solve(rhs), expected, **tol)
+    # Matrix right-hand sides take the same path.
+    rhs2 = namespace.stack((rhs, 2.0 * rhs), axis=1)
+    assert_allclose(
+        namespace,
+        op.dense_structured_solve(rhs2),
+        namespace.linalg.solve(dense, rhs2),
+        **tol,
+    )
+
+
+def test_condensed_dense_structured_solve_resolves_namespace_once(
+    namespace, monkeypatch
+):
+    """The per-solve helpers take ``xp`` from the caller instead of re-resolving
+    it from every intermediate array."""
+    from ipax.ipm import kkt as kkt_module
+
+    W = _lbfgs_operator(namespace)
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype))
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+    calls = 0
+    original = kkt_module.array_namespace
+
+    def _counting(*arrays):
+        nonlocal calls
+        calls += 1
+        return original(*arrays)
+
+    monkeypatch.setattr(kkt_module, "array_namespace", _counting)
+    op.dense_structured_solve(array(namespace, [1.0, -2.0, 0.5]))
+    assert calls <= 1, calls

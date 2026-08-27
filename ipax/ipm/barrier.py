@@ -244,34 +244,52 @@ def complementarity_measures(
     return float(total) / n_pairs, (0.0 if math.isinf(minimum) else minimum)
 
 
-def fraction_to_boundary(v: Array, dv: Array, tau: float) -> float:
-    """Largest ``alpha`` in ``[0, 1]`` preserving ``v + alpha * dv >= (1 - tau) * v``."""
+def boundary_ratio(v: Array, dv: Array, tau: float) -> Array:
+    """Device-side fraction-to-boundary bound as a 0-d array.
+
+    ``min_i τ v_i / (−dv_i)`` over the blocking components (``+inf`` when none
+    block): only components moving toward the boundary (``dv < 0``) limit the
+    step (Wächter & Biegler 2006, eq. (15)). This is the device-side half of
+    :func:`fraction_to_boundary`; callers combining several blocks (slacks,
+    lower and upper bounds) stack these and reduce once, so the whole rule
+    costs a single host sync instead of one per block.
+    """
     if len(v.shape) != 1 or len(dv.shape) != 1:
         raise ValueError("fraction-to-boundary expects rank-1 vectors")
     if v.shape != dv.shape:
         raise ValueError("v and dv must have the same shape")
     if not 0.0 < tau <= 1.0:
         raise ValueError("tau must be in (0, 1]")
-
-    if int(v.shape[0]) == 0:
-        return 1.0
-
-    # Only components moving toward the boundary (dv < 0) limit the step; for
-    # those alpha_i = tau * v_i / (-dv_i) (Wachter & Biegler 2006, eq. 15).
-    # Vectorized so the whole rule costs a single host<->device sync (the final
-    # float()) rather than one per element — the element-wise Python loop made
-    # this O(n) syncs/call and dominated GPU iteration time.
     xp = array_namespace(v, dv)
     blocking = dv < 0.0
     safe_denom = xp.where(blocking, -dv, xp.ones_like(dv))
     ratios = xp.where(blocking, tau * v / safe_denom, xp.full_like(v, math.inf))
-    alpha = float(xp.min(ratios))
+    return xp.min(ratios)
+
+
+def fraction_to_boundary(v: Array, dv: Array, tau: float) -> float:
+    """Largest ``alpha`` in ``[0, 1]`` preserving ``v + alpha * dv >= (1 - tau) * v``.
+
+    Vectorized so the rule costs a single host<->device sync (the final
+    ``float()``) rather than one per element — the element-wise Python loop
+    made this O(n) syncs/call and dominated GPU iteration time.
+    """
+    if len(v.shape) != 1 or len(dv.shape) != 1:
+        raise ValueError("fraction-to-boundary expects rank-1 vectors")
+    if v.shape != dv.shape:
+        raise ValueError("v and dv must have the same shape")
+    if not 0.0 < tau <= 1.0:
+        raise ValueError("tau must be in (0, 1]")
+    if int(v.shape[0]) == 0:
+        return 1.0
+    alpha = float(boundary_ratio(v, dv, tau))
     return max(0.0, min(1.0, alpha))
 
 
 __all__ = [
     "FreeModeMonitor",
     "adaptive_mu",
+    "boundary_ratio",
     "breedveld_mu",
     "complementarity_measures",
     "fallback_mu",

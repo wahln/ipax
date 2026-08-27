@@ -77,3 +77,37 @@ def test_fraction_to_boundary_matches_elementwise_reference(namespace):
 
     alpha = fraction_to_boundary(array(namespace, raw_v), array(namespace, raw_dv), tau)
     assert_scalar_close(alpha, expected)
+
+
+def test_boundary_ratio_is_the_device_side_half_of_fraction_to_boundary(namespace):
+    """``boundary_ratio`` returns the unclamped 0-d minimum ratio; clamping
+    it to [0, 1] reproduces ``fraction_to_boundary`` exactly."""
+    from ipax.ipm.barrier import boundary_ratio
+
+    v = array(namespace, [1.0, 2.0, 0.5, 4.0])
+    dv = array(namespace, [-0.5, 1.0, -2.0, -0.1])
+    ratio = float(boundary_ratio(v, dv, tau=0.95))
+    assert_scalar_close(ratio, 0.95 * 0.5 / 2.0)
+    assert_scalar_close(fraction_to_boundary(v, dv, tau=0.95), min(1.0, ratio))
+    # Nothing blocking: +inf on the device side, 1.0 after clamping.
+    none = float(boundary_ratio(v, array(namespace, [0.0, 1.0, 2.0, 3.0]), 0.95))
+    assert none == float("inf")
+
+
+def test_boundary_ratio_validates_inputs(namespace):
+    import pytest
+
+    from ipax.ipm.barrier import boundary_ratio
+
+    v = array(namespace, [1.0, 2.0])
+    dv = array(namespace, [-1.0, -1.0])
+    with pytest.raises(ValueError, match="rank-1"):
+        boundary_ratio(
+            array(namespace, [[1.0, 2.0]]), array(namespace, [[-1.0, -1.0]]), 0.5
+        )
+    with pytest.raises(ValueError, match="same shape"):
+        boundary_ratio(v, array(namespace, [-1.0]), 0.5)
+    with pytest.raises(ValueError, match="tau"):
+        boundary_ratio(v, dv, 0.0)
+    with pytest.raises(ValueError, match="tau"):
+        fraction_to_boundary(array(namespace, []), array(namespace, []), 1.5)

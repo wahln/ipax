@@ -58,10 +58,10 @@ from ipax.backend.operators import (
 from ipax.ipm.barrier import (
     FreeModeMonitor,
     adaptive_mu,
+    boundary_ratio,
     breedveld_mu,
     complementarity_measures,
     fallback_mu,
-    fraction_to_boundary,
     update_mu,
 )
 from ipax.ipm.breedveld_ls import BreedveldController
@@ -211,6 +211,33 @@ def _norm1(xp: Namespace, v: Array) -> float:
     return float(xp.sum(xp.abs(v)))
 
 
+def _clamped_min(xp: Namespace, ratios: list[Array]) -> float:
+    """Fraction-to-boundary step from per-block ratios: ``min(1, min ratios)``,
+    floored at zero, in a single host sync (1.0 when nothing can block)."""
+    if not ratios:
+        return 1.0
+    alpha = float(ratios[0]) if len(ratios) == 1 else float(xp.min(xp.stack(ratios)))
+    return max(0.0, min(1.0, alpha))
+
+
+def _max_of(xp: Namespace, parts: list[Array]) -> float:
+    """``max`` of device-side scalars with a single host sync (0.0 if empty)."""
+    if not parts:
+        return 0.0
+    if len(parts) == 1:
+        return float(parts[0])
+    return float(xp.max(xp.stack(parts)))
+
+
+def _sum_of(xp: Namespace, parts: list[Array]) -> float:
+    """``sum`` of device-side scalars with a single host sync (0.0 if empty)."""
+    if not parts:
+        return 0.0
+    if len(parts) == 1:
+        return float(parts[0])
+    return float(xp.sum(xp.stack(parts)))
+
+
 def _within_relaxed_tol(
     optimality: OptimalityConditionOptions, record: IterationRecord
 ) -> bool:
@@ -339,6 +366,60 @@ class _RestorationOutcome:
     mu: float | None = None
 
 
+_MISS = object()
+
+
+class _PointCache:
+    """Memoized problem callbacks at the most recently visited primal points.
+
+    The globalization evaluates ``f``/``c``/``g`` (and, on the L-BFGS route, the
+    gradient) at every trial point; the accepted trial then becomes the next
+    iterate, whose loop-top evaluation would repeat all of them — as would
+    ``phi0``/``theta0`` at the current iterate. Keying by array *identity*
+    keeps the lookup O(1) with no device sync: the driver adopts the trial
+    array object itself on acceptance (see ``run``), so the hit is exact. A
+    fresh array — a restoration or re-centered point — is simply a miss.
+
+    A tiny LRU of ``capacity`` points (current iterate, trial, SOC point) is
+    enough; each entry keeps a strong reference to its array so ``id`` cannot
+    be recycled while cached.
+    """
+
+    __slots__ = ("_capacity", "_entries")
+
+    def __init__(self, capacity: int = 4) -> None:
+        self._capacity = capacity
+        self._entries: dict[int, tuple[Any, dict[str, Any]]] = {}
+
+    def get(self, x: Array, key: str) -> Any:
+        entry = self._entries.get(id(x))
+        if entry is None or entry[0] is not x:
+            return _MISS
+        return entry[1].get(key, _MISS)
+
+    def retain(self, x: Array) -> None:
+        """Drop every cached point except ``x`` (the iterate the loop adopted).
+
+        Called at the top of each iteration so stale Jacobians/operators of
+        rejected trials or previous iterates are released immediately rather
+        than living on until the LRU cycles them out — at 1e5 variables a
+        backlog of explicit Jacobians is a multiplier on peak memory.
+        """
+        entry = self._entries.get(id(x))
+        self._entries.clear()
+        if entry is not None and entry[0] is x:
+            self._entries[id(x)] = entry
+
+    def put(self, x: Array, key: str, value: Any) -> None:
+        entry = self._entries.get(id(x))
+        if entry is None or entry[0] is not x:
+            if len(self._entries) >= self._capacity:
+                del self._entries[next(iter(self._entries))]
+            entry = (x, {})
+            self._entries[id(x)] = entry
+        entry[1][key] = value
+
+
 class IPMDriver:
     """Primal–dual interior-point iteration (condensed normal-equations route)."""
 
@@ -380,6 +461,11 @@ class IPMDriver:
         if self._mu_schedule in ("probing", "quality") and not self._corrector.active:
             self._corrector = CenteringOnly()
         self._problem_time_total = 0.0
+        self._cache = _PointCache()
+        # Whether any finite lower/upper bound exists; refined in ``run`` from
+        # the masks so bound-free problems skip the bound arithmetic entirely.
+        self._has_lower = lower is not None
+        self._has_upper = upper is not None
         self._linear_eq_data = self._normalize_linear_eq(problem.linear_eq())
         self._n = int(problem.n_vars)
         # Derivative provenance from the resolver (§3.3); surfaced in Result.
@@ -409,31 +495,68 @@ class IPMDriver:
         finally:
             self._problem_time_total += perf_counter() - start
 
+    def _cached(self, x: Array, key: str, compute: Callable[[], T]) -> T:
+        """Memoize ``compute()`` at the point ``x`` (see :class:`_PointCache`)."""
+        hit = self._cache.get(x, key)
+        if hit is not _MISS:
+            return hit  # type: ignore[no-any-return]
+        value = compute()
+        self._cache.put(x, key, value)
+        return value
+
     def _gradient(self, x: Array) -> Array:
-        return self._time_problem_call(lambda: self._problem.gradient(x))
+        return self._cached(
+            x,
+            "grad",
+            lambda: self._time_problem_call(lambda: self._problem.gradient(x)),
+        )
 
     def _objective(self, x: Array) -> float:
-        return float(self._time_problem_call(lambda: self._problem.objective(x)))
+        return self._cached(
+            x,
+            "f",
+            lambda: float(self._time_problem_call(lambda: self._problem.objective(x))),
+        )
 
     def _ineq(self, x: Array) -> Array:
         if not self._has_ineq:
             return self._xp.zeros((0,), dtype=x.dtype)
-        return self._time_problem_call(lambda: self._problem.ineq_constraints(x))
+        return self._cached(
+            x,
+            "g",
+            lambda: self._time_problem_call(lambda: self._problem.ineq_constraints(x)),
+        )
 
     def _ineq_jac(self, x: Array) -> LinearOperator:
         if not self._has_ineq:
             return Dense(self._xp.zeros((0, self._n), dtype=x.dtype))
-        jacobian = self._time_problem_call(lambda: self._problem.ineq_jacobian(x))
-        return as_operator(jacobian)
+        return self._cached(
+            x,
+            "ineq_jac",
+            lambda: as_operator(
+                self._time_problem_call(lambda: self._problem.ineq_jacobian(x))
+            ),
+        )
 
     def _eq(self, x: Array) -> Array:
         """Combined equalities ``c(x)``: nonlinear stacked with ``A x − b``."""
+        if not self._has_eq and self._linear_eq_data is None:
+            return self._xp.zeros((0,), dtype=x.dtype)
+        return self._cached(x, "c", lambda: self._eq_uncached(x))
+
+    def _eq_nonlinear(self, x: Array) -> Array:
+        """Nonlinear equalities only (cached; the setup counts them separately)."""
+        return self._cached(
+            x,
+            "c_nonlinear",
+            lambda: self._time_problem_call(lambda: self._problem.eq_constraints(x)),
+        )
+
+    def _eq_uncached(self, x: Array) -> Array:
         xp = self._xp
         parts: list[Array] = []
         if self._has_eq:
-            parts.append(
-                self._time_problem_call(lambda: self._problem.eq_constraints(x))
-            )
+            parts.append(self._eq_nonlinear(x))
         if self._linear_eq_data is not None:
             a_op, b = self._linear_eq_data
             parts.append(a_op.matvec(x) - b)
@@ -445,6 +568,11 @@ class IPMDriver:
 
     def _eq_jac(self, x: Array) -> LinearOperator:
         """Combined equality Jacobian ``∇c(x)`` as a ``LinearOperator``."""
+        if not self._has_eq and self._linear_eq_data is None:
+            return Dense(self._xp.zeros((0, self._n), dtype=x.dtype))
+        return self._cached(x, "eq_jac", lambda: self._eq_jac_uncached(x))
+
+    def _eq_jac_uncached(self, x: Array) -> LinearOperator:
         ops: list[LinearOperator] = []
         if self._has_eq:
             jacobian = self._time_problem_call(lambda: self._problem.eq_jacobian(x))
@@ -583,40 +711,61 @@ class IPMDriver:
         eq_jac: LinearOperator,
         m_eq: int,
         y_eq: Array,
+        lagrangian_grad: Array | None = None,
     ) -> KKTResiduals:
-        """Scaled KKT ∞-norm with IPOPT ``s_d, s_c`` scaling (§4.5)."""
+        """Scaled KKT ∞-norm with IPOPT ``s_d, s_c`` scaling (§4.5).
+
+        ``lagrangian_grad`` optionally supplies ``∇f + ∇cᵀy + ∇gᵀλ`` already
+        formed by the caller (the L-BFGS curvature pair needs the same vector),
+        saving the two Jacobian-transpose products.
+        """
         xp = self._xp
-        r_d = grad
-        if m > 0:
-            r_d = r_d + ineq_jac.rmatvec(y_ineq)
-        if m_eq > 0:
-            r_d = r_d + eq_jac.rmatvec(y_eq)
-        r_d = r_d - z_lower + z_upper
+        if lagrangian_grad is None:
+            lagrangian_grad = self._lagrangian_gradient(
+                grad, ineq_jac, eq_jac, y_eq, y_ineq, m, m_eq
+            )
+        r_d = lagrangian_grad
+        if self._has_lower:
+            r_d = r_d - z_lower
+        if self._has_upper:
+            r_d = r_d + z_upper
         dual_inf = _norm_inf(xp, r_d)
 
-        prim = _norm_inf(xp, g + s) if m > 0 else 0.0
-        if m_eq > 0:
-            prim = max(prim, _norm_inf(xp, c))
-
-        compl = 0.0
+        # Each block's reduction stays on the device; one sync per quantity.
+        prim_parts: list[Array] = []
         if m > 0:
-            compl = max(compl, _norm_inf(xp, s * y_ineq - mu))
-        zero = xp.zeros_like(x_minus_l)
-        compl = max(
-            compl, _norm_inf(xp, xp.where(mask_l, x_minus_l * z_lower - mu, zero))
-        )
-        compl = max(
-            compl, _norm_inf(xp, xp.where(mask_u, u_minus_x * z_upper - mu, zero))
-        )
+            prim_parts.append(xp.max(xp.abs(g + s)))
+        if m_eq > 0:
+            prim_parts.append(xp.max(xp.abs(c)))
+        prim = _max_of(xp, prim_parts)
+
+        compl_parts: list[Array] = []
+        if m > 0:
+            compl_parts.append(xp.max(xp.abs(s * y_ineq - mu)))
+        if self._has_lower:
+            zero = xp.zeros_like(x_minus_l)
+            compl_parts.append(
+                xp.max(xp.abs(xp.where(mask_l, x_minus_l * z_lower - mu, zero)))
+            )
+        if self._has_upper:
+            zero = xp.zeros_like(u_minus_x)
+            compl_parts.append(
+                xp.max(xp.abs(xp.where(mask_u, u_minus_x * z_upper - mu, zero)))
+            )
+        compl = _max_of(xp, compl_parts)
 
         n_dual = m + n_bounds + m_eq
         if n_dual > 0:
-            sum_dual = (
-                _norm1(xp, y_ineq)
-                + _norm1(xp, z_lower)
-                + _norm1(xp, z_upper)
-                + _norm1(xp, y_eq)
-            )
+            dual_parts: list[Array] = []
+            if m > 0:
+                dual_parts.append(xp.sum(xp.abs(y_ineq)))
+            if m_eq > 0:
+                dual_parts.append(xp.sum(xp.abs(y_eq)))
+            if self._has_lower:
+                dual_parts.append(xp.sum(xp.abs(z_lower)))
+            if self._has_upper:
+                dual_parts.append(xp.sum(xp.abs(z_upper)))
+            sum_dual = _sum_of(xp, dual_parts)
             s_d = max(_S_MAX, sum_dual / n_dual) / _S_MAX
             s_c = max(_S_MAX, sum_dual / n_dual) / _S_MAX
         else:
@@ -771,14 +920,15 @@ class IPMDriver:
         n = self._n
 
         mask_l, mask_u, lower_safe, upper_safe = self._masks(dtype)
-        n_bounds = int(xp.sum(xp.astype(mask_l, xp.int64))) + int(
-            xp.sum(xp.astype(mask_u, xp.int64))
-        )
+        n_lower = int(xp.sum(xp.astype(mask_l, xp.int64)))
+        n_upper = int(xp.sum(xp.astype(mask_u, xp.int64)))
+        n_bounds = n_lower + n_upper
+        self._has_lower = n_lower > 0
+        self._has_upper = n_upper > 0
 
         m = int(self._ineq(x0).shape[0]) if self._has_ineq else 0
         if self._has_eq:
-            eq0 = self._time_problem_call(lambda: self._problem.eq_constraints(x0))
-            m_nonlinear_eq = int(eq0.shape[0])
+            m_nonlinear_eq = int(self._eq_nonlinear(x0).shape[0])
         else:
             m_nonlinear_eq = 0
         m_eq = int(self._eq(x0).shape[0])
@@ -911,9 +1061,11 @@ class IPMDriver:
         last_line_search_iters = 0
         pending_restored = False
 
+        has_lower, has_upper = self._has_lower, self._has_upper
+
         def bound_gaps(x: Array) -> tuple[Array, Array]:
-            x_minus_l = xp.where(mask_l, x - lower_safe, ones)
-            u_minus_x = xp.where(mask_u, upper_safe - x, ones)
+            x_minus_l = xp.where(mask_l, x - lower_safe, ones) if has_lower else ones
+            u_minus_x = xp.where(mask_u, upper_safe - x, ones) if has_upper else ones
             return x_minus_l, u_minus_x
 
         # Count of logged rows, used to reprint the header periodically.
@@ -921,6 +1073,7 @@ class IPMDriver:
 
         for it in range(opts.max_iter + 1):
             self._step_solve_seconds = 0.0
+            self._cache.retain(x)
             x_minus_l, u_minus_x = bound_gaps(x)
             g = self._ineq(x)
             c = self._eq(x)
@@ -928,15 +1081,18 @@ class IPMDriver:
             ineq_jac = self._ineq_jac(x)
             eq_jac = self._eq_jac(x)
 
+            # ``∇_x L`` at the current multipliers — shared by the KKT residual
+            # and the L-BFGS curvature pair (one pair of Jᵀ products, not two).
+            lagrangian_grad = self._lagrangian_gradient(
+                grad, ineq_jac, eq_jac, y_eq, y_ineq, m, m_eq
+            )
             if use_lbfgs:
                 if prev_x is not None:
                     # prev_* are set together with prev_x at the loop tail.
                     assert prev_grad is not None
                     assert prev_ineq_jac is not None and prev_eq_jac is not None
                     delta = x - prev_x
-                    gamma = self._lagrangian_gradient(
-                        grad, ineq_jac, eq_jac, y_eq, y_ineq, m, m_eq
-                    ) - self._lagrangian_gradient(
+                    gamma = lagrangian_grad - self._lagrangian_gradient(
                         prev_grad, prev_ineq_jac, prev_eq_jac, y_eq, y_ineq, m, m_eq
                     )
                     lbfgs.update(delta, gamma)
@@ -962,7 +1118,9 @@ class IPMDriver:
                 "m_eq": m_eq,
                 "y_eq": y_eq,
             }
-            residuals = self.kkt_error(mu=0.0, **err_kwargs)
+            residuals = self.kkt_error(
+                mu=0.0, lagrangian_grad=lagrangian_grad, **err_kwargs
+            )
             e0 = residuals.error
             # Feed the current outer KKT residual to the linear solver so an
             # iterative route can drive an inexact-Newton forcing sequence (loose
@@ -1117,9 +1275,18 @@ class IPMDriver:
                 break
 
             sigma_s = y_ineq / s if m > 0 else xp.zeros((0,), dtype=dtype)
-            sigma_l = xp.where(mask_l, z_lower / x_minus_l, xp.zeros_like(x))
-            sigma_u = xp.where(mask_u, z_upper / u_minus_x, xp.zeros_like(x))
-            sigma_x = sigma_l + sigma_u
+            zeros_n = xp.zeros_like(x)
+            sigma_l = (
+                xp.where(mask_l, z_lower / x_minus_l, zeros_n) if has_lower else zeros_n
+            )
+            sigma_u = (
+                xp.where(mask_u, z_upper / u_minus_x, zeros_n) if has_upper else zeros_n
+            )
+            sigma_x = (
+                sigma_l + sigma_u
+                if (has_lower and has_upper)
+                else (sigma_l if has_lower else sigma_u)
+            )
 
             r_pi = g + s if m > 0 else xp.zeros((0,), dtype=dtype)
             w = self._hessian(x, y_eq[:m_nonlinear_eq], y_ineq, lbfgs)
@@ -1186,6 +1353,8 @@ class IPMDriver:
                 "u_minus_x": u_minus_x,
                 "mask_l": mask_l,
                 "mask_u": mask_u,
+                "has_lower": has_lower,
+                "has_upper": has_upper,
             }
 
             step_solve_failed = False
@@ -1363,6 +1532,10 @@ class IPMDriver:
             # prescribe when the (1,1) block is not positive definite.
             theta0 = self._theta_l1(x, s, m, m_eq)
             phi0 = self._phi(x, s, mu, m, mask_l, mask_u, lower_safe, upper_safe)
+            # The probe's directional derivative is the line search's ``dphi``
+            # whenever the loop leaves the step unchanged; keep it to avoid a
+            # second evaluation (and host sync).
+            dphi_probe: float | None = None
             if theta0 == 0.0:
                 ascent_noise = _DESCENT_NOISE_FACTOR * max(1.0, abs(phi0))
                 descent_floor = reg_applied
@@ -1372,6 +1545,8 @@ class IPMDriver:
                     )
                     if dphi_probe <= ascent_noise:
                         break
+                    dphi_rejected = dphi_probe
+                    dphi_probe = None  # the step is about to change
                     descent_floor = (
                         opts.regularization.delta_w_init
                         if descent_floor <= 0.0
@@ -1383,7 +1558,7 @@ class IPMDriver:
                         "iter %d: non-descent direction at feasible iterate "
                         "(dphi=%.3e); re-solving with delta_w >= %.2e",
                         it,
-                        dphi_probe,
+                        dphi_rejected,
                         descent_floor,
                     )
                     rhs = self._condensed_rhs(mu, mu, mu, **rhs_kwargs)
@@ -1423,27 +1598,39 @@ class IPMDriver:
                 step, y_ineq, z_lower, z_upper, m, mask_l, mask_u, tau
             )
 
-            # Bind the loop-varying state as defaults (the closure is consumed
-            # within this iteration, but this keeps it explicit and lint-clean).
-            def eval_point(
+            # Trial points by step length, so the overshoot guard, the SOC and
+            # the accepted-step update reuse the very array the line search
+            # evaluated (the point cache is keyed by identity; see _PointCache).
+            trial_points: dict[float, tuple[Array, Array]] = {}
+
+            def trial_point(
                 alpha: float,
                 x: Array = x,
                 s: Array = s,
                 step: NewtonStep = step,
+                trial_points: dict[float, tuple[Array, Array]] = trial_points,
+            ) -> tuple[Array, Array]:
+                point = trial_points.get(alpha)
+                if point is None:
+                    x_t = x + alpha * step.dx
+                    s_t = s + alpha * step.ds if m > 0 else s
+                    point = (x_t, s_t)
+                    trial_points[alpha] = point
+                return point
+
+            # Bind the loop-varying state as defaults (the closure is consumed
+            # within this iteration, but this keeps it explicit and lint-clean).
+            def eval_point(
+                alpha: float,
                 mu: float = mu,
             ) -> tuple[float, float]:
-                x_t = x + alpha * step.dx
-                s_t = s + alpha * step.ds if m > 0 else s
+                x_t, s_t = trial_point(alpha)
                 return (
                     self._theta_l1(x_t, s_t, m, m_eq),
                     self._phi(x_t, s_t, mu, m, mask_l, mask_u, lower_safe, upper_safe),
                 )
 
-            def grad_finite(
-                alpha: float,
-                x: Array = x,
-                step: NewtonStep = step,
-            ) -> bool:
+            def grad_finite(alpha: float) -> bool:
                 """Whether the objective gradient at the trial point is finite.
 
                 A quasi-Newton step can overshoot into a region where θ/φ are
@@ -1452,7 +1639,7 @@ class IPMDriver:
                 the overshoot occurs; the exact route's scaled steps do not need
                 the extra gradient evaluation.
                 """
-                return bool(xp.all(xp.isfinite(self._gradient(x + alpha * step.dx))))
+                return bool(xp.all(xp.isfinite(self._gradient(trial_point(alpha)[0]))))
 
             def kkt_progress(
                 alpha: float,
@@ -1479,8 +1666,7 @@ class IPMDriver:
                 """
                 gamma_e = opts.line_search.feasible_kkt_progress
                 assert gamma_e is not None  # closure only wired when enabled
-                x_t = x + alpha * step.dx
-                s_t = s + alpha * step.ds if m > 0 else s
+                x_t, s_t = trial_point(alpha)
                 x_minus_l_t, u_minus_x_t = bound_gaps(x_t)
                 residuals_t = self.kkt_error(
                     mu=0.0,
@@ -1505,7 +1691,7 @@ class IPMDriver:
                 e_t = residuals_t.error
                 return math.isfinite(e_t) and e_t <= (1.0 - gamma_e) * e0
 
-            soc_primal: tuple[Array, Array] | None = None
+            soc_point: tuple[Array, Array] | None = None
 
             def is_strictly_interior(x_t: Array, s_t: Array) -> bool:
                 if m > 0 and not bool(xp.all(s_t > 0.0)):
@@ -1527,12 +1713,11 @@ class IPMDriver:
                 mu: float = mu,
             ) -> tuple[float, float] | None:
                 """Second-order correction for nonlinear constraint residuals."""
-                nonlocal soc_primal
+                nonlocal soc_point
                 if opts.line_search.max_soc <= 0:
                     return None
 
-                base_x = x + alpha * step.dx
-                base_s = s + alpha * step.ds if m > 0 else s
+                base_x, base_s = trial_point(alpha)
                 corr_x = xp.zeros_like(x)
                 corr_s = xp.zeros_like(s)
                 empty_ineq = xp.zeros((0,), dtype=dtype)
@@ -1578,10 +1763,7 @@ class IPMDriver:
                 if use_lbfgs and not bool(xp.all(xp.isfinite(self._gradient(x_soc)))):
                     return None
 
-                soc_primal = (
-                    alpha * step.dx + corr_x,
-                    alpha * step.ds + corr_s if m > 0 else step.ds,
-                )
+                soc_point = (x_soc, s_soc)
                 return (
                     self._theta_l1(x_soc, s_soc, m, m_eq),
                     self._phi(
@@ -1598,8 +1780,12 @@ class IPMDriver:
 
             # θ0/φ0 were computed above for the descent enforcement; x, s and
             # μ are unchanged since.
-            dphi = self._dphi(
-                x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
+            dphi = (
+                dphi_probe
+                if dphi_probe is not None
+                else self._dphi(
+                    x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
+                )
             )
 
             used_soc = False
@@ -1627,14 +1813,8 @@ class IPMDriver:
                 # first, mirroring IPOPT's RememberCurrentPointAsAccepted: the
                 # margins are what keep the vs-current comparison from
                 # degenerating into a monotone requirement.
-                def eval_point_free(
-                    alpha: float,
-                    x: Array = x,
-                    s: Array = s,
-                    step: NewtonStep = step,
-                ) -> tuple[float, float]:
-                    x_t = x + alpha * step.dx
-                    s_t = s + alpha * step.ds if m > 0 else s
+                def eval_point_free(alpha: float) -> tuple[float, float]:
+                    x_t, s_t = trial_point(alpha)
                     return (self._theta_l1(x_t, s_t, m, m_eq), self._objective(x_t))
 
                 used_free_acceptance = True
@@ -1785,16 +1965,14 @@ class IPMDriver:
                 pending_restored = True
                 continue
 
-            if used_soc and soc_primal is not None:
-                dx_primal, ds_primal = soc_primal
-                x = x + dx_primal
+            # Adopt the evaluated trial arrays themselves (bitwise the same
+            # values as ``x + α Δx``) so the loop-top callbacks hit the cache.
+            if used_soc and soc_point is not None:
+                x, s_next = soc_point
             else:
-                x = x + alpha_p * step.dx
+                x, s_next = trial_point(alpha_p)
             if m > 0:
-                if used_soc and soc_primal is not None:
-                    s = s + ds_primal
-                else:
-                    s = s + alpha_p * step.ds
+                s = s_next
                 y_ineq = y_ineq + alpha_d * step.dy_ineq
             if m_eq > 0:
                 y_eq = y_eq + alpha_p * step.dy_eq
@@ -1992,21 +2170,19 @@ class IPMDriver:
     ) -> float:
         """Original-problem violation: ``c``, ``max(g, 0)`` and bound overshoot."""
         xp = self._xp
-        zero = xp.zeros_like(x)
-        viol = 0.0
+        parts: list[Array] = []
         if m > 0:
-            viol = max(viol, _norm_inf(xp, xp.maximum(g, xp.zeros_like(g))))
+            parts.append(xp.max(xp.maximum(g, xp.zeros_like(g))))
         if m_eq > 0:
-            viol = max(viol, _norm_inf(xp, c))
-        viol = max(
-            viol,
-            _norm_inf(xp, xp.maximum(xp.where(mask_l, lower_safe - x, zero), zero)),
-        )
-        viol = max(
-            viol,
-            _norm_inf(xp, xp.maximum(xp.where(mask_u, x - upper_safe, zero), zero)),
-        )
-        return viol
+            parts.append(xp.max(xp.abs(c)))
+        if self._has_lower or self._has_upper:
+            zero = xp.zeros_like(x)
+        if self._has_lower:
+            parts.append(xp.max(xp.where(mask_l, lower_safe - x, zero)))
+        if self._has_upper:
+            parts.append(xp.max(xp.where(mask_u, x - upper_safe, zero)))
+        # Bound overshoots are clamped at zero by the max with the empty case.
+        return max(0.0, _max_of(xp, parts))
 
     def _next_mu(
         self,
@@ -2111,14 +2287,15 @@ class IPMDriver:
         enters the condensed reduction (§2.3).
         """
         xp = self._xp
-        zeros = xp.zeros_like(grad)
         rhs = -grad
         if m > 0:
             rhs = rhs - ineq_jac.rmatvec(sigma_s * r_pi + target_s / s)
         if m_eq > 0:
             rhs = rhs - eq_jac.rmatvec(y_eq)
-        rhs = rhs + xp.where(mask_l, target_l / x_minus_l, zeros)
-        rhs = rhs - xp.where(mask_u, target_u / u_minus_x, zeros)
+        if self._has_lower:
+            rhs = rhs + xp.where(mask_l, target_l / x_minus_l, xp.zeros_like(grad))
+        if self._has_upper:
+            rhs = rhs - xp.where(mask_u, target_u / u_minus_x, xp.zeros_like(grad))
         return rhs
 
     def _solve_targets_reused_operator(
@@ -2283,13 +2460,15 @@ class IPMDriver:
         (no reliable target) — it returns ``True`` and leaves correction to the
         factorization-failure escalation.
         """
-        target_fn = getattr(operator, "expected_inertia", None)
-        target = target_fn() if target_fn is not None else None
-        if target is None:
-            return True
+        # Ask the solver first: dense/Krylov solvers never report an inertia,
+        # and the target below costs an eigensolve of the L-BFGS middle block.
         inertia_fn = getattr(self._solver, "inertia_or_none", None)
         actual = inertia_fn() if inertia_fn is not None else None
         if actual is None:
+            return True
+        target_fn = getattr(operator, "expected_inertia", None)
+        target = target_fn() if target_fn is not None else None
+        if target is None:
             return True
         return bool(actual == target)
 
@@ -2357,7 +2536,12 @@ class IPMDriver:
 
         for _ in range(_MAX_REG_ATTEMPTS):
             condensed = build_condensed_operator(
-                w, sigma_x_op, sigma_s_op, ineq_jac, reg
+                w,
+                sigma_x_op,
+                sigma_s_op,
+                ineq_jac,
+                reg,
+                sigma_x_zero=not (self._has_lower or self._has_upper),
             )
             if m_eq > 0:
                 operator = build_saddle_operator(condensed, eq_jac, current_delta_c)
@@ -2405,16 +2589,18 @@ class IPMDriver:
         tau: float,
     ) -> float:
         xp = self._xp
-        alpha = 1.0
+        parts: list[Array] = []
         if m > 0:
-            alpha = min(alpha, fraction_to_boundary(s, step.ds, tau))
-        v_l = xp.where(mask_l, x_minus_l, xp.ones_like(x_minus_l))
-        dv_l = xp.where(mask_l, step.dx, xp.zeros_like(x_minus_l))
-        alpha = min(alpha, fraction_to_boundary(v_l, dv_l, tau))
-        v_u = xp.where(mask_u, u_minus_x, xp.ones_like(u_minus_x))
-        dv_u = xp.where(mask_u, -step.dx, xp.zeros_like(u_minus_x))
-        alpha = min(alpha, fraction_to_boundary(v_u, dv_u, tau))
-        return alpha
+            parts.append(boundary_ratio(s, step.ds, tau))
+        if self._has_lower:
+            v_l = xp.where(mask_l, x_minus_l, xp.ones_like(x_minus_l))
+            dv_l = xp.where(mask_l, step.dx, xp.zeros_like(x_minus_l))
+            parts.append(boundary_ratio(v_l, dv_l, tau))
+        if self._has_upper:
+            v_u = xp.where(mask_u, u_minus_x, xp.ones_like(u_minus_x))
+            dv_u = xp.where(mask_u, -step.dx, xp.zeros_like(u_minus_x))
+            parts.append(boundary_ratio(v_u, dv_u, tau))
+        return _clamped_min(xp, parts)
 
     def _alpha_dual(
         self,
@@ -2428,16 +2614,18 @@ class IPMDriver:
         tau: float,
     ) -> float:
         xp = self._xp
-        alpha = 1.0
+        parts: list[Array] = []
         if m > 0:
-            alpha = min(alpha, fraction_to_boundary(y_ineq, step.dy_ineq, tau))
-        v_l = xp.where(mask_l, z_lower, xp.ones_like(z_lower))
-        dv_l = xp.where(mask_l, step.dz_lower, xp.zeros_like(z_lower))
-        alpha = min(alpha, fraction_to_boundary(v_l, dv_l, tau))
-        v_u = xp.where(mask_u, z_upper, xp.ones_like(z_upper))
-        dv_u = xp.where(mask_u, step.dz_upper, xp.zeros_like(z_upper))
-        alpha = min(alpha, fraction_to_boundary(v_u, dv_u, tau))
-        return alpha
+            parts.append(boundary_ratio(y_ineq, step.dy_ineq, tau))
+        if self._has_lower:
+            v_l = xp.where(mask_l, z_lower, xp.ones_like(z_lower))
+            dv_l = xp.where(mask_l, step.dz_lower, xp.zeros_like(z_lower))
+            parts.append(boundary_ratio(v_l, dv_l, tau))
+        if self._has_upper:
+            v_u = xp.where(mask_u, z_upper, xp.ones_like(z_upper))
+            dv_u = xp.where(mask_u, step.dz_upper, xp.zeros_like(z_upper))
+            parts.append(boundary_ratio(v_u, dv_u, tau))
+        return _clamped_min(xp, parts)
 
     def _phi(
         self,
@@ -2453,26 +2641,26 @@ class IPMDriver:
         """Barrier objective ``φ_μ`` (Wächter & Biegler 2006, §2)."""
         xp = self._xp
         val = self._objective(x)
-        x_minus_l = xp.where(mask_l, x - lower_safe, xp.ones_like(x))
-        u_minus_x = xp.where(mask_u, upper_safe - x, xp.ones_like(x))
+        parts: list[Array] = []
         if m > 0:
-            val = val - mu * float(xp.sum(xp.log(s)))
-        val = val - mu * float(
-            xp.sum(xp.where(mask_l, xp.log(x_minus_l), xp.zeros_like(x)))
-        )
-        val = val - mu * float(
-            xp.sum(xp.where(mask_u, xp.log(u_minus_x), xp.zeros_like(x)))
-        )
-        return val
+            parts.append(xp.sum(xp.log(s)))
+        if self._has_lower:
+            x_minus_l = xp.where(mask_l, x - lower_safe, xp.ones_like(x))
+            parts.append(xp.sum(xp.where(mask_l, xp.log(x_minus_l), xp.zeros_like(x))))
+        if self._has_upper:
+            u_minus_x = xp.where(mask_u, upper_safe - x, xp.ones_like(x))
+            parts.append(xp.sum(xp.where(mask_u, xp.log(u_minus_x), xp.zeros_like(x))))
+        return val - mu * _sum_of(xp, parts)
 
     def _theta_l1(self, x: Array, s: Array, m: int, m_eq: int) -> float:
         """Constraint violation ``θ = ‖(c, g+s)‖₁`` used by the filter."""
         xp = self._xp
-        val = 0.0
+        parts: list[Array] = []
         if m > 0:
-            val += _norm1(xp, self._ineq(x) + s)
+            parts.append(xp.sum(xp.abs(self._ineq(x) + s)))
         if m_eq > 0:
-            val += _norm1(xp, self._eq(x))
+            parts.append(xp.sum(xp.abs(self._eq(x))))
+        val = _sum_of(xp, parts)
         return val
 
     def _theta_linf(self, x: Array, s: Array, m: int, m_eq: int) -> float:
@@ -2487,12 +2675,12 @@ class IPMDriver:
         declared it feasible and returned it unchanged.
         """
         xp = self._xp
-        val = 0.0
+        parts: list[Array] = []
         if m > 0:
-            val = max(val, float(xp.max(xp.abs(self._ineq(x) + s))))
+            parts.append(xp.max(xp.abs(self._ineq(x) + s)))
         if m_eq > 0:
-            val = max(val, float(xp.max(xp.abs(self._eq(x)))))
-        return val
+            parts.append(xp.max(xp.abs(self._eq(x))))
+        return _max_of(xp, parts)
 
     def _dphi(
         self,
@@ -2509,16 +2697,18 @@ class IPMDriver:
     ) -> float:
         """Directional derivative ``∇φ_μᵀ d`` along the step."""
         xp = self._xp
-        dd = float(xp.sum(grad * step.dx))
+        parts: list[Array] = [xp.sum(grad * step.dx)]
         if m > 0:
-            dd -= mu * float(xp.sum(step.ds / s))
-        dd -= mu * float(
-            xp.sum(xp.where(mask_l, step.dx / x_minus_l, xp.zeros_like(x)))
-        )
-        dd += mu * float(
-            xp.sum(xp.where(mask_u, step.dx / u_minus_x, xp.zeros_like(x)))
-        )
-        return dd
+            parts.append(-mu * xp.sum(step.ds / s))
+        if self._has_lower:
+            parts.append(
+                -mu * xp.sum(xp.where(mask_l, step.dx / x_minus_l, xp.zeros_like(x)))
+            )
+        if self._has_upper:
+            parts.append(
+                mu * xp.sum(xp.where(mask_u, step.dx / u_minus_x, xp.zeros_like(x)))
+            )
+        return _sum_of(xp, parts)
 
     def _repair_equality_duals(
         self, x: Array, y_eq: Array, m_eq: int, *, factor: float = 1.0
