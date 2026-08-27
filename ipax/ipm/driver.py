@@ -397,6 +397,19 @@ class _PointCache:
             return _MISS
         return entry[1].get(key, _MISS)
 
+    def retain(self, x: Array) -> None:
+        """Drop every cached point except ``x`` (the iterate the loop adopted).
+
+        Called at the top of each iteration so stale Jacobians/operators of
+        rejected trials or previous iterates are released immediately rather
+        than living on until the LRU cycles them out — at 1e5 variables a
+        backlog of explicit Jacobians is a multiplier on peak memory.
+        """
+        entry = self._entries.get(id(x))
+        self._entries.clear()
+        if entry is not None and entry[0] is x:
+            self._entries[id(x)] = entry
+
     def put(self, x: Array, key: str, value: Any) -> None:
         entry = self._entries.get(id(x))
         if entry is None or entry[0] is not x:
@@ -1060,6 +1073,7 @@ class IPMDriver:
 
         for it in range(opts.max_iter + 1):
             self._step_solve_seconds = 0.0
+            self._cache.retain(x)
             x_minus_l, u_minus_x = bound_gaps(x)
             g = self._ineq(x)
             c = self._eq(x)
@@ -1531,7 +1545,8 @@ class IPMDriver:
                     )
                     if dphi_probe <= ascent_noise:
                         break
-                    dphi_probe = None
+                    dphi_rejected = dphi_probe
+                    dphi_probe = None  # the step is about to change
                     descent_floor = (
                         opts.regularization.delta_w_init
                         if descent_floor <= 0.0
@@ -1543,7 +1558,7 @@ class IPMDriver:
                         "iter %d: non-descent direction at feasible iterate "
                         "(dphi=%.3e); re-solving with delta_w >= %.2e",
                         it,
-                        dphi_probe,
+                        dphi_rejected,
                         descent_floor,
                     )
                     rhs = self._condensed_rhs(mu, mu, mu, **rhs_kwargs)
