@@ -17,6 +17,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (5 ms per step at `n = 50k`).
 
 ### Changed
+- **The L-BFGS compact factor stays in S/Y block form on the hot path.** The
+  operator no longer materializes and copies `U = [xiS Y]` (n x 2k) on every
+  curvature update; the matvec, the structured Woodbury solves and the exact
+  inverse consume the `S`/`Y` blocks directly (new `compact_blocks` hook, with
+  `compact_form` materializing on demand for the sparse assembly). The inner
+  Woodbury factor is assembled from three n x k Gram products instead of the
+  2k-wide product. Iterates are unchanged; at n = 50k the per-iteration
+  bookkeeping drops from ~17 to ~13 ms at memory 20 and the memory-50
+  configuration falls from ~88 to ~55 ms/iteration end to end.
 - **Krylov applies the exact L-BFGS inverse on bound-only systems.** With no
   inequality Gram term the condensed Woodbury inverse is the exact `N⁻¹`, so
   the default (`"jacobi"`) and `"auto"` preconditioner modes now use it

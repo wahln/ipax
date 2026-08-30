@@ -84,8 +84,12 @@ class LBFGSOperator(LinearOperator):
         # per-apply paths need not re-resolve it from their inputs.
         self._xp: Namespace | None = None
         # Cached compact-form pieces, rebuilt whenever the history changes.
+        # ``U = [ξS  Y]`` is *not* cached: the hot paths (matvec and the
+        # Woodbury solves in ``ipm/kkt.py``) consume ``S`` and ``Y`` through
+        # :meth:`compact_blocks`, so the n×2k concatenation is only built on
+        # demand for the cold consumers (:meth:`compact_form`, the sparse
+        # assembly) instead of being copied on every update.
         self._xi: float = 1.0
-        self._u: Array | None = None
         self._m: Array | None = None
 
     @property
@@ -108,13 +112,13 @@ class LBFGSOperator(LinearOperator):
         """Namespace of the stored pairs (learned at the first update; resolved
         lazily for operators assembled from explicit factors)."""
         if self._xp is None:
-            assert self._u is not None
-            self._xp = array_namespace(self._u)
+            assert self._s is not None
+            self._xp = array_namespace(self._s)
         return self._xp
 
     def dense_matrix(self, like: Array | None = None) -> Array:
         """Materialize the compact Hessian directly from ``B = xi*I - U M^-1 U.T``."""
-        if self._u is None or self._m is None:
+        if self._s is None or self._m is None:
             if like is None:
                 raise NotImplementedError(
                     "L-BFGS dense matrix requires a template before the first pair"
@@ -123,12 +127,10 @@ class LBFGSOperator(LinearOperator):
             return xp.eye(self._n, dtype=like.dtype)
 
         xp = self._namespace()
-        identity = xp.eye(self._n, dtype=self._u.dtype)
-        correction = xp.matmul(
-            self._u,
-            xp.linalg.solve(self._m, xp.permute_dims(self._u, (1, 0))),
-        )
-        return self._xi * identity - correction
+        xi, u, m = self.compact_form()
+        identity = xp.eye(self._n, dtype=u.dtype)
+        correction = xp.matmul(u, xp.linalg.solve(m, xp.permute_dims(u, (1, 0))))
+        return xi * identity - correction
 
     def _apply(self, x: Array) -> Array:
         """Apply ``B = ξI − U M⁻¹ Uᵀ`` to a vector or a batch of columns.
@@ -137,10 +139,18 @@ class LBFGSOperator(LinearOperator):
         RHS, so the compact form is evaluated in one pass whether ``x`` is 1-D
         (single application) or 2-D (batched materialization for the dense route).
         """
-        if self._u is None or self._m is None:
+        if self._s is None or self._y is None or self._m is None:
             return x  # B = ξI with ξ = 1 (identity seed)
         xp = self._namespace()
-        u_t_x = xp.matmul(xp.permute_dims(self._u, (1, 0)), x)
+        k = int(self._s.shape[1])
+        # ``Uᵀx`` from the S/Y blocks (``U = [ξS  Y]`` is never materialized).
+        u_t_x = xp.concat(
+            (
+                self._xi * xp.matmul(xp.permute_dims(self._s, (1, 0)), x),
+                xp.matmul(xp.permute_dims(self._y, (1, 0)), x),
+            ),
+            axis=0,
+        )
         # A singular middle matrix leaves the low-rank correction undefined, and
         # letting the backend's error escape aborts the whole solve (S2MPJ
         # ``LINSPANH`` on ``lbfgs/krylov``). ``SᵀS`` degenerates when a stored
@@ -164,7 +174,10 @@ class LBFGSOperator(LinearOperator):
             return self._xi * x
         if not bool(xp.all(xp.isfinite(z))):
             return self._xi * x
-        return self._xi * x - xp.matmul(self._u, z)
+        correction = self._xi * xp.matmul(self._s, z[:k, ...]) + xp.matmul(
+            self._y, z[k:, ...]
+        )
+        return self._xi * x - correction
 
     def diagonal(self, like: Array | None = None) -> Array:
         """Diagonal of the compact Hessian ``B = ξI − U M⁻¹ Uᵀ`` (§4.3).
@@ -174,7 +187,7 @@ class LBFGSOperator(LinearOperator):
         pair (``B = I`` then, but no array is on hand to size the result), which
         the Jacobi preconditioner treats as "no diagonal available".
         """
-        if self._u is None or self._m is None:
+        if self._s is None or self._y is None or self._m is None:
             if like is not None:
                 xp = array_namespace(like)
                 return xp.ones((self._n,), dtype=like.dtype)
@@ -183,6 +196,7 @@ class LBFGSOperator(LinearOperator):
             )
         del like
         xp = self._namespace()
+        k = int(self._s.shape[1])
         # z = M⁻¹ Uᵀ (2k×n); (U M⁻¹ Uᵀ)_kk = Σ_j U_kj z_jk.
         #
         # A singular M makes the correction — and therefore the diagonal —
@@ -194,13 +208,22 @@ class LBFGSOperator(LinearOperator):
         # (S2MPJ ``LINSPANH`` on ``lbfgs/krylov``). Backends disagree on how they
         # fail — NumPy raises ``LinAlgError``, Torch its own type, and some
         # return inf/nan — so both paths are covered.
+        u_t = xp.concat(
+            (
+                self._xi * xp.permute_dims(self._s, (1, 0)),
+                xp.permute_dims(self._y, (1, 0)),
+            ),
+            axis=0,
+        )
         try:
-            z = xp.linalg.solve(self._m, xp.permute_dims(self._u, (1, 0)))
+            z = xp.linalg.solve(self._m, u_t)
         except Exception as exc:
             raise NotImplementedError(
                 "L-BFGS diagonal is unavailable: the compact middle matrix is singular"
             ) from exc
-        correction = xp.sum(self._u * xp.permute_dims(z, (1, 0)), axis=1)
+        correction = self._xi * xp.sum(
+            self._s * xp.permute_dims(z[:k, ...], (1, 0)), axis=1
+        ) + xp.sum(self._y * xp.permute_dims(z[k:, ...], (1, 0)), axis=1)
         diagonal = self._xi - correction
         if not bool(xp.all(xp.isfinite(diagonal))):
             raise NotImplementedError(
@@ -217,7 +240,21 @@ class LBFGSOperator(LinearOperator):
         the structured condensed solve keys on this explicitly instead of
         inferring it from :meth:`compact_form` raising.
         """
-        return self._u is not None and self._m is not None
+        return self._s is not None and self._m is not None
+
+    def compact_blocks(self) -> tuple[float, Array, Array, Array]:
+        """Return the compact factors as blocks ``(ξ, S, Y, M)``.
+
+        The hot-path view of :meth:`compact_form`: ``U = [ξS  Y]`` stays
+        implicit, so consumers (the Woodbury solves in ``ipm/kkt.py``) apply
+        ``S`` and ``Y`` directly instead of paying an n×2k materialization per
+        iteration. Raised before the first curvature pair.
+        """
+        if self._s is None or self._y is None or self._m is None:
+            raise NotImplementedError(
+                "L-BFGS compact form is unavailable before the first curvature pair"
+            )
+        return self._xi, self._s, self._y, self._m
 
     def compact_form(self) -> tuple[float, Array, Array]:
         """Return the compact-form factors ``(ξ, U, M)`` of ``B = ξI − U M⁻¹ Uᵀ``.
@@ -227,11 +264,13 @@ class LBFGSOperator(LinearOperator):
         curvature pair (``B = I``, no low-rank part), which callers treat as
         "no L-BFGS structure available".
         """
-        if self._u is None or self._m is None:
+        if self._s is None or self._y is None or self._m is None:
             raise NotImplementedError(
                 "L-BFGS compact form is unavailable before the first curvature pair"
             )
-        return self._xi, self._u, self._m
+        xp = self._namespace()
+        u = xp.concat((self._xi * self._s, self._y), axis=1)  # built on demand
+        return self._xi, u, self._m
 
     def gram_blocks(self) -> tuple[Array, Array, Array]:
         """Return the cached Gram blocks ``(SᵀS, SᵀY, YᵀY)`` of the window.
@@ -260,13 +299,10 @@ class LBFGSOperator(LinearOperator):
         a plain unit diagonal. This is the generic hook any *diagonal-plus-low-
         rank* operator implements; the L-BFGS case is one instance.
         """
-        if self._u is None or self._m is None:
-            raise NotImplementedError(
-                "L-BFGS low-rank form is unavailable before the first curvature pair"
-            )
+        xi, u, m = self.compact_form()
         xp = self._namespace()
-        d = self._xi * xp.ones((self._n,), dtype=self._u.dtype)
-        return d, self._u, self._m
+        d = xi * xp.ones((self._n,), dtype=u.dtype)
+        return d, u, m
 
     def update(self, delta: Array, gamma: Array) -> None:
         """Push a curvature pair, applying Powell damping to keep ``δᵀγ > 0``.
@@ -378,7 +414,8 @@ class LBFGSOperator(LinearOperator):
 
         ``s_y_last = δ_kᵀγ_k`` of the newest (damped) pair is already known to
         the caller, and the Gram blocks come from the incremental cache, so
-        this costs O(k²) plus the O(n·k) copy into ``U``.
+        this costs O(k²) — ``U`` is never materialized here (see
+        :meth:`compact_blocks`).
         """
         s = self._s
         y = self._y
@@ -414,7 +451,6 @@ class LBFGSOperator(LinearOperator):
         top = xp.concat((xi * s_s, lower), axis=1)
         bottom = xp.concat((xp.permute_dims(lower, (1, 0)), -d_mat), axis=1)
         self._m = xp.concat((top, bottom), axis=0)
-        self._u = xp.concat((xi * s, y), axis=1)  # n×2k
 
 
 __all__ = ["LBFGSOperator"]
