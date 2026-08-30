@@ -100,6 +100,12 @@ equality-constrained saddle systems currently assemble exactly and ignore it.
     below ~1e4 variables), so default usage is unaffected; the residual gap is for
     large, matrix-free, equality-constrained models.
 
+    On **bound-only** L-BFGS problems (no inequality rows — the radiotherapy
+    fluence-map shape) the Woodbury inverse is the *exact* `N⁻¹`, so the default
+    `jacobi` mode (and `auto`) apply it outright and CG converges in one
+    iteration; `Result.linear_solver` then reads `pc=lbfgs-exact`.
+    `KrylovOptions(exact_lbfgs_inverse=False)` restores the plain diagonal.
+
     To get the block preconditioner *only where it pays off*, use
     `KrylovOptions(preconditioner="auto")`: it runs the cheap Jacobi diagonal
     until a solve struggles — a convergence failure triggers an immediate promoted

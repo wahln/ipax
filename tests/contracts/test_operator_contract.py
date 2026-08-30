@@ -74,3 +74,22 @@ class LinearOperatorContract:
                 return
 
         assert_allclose(namespace, actual, dense, **tol)
+
+    def test_exact_lbfgs_inverse_claim_is_honest(self, namespace, tol):
+        # ``lbfgs_inverse_is_exact`` defaults to False; an operator that claims
+        # exactness must back it with an apply that inverts it to round-off.
+        with implemented(self.implementation_reason):
+            op = self.make_operator(namespace)
+            dense = self.make_dense(namespace)
+            exact = op.lbfgs_inverse_is_exact()
+            assert isinstance(exact, bool)
+            if not exact:
+                return
+            apply = op.lbfgs_inverse_apply()
+            n = int(dense.shape[0])
+            v = namespace.asarray(
+                [((-1.0) ** k) * (1.0 + k / n) for k in range(n)], dtype=dense.dtype
+            )
+            recovered = apply(namespace.matmul(dense, v))
+
+        assert_allclose(namespace, recovered, v, **tol)

@@ -379,6 +379,13 @@ class KrylovOptions:
     rtol: float = 1e-10
     max_iter: int | None = None  # default: 2 * dim + 100 at the call site
     preconditioner: KrylovPreconditioner = "jacobi"
+    # ``"jacobi"`` (default) and ``"auto"`` apply the operator's *exact* condensed
+    # Woodbury inverse instead of the diagonal whenever it is exact — a bound-only
+    # L-BFGS system (no inequality Gram term): CG then converges in one iteration
+    # and the O(n·k²) L-BFGS diagonal is never formed (``pc=lbfgs-exact`` in
+    # ``Result.linear_solver``). ``False`` keeps the plain diagonal in those modes
+    # — the A/B lever; ``"none"`` disables preconditioning entirely.
+    exact_lbfgs_inverse: bool = True
     gmres_restart: int = 30  # GMRES(m) restart length
     # Inexact-Newton forcing sequence (Eisenstat–Walker 1996): the inner solve need
     # only be as accurate as the *current* outer KKT residual demands, so early
@@ -394,8 +401,9 @@ class KrylovOptions:
     # drives step-sensitive IPM problems into infeasibility) while still relaxing the
     # unreachable 1e-10 that stalls ill-conditioned initial systems.
     adaptive_rtol_max: float = 1e-8
-    # ``"auto"`` starts with the cheap Jacobi diagonal and self-promotes to the
-    # L-BFGS Woodbury/block preconditioner the first time a solve struggles —
+    # ``"auto"`` starts with the cheap Jacobi diagonal (or the exact inverse where
+    # ``exact_lbfgs_inverse`` applies) and self-promotes to the L-BFGS
+    # Woodbury/block preconditioner the first time a solve struggles —
     # either it fails to converge (then it retries the same solve promoted) or it
     # burns more than this fraction of the iteration budget. Sticky thereafter.
     auto_switch_ratio: float = 0.5

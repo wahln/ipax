@@ -1316,3 +1316,63 @@ def test_condensed_dense_structured_solve_resolves_namespace_once(
     monkeypatch.setattr(kkt_module, "array_namespace", _counting)
     op.dense_structured_solve(array(namespace, [1.0, -2.0, 0.5]))
     assert calls <= 1, calls
+
+
+def test_condensed_dense_structured_solve_before_first_lbfgs_pair(namespace, tol):
+    # Iteration 0 of every L-BFGS run: no curvature pair yet, so ``W`` is the
+    # identity seed and ``N = I + Σ_x + δ_w I`` is diagonal. The structured
+    # solve must handle it instead of raising — the dense solver would
+    # otherwise materialize the full n×n block (39 GB at n = 50k).
+    W = LBFGSOperator(3, LBFGSOptions(memory=5))
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype))
+    rhs = array(namespace, [1.0, -2.0, 0.5])
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+
+    actual = op.dense_structured_solve(rhs)
+    expected = rhs / array(namespace, [1.25 + 1e-6, 1.75 + 1e-6, 2.25 + 1e-6])
+
+    assert_allclose(namespace, actual, expected, **tol)
+    matrix_rhs = namespace.stack((rhs, 2.0 * rhs), axis=1)
+    assert_allclose(
+        namespace,
+        op.dense_structured_solve(matrix_rhs),
+        namespace.stack((expected, 2.0 * expected), axis=1),
+        **tol,
+    )
+
+
+def test_condensed_lbfgs_inverse_exactness_flag(namespace):
+    # The Woodbury inverse is the *exact* N⁻¹ only without an inequality Gram
+    # term (whose off-diagonal it drops); the Krylov solver keys on this.
+    W = _lbfgs_operator(namespace)
+    dtype = array(namespace, [0.0]).dtype
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    bound_only = build_condensed_operator(
+        W,
+        sigma_x,
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 3), dtype=dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+    with_ineq = build_condensed_operator(
+        W,
+        sigma_x,
+        Diagonal(array(namespace, [2.0])),
+        Dense(array(namespace, [[1.0, 2.0, 0.5]])),
+        RegularizationState(delta_w=1e-6),
+    )
+    no_pairs = build_condensed_operator(
+        LBFGSOperator(3, LBFGSOptions(memory=5)),
+        sigma_x,
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 3), dtype=dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+
+    assert bound_only.lbfgs_inverse_is_exact()
+    assert not with_ineq.lbfgs_inverse_is_exact()
+    assert not no_pairs.lbfgs_inverse_is_exact()

@@ -331,6 +331,16 @@ class LinearOperator(ABC):
         """
         raise NotImplementedError("operator has no L-BFGS-aware preconditioner")
 
+    def lbfgs_inverse_is_exact(self) -> bool:
+        """Whether :meth:`lbfgs_inverse_apply` is the *exact* inverse ``K⁻¹``.
+
+        True only for a condensed block whose sole non-diagonal part is the
+        L-BFGS low-rank term (no inequality Gram term): the Woodbury apply is
+        then a direct solve, and a Krylov method preconditioned with it
+        converges in one iteration (§5.2). Optional; defaults to ``False``.
+        """
+        return False
+
     def lbfgs_block_preconditioner_apply(self) -> Callable[[Array], Array]:
         """Return an L-BFGS-aware block-diagonal preconditioner for a saddle.
 

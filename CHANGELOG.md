@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+- **Bound-only L-BFGS problems no longer materialize the dense condensed
+  block.** Before the first curvature pair `LBFGSOperator.compact_form` raised,
+  the structured Woodbury solve propagated the error and `DenseSolver` fell
+  through to forming and LU-factoring the full `n×n` matrix — 39 GB and
+  488 s per iteration at `n = 50k` on an RT-style box-bounded least-squares
+  problem. The pair-less seed `B = I` is now solved as the diagonal it is, so
+  `linsolve="dense"` stays on the structured path from iteration 0
+  (5 ms per step at `n = 50k`).
+
+### Changed
+- **Krylov applies the exact L-BFGS inverse on bound-only systems.** With no
+  inequality Gram term the condensed Woodbury inverse is the exact `N⁻¹`, so
+  the default (`"jacobi"`) and `"auto"` preconditioner modes now use it
+  directly (`Result.linear_solver` reports `pc=lbfgs-exact`): one CG
+  iteration instead of ~30, and no O(n·k²) L-BFGS diagonal per solve —
+  34 → 6 ms per step at `n = 50k`. Iterates are unchanged up to the inner
+  tolerance. A solve that breaks down under the exact inverse retries on
+  Jacobi. `"none"` still disables preconditioning entirely.
+
 ## [0.10.1] - 2026-08-27
 
 ### Changed

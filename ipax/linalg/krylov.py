@@ -30,7 +30,13 @@ Preconditioning (§5.2), all matrix-free:
 - ``jacobi`` — a strictly positive (SPD) diagonal: the operator's own diagonal for
   CG/GMRES, or the equality saddle's SPD *block* diagonal (PD primal Jacobi block
   plus a positive approximate-Schur dual block, ``spd_preconditioner_diagonal``)
-  applied to MINRES by symmetric scaling.
+  applied to MINRES by symmetric scaling. **Exception:** when the operator
+  reports its Woodbury inverse as *exact* (``lbfgs_inverse_is_exact`` — a
+  bound-only L-BFGS condensed block, no inequality Gram term) ``jacobi`` and
+  ``auto`` apply that inverse instead (reported as ``pc=lbfgs-exact``): CG then
+  converges in one iteration, and neither the O(n·k²) L-BFGS diagonal nor its
+  two host syncs are paid. ``KrylovOptions.exact_lbfgs_inverse=False`` restores
+  the plain diagonal (the A/B lever).
 - ``lbfgs`` — an L-BFGS-aware Sherman–Morrison–Woodbury inverse. On the condensed
   (equality-free) operator it is ``N⁻¹`` (``lbfgs_inverse_apply``), an SPD operator
   used directly by CG/GMRES. On the equality **saddle** it is the block-diagonal
@@ -41,8 +47,8 @@ Preconditioning (§5.2), all matrix-free:
   is available), since MINRES admits only a diagonal. It degrades to ``jacobi``
   where no L-BFGS compact form is available (e.g. before the first curvature pair,
   or an exact/matrix-free Hessian).
-- ``auto`` — start with cheap ``jacobi`` and self-promote to ``lbfgs`` the first
-  time a solve struggles: a convergence failure the Woodbury inverse could rescue
+- ``auto`` — start with cheap ``jacobi`` (or the exact inverse where it applies,
+  as above) and self-promote to ``lbfgs`` the first time a solve struggles: a convergence failure the Woodbury inverse could rescue
   triggers an immediate promoted retry, and a merely slow success (more than
   ``auto_switch_ratio`` of the iteration budget) promotes for the next solve. The
   flag is sticky for the life of the solver, so the extra Woodbury cost is paid
@@ -121,6 +127,16 @@ class KrylovSolver:
         # ``preconditioner="auto"``: sticky flag, set once a solve struggles, that
         # promotes the effective preconditioner from Jacobi to L-BFGS (§5.2).
         self._auto_promoted: bool = False
+        # Set per solve (reset at the top of ``solve``) when the default/auto
+        # mode applied the operator's *exact* condensed Woodbury inverse instead
+        # of Jacobi (bound-only L-BFGS systems); reported by ``describe``.
+        self._exact_inverse_active: bool = False
+        # Sticky opt-out (like ``_auto_promoted``): a solve that broke down
+        # under the exact inverse — a numerically singular L-BFGS middle
+        # matrix, the ``_apply`` fallback case — retries on Jacobi and this
+        # solver stays on Jacobi thereafter, so a persistently singular window
+        # never pays a failed exact-inverse CG on every IPM iteration.
+        self._exact_inverse_blocked: bool = False
         # Inexact-Newton forcing: the most recent outer KKT residual hinted by the
         # driver, or ``None`` before the first hint (then the fixed ``rtol`` is used).
         self._outer_residual: float | None = None
@@ -155,6 +171,8 @@ class KrylovSolver:
         pc: str = self._options.preconditioner
         if pc == "auto":
             pc = f"auto:{self._effective_preconditioner()}"
+        if self._exact_inverse_active:
+            pc = "auto:lbfgs-exact" if pc.startswith("auto") else "lbfgs-exact"
         return f"krylov ({self._options.method}, pc={pc})"
 
     def kkt_form(self) -> str:
@@ -201,13 +219,23 @@ class KrylovSolver:
         # on a convergence failure the condensed Woodbury could rescue, promote and
         # retry the same solve once, then (on success) promote for the next solve if
         # this one was slow. In any non-auto mode this is a single ``_dispatch`` call.
+        self._exact_inverse_active = False
         try:
             solution = self._dispatch(K, rhs, xp, max_iter, rtol)
         except KrylovConvergenceError:
-            if not self._auto_can_promote(K):
+            if self._exact_inverse_active:
+                # The exact Woodbury inverse broke down (numerically singular
+                # L-BFGS middle matrix): retry this solve on plain Jacobi, the
+                # route these modes took before the exact inverse existed, and
+                # stay there for the rest of this solver's life.
+                self._exact_inverse_blocked = True
+                self._exact_inverse_active = False
+                solution = self._dispatch(K, rhs, xp, max_iter, rtol)
+            elif not self._auto_can_promote(K):
                 raise
-            self._auto_promoted = True
-            solution = self._dispatch(K, rhs, xp, max_iter, rtol)
+            else:
+                self._auto_promoted = True
+                solution = self._dispatch(K, rhs, xp, max_iter, rtol)
         else:
             self._auto_promote_if_slow(K, max_iter)
         return solution
@@ -317,6 +345,21 @@ class KrylovSolver:
         mode = self._effective_preconditioner()
         if mode == "none":
             return lambda r: r
+        if (
+            mode == "jacobi"
+            and self._options.exact_lbfgs_inverse
+            and not self._exact_inverse_blocked
+            and K.lbfgs_inverse_is_exact()
+        ):
+            # Bound-only L-BFGS block (no inequality Gram term): the
+            # Sherman–Morrison–Woodbury apply (§5.2; Byrd, Nocedal & Schnabel
+            # 1994 compact form) is the *exact* ``N⁻¹``, so CG converges in one
+            # iteration — strictly better than Jacobi, whose O(n·k²) L-BFGS
+            # diagonal costs the same order as the Woodbury factor plus two
+            # host syncs. (RT-scale study, n = 50k: 27 CG iterations + 17 ms
+            # diagonal → 1 iteration; step solve 34 → 6 ms.)
+            self._exact_inverse_active = True
+            return K.lbfgs_inverse_apply()
         if mode == "lbfgs":
             # Prefer the saddle block preconditioner diag(N⁻¹, S⁻¹) (non-diagonal,
             # GMRES-only); else the condensed Woodbury inverse; else Jacobi.

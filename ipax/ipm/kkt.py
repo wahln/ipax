@@ -529,6 +529,13 @@ class _CondensedOperator(LinearOperator):
         bottom = xp.concat((jac, e_block), axis=1)
         return xp.concat((top, bottom), axis=0)
 
+    def _seed_diagonal_solve(self, sigma_x: Array, rhs: Array, xp: Namespace) -> Array:
+        """Solve the diagonal ``N = diag(W) + Σ_x + δ_w I`` (``W`` diagonal)."""
+        d = self._W.diagonal(sigma_x) + sigma_x
+        if self._delta_w != 0.0:
+            d = d + self._delta_w
+        return _diagonal_solve(d, rhs, xp)
+
     def dense_structured_solve(self, rhs: Array) -> Array:
         """Exact dense solve for ``D - U M⁻¹ Uᵀ`` L-BFGS condensed blocks.
 
@@ -536,7 +543,9 @@ class _CondensedOperator(LinearOperator):
         ``D = ξI + Σ_x + δ_w I``. The Woodbury identity solves ``N rhs = b``
         through one diagonal inverse and one compact ``2m × 2m`` solve, avoiding
         the dense ``n × n`` materialization. Inequality Gram terms are intentionally
-        excluded here so this direct path remains exact.
+        excluded here so this direct path remains exact. A diagonal ``W`` — a
+        ``Diagonal``/``Identity`` Hessian, or an L-BFGS operator before its
+        first curvature pair (the identity seed) — reduces to a diagonal solve.
         """
         if self._ineq_jac.shape[0] > 0:
             raise NotImplementedError(
@@ -549,16 +558,25 @@ class _CondensedOperator(LinearOperator):
         xp = array_namespace(rhs)
         sigma_x = self._sigma_x.diagonal()
         if isinstance(self._W, (Diagonal, Identity)):
-            d = self._W.diagonal(sigma_x) + sigma_x
-            if self._delta_w != 0.0:
-                d = d + self._delta_w
-            return _diagonal_solve(d, rhs, xp)
+            return self._seed_diagonal_solve(sigma_x, rhs, xp)
 
         compact_form = getattr(self._W, "compact_form", None)
         if compact_form is None:
             raise NotImplementedError(
                 "structured dense solve requires an L-BFGS compact Hessian"
             )
+        has_pairs = getattr(self._W, "has_curvature_pairs", None)
+        if has_pairs is not None and not has_pairs():
+            # Before the first curvature pair the L-BFGS Hessian is its seed
+            # ``B = I`` (``LBFGSOperator.diagonal`` reports it as ones), so
+            # ``N = I + Σ_x + δ_w I`` is diagonal. Solving it here keeps
+            # iteration 0 of every bound-only L-BFGS run on the structured
+            # path — propagating ``compact_form``'s NotImplementedError made
+            # the dense solver materialize and LU-factor the full n×n block
+            # (488 s/iteration at n = 50k). The predicate is explicit so a
+            # future "singular middle matrix" guard in ``compact_form`` can
+            # never be mistaken for the seed and answered with a diagonal.
+            return self._seed_diagonal_solve(sigma_x, rhs, xp)
         xi, u, m_lbfgs = compact_form()
         gram_blocks = getattr(self._W, "gram_blocks", None)
         if self._sigma_x_zero and gram_blocks is not None:
@@ -883,6 +901,29 @@ class _CondensedOperator(LinearOperator):
         if getattr(self._W, "diagonal_low_rank_form", None) is not None:
             return None
         return self
+
+    def lbfgs_inverse_is_exact(self) -> bool:
+        """Whether :meth:`lbfgs_inverse_apply` is the *exact* ``N⁻¹``.
+
+        True for a bound-only (no inequality rows) L-BFGS block with at least
+        one curvature pair: ``N = D̃ − U M⁻¹ Uᵀ`` exactly, so the Woodbury
+        apply is a direct solve and a Krylov method preconditioned with it
+        converges in one iteration. An inequality Gram term makes the apply
+        an approximation (its off-diagonal is dropped), and before the first
+        pair there is no compact form at all.
+        """
+        if self._ineq_jac.shape[0] > 0:
+            return False
+        if not isinstance(self._sigma_x, Diagonal):
+            return False  # the apply reads only diag(Σ_x)
+        compact_form = getattr(self._W, "compact_form", None)
+        if compact_form is None:
+            return False
+        try:
+            compact_form()
+        except NotImplementedError:
+            return False
+        return True
 
     def lbfgs_inverse_apply(self) -> Callable[[Array], Array]:
         """L-BFGS-aware approximate inverse via Sherman–Morrison–Woodbury (§5.2).

@@ -209,6 +209,16 @@ class LBFGSOperator(LinearOperator):
             )
         return diagonal
 
+    def has_curvature_pairs(self) -> bool:
+        """Whether at least one curvature pair has been stored.
+
+        Before the first pair the operator is its identity seed ``B = I``
+        (``_apply`` returns ``x`` unchanged and :meth:`diagonal` reports ones);
+        the structured condensed solve keys on this explicitly instead of
+        inferring it from :meth:`compact_form` raising.
+        """
+        return self._u is not None and self._m is not None
+
     def compact_form(self) -> tuple[float, Array, Array]:
         """Return the compact-form factors ``(ξ, U, M)`` of ``B = ξI − U M⁻¹ Uᵀ``.
 
