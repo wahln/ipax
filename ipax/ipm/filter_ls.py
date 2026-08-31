@@ -253,8 +253,39 @@ class FilterLineSearch:
             if reason is None:
                 augment = self._augments_filter(phi_t, phi0, dphi, alpha, theta0)
                 return LineSearchResult(alpha, True, augment, False, n_trials=trials)
-            alpha *= 0.5
+            alpha = self._next_alpha(alpha, phi_t, phi0, dphi)
         return LineSearchResult(alpha_min, False, False, True, n_trials=trials)
+
+    def _next_alpha(
+        self, alpha: float, phi_t: float, phi0: float, dphi: float
+    ) -> float:
+        """The next trial step size after a rejection.
+
+        Safeguarded quadratic interpolation (Nocedal & Wright 2006, eq. 3.58):
+        the minimizer ``−φ'(0)·α² / (2(φ(α) − φ(0) − φ'(0)·α))`` of the
+        quadratic through ``φ(0)``, ``φ'(0)`` and the rejected trial, clipped
+        into ``[0.1·α, 0.5·α]``. The upper clip keeps every trial at least as
+        short as W&B's plain halving; the lower clip stops one wild trial value
+        (e.g. a barrier blow-up just inside the domain) from collapsing the
+        step past what the model supports. Halving is the fallback whenever
+        the model is unusable: non-finite ``φ(α)`` (trial outside the barrier
+        domain), non-descent ``dφ`` (θ-type steps), or non-positive curvature
+        along the ray. Note the interpolant drops below ``0.5·α`` only when
+        ``φ(α) > φ(0)``: filter-/θ-driven rejections of a φ-decreasing trial
+        still shrink by exactly the halving factor, so the eq. (23) hand-off
+        skips a wider window only on rays the merit model already condemns.
+        """
+        o = self._o
+        if not o.backtrack_interpolation:
+            return 0.5 * alpha
+        denominator = 2.0 * (phi_t - phi0 - dphi * alpha)
+        if not (math.isfinite(denominator) and denominator > 0.0 and dphi < 0.0):
+            return 0.5 * alpha
+        alpha_q = -dphi * alpha * alpha / denominator
+        return min(
+            max(alpha_q, o.backtrack_shrink_min * alpha),
+            o.backtrack_shrink_max * alpha,
+        )
 
     def search_free(
         self,

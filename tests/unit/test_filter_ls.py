@@ -454,3 +454,137 @@ def test_search_hands_off_to_restoration_when_gradient_never_finite():
     assert result.restoration
     # Every halving of alpha down to alpha_min_frac counts as one trial.
     assert result.n_trials > 1
+
+
+def _quadratic_search(ls, c, record=None):
+    """Run ``search`` on the merit ray ``φ(α) = -α + c·α²`` (θ ≡ 0)."""
+
+    def eval_point(alpha):
+        if record is not None:
+            record.append(alpha)
+        return (0.0, -alpha + c * alpha * alpha)
+
+    return ls.search(
+        alpha_max=1.0,
+        theta0=0.0,
+        phi0=0.0,
+        dphi=-1.0,
+        theta_max=1e10,
+        theta_min=1e10,
+        eval_point=eval_point,
+        entries=[],
+        soc=None,
+    )
+
+
+def test_backtrack_interpolation_jumps_to_the_model_minimizer():
+    # φ(α) = -α + 5α²: minimizer at α = 0.1. The full step fails Armijo
+    # (φ(1) = 4 > 0); the quadratic model (N&W eq. 3.58) is exact here, so the
+    # second trial lands on 0.1 and is accepted — where halving needs four.
+    ls = FilterLineSearch(LineSearchOptions())
+    result = _quadratic_search(ls, c=5.0)
+
+    assert result.accepted
+    assert result.n_trials == 2
+    assert abs(result.alpha - 0.1) < 1e-12
+
+
+def test_backtrack_halving_lever_restores_plain_halving():
+    ls = FilterLineSearch(LineSearchOptions(backtrack_interpolation=False))
+    result = _quadratic_search(ls, c=5.0)
+
+    assert result.accepted
+    assert result.n_trials == 4
+    assert abs(result.alpha - 0.125) < 1e-12
+
+
+def test_backtrack_interpolation_is_safeguarded_below():
+    # A very steep model minimizer (α_q = 1e-3) must be clipped to 0.1·α so a
+    # single bad trial can never collapse the step by orders of magnitude.
+    ls = FilterLineSearch(LineSearchOptions())
+    alphas: list[float] = []
+    _quadratic_search(ls, c=500.0, record=alphas)
+
+    assert len(alphas) >= 2
+    assert abs(alphas[1] - 0.1) < 1e-12
+
+
+def test_backtrack_interpolation_halves_on_a_non_finite_trial():
+    # A trial outside the barrier domain (φ = +inf) gives the model nothing to
+    # interpolate: fall back to plain halving.
+    ls = FilterLineSearch(LineSearchOptions())
+    alphas: list[float] = []
+
+    def eval_point(alpha):
+        alphas.append(alpha)
+        if alpha > 0.75:
+            return (0.0, float("inf"))
+        return (0.0, -alpha + 0.01 * alpha * alpha)
+
+    result = ls.search(
+        alpha_max=1.0,
+        theta0=0.0,
+        phi0=0.0,
+        dphi=-1.0,
+        theta_max=1e10,
+        theta_min=1e10,
+        eval_point=eval_point,
+        entries=[],
+        soc=None,
+    )
+
+    assert result.accepted
+    assert alphas[1] == 0.5
+
+
+def test_backtrack_interpolation_is_clipped_at_halving_above():
+    # A θ-type rejection of a φ-decreasing trial: the model minimizer sits far
+    # beyond the step (α_q = 5), so the upper safeguard keeps the reduction at
+    # exactly the halving factor — interpolation is never *longer* than W&B.
+    ls = FilterLineSearch(LineSearchOptions())
+    alphas: list[float] = []
+
+    def eval_point(alpha):
+        alphas.append(alpha)
+        # Decreasing but far too slowly for the θ-type φ-progress margin.
+        return (1.0, -1e-6 * alpha + 1e-7 * alpha * alpha)
+
+    ls.search(
+        alpha_max=1.0,
+        theta0=1.0,
+        phi0=0.0,
+        dphi=-1e-6,
+        theta_max=1e10,
+        theta_min=1e-8,  # θ0 > θ_min: the θ-type branch judges the trial
+        eval_point=eval_point,
+        entries=[],
+        soc=None,
+    )
+
+    assert len(alphas) >= 2
+    assert alphas[1] == 0.5
+
+
+def test_backtrack_halves_on_a_non_descent_direction():
+    # dφ ≥ 0 (a θ-type ray): there is no descent model to interpolate.
+    ls = FilterLineSearch(LineSearchOptions())
+    alphas: list[float] = []
+
+    def eval_point(alpha):
+        alphas.append(alpha)
+        return (1.0, 5.0)  # neither θ- nor φ-progress
+
+    ls.search(
+        alpha_max=1.0,
+        theta0=1.0,
+        phi0=1.0,
+        dphi=1.0,
+        theta_max=1e10,
+        theta_min=1e-8,
+        eval_point=eval_point,
+        entries=[],
+        soc=None,
+    )
+
+    assert len(alphas) >= 2
+    assert alphas[1] == 0.5

@@ -235,7 +235,10 @@ The filter constants
 regularization escalation
 ([`RegularizationOptions`](../reference.md#ipax.options.RegularizationOptions))
 are rarely-touched advanced knobs; the defaults follow Wächter & Biegler (2006)
-and Friedlander & Orban (2012).
+and Friedlander & Orban (2012), with one deviation: a rejected trial step
+backtracks by safeguarded quadratic interpolation of the merit model
+(Nocedal & Wright 2006, eq. (3.58)) instead of plain halving —
+`LineSearchOptions(backtrack_interpolation=False)` restores W&B's `α ← α/2`.
 
 ## Barrier μ schedule
 

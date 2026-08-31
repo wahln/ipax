@@ -84,13 +84,15 @@ class LBFGSOperator(LinearOperator):
         # per-apply paths need not re-resolve it from their inputs.
         self._xp: Namespace | None = None
         # Cached compact-form pieces, rebuilt whenever the history changes.
-        # ``U = [ξS  Y]`` is *not* cached: the hot paths (matvec and the
-        # Woodbury solves in ``ipm/kkt.py``) consume ``S`` and ``Y`` through
-        # :meth:`compact_blocks`, so the n×2k concatenation is only built on
-        # demand for the cold consumers (:meth:`compact_form`, the sparse
-        # assembly) instead of being copied on every update.
+        # ``U = [ξS  Y]`` is not rebuilt on every update: the hot paths
+        # (matvec and the Woodbury solves in ``ipm/kkt.py``) consume ``S`` and
+        # ``Y`` through :meth:`compact_blocks`, and the cold consumers
+        # (:meth:`compact_form`, the sparse assembly — several calls per
+        # sparse factorization) share a lazily built cache that is cleared
+        # when the history changes.
         self._xi: float = 1.0
         self._m: Array | None = None
+        self._u_cache: Array | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -126,8 +128,8 @@ class LBFGSOperator(LinearOperator):
             xp = array_namespace(like)
             return xp.eye(self._n, dtype=like.dtype)
 
-        xp = self._namespace()
         xi, u, m = self.compact_form()
+        xp = self._namespace()
         identity = xp.eye(self._n, dtype=u.dtype)
         correction = xp.matmul(u, xp.linalg.solve(m, xp.permute_dims(u, (1, 0))))
         return xi * identity - correction
@@ -240,7 +242,7 @@ class LBFGSOperator(LinearOperator):
         the structured condensed solve keys on this explicitly instead of
         inferring it from :meth:`compact_form` raising.
         """
-        return self._s is not None and self._m is not None
+        return self._s is not None and self._y is not None and self._m is not None
 
     def compact_blocks(self) -> tuple[float, Array, Array, Array]:
         """Return the compact factors as blocks ``(ξ, S, Y, M)``.
@@ -268,9 +270,10 @@ class LBFGSOperator(LinearOperator):
             raise NotImplementedError(
                 "L-BFGS compact form is unavailable before the first curvature pair"
             )
-        xp = self._namespace()
-        u = xp.concat((self._xi * self._s, self._y), axis=1)  # built on demand
-        return self._xi, u, self._m
+        if self._u_cache is None:  # built lazily, invalidated by _rebuild
+            xp = self._namespace()
+            self._u_cache = xp.concat((self._xi * self._s, self._y), axis=1)
+        return self._xi, self._u_cache, self._m
 
     def gram_blocks(self) -> tuple[Array, Array, Array]:
         """Return the cached Gram blocks ``(SᵀS, SᵀY, YᵀY)`` of the window.
@@ -451,6 +454,7 @@ class LBFGSOperator(LinearOperator):
         top = xp.concat((xi * s_s, lower), axis=1)
         bottom = xp.concat((xp.permute_dims(lower, (1, 0)), -d_mat), axis=1)
         self._m = xp.concat((top, bottom), axis=0)
+        self._u_cache = None  # the lazy U = [ξS Y] cache is stale now
 
 
 __all__ = ["LBFGSOperator"]

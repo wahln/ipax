@@ -17,13 +17,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (5 ms per step at `n = 50k`).
 
 ### Changed
+- **Rejected line-search trials backtrack by quadratic interpolation.** After
+  a rejected trial the filter line search now steps to the minimizer of the
+  quadratic merit model through `phi(0)`, `phi'(0)` and the rejected
+  `phi(alpha)` (Nocedal & Wright 2006, eq. (3.58)), safeguarded into
+  `[0.1 alpha, 0.5 alpha]` — never longer than the previous plain halving, and
+  falling back to halving whenever the model is unusable (non-finite trial
+  merit, non-descent direction, non-positive model curvature). The opt-in
+  free-mode search has no merit model and keeps halving. **Trajectories
+  change** (the accepted step length differs), pending the full-corpus sweep;
+  `LineSearchOptions(backtrack_interpolation=False)` restores plain halving
+  (the A/B lever), and `backtrack_shrink_min`/`backtrack_shrink_max` expose
+  the safeguard bounds. Measured on the RT-style bound-only L-BFGS study
+  (n = 50k, `scalar1` seed): 3.3-4.1 objective evaluations per iteration drop
+  to 2.0-2.4 — each one a dose-projection `D@x` at scale — at equal or better
+  objective quality, and a hopeless ray now concedes to restoration in ~7
+  trials instead of 21. One budget-calibration regression test is pinned to
+  halving.
 - **The L-BFGS compact factor stays in S/Y block form on the hot path.** The
   operator no longer materializes and copies `U = [xiS Y]` (n x 2k) on every
   curvature update; the matvec, the structured Woodbury solves and the exact
   inverse consume the `S`/`Y` blocks directly (new `compact_blocks` hook, with
   `compact_form` materializing on demand for the sparse assembly). The inner
   Woodbury factor is assembled from three n x k Gram products instead of the
-  2k-wide product. Iterates are unchanged; at n = 50k the per-iteration
+  2k-wide product. The algebra is identical but the operation order differs at
+  round-off level, so knife-edge trajectories may flip (sweep pending); at
+  n = 50k the per-iteration
   bookkeeping drops from ~17 to ~13 ms at memory 20 and the memory-50
   configuration falls from ~88 to ~55 ms/iteration end to end.
 - **Krylov applies the exact L-BFGS inverse on bound-only systems.** With no

@@ -128,6 +128,30 @@ class LineSearchOptions:
     """
 
     max_soc: int = 4
+    # Backtracking rule after a rejected trial: quadratic interpolation of the
+    # barrier merit φ along the step (Nocedal & Wright 2006, eq. 3.58) — the
+    # minimizer of the quadratic through φ(0), φ'(0) and the rejected φ(α) —
+    # safeguarded into [0.1·α, 0.5·α], so a trial is never longer than plain
+    # halving and a single bad model can never collapse the step. Falls back to
+    # halving whenever the model is unusable (non-finite trial φ, non-descent
+    # dφ). ``False`` restores W&B's plain ``α ← α/2`` (the A/B lever). On
+    # RT-style bound-only L-BFGS problems the ``scalar1`` seed overshoots and
+    # backtracks ~3.3-4.1 trials/iteration under halving — each trial one
+    # objective evaluation (one dose-projection ``D@x`` at scale); interpolation
+    # measured 2.0-2.4 trials/iteration at equal or better objective quality.
+    # ``search_free`` (the opt-in free mode) has no merit model and keeps plain
+    # halving regardless. DEFAULT PENDING the full-corpus S2MPJ sweep: the rule
+    # changes trajectories (the accepted α differs), so the sweep decides
+    # whether this stays the default — unlike the opt-in precedent
+    # (``gamma_alpha``, ``slack_init_scale``) the A/B was scheduled immediately
+    # after landing.
+    backtrack_interpolation: bool = True
+    # Safeguard bounds on one interpolated backtrack, as fractions of the
+    # rejected α (N&W 2006 §3.5): never above ``shrink_max`` (0.5 keeps every
+    # trial at least as short as plain halving) and never below ``shrink_min``
+    # (one wild trial φ cannot collapse the step past what the model supports).
+    backtrack_shrink_min: float = 0.1
+    backtrack_shrink_max: float = 0.5
     # The absolute step size below which the search concedes to restoration.
     # Also the floor under the opt-in eq. (23) rule (see ``gamma_alpha``), where
     # it is what keeps a feasible iterate's α_min off zero.

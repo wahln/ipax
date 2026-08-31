@@ -228,6 +228,11 @@ def _woodbury_factors_blocks(
     O(r²) instead of the O(n·r²) product — the bound-free case ``D = ξ + δ_w``.
     """
     if isinstance(d, float):
+        # Scalar D: two n×k divisions. Folding the 1/d factors into the small
+        # 2k-sized products instead would save the temporaries, but perturbs
+        # round-off on the bound-free path enough to flip knife-edge statuses
+        # (torch HS35 OPTIMAL→ACCEPTABLE) — keep the division order identical
+        # to the vector-D branch.
         s_d = s / d
         y_d = y / d
     else:
@@ -257,14 +262,12 @@ def _woodbury_solve_blocks(
     ``D⁻¹ U z = ξ(D⁻¹S) z₁ + (D⁻¹Y) z₂``.
     """
     d, xi, s_d, y_d, inner = factors
-    if len(rhs.shape) == 1 or isinstance(d, float):
-        if len(rhs.shape) > 2:
-            raise ValueError("Woodbury solve requires a vector or matrix RHS")
-        inv_d_rhs = rhs / d
-    elif len(rhs.shape) == 2:
-        inv_d_rhs = rhs / xp.expand_dims(d, axis=1)
-    else:
+    if len(rhs.shape) not in (1, 2):
         raise ValueError("Woodbury solve requires a vector or matrix RHS")
+    if len(rhs.shape) == 1 or isinstance(d, float):
+        inv_d_rhs = rhs / d
+    else:
+        inv_d_rhs = rhs / xp.expand_dims(d, axis=1)
     u_t_rhs = xp.concat(
         (
             xi * xp.matmul(xp.permute_dims(s_d, (1, 0)), rhs),
@@ -282,7 +285,8 @@ def _woodbury_solve(factors: _WoodburyFactors, rhs: Array, xp: Namespace) -> Arr
 
     ``rhs`` may be a vector or a matrix (columns solved independently): one
     diagonal inverse plus one ``r × r`` solve, never forming the ``n × n`` operator.
-    ``d`` is a vector or, from :func:`_woodbury_factors_scalar`, a Python float.
+    ``d`` is a vector (the scalar-``D`` case lives in
+    :func:`_woodbury_factors_blocks`).
     """
     d, inv_d_u, u_t, inner = factors
     if len(rhs.shape) == 1 or isinstance(d, float):
@@ -620,8 +624,9 @@ class _CondensedOperator(LinearOperator):
         if isinstance(self._W, (Diagonal, Identity)):
             return self._seed_diagonal_solve(sigma_x, rhs, xp)
 
+        compact_blocks = getattr(self._W, "compact_blocks", None)
         compact_form = getattr(self._W, "compact_form", None)
-        if compact_form is None:
+        if compact_blocks is None and compact_form is None:
             raise NotImplementedError(
                 "structured dense solve requires an L-BFGS compact Hessian"
             )
@@ -637,7 +642,6 @@ class _CondensedOperator(LinearOperator):
             # future "singular middle matrix" guard in ``compact_form`` can
             # never be mistaken for the seed and answered with a diagonal.
             return self._seed_diagonal_solve(sigma_x, rhs, xp)
-        compact_blocks = getattr(self._W, "compact_blocks", None)
         if compact_blocks is not None:
             # Hot path: S/Y blocks, U = [ξS Y] never materialized (§5.2).
             xi, s, y, m_lbfgs = compact_blocks()
@@ -656,6 +660,7 @@ class _CondensedOperator(LinearOperator):
                     d = d + self._delta_w
                 factors = _woodbury_factors_blocks(d, xi, s, y, m_lbfgs, xp)
             return _woodbury_solve_blocks(factors, rhs, xp)
+        assert compact_form is not None
         xi, u, m_lbfgs = compact_form()
         d = xi + sigma_x
         if self._delta_w != 0.0:

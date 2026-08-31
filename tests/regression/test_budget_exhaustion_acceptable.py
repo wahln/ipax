@@ -18,7 +18,7 @@ that value sits between the exact and the relaxed tolerance.
 from __future__ import annotations
 
 from ipax import Options, Status, solve
-from ipax.options import OptimalityConditionOptions
+from ipax.options import LineSearchOptions, OptimalityConditionOptions
 from ipax.testing.problems import BoundConstrainedQP
 from tests._helpers import array
 
@@ -28,7 +28,18 @@ def _reference_best_dual(namespace) -> float:
     result = solve(
         problem,
         array(namespace, [0.25, 0.75]),
-        options=Options(hessian="exact", linsolve="dense", max_iter=3),
+        # Plain halving pins the calibration trajectory: under the
+        # interpolating backtrack this QP's best iterate reaches an exactly
+        # zero dual infeasibility within the 3-iteration budget on some
+        # backends, and the scenario (best iterate near but not at the
+        # tolerance) needs a nonzero value to place the tolerances around.
+        # The salvage logic under test is orthogonal to the backtracking rule.
+        options=Options(
+            hessian="exact",
+            linsolve="dense",
+            max_iter=3,
+            line_search=LineSearchOptions(backtrack_interpolation=False),
+        ),
     )
     assert result.status is Status.MAX_ITER
     best = min(result.history, key=lambda r: r.kkt_error)
@@ -46,6 +57,7 @@ def _solve_with_dual_tol(namespace, dual_tol: float):
             hessian="exact",
             linsolve="dense",
             max_iter=3,
+            line_search=LineSearchOptions(backtrack_interpolation=False),
             optimality=OptimalityConditionOptions(
                 dual_inf_tol=dual_tol,
                 constr_viol_tol=1e3,

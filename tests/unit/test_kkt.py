@@ -1280,7 +1280,19 @@ def test_condensed_dense_structured_solve_cached_gram_without_bounds(
         raise AssertionError("Uᵀ D⁻¹ U must come from the cached Gram blocks")
 
     monkeypatch.setattr(kkt_module, "_woodbury_factors", _forbidden)
+    # The block route must actually receive the cached Gram — without this spy
+    # the ban above is vacuous (the block branch never calls the legacy
+    # ``_woodbury_factors`` even when it recomputes the O(n·k²) product).
+    gram_seen: list[bool] = []
+    original_blocks = kkt_module._woodbury_factors_blocks
+
+    def _spy(*args, **kwargs):
+        gram_seen.append(kwargs.get("gram_u") is not None)
+        return original_blocks(*args, **kwargs)
+
+    monkeypatch.setattr(kkt_module, "_woodbury_factors_blocks", _spy)
     assert_allclose(namespace, op.dense_structured_solve(rhs), expected, **tol)
+    assert gram_seen and all(gram_seen)
     # Matrix right-hand sides take the same path.
     rhs2 = namespace.stack((rhs, 2.0 * rhs), axis=1)
     assert_allclose(

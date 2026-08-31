@@ -384,6 +384,10 @@ history and the v15 report.
     sweep (2026-07-17) attributed the two independently; they sum exactly to the
     combined −14.
 
+    - **`LineSearchOptions.backtrack_interpolation`** (default `True`) selects
+      the safeguarded quadratic-interpolation backtrack (N&W eq. (3.58),
+      clipped to `[0.1α, 0.5α]`); `False` is the plain-halving control arm for
+      A/B sweeps of the line-search trial rule.
     - **`LineSearchOptions.gamma_alpha`** (γ_α, default `None`) switches the
       minimum step size from the flat `alpha_min_frac` to the **adaptive eq. (23)
       rule**, so a hopeless ray concedes to restoration as soon as no acceptable
