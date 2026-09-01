@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- **Docs: bound-only RT recipe and objective/gradient work-sharing.** The
+  TROTS benchmark page gains a measured recipe for bound-only fluence-map
+  runs (`LBFGSOptions(seed_formula="scalar1", memory=20-50)` + the default
+  monotone mu schedule; objective 13.4 -> 8.396 at 300 iterations on the
+  n = 50k study problem, beating SciPy L-BFGS-B at equal memory), with a
+  matching signature row on the routing-hints page. The Problem guide gains
+  a "Sharing work between the objective and the gradient" recipe: a one-slot
+  identity-keyed cache for a shared intermediate such as `A @ x`, which the
+  driver's once-per-point callback evaluation turns into a guaranteed hit at
+  every accepted point (verified: 145 callback calls -> 81 products on a
+  bound-constrained composite least-squares solve).
+
 ### Fixed
 - **Bound-only L-BFGS problems no longer materialize the dense condensed
   block.** Before the first curvature pair `LBFGSOperator.compact_form` raised,

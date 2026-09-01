@@ -165,6 +165,71 @@ log the clocks.
     tall, default recipe stalls near the optimum after a long `α ≈ 10⁻³`
     grind), not a general RT setting.
 
+## Bound-only fluence-map runs
+
+Not every RT formulation carries per-voxel dose *constraints*: composite
+plans often fold the dose criteria into the objective, leaving `min f(Dx)`
+with only box bounds on the fluence — a different regime from the TROTS
+tables above (no slacks, no Gram; the barrier acts on the bounds alone). The
+recipe for that shape was measured on a synthetic study problem
+(2026-08-28: piecewise least-squares `f(Dx)`, `0 ≤ x ≤ 10`, `n = 50 000`,
+`D` 80k×50k sparse with 1.9·10⁷ nonzeros, `cond(DᵀD) ≈ 1.4·10⁵` — see
+provenance below):
+
+```python
+from ipax.options import LBFGSOptions, LineSearchOptions
+
+opts = ipax.Options(
+    # mu_schedule="monotone" is the default — keep it (see numbers below)
+    lbfgs=LBFGSOptions(seed_formula="scalar1", memory=20),  # 20–50
+    line_search=LineSearchOptions(backtrack_interpolation=True),  # optional
+)
+```
+
+Measured at `n = 50k` over 300 iterations (objective, lower is better;
+SciPy L-BFGS-B references on the identical problem: `m=10` reaches 8.61,
+`m=20` reaches 8.34):
+
+| arm | objective @300 |
+| --- | ---: |
+| defaults (`direct` seed, monotone μ) | 13.4 |
+| `scalar1` seed, memory 20, monotone μ | **8.396** |
+| `scalar1`, memory 50 | ≈ converged by iteration 100 |
+| `scalar1` m20, `mu_schedule="adaptive"` | 8.97 |
+| `scalar1` m20, adaptive + Gondzio correctors | 21.6 |
+| `scalar1` m20, `globalization="breedveld"` arms | 25.7–113.8 |
+
+The mechanism: the default `direct` ξ seed is over-stiff on chained least
+squares (the δ–γ misalignment factor — the same pathology as the
+`GASOIL`/`NELSONLS` corpus signature), so steps are tiny despite cheap
+iterations; `scalar1` un-freezes them, and the larger window pays because
+`DᵀD`'s spectrum is genuinely ill-conditioned. The default **monotone μ
+already wins outright** here — every adaptive/Breedveld arm is worse, and
+Gondzio correctors cost +40% time for no objective gain. `scalar1`'s
+under-stiff seed does buy more halving backtracks (3.5–3.9 objective
+evaluations per iteration); the opt-in `backtrack_interpolation` cuts that
+to 2.0–2.4 (measured 87 → 65 ms/iteration at memory 20).
+
+Both the dense and the Krylov route hit the structured Woodbury solve on
+this shape (the Krylov route reports `pc=lbfgs-exact`); either is fine, and
+the per-iteration floor is the two dose-matrix passes (`D@x` + `Dᵀg`). To
+avoid paying a third pass, share `D@x` between the objective and the
+gradient — see the
+[Problem guide](../guide/problems.md#sharing-work-between-the-objective-and-the-gradient).
+
+!!! warning "This is a routing hint, not a better default"
+    `seed_formula="scalar1"` as a corpus-wide default measured **net −140**
+    on the full S2MPJ sweep (see the
+    [routing-hints page](../guide/routing-hints.md)); it is decisive on this
+    signature and harmful elsewhere. Reach for it when your problem matches
+    the shape above.
+
+**Provenance:** measured 2026-08-28 on `develop` (post-0.10.1), NumPy
+backend, single desktop; per-arm objective trajectories at fixed iteration
+budgets, interleaved runs. The study problem is synthetic (banded-random
+`D`, piecewise-quadratic under/overdose penalties) but matches the
+fluence-map shape in dimensionality, sparsity, and conditioning.
+
 ## Known limits
 
 - **VMAT last mile**: both VMAT cases descend cleanly to within ~1 % of the
