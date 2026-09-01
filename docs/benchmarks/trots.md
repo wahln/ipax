@@ -217,6 +217,16 @@ avoid paying a third pass, share `D@x` between the objective and the
 gradient — see the
 [Problem guide](../guide/problems.md#sharing-work-between-the-objective-and-the-gradient).
 
+The same recipe on GPU (CuPy, RTX 4070 Laptop 8 GB, measured 2026-09-01 at
+`n = 50k` with interleaved order-alternated pairs, identical trajectories to
+CPU): **11.9 ms/iteration** on the dense route and 12.7 on Krylov, vs ~56 on
+this machine's threaded-BLAS NumPy — about **4.5×** end to end. The exact
+Woodbury inverse is what makes the Krylov route viable on device at all:
+with `exact_lbfgs_inverse=False` the Jacobi-CG arm pays ~27 latency-bound CG
+iterations per solve plus the O(n·k²) L-BFGS diagonal and lands at
+42.6 ms/iteration (3.4× slower). The remaining dense-vs-Krylov gap
+(~0.5–0.8 ms) is the direct solve's residual-verification host syncs.
+
 !!! warning "This is a routing hint, not a better default"
     `seed_formula="scalar1"` as a corpus-wide default measured **net −140**
     on the full S2MPJ sweep (see the
