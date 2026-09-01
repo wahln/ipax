@@ -223,9 +223,10 @@ class SparseOperator(LinearOperator):
         self._csc: scipy.sparse.csc_matrix | None = csc
         self._symmetric: bool | None = None
         # Gram-path caches (the condensed n ≪ m route calls ``gram(Σ_s)`` on
-        # every KKT factor — per IPM iteration *and* per δ_w retry / SOC /
-        # Mehrotra re-solve with bit-identical weights, so an O(m) value compare
-        # amortizes the Σ nnz_row² SpGEMM):
+        # every KKT factor — per IPM iteration *and* per δ_w retry with
+        # bit-identical weights, so an O(m) value compare amortizes the
+        # Σ nnz_row² SpGEMM; SOC and the correctors re-solve the retained
+        # factorization and never reach here):
         self._gram_transpose: scipy.sparse.csr_matrix | None = None  # Aᵀ as CSR
         self._gram_scaled: scipy.sparse.csr_matrix | None = None  # diag(w)A buffer
         self._gram_row_index: np.ndarray | None = None  # nnz → row map for w
@@ -336,8 +337,9 @@ class SparseOperator(LinearOperator):
         #
         # The wrapped matrix is fixed for this operator's lifetime, so two levels
         # of caching amortize the per-iteration cost (the SpGEMM arithmetic floor
-        # is Σ_i nnz_row_i²): a last-weights memo — δ_w retries, SOC and Mehrotra
-        # re-solves within one IPM iteration re-request the *same* Σ_s — and,
+        # is Σ_i nnz_row_i²): a last-weights memo — δ_w retries within one IPM
+        # iteration re-request the *same* Σ_s (SOC and the correctors re-solve
+        # the retained factorization and never re-factor) — and,
         # on a miss, a cached Aᵀ CSR + same-pattern ``diag(w)A`` buffer so only
         # value work (no CSC→CSR conversion, no ``multiply`` allocation) remains
         # besides the product itself. Callers must treat the returned array as

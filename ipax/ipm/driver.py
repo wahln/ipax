@@ -1358,6 +1358,12 @@ class IPMDriver:
             }
 
             step_solve_failed = False
+            # Whether the solver's retained factorization is the one that
+            # produced ``step``. The two failure branches below (corrected-step
+            # descent fallback, descent-enforcement re-solve) can leave the
+            # solver factored at an escalated δ_w while keeping the *earlier*
+            # direction; SOC must not correct against that mismatched matrix.
+            factor_matches_step = True
             if self._corrector.active:
                 # Mehrotra/Gondzio/probing: the affine and correction directions
                 # share one KKT operator. Sparse-direct reuses its factorization;
@@ -1425,6 +1431,11 @@ class IPMDriver:
                                 dx, mu=mu, dy_eq=dy_eq, **recover_kwargs
                             )
                             reg_applied = max(reg_applied, reg_fallback)
+                        else:
+                            # The failed fallback ladder refactored the solver
+                            # past the matrix that produced the (kept)
+                            # corrected direction.
+                            factor_matches_step = False
             else:
                 mu = self._next_mu(
                     mu,
@@ -1575,8 +1586,12 @@ class IPMDriver:
                         delta_w_floor=descent_floor,
                     )
                     if not ok:
+                        # The failed escalation refactored the solver past the
+                        # matrix that produced the (kept) earlier direction.
+                        factor_matches_step = False
                         break
                     step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
+                    factor_matches_step = True  # step and factorization re-aligned
                     reg_applied = max(reg_applied, reg_descent)
                     descent_floor = max(descent_floor, reg_descent)
 
@@ -1707,14 +1722,25 @@ class IPMDriver:
                 step: NewtonStep = step,
                 ineq_jac: LinearOperator = ineq_jac,
                 sigma_s: Array = sigma_s,
-                sigma_x: Array = sigma_x,
-                w: LinearOperator = w,
-                eq_jac: LinearOperator = eq_jac,
                 mu: float = mu,
+                factor_matches_step: bool = factor_matches_step,
             ) -> tuple[float, float] | None:
-                """Second-order correction for nonlinear constraint residuals."""
+                """Second-order correction for nonlinear constraint residuals.
+
+                Each correction solves the *same* linear system as the search
+                direction — Wächter & Biegler 2006, §2.4, eq. (26): "the same
+                matrix as in (13)", same ``δ_w``/``δ_c``, "to avoid additional
+                matrix factorizations" — so this is a plain re-solve on the
+                solver's retained factorization rather than a rebuilt operator
+                with a fresh δ_w ladder. (The *matrix* matches the paper; the
+                right-hand side keeps ipax's pre-existing residual convention
+                — ``c`` at the accumulated corrected point — rather than the
+                eq. (27) blend.) The ``factor_matches_step`` guard skips SOC
+                on the rare iterations where a failed re-solve ladder left the
+                solver factored past the matrix that produced ``step``.
+                """
                 nonlocal soc_point
-                if opts.line_search.max_soc <= 0:
+                if opts.line_search.max_soc <= 0 or not factor_matches_step:
                     return None
 
                 base_x, base_s = trial_point(alpha)
@@ -1735,19 +1761,10 @@ class IPMDriver:
                     if m > 0:
                         rhs_soc = rhs_soc - ineq_jac.rmatvec(sigma_s * r_pi_c)
 
-                    dx_c, _, _, ok = solve_step_timed(
-                        w,
-                        sigma_x,
-                        sigma_s,
-                        ineq_jac,
-                        rhs_soc,
-                        eq_jac,
-                        m_eq,
-                        -c_c,
-                        delta_c,
-                    )
-                    if not ok:
+                    sol_c = self._resolve_reused_factorization(rhs_soc, -c_c, m_eq)
+                    if sol_c is None:
                         return None
+                    dx_c = sol_c[: self._n]
 
                     corr_x = corr_x + dx_c
                     if m > 0:
@@ -2298,6 +2315,42 @@ class IPMDriver:
             rhs = rhs - xp.where(mask_u, target_u / u_minus_x, xp.zeros_like(grad))
         return rhs
 
+    def _resolve_reused_factorization(
+        self, rhs_x: Array, r_y: Array, m_eq: int
+    ) -> Array | None:
+        """Re-solve the most recently factored KKT system for a new RHS.
+
+        Second-order corrections and the centrality correctors solve the same
+        linear system as the search direction, only with a different
+        right-hand side; Wächter & Biegler 2006 (§2.4, eq. (26)) use "the
+        same matrix as in (13)" — same ``δ_w``/``δ_c``, same factorization —
+        explicitly "to avoid additional matrix factorizations". The
+        sparse-direct route back-solves its LDLᵀ; the dense route
+        back-substitutes the retained Cholesky factor (an LU re-solve where
+        the backend lacks the triangular-solve gap-filler); the Krylov route
+        reuses the operator — the memoized Woodbury factors on structured
+        bound-only L-BFGS blocks, a fresh iterative solve otherwise. Returns
+        ``None`` on a failed or non-finite solve — these corrections are
+        opportunistic, so the caller simply proceeds without one.
+        """
+        xp = self._xp
+        rhs = xp.concat((rhs_x, r_y)) if m_eq > 0 else rhs_x
+        # Same accounting as ``solve_step_timed``: a matrix-free re-solve can
+        # call back into problem derivatives (autodiff-HVP matvecs), whose
+        # time is already charged to the problem — don't double-count it.
+        problem_before = self._problem_time_total
+        start = perf_counter()
+        try:
+            sol = self._solver.solve(rhs)
+        except LinearSolveError:
+            sol = None
+        elapsed = perf_counter() - start
+        problem_elapsed = self._problem_time_total - problem_before
+        self._step_solve_seconds += max(0.0, elapsed - problem_elapsed)
+        if sol is None or not bool(xp.all(xp.isfinite(sol))):
+            return None
+        return sol
+
     def _solve_targets_reused_operator(
         self,
         comp_s: Array,
@@ -2311,25 +2364,17 @@ class IPMDriver:
     ) -> NewtonStep | None:
         """Solve the current condensed system for new complementarity targets.
 
-        The sparse-direct route reuses the factorization established by the
-        affine solve. Dense and Krylov solvers reuse the operator but perform a
-        fresh direct/iterative solve. Returns ``None`` on a failed/non-finite
-        solve so the corrector can fall back to the affine step.
+        A :meth:`_resolve_reused_factorization` on the system established by
+        the affine solve. Returns ``None`` on a failed/non-finite solve so
+        the corrector can fall back to the affine step.
         """
         xp = self._xp
         rhs_x = self._condensed_rhs(comp_s, comp_l, comp_u, **rhs_kwargs)
-        rhs = xp.concat((rhs_x, -c)) if m_eq > 0 else rhs_x
-        start = perf_counter()
-        try:
-            sol = self._solver.solve(rhs)
-        except LinearSolveError:
-            self._step_solve_seconds += perf_counter() - start
-            return None
-        self._step_solve_seconds += perf_counter() - start
-        if not bool(xp.all(xp.isfinite(sol))):
+        sol = self._resolve_reused_factorization(rhs_x, -c, m_eq)
+        if sol is None:
             return None
         dx_t = sol[: self._n]
-        dy_t = sol[self._n :] if m_eq > 0 else xp.zeros((0,), dtype=rhs.dtype)
+        dy_t = sol[self._n :] if m_eq > 0 else xp.zeros((0,), dtype=rhs_x.dtype)
         return recover_eliminated(
             dx_t,
             mu=0.0,

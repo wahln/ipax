@@ -74,7 +74,14 @@ class LinearSolver(Protocol):
         ...
 
     def solve(self, rhs: Array) -> Array:
-        """Return ``x`` such that ``K x = rhs`` to the configured tolerance."""
+        """Return ``x`` such that ``K x = rhs`` to the configured tolerance.
+
+        One ``factor`` must serve *multiple* ``solve`` calls with different
+        right-hand sides, reusing whatever the factor step prepared — the
+        driver relies on this on its default path: second-order corrections
+        and the centrality correctors re-solve the search direction's system
+        (Wächter & Biegler 2006, §2.4, eq. (26)) without re-factoring.
+        """
         ...
 
     def set_outer_residual(self, residual: float) -> None:
