@@ -55,11 +55,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Krylov applies the exact L-BFGS inverse on bound-only systems.** With no
   inequality Gram term the condensed Woodbury inverse is the exact `N⁻¹`, so
   the default (`"jacobi"`) and `"auto"` preconditioner modes now use it
-  directly (`Result.linear_solver` reports `pc=lbfgs-exact`): one CG
-  iteration instead of ~30, and no O(n·k²) L-BFGS diagonal per solve —
-  34 → 6 ms per step at `n = 50k`. Iterates are unchanged up to the inner
-  tolerance. A solve that breaks down under the exact inverse retries on
-  Jacobi. `"none"` still disables preconditioning entirely.
+  directly (`Result.linear_solver` reports `pc=lbfgs-exact`): a direct
+  one-apply solve — verified by a true-residual check, with working-precision
+  iterative refinement covering round-off, and falling back to the
+  CG-preconditioned route whenever refinement stalls, so robustness is a
+  strict superset of the old CG wrapper — instead of ~30 CG iterations, and
+  no O(n·k²) L-BFGS diagonal per solve — 34 → 6 ms per step at `n = 50k`.
+  Iterates are unchanged up to the inner tolerance. A solve that breaks down
+  under the exact inverse retries on Jacobi. `"none"` still disables
+  preconditioning entirely.
+- **Less redundant work around the condensed Woodbury factors.** The condensed
+  operator memoizes its Woodbury factorization per instance (keyed on the
+  L-BFGS window's new `generation` token, so a curvature update can never
+  serve stale factors): the Krylov auto-promotion probe and a promoted retry
+  reuse the factors the solve already built instead of repeating the O(n·k²)
+  product. The `"auto"` promotion check now also tests slowness *before*
+  probing availability, so a fast successful solve no longer pays a
+  build-and-discard factorization every iteration. Reused factors are
+  bitwise-identical — results do not change.
 
 ## [0.10.1] - 2026-08-27
 

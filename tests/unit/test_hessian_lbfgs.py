@@ -296,3 +296,20 @@ def test_lbfgs_compact_blocks_unavailable_before_first_pair(namespace):
     op = LBFGSOperator(3, LBFGSOptions(memory=5))
     with pytest.raises(NotImplementedError):
         op.compact_blocks()
+
+
+def test_lbfgs_generation_tracks_window_changes(namespace):
+    """``generation`` is a cheap staleness token for factor caches downstream.
+
+    Consumers that cache work derived from the compact window (the condensed
+    Woodbury factors in ``ipm/kkt.py``) key on it; it must change on every
+    accepted curvature update and start at a stable value before the first.
+    """
+    op = LBFGSOperator(3, LBFGSOptions(memory=5))
+    g0 = op.generation
+    op.update(array(namespace, [1.0, 0.5, -0.5]), array(namespace, [2.0, 1.0, 0.5]))
+    g1 = op.generation
+    op.update(array(namespace, [0.5, -1.0, 1.0]), array(namespace, [1.0, 1.5, 0.5]))
+    g2 = op.generation
+
+    assert g0 != g1 and g1 != g2 and g0 != g2

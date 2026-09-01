@@ -373,6 +373,9 @@ class _CondensedOperator(LinearOperator):
         # Declared by the driver for bound-free problems (``Σ_x`` is then an
         # all-zero diagonal); lets the structured solve treat ``D`` as scalar.
         self._sigma_x_zero = sigma_x_zero
+        # Per-instance memo for the Woodbury factors (see
+        # :meth:`_woodbury_blocks_cached`): variant → (W.generation, factors).
+        self._woodbury_memo: dict[str, tuple[int, _WoodburyBlockFactors]] = {}
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -600,6 +603,57 @@ class _CondensedOperator(LinearOperator):
             d = d + self._delta_w
         return _diagonal_solve(d, rhs, xp)
 
+    def _woodbury_diagonal(self, xi: float) -> Array:
+        """The Woodbury diagonal ``D̃ = ξ + diag(Σ_x) [+ diag(∇gᵀΣ_s∇g)] [+ δ_w]``.
+
+        The single source for both :meth:`dense_structured_solve` (which has
+        already ruled out inequality rows) and :meth:`lbfgs_inverse_apply`:
+        their ``D`` must stay *bitwise* identical on bound-only blocks for the
+        shared ``"plain"`` memo slot in :meth:`_woodbury_blocks_cached` to be
+        sound, so neither site assembles it by hand.
+        """
+        d = xi + self._sigma_x.diagonal()
+        if self._ineq_jac.shape[0] > 0:
+            d = d + self._ineq_jac.gram_diagonal(self._sigma_s.diagonal())
+        if self._delta_w != 0.0:
+            d = d + self._delta_w
+        return d
+
+    def _woodbury_blocks_cached(
+        self,
+        variant: str,
+        d: Array | float,
+        xi: float,
+        s: Array,
+        y: Array,
+        m_lbfgs: Array,
+        xp: Namespace,
+        *,
+        gram_u: Array | None = None,
+    ) -> _WoodburyBlockFactors:
+        """Memoized :func:`_woodbury_factors_blocks` for this operator instance.
+
+        Every block this operator holds is immutable after construction, so the
+        factors depend only on the L-BFGS window: repeated applies — the Krylov
+        auto-promotion probe, a promoted retry right after it, repeated
+        ``lbfgs_inverse_apply`` calls — reuse the factors instead of paying the
+        O(n·k²) build each time. ``variant`` separates builds whose ``D``
+        differs (``"plain"``, the Σ_x ≡ 0 ``"gram"`` fast path, the
+        inequality-Gram-augmented ``"ineq"`` diagonal). The memo is keyed on
+        ``W.generation`` so a curvature update on the shared L-BFGS operator
+        can never serve stale factors; a ``W`` without that token is never
+        cached.
+        """
+        token = getattr(self._W, "generation", None)
+        if token is not None:
+            hit = self._woodbury_memo.get(variant)
+            if hit is not None and hit[0] == token:
+                return hit[1]
+        factors = _woodbury_factors_blocks(d, xi, s, y, m_lbfgs, xp, gram_u=gram_u)
+        if token is not None:
+            self._woodbury_memo[variant] = (token, factors)
+        return factors
+
     def dense_structured_solve(self, rhs: Array) -> Array:
         """Exact dense solve for ``D - U M⁻¹ Uᵀ`` L-BFGS condensed blocks.
 
@@ -651,14 +705,13 @@ class _CondensedOperator(LinearOperator):
                 # which the L-BFGS operator maintains incrementally (O(k²) here
                 # instead of the O(n·k²) Uᵀ D⁻¹ U product).
                 gram_u = _lbfgs_gram_u(xi, gram_blocks(), xp)
-                factors = _woodbury_factors_blocks(
-                    xi + self._delta_w, xi, s, y, m_lbfgs, xp, gram_u=gram_u
+                factors = self._woodbury_blocks_cached(
+                    "gram", xi + self._delta_w, xi, s, y, m_lbfgs, xp, gram_u=gram_u
                 )
             else:
-                d = xi + sigma_x
-                if self._delta_w != 0.0:
-                    d = d + self._delta_w
-                factors = _woodbury_factors_blocks(d, xi, s, y, m_lbfgs, xp)
+                factors = self._woodbury_blocks_cached(
+                    "plain", self._woodbury_diagonal(xi), xi, s, y, m_lbfgs, xp
+                )
             return _woodbury_solve_blocks(factors, rhs, xp)
         assert compact_form is not None
         xi, u, m_lbfgs = compact_form()
@@ -1030,17 +1083,20 @@ class _CondensedOperator(LinearOperator):
         else:
             assert compact_form is not None
             xi, u, m_lbfgs = compact_form()
-        d_tilde = xi + self._sigma_x.diagonal()
-        if self._ineq_jac.shape[0] > 0:
-            d_tilde = d_tilde + self._ineq_jac.gram_diagonal(self._sigma_s.diagonal())
-        if self._delta_w != 0.0:
-            d_tilde = d_tilde + self._delta_w
+        d_tilde = self._woodbury_diagonal(xi)
 
         # Factor the 2k×2k inner block once (nonsingular for PD N); each apply is
         # then one diagonal inverse plus one small solve via Sherman–Morrison–Woodbury.
         xp = array_namespace(d_tilde)
         if compact_blocks is not None:
-            block_factors = _woodbury_factors_blocks(d_tilde, xi, s, y, m_lbfgs, xp)
+            # Bound-only ``D̃`` matches the structured solve's ``D`` bitwise by
+            # construction (both come from :meth:`_woodbury_diagonal`), so the
+            # two entry points share the ``"plain"`` slot; the
+            # inequality-augmented diagonal differs and gets its own.
+            variant = "ineq" if self._ineq_jac.shape[0] > 0 else "plain"
+            block_factors = self._woodbury_blocks_cached(
+                variant, d_tilde, xi, s, y, m_lbfgs, xp
+            )
             return lambda r: _woodbury_solve_blocks(block_factors, r, xp)
         factors = _woodbury_factors(d_tilde, u, m_lbfgs, xp)
         return lambda r: _woodbury_solve(factors, r, xp)

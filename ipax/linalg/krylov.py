@@ -33,10 +33,14 @@ Preconditioning (§5.2), all matrix-free:
   applied to MINRES by symmetric scaling. **Exception:** when the operator
   reports its Woodbury inverse as *exact* (``lbfgs_inverse_is_exact`` — a
   bound-only L-BFGS condensed block, no inequality Gram term) ``jacobi`` and
-  ``auto`` apply that inverse instead (reported as ``pc=lbfgs-exact``): CG then
-  converges in one iteration, and neither the O(n·k²) L-BFGS diagonal nor its
-  two host syncs are paid. ``KrylovOptions.exact_lbfgs_inverse=False`` restores
-  the plain diagonal (the A/B lever).
+  ``auto`` solve with that inverse *directly* (reported as ``pc=lbfgs-exact``,
+  ``last_method="direct"``): one Woodbury apply verified by a true-residual
+  check, with working-precision iterative refinement (Carson & Higham 2018)
+  covering round-off, falling back to the CG-preconditioned route when
+  refinement stalls — no CG loop on the fast path, and neither the O(n·k²)
+  L-BFGS diagonal nor its two host syncs are paid.
+  ``KrylovOptions.exact_lbfgs_inverse=False`` restores the plain diagonal
+  (the A/B lever).
 - ``lbfgs`` — an L-BFGS-aware Sherman–Morrison–Woodbury inverse. On the condensed
   (equality-free) operator it is ``N⁻¹`` (``lbfgs_inverse_apply``), an SPD operator
   used directly by CG/GMRES. On the equality **saddle** it is the block-diagonal
@@ -87,6 +91,18 @@ class KrylovConvergenceError(LinearSolveError):
 
 class _IndefiniteOperatorError(Exception):
     """Internal signal: CG hit non-positive curvature; retry with MINRES."""
+
+
+# Woodbury-apply budget for the direct exact-inverse solve: one apply plus up
+# to two working-precision iterative-refinement rounds (they converge when
+# cond(N)·u ≲ 1 — Carson & Higham 2018; the exact-inverse case is the
+# best-conditioned instance of their fixed-precision setting). A residual
+# still above tolerance after the budget does NOT fail the solve: the dispatch
+# falls back to CG preconditioned with the same inverse — the pre-direct route,
+# which is Galerkin-optimal per apply and therefore at least as strong — so
+# the budget is purely a fast-path/fallback split, not a robustness knob (the
+# same pattern as ``_MAX_REG_ATTEMPTS`` in the driver).
+_MAX_EXACT_APPLIES = 3
 
 
 def _inner(xp: Namespace, a: Array, b: Array) -> float:
@@ -284,6 +300,10 @@ class KrylovSolver:
             raise ValueError("Krylov method must be 'cg', 'minres', or 'gmres'")
 
         # method == "cg": prefer CG, fall back to MINRES on indefiniteness.
+        if self._exact_inverse_eligible(K):
+            # The Woodbury apply is the exact N⁻¹ here — solve directly instead
+            # of paying the CG loop's inner products and host syncs around it.
+            return self._exact_inverse_solve(K, rhs, xp, max_iter, rtol)
         precond = self._make_preconditioner(K, rhs, xp)
         try:
             return self._cg(K, rhs, xp, max_iter, rtol, precond)
@@ -312,10 +332,17 @@ class KrylovSolver:
         return self._auto_open() and self._lbfgs_condensed_available(K)
 
     def _auto_promote_if_slow(self, K: LinearOperator, max_iter: int) -> None:
-        """Promote after a slow-but-successful solve (iterations over threshold)."""
-        if not self._auto_can_promote(K):
+        """Promote after a slow-but-successful solve (iterations over threshold).
+
+        The cheap slowness test decides *first*: the availability probe inside
+        :meth:`_auto_can_promote` builds the full Woodbury factors (O(n·k²)),
+        which a fast successful solve must not pay on every iteration.
+        """
+        if not self._auto_open():
             return
-        if self.last_iterations > self._options.auto_switch_ratio * max_iter:
+        if self.last_iterations <= self._options.auto_switch_ratio * max_iter:
+            return
+        if self._lbfgs_condensed_available(K):
             self._auto_promoted = True
 
     def _lbfgs_condensed_available(self, K: LinearOperator) -> bool:
@@ -332,6 +359,84 @@ class KrylovSolver:
 
     # -- preconditioning --------------------------------------------------
 
+    def _exact_inverse_eligible(self, K: LinearOperator) -> bool:
+        """Whether this solve may use the operator's exact Woodbury ``N⁻¹``.
+
+        The same gate for the direct dispatch and the GMRES preconditioner: the
+        effective mode is the default Jacobi (an explicit ``none``/``lbfgs``
+        keeps its documented behavior), the ``exact_lbfgs_inverse`` A/B lever
+        is on, no earlier breakdown blocked it, and the operator reports its
+        Woodbury apply as the exact inverse (bound-only L-BFGS block).
+        """
+        return (
+            self._effective_preconditioner() == "jacobi"
+            and self._options.exact_lbfgs_inverse
+            and not self._exact_inverse_blocked
+            and K.lbfgs_inverse_is_exact()
+        )
+
+    def _exact_inverse_solve(
+        self, K: LinearOperator, b: Array, xp: Namespace, max_iter: int, rtol: float
+    ) -> Array:
+        """Direct solve via the exact condensed Woodbury inverse (§5.2).
+
+        Bound-only L-BFGS systems: ``x = N⁻¹ b`` in one apply (Byrd, Nocedal &
+        Schnabel 1994 compact form). Wrapping this apply in CG — the previous
+        route — paid the loop's inner products (three host syncs) and vector
+        updates just to confirm convergence; here one true-residual check does
+        that, with up to ``_MAX_EXACT_APPLIES − 1`` working-precision
+        iterative-refinement rounds ``x += N⁻¹ r`` (Carson & Higham 2018)
+        covering round-off on an ill-conditioned late-barrier ``D̃``.
+        (RT-scale study, n = 50k: 27 CG iterations + 17 ms Jacobi diagonal →
+        one verified apply; step solve 34 → 6 ms.)
+
+        Refinement is *weaker* per apply than a CG iteration (which is
+        Galerkin-optimal over the preconditioned Krylov space), so a stalled
+        or non-finite refinement never fails the solve here: it falls back to
+        exactly the pre-direct route — CG preconditioned with the same inverse
+        — whose breakdown paths keep the established semantics (sticky Jacobi
+        via :meth:`solve`). A backend-native error out of the Woodbury apply
+        (an exactly singular L-BFGS middle matrix) is converted to
+        :class:`KrylovConvergenceError` so it takes that same path instead of
+        escaping the driver's δ_w ladder.
+
+        ``last_iterations`` counts Woodbury applies on the fast path (1 in the
+        regular case) with ``last_method="direct"``; the fallback records as
+        CG/MINRES, exactly as before this fast path existed.
+        """
+        self._exact_inverse_active = True
+        b_norm = _norm(xp, b)
+        if b_norm == 0.0:
+            self._record(0, 0.0, "direct")
+            return xp.zeros_like(b)
+        tol = rtol * b_norm
+
+        raw_apply = K.lbfgs_inverse_apply()
+
+        def apply_inverse(v: Array) -> Array:
+            try:
+                return raw_apply(v)
+            except Exception as exc:  # backend-native LinAlgError and kin
+                raise KrylovConvergenceError(
+                    f"exact Woodbury apply failed: {exc}"
+                ) from exc
+
+        x = apply_inverse(b)
+        for applies in range(1, _MAX_EXACT_APPLIES + 1):
+            r = b - K.matvec(x)
+            r_norm = _norm(xp, r)
+            if r_norm <= tol:
+                self._record(applies, r_norm, "direct")
+                return x
+            if not math.isfinite(r_norm):
+                break  # a non-finite apply: refinement cannot recover it
+            if applies < _MAX_EXACT_APPLIES:
+                x = x + apply_inverse(r)
+        try:
+            return self._cg(K, b, xp, max_iter, rtol, apply_inverse)
+        except _IndefiniteOperatorError:
+            return self._preconditioned_minres(K, b, xp, max_iter, rtol)
+
     def _make_preconditioner(
         self, K: LinearOperator, rhs: Array, xp: Namespace
     ) -> Callable[[Array], Array]:
@@ -345,19 +450,16 @@ class KrylovSolver:
         mode = self._effective_preconditioner()
         if mode == "none":
             return lambda r: r
-        if (
-            mode == "jacobi"
-            and self._options.exact_lbfgs_inverse
-            and not self._exact_inverse_blocked
-            and K.lbfgs_inverse_is_exact()
-        ):
+        if self._exact_inverse_eligible(K):
             # Bound-only L-BFGS block (no inequality Gram term): the
             # Sherman–Morrison–Woodbury apply (§5.2; Byrd, Nocedal & Schnabel
-            # 1994 compact form) is the *exact* ``N⁻¹``, so CG converges in one
-            # iteration — strictly better than Jacobi, whose O(n·k²) L-BFGS
-            # diagonal costs the same order as the Woodbury factor plus two
-            # host syncs. (RT-scale study, n = 50k: 27 CG iterations + 17 ms
-            # diagonal → 1 iteration; step solve 34 → 6 ms.)
+            # 1994 compact form) is the *exact* ``N⁻¹`` — strictly better than
+            # Jacobi, whose O(n·k²) L-BFGS diagonal costs the same order as
+            # the Woodbury factor plus two host syncs. The default CG dispatch
+            # short-circuits to the *direct* ``_exact_inverse_solve`` (which
+            # carries the RT-scale measurements) before ever building a
+            # preconditioner, so this branch serves the explicit
+            # ``method="gmres"`` route.
             self._exact_inverse_active = True
             return K.lbfgs_inverse_apply()
         if mode == "lbfgs":

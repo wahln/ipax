@@ -102,9 +102,12 @@ equality-constrained saddle systems currently assemble exactly and ignore it.
 
     On **bound-only** L-BFGS problems (no inequality rows — the radiotherapy
     fluence-map shape) the Woodbury inverse is the *exact* `N⁻¹`, so the default
-    `jacobi` mode (and `auto`) apply it outright and CG converges in one
-    iteration; `Result.linear_solver` then reads `pc=lbfgs-exact`.
-    `KrylovOptions(exact_lbfgs_inverse=False)` restores the plain diagonal.
+    `jacobi` mode (and `auto`) skip the Krylov iteration entirely: one direct
+    apply verified by a true-residual check, with iterative refinement covering
+    round-off and a fallback to the CG-preconditioned route when refinement
+    stalls; `Result.linear_solver` then reads `pc=lbfgs-exact`.
+    `KrylovOptions(exact_lbfgs_inverse=False)` restores the plain diagonal
+    (and the CG loop).
 
     To get the block preconditioner *only where it pays off*, use
     `KrylovOptions(preconditioner="auto")`: it runs the cheap Jacobi diagonal

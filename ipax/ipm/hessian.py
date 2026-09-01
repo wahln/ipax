@@ -63,6 +63,11 @@ class LBFGSOperator(LinearOperator):
     ``(γ_kᵀγ_k)/(δ_kᵀγ_k)`` from the newest pair. Otherwise the compact update
     uses the unscaled identity seed. With no pairs the operator is always the
     identity, so the first IPM step is a Newton-seed step.
+
+    The public ``generation`` attribute is a monotone staleness token, bumped
+    on every accepted window change: consumers that cache work derived from
+    the compact window (the condensed operator's Woodbury factor memo in
+    ``ipm/kkt.py``) key their caches on it.
     """
 
     def __init__(self, n: int, options: LBFGSOptions) -> None:
@@ -93,6 +98,9 @@ class LBFGSOperator(LinearOperator):
         self._xi: float = 1.0
         self._m: Array | None = None
         self._u_cache: Array | None = None
+        # Staleness token for downstream factor caches (the condensed Woodbury
+        # memo in ``ipm/kkt.py`` keys on it): bumped on every window change.
+        self.generation: int = 0
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -455,6 +463,7 @@ class LBFGSOperator(LinearOperator):
         bottom = xp.concat((xp.permute_dims(lower, (1, 0)), -d_mat), axis=1)
         self._m = xp.concat((top, bottom), axis=0)
         self._u_cache = None  # the lazy U = [ξS Y] cache is stale now
+        self.generation += 1  # downstream Woodbury factor caches are stale too
 
 
 __all__ = ["LBFGSOperator"]

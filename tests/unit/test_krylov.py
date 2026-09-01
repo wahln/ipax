@@ -1060,3 +1060,159 @@ def test_preconditioner_none_ignores_exact_lbfgs_inverse(namespace):
 
     assert solver.last_iterations > 2
     assert solver.describe() == "krylov (cg, pc=none)"
+
+
+def test_exact_inverse_dispatches_directly_not_through_cg(namespace):
+    # The exact condensed Woodbury inverse is a *direct* solve; wrapping it in
+    # CG paid the loop's extra inner-product host syncs and vector ops just to
+    # confirm what holds algebraically. The dispatch must apply it directly.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    solver = _solver()
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.last_method == "direct"
+    assert solver.last_iterations == 1  # one Woodbury apply, verified
+    assert solver.describe() == "krylov (cg, pc=lbfgs-exact)"
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-8 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_direct_dispatch_refines_a_round_off_limited_apply(namespace):
+    # CG around the exact inverse implicitly refined when one apply's residual
+    # sat above tolerance (ill-conditioned late-barrier systems); the direct
+    # dispatch must keep that robustness via iterative refinement, not fail.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    original = K.lbfgs_inverse_apply()
+    # A slightly-off apply: first residual ~1e-6·‖b‖ (above rtol=1e-10), one
+    # refinement round lands it at ~1e-12·‖b‖.
+    K.lbfgs_inverse_apply = lambda: (  # type: ignore[method-assign]
+        lambda r: (1.0 - 1e-6) * original(r)
+    )
+    solver = _solver()
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.last_method == "direct"
+    assert solver.last_iterations == 2  # apply + one refinement round
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-8 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_direct_dispatch_falls_back_to_preconditioned_cg_on_stall(namespace):
+    # A finite-but-wrong "exact" apply must not be returned unverified: the
+    # refinement stalls and the dispatch falls back to CG preconditioned with
+    # the same apply — the pre-direct route, whose per-apply Galerkin
+    # optimality recovers cases plain refinement cannot. No sticky Jacobi
+    # block: the old route never blocked on this input either.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    # Identity apply: refinement is Richardson iteration and diverges on this
+    # ill-scaled Σ_x, but identity-preconditioned CG converges fine.
+    K.lbfgs_inverse_apply = lambda: lambda r: r  # type: ignore[method-assign]
+    solver = _solver()
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.last_method == "cg"  # the fallback ran, and it sufficed
+    assert solver.describe() == "krylov (cg, pc=lbfgs-exact)"
+    assert not solver._exact_inverse_blocked
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-7 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_direct_dispatch_converts_backend_errors_to_the_fallback(namespace):
+    # An exactly singular L-BFGS middle matrix raises a backend-native error
+    # inside the Woodbury apply (e.g. ``numpy.linalg.LinAlgError``); the direct
+    # path must convert it to KrylovConvergenceError so the established sticky
+    # Jacobi fallback handles it, instead of escaping the driver's δ_w ladder.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+
+    def _raising():
+        def _apply(r):
+            raise ValueError("singular middle matrix")
+
+        return _apply
+
+    K.lbfgs_inverse_apply = _raising  # type: ignore[method-assign]
+    solver = _solver()
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.describe() == "krylov (cg, pc=jacobi)"
+    assert solver._exact_inverse_blocked
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-7 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_direct_dispatch_zero_rhs_returns_zero(namespace):
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    solver = _solver()
+    solver.factor(K)
+
+    x = solver.solve(namespace.zeros((n,), dtype=array(namespace, [0.0]).dtype))
+
+    assert bool(namespace.all(x == 0.0))
+    assert solver.last_iterations == 0
+    assert solver.last_method == "direct"
+
+
+def test_explicit_gmres_still_uses_the_exact_inverse_as_preconditioner(namespace):
+    # The direct dispatch lives on the default CG route only; an explicit
+    # ``method="gmres"`` keeps its documented behavior — the exact inverse
+    # serves as GMRES's left preconditioner via ``_make_preconditioner``.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    solver = _solver(method="gmres")
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.last_method == "gmres"
+    assert solver.describe() == "krylov (gmres, pc=lbfgs-exact)"
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-8 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_auto_promotion_probe_skipped_on_fast_solves(namespace):
+    # The auto-mode availability probe (``lbfgs_inverse_apply``) builds the full
+    # O(n·k²) Woodbury factors; a fast successful solve must not pay it — the
+    # cheap slowness test decides first.
+    probes: list[int] = []
+
+    class _ProbeCounting(Dense):
+        def lbfgs_inverse_apply(self):
+            probes.append(1)
+            raise NotImplementedError
+
+    A, rhs, _ = _spd_system(namespace)
+    solver = _solver(preconditioner="auto")
+    solver.factor(_ProbeCounting(A))
+
+    solver.solve(rhs)
+
+    assert solver.last_iterations <= 5  # well-conditioned: genuinely fast
+    assert probes == []

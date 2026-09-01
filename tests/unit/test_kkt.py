@@ -1388,3 +1388,118 @@ def test_condensed_lbfgs_inverse_exactness_flag(namespace):
     assert bound_only.lbfgs_inverse_is_exact()
     assert not with_ineq.lbfgs_inverse_is_exact()
     assert not no_pairs.lbfgs_inverse_is_exact()
+
+
+def test_condensed_woodbury_factors_memoized_per_instance(namespace, tol, monkeypatch):
+    """Repeated Woodbury applies on one operator instance reuse the factors.
+
+    The factors depend only on the instance's (immutable) blocks and the L-BFGS
+    window, so the auto-promotion probe, a promoted retry, and repeated
+    ``lbfgs_inverse_apply`` calls must not each pay the O(n·k²) build again.
+    """
+    from ipax.ipm import kkt as kkt_module
+
+    W = _lbfgs_operator(namespace)
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    op = build_condensed_operator(
+        W,
+        sigma_x,
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+    rhs = array(namespace, [1.0, -2.0, 0.5])
+
+    builds: list[int] = []
+    original = kkt_module._woodbury_factors_blocks
+
+    def _spy(*args, **kwargs):
+        builds.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kkt_module, "_woodbury_factors_blocks", _spy)
+    first = op.lbfgs_inverse_apply()(rhs)
+    second = op.lbfgs_inverse_apply()(rhs)
+
+    assert len(builds) == 1
+    # A cache hit reuses the very same factors: bitwise-identical results.
+    assert bool(namespace.all(first == second))
+    # ... and the structured dense solve shares them on a bound-only block
+    # (same ``D`` by construction: no inequality Gram term).
+    op.dense_structured_solve(rhs)
+    assert len(builds) == 1
+
+
+def test_condensed_woodbury_memo_invalidated_by_lbfgs_update(namespace, tol):
+    """A curvature update on the shared ``W`` must never serve stale factors."""
+    W = _lbfgs_operator(namespace)
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype))
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+    rhs = array(namespace, [1.0, -2.0, 0.5])
+
+    before = op.lbfgs_inverse_apply()(rhs)
+    W.update(array(namespace, [0.3, 0.8, -0.2]), array(namespace, [0.9, 1.1, 0.4]))
+    after = op.lbfgs_inverse_apply()(rhs)
+
+    fresh = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+    expected = fresh.lbfgs_inverse_apply()(rhs)
+    assert_allclose(namespace, after, expected, **tol)
+    # The update genuinely changed the system — a stale cache would show here.
+    assert not bool(namespace.all(before == after))
+
+
+def test_condensed_woodbury_without_generation_token_is_never_cached(
+    namespace, monkeypatch
+):
+    """A duck-typed ``W`` exposing ``compact_blocks`` but no ``generation``
+    cannot be staleness-checked, so its factors must be rebuilt on every call
+    (correctness over speed for foreign compact-form operators)."""
+    from ipax.ipm import kkt as kkt_module
+
+    inner = _lbfgs_operator(namespace)
+
+    class _TokenlessCompactW(LinearOperator):
+        @property
+        def shape(self):
+            return inner.shape
+
+        def matvec(self, v):
+            return inner.matvec(v)
+
+        def rmatvec(self, v):
+            return inner.rmatvec(v)
+
+        def diagonal(self, like=None):
+            return inner.diagonal(like)
+
+        def compact_blocks(self):
+            return inner.compact_blocks()
+
+    op = build_condensed_operator(
+        _TokenlessCompactW(),
+        Diagonal(array(namespace, [0.25, 0.75, 1.25])),
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+    rhs = array(namespace, [1.0, -2.0, 0.5])
+
+    builds: list[int] = []
+    original = kkt_module._woodbury_factors_blocks
+
+    def _spy(*args, **kwargs):
+        builds.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kkt_module, "_woodbury_factors_blocks", _spy)
+    first = op.lbfgs_inverse_apply()(rhs)
+    second = op.lbfgs_inverse_apply()(rhs)
+
+    assert len(builds) == 2
+    assert bool(namespace.all(first == second))

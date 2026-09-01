@@ -414,10 +414,11 @@ class KrylovOptions:
     rtol: float = 1e-10
     max_iter: int | None = None  # default: 2 * dim + 100 at the call site
     preconditioner: KrylovPreconditioner = "jacobi"
-    # ``"jacobi"`` (default) and ``"auto"`` apply the operator's *exact* condensed
-    # Woodbury inverse instead of the diagonal whenever it is exact — a bound-only
-    # L-BFGS system (no inequality Gram term): CG then converges in one iteration
-    # and the O(n·k²) L-BFGS diagonal is never formed (``pc=lbfgs-exact`` in
+    # ``"jacobi"`` (default) and ``"auto"`` solve with the operator's *exact*
+    # condensed Woodbury inverse instead of iterating whenever it is exact — a
+    # bound-only L-BFGS system (no inequality Gram term): one direct apply with a
+    # residual check (plus iterative refinement when round-off demands it), and
+    # the O(n·k²) L-BFGS diagonal is never formed (``pc=lbfgs-exact`` in
     # ``Result.linear_solver``). ``False`` keeps the plain diagonal in those modes
     # — the A/B lever; ``"none"`` disables preconditioning entirely.
     exact_lbfgs_inverse: bool = True

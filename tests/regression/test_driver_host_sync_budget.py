@@ -15,25 +15,41 @@ import pytest
 
 from benchmarks.harness import _ScalarSyncCounter
 from ipax import Options, Status, solve
-from ipax.testing.problems import HS43, HS71
+from ipax.testing.problems import HS43, HS71, BoundConstrainedQP
 from tests._helpers import array
 from tests.regression.test_callback_evaluation_counts import _Rosenbrock
 
 
 @pytest.mark.parametrize(
-    ("make", "x0", "budget"),
+    ("make", "x0", "budget", "options"),
     [
-        (lambda xp: _Rosenbrock(xp, 20), [-1.2, 1.0] * 10, 13.0),
-        (HS43, [0.0, 0.0, 0.0, 0.0], 21.0),
-        (HS71, [1.0, 5.0, 5.0, 1.0], 31.0),
+        (lambda xp: _Rosenbrock(xp, 20), [-1.2, 1.0] * 10, 13.0, Options()),
+        (HS43, [0.0, 0.0, 0.0, 0.0], 21.0, Options()),
+        (HS71, [1.0, 5.0, 5.0, 1.0], 31.0, Options()),
+        # Bound-only L-BFGS on the Krylov route: the budget sits *between* the
+        # direct exact-inverse dispatch (~24.2 syncs/iter) and the same solve
+        # re-wrapped in CG (~26.8), so it pins that the direct route stays
+        # dispatched — the change's device-efficiency property, not just its
+        # iteration counts.
+        (
+            BoundConstrainedQP,
+            [0.25, 0.75],
+            25.0,
+            Options(hessian="lbfgs", linsolve="krylov"),
+        ),
     ],
-    ids=["rosenbrock-unconstrained", "HS43-ineq", "HS71-eq-ineq-bounds"],
+    ids=[
+        "rosenbrock-unconstrained",
+        "HS43-ineq",
+        "HS71-eq-ineq-bounds",
+        "bound-only-lbfgs-krylov-direct",
+    ],
 )
-def test_host_syncs_per_iteration_bounded(namespace, make, x0, budget):
+def test_host_syncs_per_iteration_bounded(namespace, make, x0, budget, options):
     problem = make(namespace)
     x = array(namespace, x0)
     with _ScalarSyncCounter(type(x)) as counter:
-        result = solve(problem, x, options=Options())
+        result = solve(problem, x, options=options)
     if not counter.available:
         pytest.skip(f"scalar-sync counting unavailable for {type(x)!r}")
     assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
