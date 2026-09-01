@@ -108,6 +108,8 @@ def default_configs(
     powell_damping: bool | None = None,
     damping_skip_ratio: float | None = None,
     lbfgs_seed: str | None = None,
+    backtrack_interpolation: bool | None = None,
+    exact_lbfgs_inverse: bool | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -143,6 +145,15 @@ def default_configs(
         # NWW §5 free-mode acceptance A/B lever ("rigorous" keeps the W&B gate
         # in both regimes); only observable under a non-monotone --mu-schedule.
         ls_overrides["free_mode_acceptance"] = free_mode_acceptance
+    if backtrack_interpolation is not None:
+        # Interpolated-backtrack A/B lever (2026-08 RT perf study): the
+        # solver default (False) is W&B's plain halving; True selects
+        # safeguarded quadratic interpolation of the rejected trial's merit
+        # (N&W eq. 3.58) instead — opt-in per a non-unanimous full-corpus
+        # sweep (see docs/benchmarks/s2mpj.md). Affects every config (the
+        # filter line search runs on both Hessian routes), unlike the
+        # L-BFGS-only levers above.
+        ls_overrides["backtrack_interpolation"] = backtrack_interpolation
     if ls_overrides:
         common["line_search"] = LineSearchOptions(**ls_overrides)
     if slack_init_scale is not None:
@@ -174,8 +185,19 @@ def default_configs(
             seed_formula="direct" if lbfgs_seed is None else lbfgs_seed,  # type: ignore[arg-type]
         )
     krylov_common = dict(common)
-    if krylov_preconditioner is not None:
-        krylov_common["krylov"] = KrylovOptions(preconditioner=krylov_preconditioner)  # type: ignore[arg-type]
+    if krylov_preconditioner is not None or exact_lbfgs_inverse is not None:
+        # exact_lbfgs_inverse A/B lever (2026-08 RT perf study): the solver
+        # default (True) applies the condensed Woodbury inverse outright on
+        # bound-only L-BFGS systems instead of the plain Jacobi diagonal.
+        # Only observable on the two Krylov configs.
+        krylov_common["krylov"] = KrylovOptions(
+            preconditioner=(  # type: ignore[arg-type]
+                "jacobi" if krylov_preconditioner is None else krylov_preconditioner
+            ),
+            exact_lbfgs_inverse=(
+                True if exact_lbfgs_inverse is None else exact_lbfgs_inverse
+            ),
+        )
     return [
         (
             "lbfgs/dense",
@@ -560,6 +582,25 @@ def main(argv: list[str] | None = None) -> int:
         "'scalar1' is IPOPT's δᵀγ/δᵀδ; only observable on the L-BFGS configs.",
     )
     parser.add_argument(
+        "--backtrack-interpolation",
+        choices=("on", "off"),
+        default=None,
+        help="override LineSearchOptions.backtrack_interpolation on every config "
+        "(default: the solver default 'off' = W&B's plain halving) — the lever "
+        "for the interpolation-vs-halving A/B; 'on' selects the safeguarded "
+        "N&W eq. 3.58 quadratic-interpolation backtrack instead. Affects every "
+        "config.",
+    )
+    parser.add_argument(
+        "--exact-lbfgs-inverse",
+        choices=("on", "off"),
+        default=None,
+        help="override KrylovOptions.exact_lbfgs_inverse on every config "
+        "(default: the solver default 'on' = apply the condensed Woodbury "
+        "inverse outright on bound-only L-BFGS systems) — the lever for the "
+        "exact-inverse-vs-Jacobi A/B; only observable on the Krylov configs.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -633,6 +674,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
         damping_skip_ratio=args.damping_skip_ratio,
         lbfgs_seed=args.lbfgs_seed,
+        backtrack_interpolation=(
+            None
+            if args.backtrack_interpolation is None
+            else args.backtrack_interpolation == "on"
+        ),
+        exact_lbfgs_inverse=(
+            None
+            if args.exact_lbfgs_inverse is None
+            else args.exact_lbfgs_inverse == "on"
+        ),
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}

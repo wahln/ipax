@@ -261,7 +261,10 @@ class FilterLineSearch:
     ) -> float:
         """The next trial step size after a rejection.
 
-        Safeguarded quadratic interpolation (Nocedal & Wright 2006, eq. 3.58):
+        Plain halving (``α ← α/2``), unless ``LineSearchOptions.
+        backtrack_interpolation`` is set (opt-in; default off — see that
+        option for the full-corpus sweep), which selects safeguarded
+        quadratic interpolation (Nocedal & Wright 2006, eq. 3.58):
         the minimizer ``−φ'(0)·α² / (2(φ(α) − φ(0) − φ'(0)·α))`` of the
         quadratic through ``φ(0)``, ``φ'(0)`` and the rejected trial, clipped
         into ``[0.1·α, 0.5·α]``. The upper clip keeps every trial at least as

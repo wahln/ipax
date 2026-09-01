@@ -20,12 +20,14 @@ win next to any default-configuration row that misses one of those problems
 | an **L-BFGS run grinding at a worse objective** on a nonconvex problem while the exact-Hessian routes solve it | `LBFGSOptions(damping_skip_ratio=1.0)` | Powell damping fabricates positive curvature out of pairs that strongly contradict it (`δᵀγ/δᵀBδ` down to −25 on `ORTHRGDS`); the threshold skips those pairs and damps only mild indefiniteness — `ORTHRGDS` reaches IPOPT's objective in 19 iterations |
 | an **L-BFGS run frozen at a KKT plateau** (steps microscopic, KKT barely moving) | `LBFGSOptions(seed_formula="scalar1")` | the default ξ seed `γᵀγ/δᵀγ` exceeds IPOPT's `δᵀγ/δᵀδ` by the δ–γ misalignment factor `1/cos²∠`, which badly-scaled least squares drives to ~1e15 — an over-stiff seed freezes the step (`GASOIL`: 508 stalled iterations → optimal in 25, IPOPT parity; `NELSONLS` runs the default seed at ξ ≈ 1e20) |
 | deeply infeasible start grinds with **α clipped by fraction-to-boundary** (radiotherapy-scale) | `BarrierOptions(slack_init_scale=0.1)` first; add `mu_schedule="quality"` + `globalization="breedveld"` + `kappa_centrality=1e-4` **only** on the proton signature (extremely tall `m/n`, recipe stalls near the optimum) | the slack floor fixes the init-time slack/dual scale on all TROTS groups; the μ-raising stack rescues the proton grind but blows up Liver/CK/VMAT — see the [TROTS page](../benchmarks/trots.md) |
+| clean-looking `acceptable` stall well above a near-zero documented optimum on a least-squares-shaped **L-BFGS** problem | `LineSearchOptions(backtrack_interpolation=True)` | plain halving concedes a trial the quadratic merit model (N&W eq. (3.58)) would have refined further (`HS25`: `acceptable` at 32.83 → `optimal` at ~1.4e-16, all three `lbfgs/*` routes) |
 
 ## How to read a hint
 
 A hint is a *routing* suggestion, not a better default: every one of these
-levers lost or tied its full-corpus A/B as a default (the sweeps are recorded
-in the [S2MPJ benchmark page](../benchmarks/s2mpj.md) and the changelog), so
+levers lost, tied, or won only non-unanimously on its full-corpus A/B as a
+default (the sweeps are recorded in the
+[S2MPJ benchmark page](../benchmarks/s2mpj.md) and the changelog), so
 switching one on globally trades your problem family for another. Reach for
 the lever when your solve matches the signature; verify against the metrics
 the registry records.

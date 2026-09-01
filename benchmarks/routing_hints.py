@@ -48,11 +48,14 @@ class RoutingHint:
     ``signature`` the failure pattern this lever addresses (what to look for
     on problems *outside* this registry).
 
-    ``hessian`` restricts the hint to configurations where the lever is
-    *observable at all*: an ``LBFGSOptions`` knob does nothing under
-    ``hessian="exact"``, so offering it next to an ``exact/*`` row would
-    recommend a no-op and quote a win measured on a different route. ``None``
-    (the default) means the lever applies to any Hessian mode.
+    ``hessian`` restricts the hint to configurations where it is worth
+    recommending at all: either the lever has no effect there (an
+    ``LBFGSOptions`` knob does nothing under ``hessian="exact"``) or the win
+    was measured only there (the default route already solves the problem on
+    the other Hessian mode). Either way, offering it next to a row on the
+    excluded mode would recommend something inert or quote a win measured on
+    a different route. ``None`` (the default) means the lever applies to any
+    Hessian mode.
     """
 
     options: str
@@ -93,6 +96,23 @@ HINTS: dict[str, tuple[RoutingHint, ...]] = {
             "exact-Hessian routes solve the problem — the direct ξ seed "
             "inflated by δ–γ misalignment",
             hessian="lbfgs",  # seeds the L-BFGS operator; inert with exact
+        ),
+    ),
+    "HS25": (
+        RoutingHint(
+            options="LineSearchOptions(backtrack_interpolation=True)",
+            win="optimal at ~1.4e-16 (documented optimum 0.0), reproduced "
+            "identically on lbfgs/dense, lbfgs/krylov and lbfgs/sparse "
+            "(default: acceptable at 32.83), measured at max_iter=10000 / "
+            "max_time=300s",
+            signature="a clean-looking acceptable stall well above a "
+            "documented near-zero optimum on a least-squares-shaped problem — "
+            "plain halving concedes a trial the quadratic merit model would "
+            "have refined further",
+            hessian="lbfgs",  # every exact/* route already reaches ~1.4e-16
+            # on HS25 regardless of this lever (verified both with and
+            # without it), so the hint next to an exact/* row would be inert
+            # rather than merely unobservable — the win is L-BFGS-only
         ),
     ),
     "HS59": (

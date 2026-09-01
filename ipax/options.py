@@ -134,18 +134,29 @@ class LineSearchOptions:
     # safeguarded into [0.1·α, 0.5·α], so a trial is never longer than plain
     # halving and a single bad model can never collapse the step. Falls back to
     # halving whenever the model is unusable (non-finite trial φ, non-descent
-    # dφ). ``False`` restores W&B's plain ``α ← α/2`` (the A/B lever). On
-    # RT-style bound-only L-BFGS problems the ``scalar1`` seed overshoots and
-    # backtracks ~3.3-4.1 trials/iteration under halving — each trial one
-    # objective evaluation (one dose-projection ``D@x`` at scale); interpolation
-    # measured 2.0-2.4 trials/iteration at equal or better objective quality.
-    # ``search_free`` (the opt-in free mode) has no merit model and keeps plain
-    # halving regardless. DEFAULT PENDING the full-corpus S2MPJ sweep: the rule
-    # changes trajectories (the accepted α differs), so the sweep decides
-    # whether this stays the default — unlike the opt-in precedent
-    # (``gamma_alpha``, ``slack_init_scale``) the A/B was scheduled immediately
-    # after landing.
-    backtrack_interpolation: bool = True
+    # dφ, non-positive model curvature). ``search_free`` (the opt-in free
+    # mode) has no merit model and keeps plain halving regardless.
+    #
+    # OPT-IN (default ``False`` = W&B's plain ``α ← α/2``), per the 2026-08-31
+    # full S2MPJ corpus sweep (numpy, max_iter=10000, max_time=300s, incl.
+    # objective-free; see ``docs/benchmarks/s2mpj.md`` for the full table).
+    # The v23→v24 candidate delta (+18/6600) credits *three* perf commits at
+    # once, not this lever alone — isolated on its own this lever scores
+    # **+11/6600**, and not unanimously: the three ``exact/*`` configs never
+    # touch the L-BFGS code, so a direct v23→v24 comparison there isolates
+    # this lever alone (net -1/3300: exact/dense -1, exact/krylov +5,
+    # exact/sparse -5, incl. reproducible worse-basin flips on
+    # HS97/HS98/OSBORNEB on 2 of the 3 exact routes). The gain concentrates on
+    # the *default* Hessian mode instead: a same-commit A/B (this lever on vs
+    # off, the other two perf commits held fixed) scores lbfgs/* at +12/3300
+    # (39 fixed, 27 broken). Per this repo's own precedent (``gamma_alpha``
+    # scored -4 and stayed opt-in; ``lbfgs_seed="scalar1"`` scored -140 and
+    # stayed a routing hint), a mixed/non-unanimous corpus result does not
+    # flip a default here even though the net is positive and the value is
+    # real on L-BFGS problems — see the RT-style measurement above and
+    # ``benchmarks/routing_hints.py`` (e.g. HS25: acceptable at 32.8 default
+    # vs optimal at ~1.4e-16 with this lever on, all three lbfgs/* routes).
+    backtrack_interpolation: bool = False
     # Safeguard bounds on one interpolated backtrack, as fractions of the
     # rejected α (N&W 2006 §3.5): never above ``shrink_max`` (0.5 keeps every
     # trial at least as short as plain halving) and never below ``shrink_min``

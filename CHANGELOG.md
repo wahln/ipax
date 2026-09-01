@@ -17,23 +17,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (5 ms per step at `n = 50k`).
 
 ### Changed
-- **Rejected line-search trials backtrack by quadratic interpolation.** After
-  a rejected trial the filter line search now steps to the minimizer of the
-  quadratic merit model through `phi(0)`, `phi'(0)` and the rejected
+- **New opt-in: quadratic-interpolation backtracking in the filter line
+  search.** After a rejected trial,
+  `LineSearchOptions(backtrack_interpolation=True)` steps to the minimizer of
+  the quadratic merit model through `phi(0)`, `phi'(0)` and the rejected
   `phi(alpha)` (Nocedal & Wright 2006, eq. (3.58)), safeguarded into
-  `[0.1 alpha, 0.5 alpha]` — never longer than the previous plain halving, and
-  falling back to halving whenever the model is unusable (non-finite trial
-  merit, non-descent direction, non-positive model curvature). The opt-in
-  free-mode search has no merit model and keeps halving. **Trajectories
-  change** (the accepted step length differs), pending the full-corpus sweep;
-  `LineSearchOptions(backtrack_interpolation=False)` restores plain halving
-  (the A/B lever), and `backtrack_shrink_min`/`backtrack_shrink_max` expose
-  the safeguard bounds. Measured on the RT-style bound-only L-BFGS study
+  `[0.1 alpha, 0.5 alpha]` (`backtrack_shrink_min`/`backtrack_shrink_max`) —
+  never longer than plain halving — falling back to halving whenever the
+  model is unusable (non-finite trial merit, non-descent direction,
+  non-positive model curvature). The opt-in free-mode search has no merit
+  model and always halves. Measured on the RT-style bound-only L-BFGS study
   (n = 50k, `scalar1` seed): 3.3-4.1 objective evaluations per iteration drop
-  to 2.0-2.4 — each one a dose-projection `D@x` at scale — at equal or better
-  objective quality, and a hopeless ray now concedes to restoration in ~7
-  trials instead of 21. One budget-calibration regression test is pinned to
-  halving.
+  to 2.0-2.4 — each one a dose-projection `D@x` at scale — and a hopeless ray
+  concedes to restoration in ~7 trials instead of 21. **Default stays `False`
+  (plain halving)**: this lever's own contribution to the 2026-08-31 full
+  S2MPJ corpus sweep is **+11/6600**, and not unanimously — the three
+  Hessian-agnostic `exact/*` configs (which isolate this lever alone, since
+  they never touch the L-BFGS code the other changes below target) net
+  -1/3300, including reproducible worse-basin flips on HS97/HS98/OSBORNEB on
+  2 of the 3 exact routes, while the default L-BFGS Hessian mode nets +12/3300
+  (a same-commit A/B with the other L-BFGS-specific changes below held fixed).
+  See `benchmarks/routing_hints.py` (e.g. HS25) and `docs/benchmarks/s2mpj.md`
+  for the per-problem detail and the full table (the raw candidate-vs-baseline
+  delta there is +18/6600, but that credits all three perf commits at once —
+  not this lever in isolation).
 - **The L-BFGS compact factor stays in S/Y block form on the hot path.** The
   operator no longer materializes and copies `U = [xiS Y]` (n x 2k) on every
   curvature update; the matvec, the structured Woodbury solves and the exact

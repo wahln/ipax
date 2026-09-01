@@ -28,12 +28,14 @@ def _reference_best_dual(namespace) -> float:
     result = solve(
         problem,
         array(namespace, [0.25, 0.75]),
-        # Plain halving pins the calibration trajectory: under the
-        # interpolating backtrack this QP's best iterate reaches an exactly
-        # zero dual infeasibility within the 3-iteration budget on some
-        # backends, and the scenario (best iterate near but not at the
+        # Plain halving (the default) pins the calibration trajectory: under
+        # the opt-in interpolating backtrack this QP's best iterate reaches an
+        # exactly zero dual infeasibility within the 3-iteration budget on
+        # some backends, and the scenario (best iterate near but not at the
         # tolerance) needs a nonzero value to place the tolerances around.
         # The salvage logic under test is orthogonal to the backtracking rule.
+        # (Explicit rather than relying on the default so this calibration
+        # never silently breaks if that default changes again.)
         options=Options(
             hessian="exact",
             linsolve="dense",

@@ -235,10 +235,12 @@ The filter constants
 regularization escalation
 ([`RegularizationOptions`](../reference.md#ipax.options.RegularizationOptions))
 are rarely-touched advanced knobs; the defaults follow Wächter & Biegler (2006)
-and Friedlander & Orban (2012), with one deviation: a rejected trial step
-backtracks by safeguarded quadratic interpolation of the merit model
-(Nocedal & Wright 2006, eq. (3.58)) instead of plain halving —
-`LineSearchOptions(backtrack_interpolation=False)` restores W&B's `α ← α/2`.
+and Friedlander & Orban (2012).
+`LineSearchOptions(backtrack_interpolation=True)` is an opt-in deviation —
+safeguarded quadratic interpolation of the merit model (Nocedal & Wright 2006,
+eq. (3.58)) instead of plain halving after a rejected trial — see
+[S2MPJ benchmarks](../benchmarks/s2mpj.md) for when it helps and why it stays
+opt-in.
 
 ## Barrier μ schedule
 

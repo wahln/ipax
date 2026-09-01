@@ -384,10 +384,6 @@ history and the v15 report.
     sweep (2026-07-17) attributed the two independently; they sum exactly to the
     combined −14.
 
-    - **`LineSearchOptions.backtrack_interpolation`** (default `True`) selects
-      the safeguarded quadratic-interpolation backtrack (N&W eq. (3.58),
-      clipped to `[0.1α, 0.5α]`); `False` is the plain-halving control arm for
-      A/B sweeps of the line-search trial rule.
     - **`LineSearchOptions.gamma_alpha`** (γ_α, default `None`) switches the
       minimum step size from the flat `alpha_min_frac` to the **adaptive eq. (23)
       rule**, so a hopeless ray concedes to restoration as soon as no acceptable
@@ -507,6 +503,51 @@ history and the v15 report.
     not clear the bar to change the default; the radiotherapy win is available
     per-solve via the option. A value in `[0.05, 0.5]` matches the constraint
     scale on RT-sized problems.
+
+!!! note "Interpolated line-search backtracking (`backtrack_interpolation`, opt-in, 2026-08-31)"
+    `LineSearchOptions.backtrack_interpolation` (default `False`) replaces the
+    plain `α ← α/2` backtrack after a rejected trial with the safeguarded
+    minimizer of the quadratic merit model through `φ(0)`, `φ'(0)` and the
+    rejected `φ(α)` (Nocedal & Wright 2006, eq. (3.58)), clipped to
+    `[0.1α, 0.5α]`. It targets an RT-scale finding: on a bound-only L-BFGS
+    problem (n = 50k, `scalar1` seed) halving needs 3.3–4.1 objective
+    evaluations per accepted step, each one a full dose-projection `D@x`;
+    interpolation lands the trial in 2.0–2.4.
+
+    Three commits landed together on 2026-08-31 (`6b5058a`/`eb46439`/
+    `bdaff4e`, this lever being the last): the candidate-vs-baseline delta
+    (develop @ `7673ac1`, 2026-08-26, vs `bdaff4e`; full corpus, NumPy,
+    `max_iter=10000`, `max_time=300s`, incl. objective-free, `--jobs 8` with
+    BLAS threads pinned to 1) is **+18/6600**, but that credits all three
+    commits at once. Isolating *this lever alone* needs two more sweeps: the
+    `exact/*` configs never touch the L-BFGS code the other two commits
+    target, so the same `7673ac1`→`bdaff4e` comparison isolates it there
+    directly; on `lbfgs/*`, a same-commit A/B at `bdaff4e`
+    (`--backtrack-interpolation off` vs the default) isolates it with the
+    other two commits' effects held fixed:
+
+    | correct (Δ from this lever alone) | `exact/dense` | `exact/krylov` | `exact/sparse` | `lbfgs/dense` | `lbfgs/krylov` | `lbfgs/sparse` |
+    |---|---|---|---|---|---|---|
+    | net | **−1** (+8/−9) | **+5** (+16/−11) | **−5** (+7/−12) | **+9** (+15/−6) | **+4** (+12/−8) | **−1** (+12/−13) |
+
+    `exact/*` nets **−1/3300**, including reproducible worse-basin flips on
+    `HS97`/`HS98` (+30%) and `OSBORNEB` (+118%) — same `optimal` status both
+    ways, a genuinely different local optimum — on 2 of the 3 exact routes
+    (`exact/krylov` is unaffected on all three). `lbfgs/*` nets **+12/3300**
+    (39 fixed, 27 broken) with the other two commits' own contribution
+    (`6b5058a` + `eb46439` alone, `--backtrack-interpolation off` throughout)
+    already at +7/3300 there. So this lever's own total contribution across
+    the full corpus is **−1 + 12 = +11/6600** — real, but not the +18 the raw
+    candidate delta suggests, and not unanimous.
+
+    Per the same bar as `slack_init_scale` above (and `gamma_alpha`'s −4), a
+    non-unanimous corpus result does not flip the default even though the net
+    is positive; the L-BFGS-specific win is real and available per-solve via
+    the option. `HS25` is the cleanest single-problem case: default `acceptable`
+    at `32.83` (documented optimum `0`, measured at this sweep's `10000`/`300s`
+    budget) versus `optimal` at `~1.4e-16` with the lever on, reproduced
+    identically on all three `lbfgs/*` routes and already solved to `~1.4e-16`
+    by every `exact/*` route regardless (see `benchmarks/routing_hints.py`).
 
 ## Reproducing
 

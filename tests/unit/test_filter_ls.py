@@ -477,20 +477,10 @@ def _quadratic_search(ls, c, record=None):
     )
 
 
-def test_backtrack_interpolation_jumps_to_the_model_minimizer():
-    # φ(α) = -α + 5α²: minimizer at α = 0.1. The full step fails Armijo
-    # (φ(1) = 4 > 0); the quadratic model (N&W eq. 3.58) is exact here, so the
-    # second trial lands on 0.1 and is accepted — where halving needs four.
+def test_default_backtrack_is_plain_halving():
+    # backtrack_interpolation defaults to False (opt-in; see options.py for
+    # the full-corpus sweep that kept it off) — W&B's plain α ← α/2.
     ls = FilterLineSearch(LineSearchOptions())
-    result = _quadratic_search(ls, c=5.0)
-
-    assert result.accepted
-    assert result.n_trials == 2
-    assert abs(result.alpha - 0.1) < 1e-12
-
-
-def test_backtrack_halving_lever_restores_plain_halving():
-    ls = FilterLineSearch(LineSearchOptions(backtrack_interpolation=False))
     result = _quadratic_search(ls, c=5.0)
 
     assert result.accepted
@@ -498,10 +488,22 @@ def test_backtrack_halving_lever_restores_plain_halving():
     assert abs(result.alpha - 0.125) < 1e-12
 
 
+def test_backtrack_interpolation_jumps_to_the_model_minimizer():
+    # φ(α) = -α + 5α²: minimizer at α = 0.1. The full step fails Armijo
+    # (φ(1) = 4 > 0); the quadratic model (N&W eq. 3.58) is exact here, so the
+    # second trial lands on 0.1 and is accepted — where halving needs four.
+    ls = FilterLineSearch(LineSearchOptions(backtrack_interpolation=True))
+    result = _quadratic_search(ls, c=5.0)
+
+    assert result.accepted
+    assert result.n_trials == 2
+    assert abs(result.alpha - 0.1) < 1e-12
+
+
 def test_backtrack_interpolation_is_safeguarded_below():
     # A very steep model minimizer (α_q = 1e-3) must be clipped to 0.1·α so a
     # single bad trial can never collapse the step by orders of magnitude.
-    ls = FilterLineSearch(LineSearchOptions())
+    ls = FilterLineSearch(LineSearchOptions(backtrack_interpolation=True))
     alphas: list[float] = []
     _quadratic_search(ls, c=500.0, record=alphas)
 
@@ -512,7 +514,7 @@ def test_backtrack_interpolation_is_safeguarded_below():
 def test_backtrack_interpolation_halves_on_a_non_finite_trial():
     # A trial outside the barrier domain (φ = +inf) gives the model nothing to
     # interpolate: fall back to plain halving.
-    ls = FilterLineSearch(LineSearchOptions())
+    ls = FilterLineSearch(LineSearchOptions(backtrack_interpolation=True))
     alphas: list[float] = []
 
     def eval_point(alpha):
@@ -541,7 +543,7 @@ def test_backtrack_interpolation_is_clipped_at_halving_above():
     # A θ-type rejection of a φ-decreasing trial: the model minimizer sits far
     # beyond the step (α_q = 5), so the upper safeguard keeps the reduction at
     # exactly the halving factor — interpolation is never *longer* than W&B.
-    ls = FilterLineSearch(LineSearchOptions())
+    ls = FilterLineSearch(LineSearchOptions(backtrack_interpolation=True))
     alphas: list[float] = []
 
     def eval_point(alpha):
@@ -567,7 +569,7 @@ def test_backtrack_interpolation_is_clipped_at_halving_above():
 
 def test_backtrack_halves_on_a_non_descent_direction():
     # dφ ≥ 0 (a θ-type ray): there is no descent model to interpolate.
-    ls = FilterLineSearch(LineSearchOptions())
+    ls = FilterLineSearch(LineSearchOptions(backtrack_interpolation=True))
     alphas: list[float] = []
 
     def eval_point(alpha):
