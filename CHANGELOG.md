@@ -77,22 +77,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   Iterates are unchanged up to the inner tolerance. A solve that breaks down
   under the exact inverse retries on Jacobi. `"none"` still disables
   preconditioning entirely.
-- **Second-order corrections reuse the step's factorization.** Each SOC
-  round used to rebuild the condensed/saddle operator and re-run the delta_w
-  escalation ladder from zero — a fresh factorization per round, and (for a
-  step accepted at delta_w > 0) a *less regularized* matrix than the
-  direction being corrected. SOC now re-solves the retained factorization
-  exactly as the centrality correctors already did, which is the reference
-  behavior (Wächter & Biegler 2006, §2.4, eq. (26): "the same matrix as in
-  (13)... to avoid additional matrix factorizations" — including the step's
-  delta_w/delta_c). On HS71 under defaults this cuts the dense route from 28
-  factorizations to 8 (20 of 28 KKT solves per run are SOC re-solves); on
-  the sparse-direct route each avoided factorization is a full LDLT. A
-  failed SOC re-solve abandons the correction (it is opportunistic) instead
-  of escalating delta_w. SOC solves now run at the step's delta_w rather
-  than a fresh ladder from zero, so constrained trajectories can shift
-  (sweep pending); an iteration whose failed re-solve ladder left the
-  solver factored past the step's matrix skips SOC entirely.
+- **Second-order corrections reuse the step's factorization at
+  unregularized steps.** Each SOC round used to rebuild the condensed/saddle
+  operator and re-run the delta_w escalation ladder from zero — a fresh
+  factorization per round — even though at a `delta_w = 0` step the retained
+  matrix is exactly the reference SOC system (Wächter & Biegler 2006, §2.4,
+  eq. (26): "the same matrix as in (13)... to avoid additional matrix
+  factorizations"). SOC now re-solves the retained factorization there,
+  like the centrality correctors; on HS71 under defaults this cuts the
+  dense route from 28 factorizations to 8 (20 of 28 KKT solves per run are
+  SOC re-solves), and on the sparse-direct route each avoided factorization
+  is a full LDLT. At a *regularized* step (`delta_w > 0`) SOC keeps ipax's
+  long-standing fresh `delta_w = 0` solve — a deliberate, now-documented
+  deviation from eq. (26): reusing the delta_w-inflated matrix measurably
+  degrades the feasibility correction (ZAMB2/ZAMB2m11/ACOPP30/TWIRIMD1 left
+  their baseline trajectories for restoration-heavy paths 10-60x more
+  expensive per iteration). The fresh solve is also the fallback when a
+  re-solve fails, so iterate trajectories are unchanged; this is purely a
+  per-iteration cost reduction.
 - **Less redundant work around the condensed Woodbury factors.** The
   condensed
   operator memoizes its Woodbury factorization per instance (keyed on the

@@ -12,17 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression: SOC solves reuse the step's factorization (W&B 2006, §2.4).
+"""Regression: SOC reuses the step's factorization at unregularized steps.
 
-Eq. (26) computes the corrected step with "the same matrix as in (13)" —
-same ``δ_w``/``δ_c``, same factorization — explicitly "to avoid additional
-matrix factorizations". ipax's SOC closure instead re-entered
-``_solve_step``, which rebuilt the operator and re-ran the δ_w ladder from
-zero: a fresh factorization per SOC round and, whenever the step had been
-accepted at ``δ_w > 0``, a *different, less regularized* matrix than the
-direction being corrected. The centrality correctors already reused the
-factorization (``_solve_targets_reused_operator``); this pins that SOC does
-too.
+At a ``δ_w = 0`` step the retained matrix is exactly Wächter & Biegler
+2006's SOC choice (§2.4, eq. (26): "the same matrix as in (13)... to avoid
+additional matrix factorizations"), yet ipax's SOC closure re-entered
+``_solve_step`` — rebuilding the operator and re-running the δ_w ladder, a
+fresh factorization per round. This pins the re-solve fast path on a
+problem whose SOC iterations are all unregularized (HS71): no
+``_solve_step`` re-entry during the line search, and the reuse helper
+actually running there. (At ``δ_w > 0`` steps SOC deliberately keeps the
+fresh δ_w = 0 solve — reusing the inflated matrix rerouted
+ZAMB2/ACOPP30/TWIRIMD1 onto restoration-heavy trajectories, measured
+2026-09-02 — so the in-search ladder stays legitimate on such iterations;
+HS71 has none.)
 """
 
 from __future__ import annotations
@@ -40,6 +43,14 @@ from tests._helpers import array
 def test_soc_solves_reuse_the_step_factorization(namespace, linsolve, monkeypatch):
     in_search = {"active": False}
     soc_invoked = {"n": 0}
+    reused = {"n": 0}
+
+    orig_reuse = IPMDriver._resolve_reused_factorization
+
+    def counting_reuse(self, *args, **kwargs):
+        if in_search["active"]:
+            reused["n"] += 1
+        return orig_reuse(self, *args, **kwargs)
 
     orig_search = FilterLineSearch.search
 
@@ -64,17 +75,20 @@ def test_soc_solves_reuse_the_step_factorization(namespace, linsolve, monkeypatc
     orig_step = IPMDriver._solve_step
 
     def guarded_step(self, *args, **kwargs):
-        # The only solver activity inside the line search is the SOC solve,
-        # which must be a re-solve on the retained factorization — never a
-        # rebuild through the δ_w ladder.
+        # HS71's SOC iterations are all unregularized (δ_w = 0), so every SOC
+        # solve must be a re-solve on the retained factorization — never a
+        # rebuild through the δ_w ladder. (On a problem with δ_w > 0 SOC
+        # iterations the ladder is legitimate; see the module docstring.)
         assert not in_search["active"], (
-            "SOC re-entered _solve_step (fresh operator + δ_w ladder) instead "
-            "of reusing the step's factorization (W&B 2006 §2.4, eq. (26))"
+            "SOC re-entered _solve_step (fresh operator + δ_w ladder) at an "
+            "unregularized step instead of reusing the step's factorization "
+            "(W&B 2006 §2.4, eq. (26))"
         )
         return orig_step(self, *args, **kwargs)
 
     monkeypatch.setattr(FilterLineSearch, "search", marked_search)
     monkeypatch.setattr(IPMDriver, "_solve_step", guarded_step)
+    monkeypatch.setattr(IPMDriver, "_resolve_reused_factorization", counting_reuse)
 
     result = solve(
         HS71(namespace),
@@ -84,5 +98,6 @@ def test_soc_solves_reuse_the_step_factorization(namespace, linsolve, monkeypatc
 
     assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
     # Non-vacuous: HS71 under defaults invokes SOC several times, so the
-    # guard above actually saw SOC solves.
+    # guard above actually saw SOC solves — and they took the reuse path.
     assert soc_invoked["n"] > 0
+    assert reused["n"] > 0

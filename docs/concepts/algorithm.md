@@ -30,11 +30,13 @@ quasidefinite and factorizable **without an inertia oracle**.
 ## Globalization
 
 IPOPT-style **filter line search** on $(\theta,\varphi_\mu)$ with second-order
-correction — solved on the step's own retained factorization, same
-$\delta_w$/$\delta_c$ (Wächter & Biegler §2.4, eq. (26)) — and a **feasibility
-restoration** phase (Wächter & Biegler §2–3). A lighter **Breedveld step
-controller** (Markov filter + ratio control) is selectable for convex/RT-like
-problems.
+correction — solved on the step's own retained factorization at
+unregularized steps (Wächter & Biegler §2.4, eq. (26)); at a
+$\delta_w > 0$ step ipax deviates deliberately and re-solves fresh at
+$\delta_w = 0$, which measurably corrects feasibility better — and a
+**feasibility restoration** phase (Wächter & Biegler §2–3). A lighter
+**Breedveld step controller** (Markov filter + ratio control) is selectable
+for convex/RT-like problems.
 
 ## Higher-order corrections
 
