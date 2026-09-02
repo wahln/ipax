@@ -20,21 +20,36 @@ from tests._helpers import array
 from tests.regression.test_callback_evaluation_counts import _Rosenbrock
 
 
+def _bulk_transfer_available(namespace) -> bool:
+    """Whether ``read_scalars`` can batch on this backend (see backend/scalars)."""
+    try:
+        from array_api_compat import to_device
+
+        to_device(namespace.zeros(2), "cpu")
+        return True
+    except Exception:
+        return False
+
+
 @pytest.mark.parametrize(
     ("make", "x0", "budget", "options"),
     [
-        (lambda xp: _Rosenbrock(xp, 20), [-1.2, 1.0] * 10, 13.0, Options()),
-        (HS43, [0.0, 0.0, 0.0, 0.0], 21.0, Options()),
-        (HS71, [1.0, 5.0, 5.0, 1.0], 31.0, Options()),
-        # Bound-only L-BFGS on the Krylov route: the budget sits *between* the
-        # direct exact-inverse dispatch (~24.2 syncs/iter) and the same solve
-        # re-wrapped in CG (~26.8), so it pins that the direct route stays
-        # dispatched — the change's device-efficiency property, not just its
-        # iteration counts.
+        # Budgets tightened 2026-09-02 with the fused decision reads
+        # (``backend/scalars.py``: one transfer for the KKT-residual block,
+        # the θ/φ merit pair, and the L-BFGS curvature scalars; the L-BFGS
+        # apply guard selects device-side). Measured on torch:
+        # 10.1 / 10.5 / 18.7 / 15.2 — pre-fusion these ran 12.6 / 19.x /
+        # 29.x / 24.2, so the budgets below fail if any fusion regresses.
+        (lambda xp: _Rosenbrock(xp, 20), [-1.2, 1.0] * 10, 11.0, Options()),
+        (HS43, [0.0, 0.0, 0.0, 0.0], 12.0, Options()),
+        (HS71, [1.0, 5.0, 5.0, 1.0], 20.0, Options()),
+        # Bound-only L-BFGS on the Krylov route: also pins that the direct
+        # exact-inverse dispatch stays dispatched — re-wrapping it in CG
+        # adds the loop's inner-product reads and busts the budget.
         (
             BoundConstrainedQP,
             [0.25, 0.75],
-            25.0,
+            16.0,
             Options(hessian="lbfgs", linsolve="krylov"),
         ),
     ],
@@ -46,6 +61,11 @@ from tests.regression.test_callback_evaluation_counts import _Rosenbrock
     ],
 )
 def test_host_syncs_per_iteration_bounded(namespace, make, x0, budget, options):
+    if not _bulk_transfer_available(namespace):
+        pytest.skip(
+            "no bulk device->host transfer: read_scalars falls back to exact "
+            "per-element reads (k+1 counts), so the fused budgets do not apply"
+        )
     problem = make(namespace)
     x = array(namespace, x0)
     with _ScalarSyncCounter(type(x)) as counter:

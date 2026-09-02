@@ -225,7 +225,13 @@ Woodbury inverse is what makes the Krylov route viable on device at all:
 with `exact_lbfgs_inverse=False` the Jacobi-CG arm pays ~27 latency-bound CG
 iterations per solve plus the O(n·k²) L-BFGS diagonal and lands at
 42.6 ms/iteration (3.4× slower). The remaining dense-vs-Krylov gap
-(~0.5–0.8 ms) is the direct solve's residual-verification host syncs.
+(~0.5–0.8 ms) is the direct solve's verification round — the extra
+operator matvec and its bookkeeping, *not* the host syncs: a follow-up
+microbenchmark (2026-09-02) measured a CuPy scalar sync at ~14 µs on this
+stack, so the GPU loop's non-compute time is per-op Python/launch
+overhead (~11–16 µs across several hundred small array ops per
+iteration), and batching the driver's scalar decision reads — shipped
+anyway for the sync-expensive stacks — moved wall time by ~1% here.
 
 !!! warning "This is a routing hint, not a better default"
     `seed_formula="scalar1"` as a corpus-wide default measured **net −140**

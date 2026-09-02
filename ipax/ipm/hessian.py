@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ipax.backend import scalars
 from ipax.backend.namespace import array_namespace
 from ipax.backend.operators import LinearOperator
 
@@ -182,8 +183,16 @@ class LBFGSOperator(LinearOperator):
             z = xp.linalg.solve(self._m, u_t_x)
         except Exception:
             return self._xi * x
-        if not bool(xp.all(xp.isfinite(z))):
-            return self._xi * x
+        # The finiteness check stays on the 2k-sized ``z`` but is applied
+        # *device-side*: a host ``bool()`` here costs one sync per matvec —
+        # the hottest path in the solver — where a 0-d ``where`` select is
+        # free. The select sanitizes ``z`` itself (not the n-sized result):
+        # a poisoned solve output becomes exact zeros, so ``correction`` is
+        # the exact zero vector and ``ξx − 0`` is bitwise the seed fallback —
+        # and no inf/nan ever reaches the matmuls, which would otherwise
+        # raise under ``seterr(all="raise")`` and emit RuntimeWarnings.
+        finite = xp.all(xp.isfinite(z))
+        z = xp.where(finite, z, xp.zeros_like(z))
         correction = self._xi * xp.matmul(self._s, z[:k, ...]) + xp.matmul(
             self._y, z[k:, ...]
         )
@@ -332,14 +341,26 @@ class LBFGSOperator(LinearOperator):
         # catch it: ``s_y`` is then NaN and every ``<``/``<=`` comparison is
         # False. Drop the pair so the approximation stays finite and the solver
         # can still take a (steepest-descent-like) step to escape the region.
-        # (One host sync for both checks: each ``bool()`` syncs on a GPU.)
-        if not bool(xp.all(xp.isfinite(delta)) & xp.all(xp.isfinite(gamma))):
-            return
+        # The finiteness flag is read *fused* with the two curvature scalars
+        # (one host sync instead of three; ``backend/scalars.py``). Computing
+        # the matvec before the drop decision is safe: inf/nan inputs only
+        # *propagate* through the products (no invalid-operation FPE — probed
+        # under ``seterr(all="raise")``), ``_apply`` sanitizes its own solve
+        # output, and a poisoned pair's scalars are discarded unread.
+        finite = xp.all(xp.isfinite(delta)) & xp.all(xp.isfinite(gamma))
         s = delta
         y = gamma
         bs = self.matvec(s)
-        s_bs = float(xp.sum(s * bs))
-        s_y = float(xp.sum(s * y))
+        flag, s_bs, s_y = scalars.read_scalars(
+            xp,
+            [
+                xp.astype(finite, delta.dtype),
+                xp.sum(s * bs),
+                xp.sum(s * y),
+            ],
+        )
+        if flag != 1.0:
+            return
 
         # A pair that strongly *contradicts* positive curvature is dropped
         # rather than damped: the Powell blend below would fabricate PD
