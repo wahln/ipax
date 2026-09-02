@@ -84,9 +84,8 @@ def test_the_apply_guard_cost_does_not_grow_with_the_problem(monkeypatch):
 def test_a_non_finite_solve_output_still_falls_back_to_the_seed():
     # The condition the guard exists for: a singular middle matrix whose solve
     # returns inf/nan instead of raising. The device-side guard zeroes the
-    # 2k-sized solve output, so the correction formed from it is the exact
-    # zero vector and the result is bitwise the ξx seed — with no inf/nan
-    # ever reaching the matmuls (no FPE under seterr, no RuntimeWarning).
+    # solve output, so the correction is exactly zero and the result is the
+    # identity seed without a host synchronization.
     op = LBFGSOperator(2, LBFGSOptions())
     op._xi = 1.0
     # U = [S Y] = I with one pair: S the first column, Y the second.

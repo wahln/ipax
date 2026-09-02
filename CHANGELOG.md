@@ -30,28 +30,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (5 ms per step at `n = 50k`).
 
 ### Changed
-- **The driver's scalar decision reads are batched per transfer.** A new
-  labeled gap-filler (`ipax/backend/scalars.py`: the Array API standard has
-  no portable bulk device→host read) stacks a group of 0-d device scalars
-  and moves them in one transfer: the scaled-KKT residual block (four reads
-  → one), the filter's (θ, φ) merit pair incl. the raw objective (fused at
-  the loop top, every line-search trial, and the SOC point — the objective
-  float is cached back, so a later read at the same point is free), and the
-  L-BFGS curvature-update scalars (finiteness flag + s·Bs + s·y in one
-  read). The L-BFGS apply guard now selects device-side (`where` on the 0-d
-  finiteness flag) instead of syncing per matvec. Values are bitwise
-  unchanged — the fused groups compute exactly the reductions the separate
-  reads did — so iterates are identical; the sync-budget regression pins the
-  new counts (measured on torch: HS71 ~29 → 18.7 host syncs per iteration,
-  the RT-shape bound-only QP 24.2 → 15.2). One diagnostics-visible shift:
-  the objective's host materialization is no longer inside the
-  problem-callback timer, so on async backends a sliver of
-  `IterationRecord.problem_time` moves to driver time (consistent with how
-  the other callbacks were already timed). Honest measurement note: on the
-  dev laptop's CuPy stack a scalar sync costs only ~14 us, so this moved
-  end-to-end GPU wall time by ~1% there; the win is architectural (sync
-  cost is stack-dependent) and the remaining GPU overhead is per-op launch
-  cost.
+- **L-BFGS compact applies keep their finiteness guard on device.** A
+  non-finite compact solve output is replaced by zeros before the low-rank
+  products, preserving the identity-seed fallback without synchronizing once
+  per operator application.
 - **New opt-in: quadratic-interpolation backtracking in the filter line
   search.** After a rejected trial,
   `LineSearchOptions(backtrack_interpolation=True)` steps to the minimizer of

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 from ipax import FunctionProblem, Options, Status, solve
@@ -72,6 +74,19 @@ def test_lbfgs_update_drops_non_finite_curvature_pair(namespace, bad):
 
     assert bool(namespace.all(namespace.isfinite(after)))
     assert_allclose(namespace, after, before)
+
+
+def test_lbfgs_update_rejects_non_finite_pair_before_curvature_arithmetic(namespace):
+    """A rejected pair must not evaluate an invalid ``0 * inf`` product."""
+    delta = array(namespace, [1.0, 0.0])
+    gamma = array(namespace, [2.0, float("inf")])
+    op = LBFGSOperator(2, LBFGSOptions(memory=3, powell_damping=True))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        op.update(delta, gamma)
+
+    assert not op.has_curvature_pairs()
 
 
 def test_lbfgs_initial_scaling_option_controls_seed_curvature(namespace):

@@ -9,8 +9,7 @@ orientation map.
 ipax/
   typing.py options.py result.py solve.py
   problem/   Problem ABC, FunctionProblem, derivative resolution, autodiff adapters
-  backend/   namespace resolution, LinearOperator hierarchy, sparse adapters,
-             Array API gap-fillers (dense Cholesky solve, bulk scalar reads)
+  backend/   namespace resolution, LinearOperator hierarchy, sparse adapters
   linalg/    LinearSolver protocol: dense / krylov / sparse-direct + regularization
   ipm/       barrier, kkt, step, filter_ls, restoration, breedveld_ls, hessian, init, driver
   testing/   analytic oracle problems shared with benchmarks

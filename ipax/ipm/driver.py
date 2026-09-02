@@ -47,7 +47,6 @@ from ipax._logging import (
     format_record,
     logger,
 )
-from ipax.backend import scalars as _scalars
 from ipax.backend.operators import (
     Dense,
     Diagonal,
@@ -198,6 +197,18 @@ _RESTORATION_PROGRESS_FACTOR = 0.9
 # (never worse-centered than a cold start).
 _RECENTER_MU_RAISE_FACTOR = 10.0
 _RECENTER_MU_ERROR_FRACTION = 0.1  # μ_new target: fraction of the stall's KKT error
+
+
+def _norm_inf(xp: Namespace, v: Array) -> float:
+    if int(v.shape[0]) == 0:
+        return 0.0
+    return float(xp.max(xp.abs(v)))
+
+
+def _norm1(xp: Namespace, v: Array) -> float:
+    if int(v.shape[0]) == 0:
+        return 0.0
+    return float(xp.sum(xp.abs(v)))
 
 
 def _clamped_min(xp: Namespace, ratios: list[Array]) -> float:
@@ -500,19 +511,12 @@ class IPMDriver:
             lambda: self._time_problem_call(lambda: self._problem.gradient(x)),
         )
 
-    def _objective_raw(self, x: Array) -> Array | float:
-        """The objective exactly as the problem returned it (device scalar or
-        Python float), memoized per point — so :meth:`_theta_phi` can fold its
-        host read into the fused merit transfer instead of paying a separate
-        sync here."""
+    def _objective(self, x: Array) -> float:
         return self._cached(
             x,
-            "f_raw",
-            lambda: self._time_problem_call(lambda: self._problem.objective(x)),
+            "f",
+            lambda: float(self._time_problem_call(lambda: self._problem.objective(x))),
         )
-
-    def _objective(self, x: Array) -> float:
-        return self._cached(x, "f", lambda: float(self._objective_raw(x)))
 
     def _ineq(self, x: Array) -> Array:
         if not self._has_ineq:
@@ -725,30 +729,15 @@ class IPMDriver:
             r_d = r_d - z_lower
         if self._has_upper:
             r_d = r_d + z_upper
+        dual_inf = _norm_inf(xp, r_d)
 
-        # Each block's reduction stays on the device, and the per-quantity
-        # 0-d results are batched into ONE host transfer (see
-        # ``backend/scalars.py``): four separate ``float()`` syncs per call
-        # were the largest single sync site in the GPU loop. The group
-        # reductions are exactly what the per-quantity reads computed, so
-        # the values are bitwise unchanged.
-        reads: list[Array] = []
-        dual_slot = None
-        if int(r_d.shape[0]) > 0:
-            dual_slot = 0
-            reads.append(xp.max(xp.abs(r_d)))
-
+        # Each block's reduction stays on the device; one sync per quantity.
         prim_parts: list[Array] = []
         if m > 0:
             prim_parts.append(xp.max(xp.abs(g + s)))
         if m_eq > 0:
             prim_parts.append(xp.max(xp.abs(c)))
-        prim_slot = None
-        if prim_parts:
-            prim_slot = len(reads)
-            reads.append(
-                prim_parts[0] if len(prim_parts) == 1 else xp.max(xp.stack(prim_parts))
-            )
+        prim = _max_of(xp, prim_parts)
 
         compl_parts: list[Array] = []
         if m > 0:
@@ -763,17 +752,9 @@ class IPMDriver:
             compl_parts.append(
                 xp.max(xp.abs(xp.where(mask_u, u_minus_x * z_upper - mu, zero)))
             )
-        compl_slot = None
-        if compl_parts:
-            compl_slot = len(reads)
-            reads.append(
-                compl_parts[0]
-                if len(compl_parts) == 1
-                else xp.max(xp.stack(compl_parts))
-            )
+        compl = _max_of(xp, compl_parts)
 
         n_dual = m + n_bounds + m_eq
-        sum_slot = None
         if n_dual > 0:
             dual_parts: list[Array] = []
             if m > 0:
@@ -784,24 +765,7 @@ class IPMDriver:
                 dual_parts.append(xp.sum(xp.abs(z_lower)))
             if self._has_upper:
                 dual_parts.append(xp.sum(xp.abs(z_upper)))
-            # ``n_bounds > 0`` implies ``_has_lower``/``_has_upper`` on every
-            # in-driver caller, so parts are never empty here — but keep the
-            # pre-fusion total-function behavior (empty ⇒ sum 0.0 ⇒ s = 1)
-            # rather than relying on that non-local coupling.
-            if dual_parts:
-                sum_slot = len(reads)
-                reads.append(
-                    dual_parts[0]
-                    if len(dual_parts) == 1
-                    else xp.sum(xp.stack(dual_parts))
-                )
-
-        values = _scalars.read_scalars(xp, reads)
-        dual_inf = values[dual_slot] if dual_slot is not None else 0.0
-        prim = values[prim_slot] if prim_slot is not None else 0.0
-        compl = values[compl_slot] if compl_slot is not None else 0.0
-        if sum_slot is not None:
-            sum_dual = values[sum_slot]
+            sum_dual = _sum_of(xp, dual_parts)
             s_d = max(_S_MAX, sum_dual / n_dual) / _S_MAX
             s_c = max(_S_MAX, sum_dual / n_dual) / _S_MAX
         else:
@@ -1516,9 +1480,8 @@ class IPMDriver:
                 )
                 if status is Status.ACCEPTABLE:
                     break
-                theta0, phi0 = self._theta_phi(
-                    x, s, mu, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
-                )
+                theta0 = self._theta_l1(x, s, m, m_eq)
+                phi0 = self._phi(x, s, mu, m, mask_l, mask_u, lower_safe, upper_safe)
                 outcome = self._handle_restoration(
                     x=x,
                     s=s,
@@ -1578,9 +1541,8 @@ class IPMDriver:
             # whole 10k budget this way). Escalating δ_w until the direction
             # is descent is the same inertia-correction response W&B 2006 §3.1
             # prescribe when the (1,1) block is not positive definite.
-            theta0, phi0 = self._theta_phi(
-                x, s, mu, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
-            )
+            theta0 = self._theta_l1(x, s, m, m_eq)
+            phi0 = self._phi(x, s, mu, m, mask_l, mask_u, lower_safe, upper_safe)
             # The probe's directional derivative is the line search's ``dphi``
             # whenever the loop leaves the step unchanged; keep it to avoid a
             # second evaluation (and host sync).
@@ -1678,8 +1640,9 @@ class IPMDriver:
                 mu: float = mu,
             ) -> tuple[float, float]:
                 x_t, s_t = trial_point(alpha)
-                return self._theta_phi(
-                    x_t, s_t, mu, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
+                return (
+                    self._theta_l1(x_t, s_t, m, m_eq),
+                    self._phi(x_t, s_t, mu, m, mask_l, mask_u, lower_safe, upper_safe),
                 )
 
             def grad_finite(alpha: float) -> bool:
@@ -1851,8 +1814,18 @@ class IPMDriver:
                     return None
 
                 soc_point = (x_soc, s_soc)
-                return self._theta_phi(
-                    x_soc, s_soc, mu, m, m_eq, mask_l, mask_u, lower_safe, upper_safe
+                return (
+                    self._theta_l1(x_soc, s_soc, m, m_eq),
+                    self._phi(
+                        x_soc,
+                        s_soc,
+                        mu,
+                        m,
+                        mask_l,
+                        mask_u,
+                        lower_safe,
+                        upper_safe,
+                    ),
                 )
 
             # θ0/φ0 were computed above for the descent enforcement; x, s and
@@ -2732,96 +2705,41 @@ class IPMDriver:
             parts.append(boundary_ratio(v_u, dv_u, tau))
         return _clamped_min(xp, parts)
 
-    def _theta_parts(self, x: Array, s: Array, m: int, m_eq: int) -> list[Array]:
-        """Device-side ℓ1 constraint-violation block sums (θ's summands)."""
+    def _phi(
+        self,
+        x: Array,
+        s: Array,
+        mu: float,
+        m: int,
+        mask_l: Array,
+        mask_u: Array,
+        lower_safe: Array,
+        upper_safe: Array,
+    ) -> float:
+        """Barrier objective ``φ_μ`` (Wächter & Biegler 2006, §2)."""
+        xp = self._xp
+        val = self._objective(x)
+        parts: list[Array] = []
+        if m > 0:
+            parts.append(xp.sum(xp.log(s)))
+        if self._has_lower:
+            x_minus_l = xp.where(mask_l, x - lower_safe, xp.ones_like(x))
+            parts.append(xp.sum(xp.where(mask_l, xp.log(x_minus_l), xp.zeros_like(x))))
+        if self._has_upper:
+            u_minus_x = xp.where(mask_u, upper_safe - x, xp.ones_like(x))
+            parts.append(xp.sum(xp.where(mask_u, xp.log(u_minus_x), xp.zeros_like(x))))
+        return val - mu * _sum_of(xp, parts)
+
+    def _theta_l1(self, x: Array, s: Array, m: int, m_eq: int) -> float:
+        """Constraint violation ``θ = ‖(c, g+s)‖₁`` used by the filter."""
         xp = self._xp
         parts: list[Array] = []
         if m > 0:
             parts.append(xp.sum(xp.abs(self._ineq(x) + s)))
         if m_eq > 0:
             parts.append(xp.sum(xp.abs(self._eq(x))))
-        return parts
-
-    def _theta_phi(
-        self,
-        x: Array,
-        s: Array,
-        mu: float,
-        m: int,
-        m_eq: int,
-        mask_l: Array,
-        mask_u: Array,
-        lower_safe: Array,
-        upper_safe: Array,
-    ) -> tuple[float, float]:
-        """Filter pair ``(θ, φ_μ)`` at one point in a single host sync.
-
-        θ is the ℓ1 constraint violation and φ_μ the barrier objective
-        (Wächter & Biegler 2006, §2). Every hot consumer (loop-top merit,
-        line-search trials, the SOC point) needs both, and each device
-        reduction read separately costs a host sync — the second-largest
-        sync site in the GPU loop. The group reductions here are exactly
-        what the separate reads computed (θ's stacked sum, φ's stacked
-        barrier sum, the raw objective), batched into one transfer via
-        ``backend/scalars.py`` — values bitwise unchanged. The objective
-        float is stored back into the point cache, so a later
-        ``_objective(x)`` at the same point is free.
-        """
-        xp = self._xp
-        reads: list[Array] = []
-
-        theta_parts = self._theta_parts(x, s, m, m_eq)
-        theta_slot = None
-        if theta_parts:
-            theta_slot = len(reads)
-            reads.append(
-                theta_parts[0]
-                if len(theta_parts) == 1
-                else xp.sum(xp.stack(theta_parts))
-            )
-
-        raw = self._objective_raw(x)
-        raw_slot = None
-        # Fold the objective into the batch only when it is a 0-d array of
-        # the iterate's dtype — the same dtype the θ/φ parts derive from, so
-        # the stack involves no promotion at all. (Widening promotion would
-        # also be exact; the strict gate just keeps the reasoning local.)
-        # Otherwise ``float(raw)`` below keeps the exact pre-fusion value at
-        # the cost of its own read.
-        if getattr(raw, "shape", None) == () and getattr(raw, "dtype", None) == x.dtype:
-            raw_slot = len(reads)
-            reads.append(raw)
-
-        phi_parts: list[Array] = []
-        if m > 0:
-            phi_parts.append(xp.sum(xp.log(s)))
-        if self._has_lower:
-            x_minus_l = xp.where(mask_l, x - lower_safe, xp.ones_like(x))
-            phi_parts.append(
-                xp.sum(xp.where(mask_l, xp.log(x_minus_l), xp.zeros_like(x)))
-            )
-        if self._has_upper:
-            u_minus_x = xp.where(mask_u, upper_safe - x, xp.ones_like(x))
-            phi_parts.append(
-                xp.sum(xp.where(mask_u, xp.log(u_minus_x), xp.zeros_like(x)))
-            )
-        phi_slot = None
-        if phi_parts:
-            phi_slot = len(reads)
-            reads.append(
-                phi_parts[0] if len(phi_parts) == 1 else xp.sum(xp.stack(phi_parts))
-            )
-
-        values = _scalars.read_scalars(xp, reads)
-        theta = values[theta_slot] if theta_slot is not None else 0.0
-        val = values[raw_slot] if raw_slot is not None else float(raw)
-        self._cached(x, "f", lambda: val)
-        barrier = values[phi_slot] if phi_slot is not None else 0.0
-        return theta, val - mu * barrier
-
-    def _theta_l1(self, x: Array, s: Array, m: int, m_eq: int) -> float:
-        """Constraint violation ``θ = ‖(c, g+s)‖₁`` used by the filter."""
-        return _sum_of(self._xp, self._theta_parts(x, s, m, m_eq))
+        val = _sum_of(xp, parts)
+        return val
 
     def _theta_linf(self, x: Array, s: Array, m: int, m_eq: int) -> float:
         """Constraint violation ``θ = ‖(c, g+s)‖_∞`` — restoration's own measure.

@@ -642,7 +642,6 @@ class _ScalarSyncCounter:
     def __init__(self, array_type: type) -> None:
         self._type = array_type
         self._orig: dict[str, object] = {}
-        self._orig_read_scalars: object | None = None
         self.count = 0
         self.available = True
 
@@ -667,37 +666,12 @@ class _ScalarSyncCounter:
                 self._restore()
                 break
             self._orig[name] = orig
-        if self.available:
-            # A fused multi-part ``read_scalars`` batch is one *extra*
-            # device→host transfer on top of whatever scalar dunders it
-            # triggers: the bulk path triggers none (→ counts 1), a single
-            # part goes through ``float`` (→ its dunder counts the 1), and
-            # the per-element *fallback* keeps its k dunder counts (+1 for
-            # the failed bulk attempt) — so a backend without a bulk
-            # transfer is honestly reported as unfused rather than
-            # pretending the batching happened.
-            from ipax.backend import scalars as _scalars_module
-
-            orig_read = _scalars_module.read_scalars
-
-            def counting_read(xp, parts):  # type: ignore[no-untyped-def]
-                if len(parts) > 1:
-                    counter.count += 1
-                return orig_read(xp, parts)
-
-            self._orig_read_scalars = orig_read
-            _scalars_module.read_scalars = counting_read
         return self
 
     def _restore(self) -> None:
         for name, orig in self._orig.items():
             setattr(self._type, name, orig)
         self._orig.clear()
-        if self._orig_read_scalars is not None:
-            from ipax.backend import scalars as _scalars_module
-
-            _scalars_module.read_scalars = self._orig_read_scalars  # type: ignore[assignment]
-            self._orig_read_scalars = None
 
     def __exit__(self, *exc: object) -> None:
         self._restore()
