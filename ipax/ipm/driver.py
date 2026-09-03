@@ -1746,18 +1746,27 @@ class IPMDriver:
                 ipax's pre-existing residual convention — ``c`` at the
                 accumulated corrected point — rather than the eq. (27) blend.)
 
-                Whenever the retained factorization is *regularized* (a
+                When the *step's* retained factorization is regularized (a
                 ``δ_w > 0`` step, a δ_c-escalated saddle, a failed re-solve
-                ladder, or a fallback solve inside this loop that ended
-                regularized) ipax deliberately deviates and re-solves fresh at
-                ``δ_w = 0``, as it always has: reusing the δ_w-inflated matrix
-                degrades the feasibility correction enough to reroute whole
-                runs — measured 2026-09-02, ZAMB2/ZAMB2m11 (exact/dense) and
-                ACOPP30/TWIRIMD1 (lbfgs/dense) all left their baseline
-                trajectories for restoration-heavy paths 10-60× more expensive
-                per iteration when SOC used the step's δ_w. The fresh solve is
-                also the fallback when the re-solve fails, so trajectories are
-                unchanged relative to the pre-reuse code in every case.
+                ladder) ipax deliberately deviates and solves the first
+                correction fresh at ``δ_w = 0``, as it always has: reusing the
+                step's δ_w-inflated matrix degrades the feasibility correction
+                enough to reroute whole runs — measured 2026-09-02,
+                ZAMB2/ZAMB2m11 (exact/dense) and ACOPP30/TWIRIMD1 (lbfgs/dense)
+                all left their baseline trajectories for restoration-heavy
+                paths 10-60× more expensive per iteration when SOC used the
+                step's δ_w. The fresh solve is also the fallback when the
+                re-solve fails.
+
+                A factorization produced by *this loop's own* fresh solve is
+                reused by the later rounds even when its ladder ended
+                regularized: that ladder already established that ``δ_w = 0``
+                does not solve this rhs family, and re-climbing it per round
+                is a full Krylov ladder each time (v29 sweep, 2026-09-03:
+                DRUGDIS/DALLASS/NET1/SPECANNE on the Krylov routes ran
+                10-15× slower per iteration and hit ``max_time`` when every
+                round re-solved fresh; 161 of 170 in-SOC ladders on DRUGDIS
+                ended regularized).
                 """
                 nonlocal soc_point
                 if opts.line_search.max_soc <= 0:
@@ -1767,6 +1776,7 @@ class IPMDriver:
                 corr_x = xp.zeros_like(x)
                 corr_s = xp.zeros_like(s)
                 empty_ineq = xp.zeros((0,), dtype=dtype)
+                own_factor = False  # retained factorization made by this loop
 
                 for _ in range(opts.line_search.max_soc):
                     x_c = base_x + corr_x
@@ -1782,12 +1792,12 @@ class IPMDriver:
                         rhs_soc = rhs_soc - ineq_jac.rmatvec(sigma_s * r_pi_c)
 
                     sol_c = None
-                    if self._factor_unregularized:
+                    if self._factor_unregularized or own_factor:
                         # W&B-exact fast path (see the docstring): the retained
                         # matrix IS the δ_w = 0 matrix here, so the re-solve is
                         # bitwise the fresh solve below, minus the rebuild and
-                        # factorization. Read per round: the fresh solve below
-                        # may leave the solver factored regularized.
+                        # factorization — or it is this loop's own fallback
+                        # factorization, reused rather than re-climbed.
                         sol_c = self._resolve_reused_factorization(rhs_soc, -c_c, m_eq)
                     if sol_c is not None:
                         dx_c = sol_c[: self._n]
@@ -1805,6 +1815,7 @@ class IPMDriver:
                         )
                         if not ok:
                             return None
+                        own_factor = True
 
                     corr_x = corr_x + dx_c
                     if m > 0:

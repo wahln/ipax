@@ -47,6 +47,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   once along a fixed, deterministic aperiodic direction before certifying and
   lets the damped Gauss-Newton loop continue — a saddle's unstable manifold
   amplifies the kick, a genuine local minimizer re-certifies at the same point.
+- **SOC rounds reuse the loop's own fallback factorization.** When round 1's
+  re-solve fails and its fresh ladder ends regularized, the later rounds now
+  re-solve that factorization instead of re-climbing the ladder per round —
+  on the Krylov routes every rung is a full CG solve, and DRUGDIS spent 161
+  of 170 in-SOC ladders re-deriving the same δ_w (v29 sweep). The step's own
+  regularized matrix is still never reused for the first correction.
 - **SOC factorization reuse follows the retained factorization.** The reuse
   gate read two hand-maintained flags (`factor_matches_step`, the step's
   `δ_w`) that went stale inside the SOC loop: after a failed re-solve, the

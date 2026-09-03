@@ -111,12 +111,15 @@ def test_soc_solves_reuse_the_step_factorization(namespace, linsolve, monkeypatc
 def test_soc_gate_follows_a_regularized_fallback_inside_the_soc_loop(
     namespace, monkeypatch
 ):
-    """After an in-loop fresh solve that ended at δ_w > 0, later SOC rounds
-    must not re-solve against that inflated factorization.
+    """After round 1's re-solve fails and its fallback ladder ends at δ_w > 0,
+    the later rounds reuse *that* factorization instead of re-climbing the
+    ladder per round.
 
-    Round 1's re-solve can fail (Krylov non-convergence on the SOC rhs); the
-    fallback ladder then refactors the solver, possibly at δ_w > 0. The reuse
-    gate has to follow the *retained* factorization, not the step's.
+    The ladder established that δ_w = 0 does not solve this rhs family, and a
+    fresh ladder per round is a full Krylov solve per rung (v29 sweep:
+    DRUGDIS/DALLASS/NET1 ran 10-15x slower per iteration when every round
+    solved fresh). The step's own regularized matrix is a different matter —
+    see ``test_soc_never_reuses_the_steps_regularized_factorization``.
     """
     state = {"in_search": False, "done": False, "force_floor": False}
     events: list[str] = []  # KKT-solve events inside the first SOC search
@@ -167,11 +170,9 @@ def test_soc_gate_follows_a_regularized_fallback_inside_the_soc_loop(
     )
 
     assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
-    # Round 1: the re-solve failed and the fallback ended regularized. Round 2
-    # must then be a *fresh* solve (the retained matrix is δ_w = 1e-4), which
-    # re-establishes the unregularized factorization — later rounds may reuse
-    # it again. The old gate reused the δ_w = 1e-4 factorization in round 2.
-    assert events[:3] == ["reuse", "step:0.0001", "step:0"]
+    # Round 1: the re-solve failed and the fallback ended at δ_w = 1e-4; the
+    # remaining rounds re-solve that own factorization (max_soc = 4 rounds).
+    assert events[:5] == ["reuse", "step:0.0001", "reuse", "reuse", "reuse"]
 
 
 class _EqualityOnly(Problem):
@@ -284,3 +285,53 @@ def test_a_delta_c_escalated_solve_is_not_an_unregularized_factorization(namespa
     assert ok
     assert delta_w == 0.0  # the trap: the returned δ_w alone looks unregularized
     assert not driver._factor_unregularized
+
+
+def test_soc_never_reuses_the_steps_regularized_factorization(namespace, monkeypatch):
+    """A δ_w > 0 *step* factorization is not reused for the first correction
+    (the measured ZAMB2/ACOPP30 reroute); the fresh round-1 solve then leaves
+    an unregularized factorization that the later rounds reuse."""
+    state = {"in_search": False, "done": False}
+    events: list[str] = []
+    orig_reuse = IPMDriver._resolve_reused_factorization
+    orig_step = IPMDriver._solve_step
+    orig_search = FilterLineSearch.search
+
+    def recording_reuse(self, *args, **kwargs):
+        if state["in_search"] and not state["done"]:
+            events.append("reuse")
+        return orig_reuse(self, *args, **kwargs)
+
+    def regularized_main_step(self, *args, **kwargs):
+        if not state["in_search"]:
+            args = (*args[:9], 1e-4)  # every *step* solve ends at δ_w = 1e-4
+        out = orig_step(self, *args, **kwargs)
+        if state["in_search"] and not state["done"]:
+            events.append(f"step:{out[2]:g}")
+        return out
+
+    def marked_search(self, *args, **kwargs):
+        if state["done"]:
+            return orig_search(self, *args, **kwargs)
+        state["in_search"] = True
+        try:
+            return orig_search(self, *args, **kwargs)
+        finally:
+            state["in_search"] = False
+            if events:
+                state["done"] = True
+
+    monkeypatch.setattr(IPMDriver, "_resolve_reused_factorization", recording_reuse)
+    monkeypatch.setattr(IPMDriver, "_solve_step", regularized_main_step)
+    monkeypatch.setattr(FilterLineSearch, "search", marked_search)
+
+    result = solve(
+        HS71(namespace),
+        array(namespace, [1.0, 5.0, 5.0, 1.0]),
+        options=Options(linsolve="krylov"),
+    )
+
+    assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
+    assert events, "the first search never ran a second-order correction"
+    assert events[0] == "step:0"  # round 1 is fresh, not a reuse of δ_w = 1e-4
+    assert all(e == "reuse" for e in events[1:4])
