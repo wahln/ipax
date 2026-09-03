@@ -35,6 +35,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   bound-constrained composite least-squares solve).
 
 ### Fixed
+- **Restoration probes for a saddle before certifying local infeasibility.**
+  On a symmetry-invariant subspace (equal components at a permutation-symmetric
+  start — S2MPJ POWERSUMNE, HADAMARD — or the cyclic ring of CYCLOOCT) every
+  Gauss-Newton direction stays in the subspace, and a critical point of the
+  restricted infeasibility is a critical point of the full one (Palais 1979): a
+  saddle, which the first-order STATIONARY/NO_DESCENT certificate reported as
+  local infeasibility. The dense reference solve escaped only through LU
+  round-off in near-null directions; the exact matrix-free route did not and
+  labelled feasible problems `infeasible`. `restore()` now kicks the iterate
+  once along a fixed, deterministic aperiodic direction before certifying and
+  lets the damped Gauss-Newton loop continue — a saddle's unstable manifold
+  amplifies the kick, a genuine local minimizer re-certifies at the same point.
 - **SOC factorization reuse follows the retained factorization.** The reuse
   gate read two hand-maintained flags (`factor_matches_step`, the step's
   `δ_w`) that went stale inside the SOC loop: after a failed re-solve, the

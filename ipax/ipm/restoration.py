@@ -49,6 +49,11 @@ _LM_SHRINK = 0.1
 _LM_MAX = 1e16  # ceiling on the damping before declaring no further progress
 _GRAD_TOL = 1e-10  # stationarity test for the infeasibility objective
 _SLACK_FLOOR = 1e-12
+# One-shot escape probe before certifying local infeasibility (see
+# ``_escape_direction``): relative size of the kick, and the golden angle that
+# makes the fixed probe direction aperiodic in every component.
+_ESCAPE_SCALE = 1e-6
+_GOLDEN_ANGLE = 2.399963229728653
 
 
 class RestorationExit(Enum):
@@ -141,6 +146,26 @@ class _RestorationNormalOperator(LinearOperator):
         return self._reduced_diagonal + self.damping
 
 
+def _escape_direction(xp: Namespace, x: Array) -> Array:
+    """A fixed, component-wise aperiodic probe direction for the escape kick.
+
+    The first-order certificate is blind to saddles: on a symmetry-invariant
+    subspace (equal components at a permutation-symmetric start such as S2MPJ
+    POWERSUMNE/HADAMARD, a cyclic ring in CYCLOOCT) every Gauss-Newton direction
+    stays in the subspace, and a critical point of ½‖c‖² restricted to it is a
+    critical point of the full infeasibility (Palais 1979, principle of
+    symmetric criticality) — a saddle, not local infeasibility. An exact solve
+    never leaves the subspace; the dense LU reference only did so through
+    round-off in near-null directions amplified by the rank deficiency. Before
+    certifying, ``restore`` therefore kicks ``x`` once along this deterministic,
+    backend-agnostic direction and lets the damped Gauss-Newton loop continue:
+    a saddle's unstable manifold amplifies the kick, a true local minimizer
+    re-certifies at the same point.
+    """
+    k = xp.arange(int(x.shape[0]), dtype=x.dtype)
+    return xp.sin(1.0 + _GOLDEN_ANGLE * k)
+
+
 def _stacked_jacobian(
     xp: Namespace,
     eq_jac: LinearOperator | None,
@@ -223,9 +248,14 @@ def restore(
             theta += float(xp.sum(xp.abs(g + s_out)))
         return theta
 
+    def escape(x: Array) -> Array:
+        scale = _ESCAPE_SCALE * (1.0 + float(xp.max(xp.abs(x))))
+        return project(x + scale * _escape_direction(xp, x))
+
     x = project(x)
     lam = _LM_INIT
     f_window: list[float] = []
+    escape_used = False  # the saddle probe fires at most once per call
     exit_reason = RestorationExit.BUDGET
     for _ in range(_MAX_ITER):
         f, c, g, gpos = infeasibility(x)
@@ -299,7 +329,13 @@ def restore(
         grad_norm = float(xp.max(xp.abs(pg))) if n > 0 else 0.0
         if grad_norm <= _GRAD_TOL:
             # Stationary point of the infeasibility with θ > 0 ⇒ a local-
-            # infeasibility certificate.
+            # infeasibility certificate — once the saddle probe has had its
+            # say (``_escape_direction``).
+            if not escape_used:
+                escape_used = True
+                x = escape(x)
+                f_window.clear()
+                continue
             s_out = recover_slack(g)
             return x, s_out, RestorationExit.STATIONARY
 
@@ -391,9 +427,18 @@ def restore(
             # feasibility). The dense route keeps its established
             # exception-to-NO_DESCENT semantics: its λ = 1e16 rung is always
             # solvable, so that case is a non-finite Jacobian.
+            certified = normal is None or direction_tried
+            if certified and not escape_used:
+                # Same saddle probe as the gradient test: a symmetric trap
+                # rejects every in-subspace direction too.
+                escape_used = True
+                x = escape(x)
+                f_window.clear()
+                lam = _LM_INIT
+                continue
             exit_reason = (
                 RestorationExit.NO_DESCENT
-                if normal is None or direction_tried
+                if certified
                 else RestorationExit.LINEAR_SOLVE_FAILED
             )
             break

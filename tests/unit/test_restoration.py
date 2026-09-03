@@ -683,3 +683,64 @@ def test_stall_window_exit_is_not_an_infeasibility_certificate(namespace, monkey
 
     assert exit_reason is RestorationExit.STALL_WINDOW
     assert not exit_reason.certifies_infeasibility
+
+
+def _symmetric_trap(xp):
+    """``x0 + x1 = 3``, ``x0² + x1² = 5`` from the symmetric point (1.5, 1.5).
+
+    Solutions are (1, 2) and (2, 1). On the diagonal ``x0 = x1`` the Jacobian
+    has rank 1 and every Gauss-Newton direction is symmetric, so an exact
+    solver keeps the iterates on the diagonal, where ½‖c‖² has a strict local
+    minimum with ``c ≠ 0`` — a saddle of the full infeasibility that the
+    first-order certificate would report as local infeasibility.
+    """
+
+    def eq_fn(z):
+        return xp.stack((z[0] + z[1] - 3.0, z[0] * z[0] + z[1] * z[1] - 5.0))
+
+    def eq_jac_fn(z):
+        one = xp.ones_like(z[0])
+        return as_operator(
+            xp.stack((xp.stack((one, one)), xp.stack((2.0 * z[0], 2.0 * z[1]))))
+        )
+
+    return eq_fn, eq_jac_fn
+
+
+@pytest.mark.parametrize("route", ["dense", "krylov"])
+def test_restoration_escapes_a_symmetric_saddle_before_certifying(namespace, route):
+    """A critical point on a symmetry-invariant subspace is a saddle, not a
+    certificate: restoration must probe off the subspace before claiming
+    local infeasibility (S2MPJ POWERSUMNE/CYCLOOCT/HADAMARD, 2026-09)."""
+    xp = namespace
+    x = array(xp, [1.5, 1.5])
+    eq_fn, eq_jac_fn = _symmetric_trap(xp)
+    solver = None if route == "dense" else _krylov_solver()
+
+    x_new, _, exit_reason = restore(
+        **_restore_kwargs(xp, x, m_eq=2, eq_fn=eq_fn, eq_jac_fn=eq_jac_fn),
+        linear_solver=solver,
+    )
+
+    assert exit_reason is RestorationExit.FEASIBLE
+    assert float(xp.max(xp.abs(eq_fn(x_new)))) <= 1e-8
+    assert not exit_reason.certifies_infeasibility
+
+
+def test_restoration_still_certifies_a_genuine_local_minimum(namespace):
+    """The escape probe must not turn a true nonzero local minimizer of the
+    infeasibility into a stall: ``x² = -1`` has none, and stays certified."""
+    xp = namespace
+    problem = InfeasibleEqualities(xp)
+    x = array(xp, [0.5])
+    _, _, exit_reason = restore(
+        **_restore_kwargs(
+            xp,
+            x,
+            m_eq=1,
+            eq_fn=problem.eq_constraints,
+            eq_jac_fn=lambda z: as_operator(problem.eq_jacobian(z)),
+        ),
+        linear_solver=_krylov_solver(),
+    )
+    assert exit_reason.certifies_infeasibility
