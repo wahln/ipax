@@ -556,15 +556,20 @@ class KrylovSolver:
             if not (rz_next > 0.0 and math.isfinite(rz_next)):
                 raise KrylovConvergenceError(
                     f"CG breakdown: preconditioned inner product {rz_next:.3e} "
-                    f"at iteration {it} (residual {r_norm:.3e})"
+                    f"at iteration {it} (residual {r_norm:.3e})",
+                    iterate=x,
                 )
             beta = rz_next / rz
             p = z + beta * p
             rz = rz_next
 
+        # The truncated iterate rides along: CG minimizes the energy norm over
+        # the Krylov space it has built, so it is a descent direction for the
+        # SPD quadratic model (Steihaug 1983) even when short of ``rtol``.
         raise KrylovConvergenceError(
             f"CG did not converge in {max_iter} iterations "
-            f"(residual {r_norm:.3e}, tolerance {tol:.3e})"
+            f"(residual {r_norm:.3e}, tolerance {tol:.3e})",
+            iterate=x,
         )
 
     def _gmres(
@@ -686,7 +691,8 @@ class KrylovSolver:
             return x
         raise KrylovConvergenceError(
             f"GMRES did not converge in {max_iter} iterations "
-            f"(residual {res_norm:.3e}, tolerance {tol:.3e})"
+            f"(residual {res_norm:.3e}, tolerance {tol:.3e})",
+            iterate=x,
         )
 
     def _minres_preconditioner_diagonal(
@@ -814,13 +820,15 @@ class KrylovSolver:
                     return x
                 raise KrylovConvergenceError(
                     "MINRES Lanczos breakdown before convergence "
-                    f"(residual {true_residual:.3e}, tolerance {tol:.3e})"
+                    f"(residual {true_residual:.3e}, tolerance {tol:.3e})",
+                    iterate=x,
                 )
 
         true_residual = _true_residual_norm(xp, K, x, b)
         raise KrylovConvergenceError(
             f"MINRES did not converge in {max_iter} iterations "
-            f"(residual {true_residual:.3e}, tolerance {tol:.3e})"
+            f"(residual {true_residual:.3e}, tolerance {tol:.3e})",
+            iterate=x,
         )
 
     def _record(self, iterations: int, residual: float, method: str) -> None:

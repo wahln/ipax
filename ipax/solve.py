@@ -39,7 +39,7 @@ from ipax._logging import (
 from ipax.backend.namespace import array_namespace, capabilities
 from ipax.ipm.driver import IPMDriver
 from ipax.ipm.init import relax_fixed_bounds
-from ipax.linalg.solver import select_solver
+from ipax.linalg.solver import select_restoration_solver, select_solver
 from ipax.options import Options, ScalingOptions
 from ipax.problem.derivatives import resolve
 from ipax.problem.linear_ineq import lower_linear_inequalities
@@ -286,6 +286,7 @@ def solve(
         ineq_density=_ineq_density if has_ineq else None,
         ineq_gram_fill=_ineq_gram_fill if ne_foldable else None,
     )
+    restoration_solver_factory = select_restoration_solver(opts)
 
     # Pre-solve diagnostics (verbosity tiers 3–5; gated by the logger threshold
     # so an application's own handlers still receive every record).
@@ -305,6 +306,7 @@ def solve(
         model,
         xp=xp,
         solver=solver,
+        restoration_solver_factory=restoration_solver_factory,
         options=opts,
         lower=lower,
         upper=upper,

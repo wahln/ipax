@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
-from ipax.backend.operators import as_operator
+from dataclasses import replace
+
+import pytest
+
+from ipax import Options, solve
+from ipax.backend.operators import MatrixFreeJacobian, as_operator
 from ipax.ipm.restoration import RestorationExit, restore
+from ipax.linalg.krylov import KrylovSolver
+from ipax.linalg.solver import LinearSolveError
+from ipax.options import RestorationOptions
 from ipax.problem.base import Problem
 from ipax.testing.problems import HS6, InfeasibleEqualities
 from tests._helpers import array, assert_allclose
@@ -11,6 +19,46 @@ from tests._helpers import array, assert_allclose
 
 def _no_ineq(x):
     raise AssertionError("inequality callbacks should not be used here")
+
+
+def _krylov_solver(**overrides) -> KrylovSolver:
+    """The shipped restoration Krylov preset, optionally tightened or truncated."""
+    return KrylovSolver(replace(RestorationOptions().krylov, **overrides))
+
+
+def _restore_kwargs(xp, x, **over):
+    n = int(x.shape[0])
+    kwargs = {
+        "xp": xp,
+        "x": x,
+        "s": xp.zeros((0,), dtype=x.dtype),
+        "m": 0,
+        "m_eq": 0,
+        "eq_fn": _no_ineq,
+        "eq_jac_fn": _no_ineq,
+        "ineq_fn": _no_ineq,
+        "ineq_jac_fn": _no_ineq,
+        "mask_l": xp.zeros((n,), dtype=xp.bool),
+        "mask_u": xp.zeros((n,), dtype=xp.bool),
+        "lower_safe": xp.zeros((n,), dtype=x.dtype),
+        "upper_safe": xp.zeros((n,), dtype=x.dtype),
+        "tol": 1e-8,
+    }
+    kwargs.update(over)
+    return kwargs
+
+
+def _two_equalities(xp):
+    """``x0 + 2 x1 = 1``, ``x2 = -1``: a rank-2 system on three variables."""
+
+    def eq_fn(z):
+        return xp.stack((z[0] + 2.0 * z[1] - 1.0, z[2] + 1.0))
+
+    def eq_jac_fn(z):
+        del z
+        return as_operator(array(xp, [[1.0, 2.0, 0.0], [0.0, 0.0, 1.0]]))
+
+    return eq_fn, eq_jac_fn
 
 
 def test_restoration_reduces_equality_violation(namespace):
@@ -40,6 +88,240 @@ def test_restoration_reduces_equality_violation(namespace):
     assert exit_reason is RestorationExit.FEASIBLE
     assert theta_new < theta0
     assert theta_new <= 1e-6
+
+
+def test_matrix_free_restoration_uses_only_jacobian_products(namespace, monkeypatch):
+    """The opt-in route must never construct an n-by-n identity or probe matmat."""
+    xp = namespace
+    n = 3
+    x = array(xp, [2.0, 0.0, -1.0])
+    eye_shapes: list[int] = []
+    original_eye = xp.eye
+
+    def recording_eye(size, *args, **kwargs):
+        eye_shapes.append(int(size))
+        return original_eye(size, *args, **kwargs)
+
+    monkeypatch.setattr(xp, "eye", recording_eye)
+    eq_fn, _ = _two_equalities(xp)
+
+    def eq_jac_fn(z):
+        del z
+
+        def matvec(v):
+            return xp.stack((v[0] + 2.0 * v[1], v[2]))
+
+        def rmatvec(v):
+            return xp.stack((v[0], 2.0 * v[0], v[1]))
+
+        op = MatrixFreeJacobian((2, n), matvec, rmatvec)
+
+        def forbidden_matmat(V):
+            del V
+            raise AssertionError("matrix-free restoration densified the Jacobian")
+
+        op.matmat = forbidden_matmat  # type: ignore[method-assign]
+        return op
+
+    x_new, _, exit_reason = restore(
+        **_restore_kwargs(xp, x, m_eq=2, eq_fn=eq_fn, eq_jac_fn=eq_jac_fn),
+        linear_solver=_krylov_solver(rtol=1e-10),
+    )
+
+    assert exit_reason is RestorationExit.FEASIBLE
+    assert float(xp.max(xp.abs(eq_fn(x_new)))) <= 1e-8
+    assert n not in eye_shapes
+
+
+def test_matrix_free_restoration_uses_the_truncated_krylov_iterate(namespace):
+    """A work-capped inner solve is a trial direction, not a rejected rung.
+
+    CG iterates minimize the Gauss-Newton model over a growing Krylov space,
+    so the truncated iterate is a descent direction (Steihaug 1983). Discarding
+    it and climbing the LM ladder would degrade the route to damped steepest
+    descent at large λ — and with a one-iteration cap could never certify
+    anything but a solve failure.
+    """
+    xp = namespace
+    x = array(xp, [2.0, 0.0, -1.0])
+    eq_fn, eq_jac_fn = _two_equalities(xp)
+
+    x_new, _, exit_reason = restore(
+        **_restore_kwargs(xp, x, m_eq=2, eq_fn=eq_fn, eq_jac_fn=eq_jac_fn),
+        linear_solver=_krylov_solver(max_iter=1, rtol=1e-12),
+    )
+
+    assert exit_reason is RestorationExit.FEASIBLE
+    assert float(xp.max(xp.abs(eq_fn(x_new)))) <= 1e-8
+
+
+def test_matrix_free_restoration_tracks_dense_on_an_ill_conditioned_jacobian(
+    namespace, monkeypatch
+):
+    """Where restoration is actually entered — rank-deficient, ill-conditioned
+    Jacobians — the Krylov route must make progress comparable to the dense
+    Gauss-Newton solve on the same outer budget, not crawl along the LM ladder."""
+    import numpy as np
+
+    import ipax.ipm.restoration as restoration_mod
+
+    monkeypatch.setattr(restoration_mod, "_MAX_ITER", 20)
+    xp = namespace
+    rng = np.random.default_rng(0)
+    # Sized so that discarding truncated CG iterates (climbing the LM ladder
+    # instead) measurably lags dense: 3.8x here vs 1.4x with the reuse.
+    n, m, rank = 200, 150, 130
+    u, _ = np.linalg.qr(rng.standard_normal((m, m)))
+    v, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    sv = np.zeros(m)
+    sv[:rank] = np.logspace(0, -5, rank)
+    a = (u * sv) @ v[:m, :]
+    b = a @ rng.standard_normal(n) + 1e-3 * rng.standard_normal(m)
+    a_xp = array(xp, a.tolist())
+    b_xp = array(xp, b.tolist())
+    x0 = array(xp, rng.standard_normal(n).tolist())
+
+    def eq_fn(z):
+        return xp.matmul(a_xp, z) - b_xp
+
+    def eq_jac_fn(z):
+        del z
+        return as_operator(a_xp)
+
+    kwargs = _restore_kwargs(xp, x0, m_eq=m, eq_fn=eq_fn, eq_jac_fn=eq_jac_fn)
+    x_dense, _, _ = restore(**kwargs)
+    x_krylov, _, krylov_exit = restore(**kwargs, linear_solver=_krylov_solver())
+
+    theta_dense = float(xp.max(xp.abs(eq_fn(x_dense))))
+    theta_krylov = float(xp.max(xp.abs(eq_fn(x_krylov))))
+    assert krylov_exit is not RestorationExit.LINEAR_SOLVE_FAILED
+    assert theta_krylov <= 2.0 * theta_dense
+
+
+def test_matrix_free_restoration_does_not_fall_back_on_krylov_failure(namespace):
+    """Failed inner solves must climb the LM ladder, never allocate a dense matrix."""
+    xp = namespace
+    calls = {"factor": 0, "solve": 0}
+
+    class FailingSolver:
+        def factor(self, operator):
+            calls["factor"] += 1
+            assert operator.shape == (1, 1)
+
+        def solve(self, rhs):
+            del rhs
+            calls["solve"] += 1
+            raise LinearSolveError("synthetic Krylov failure")
+
+    def eq_jac_fn(z):
+        del z
+        return MatrixFreeJacobian((1, 1), lambda v: v, lambda v: v)
+
+    x = array(xp, [0.0])
+    _, _, exit_reason = restore(
+        **_restore_kwargs(xp, x, m_eq=1, eq_fn=lambda z: z - 1.0, eq_jac_fn=eq_jac_fn),
+        linear_solver=FailingSolver(),  # type: ignore[arg-type]
+    )
+
+    assert exit_reason is RestorationExit.LINEAR_SOLVE_FAILED
+    assert not exit_reason.certifies_infeasibility
+    assert calls["factor"] == calls["solve"]
+    assert calls["solve"] > 1
+
+
+def test_matrix_free_and_dense_restoration_match_with_active_bounds_and_inequality(
+    namespace, monkeypatch
+):
+    """The product operator must reproduce the dense reduced normal equations."""
+    import ipax.ipm.restoration as restoration_mod
+
+    monkeypatch.setattr(restoration_mod, "_MAX_ITER", 1)
+    xp = namespace
+    x = xp.zeros((3,), dtype=xp.float64)
+
+    def eq_fn(z):
+        return xp.stack((z[0] + z[1] + 1.0,))
+
+    def eq_jac_fn(z):
+        del z
+        return as_operator(array(xp, [[1.0, 1.0, 0.0]]))
+
+    def ineq_fn(z):
+        return xp.stack((z[2] + 0.5,))
+
+    def ineq_jac_fn(z):
+        del z
+        return as_operator(array(xp, [[0.0, 0.0, 1.0]]))
+
+    kwargs = _restore_kwargs(
+        xp,
+        x,
+        s=xp.ones((1,), dtype=x.dtype),
+        m=1,
+        m_eq=1,
+        eq_fn=eq_fn,
+        eq_jac_fn=eq_jac_fn,
+        ineq_fn=ineq_fn,
+        ineq_jac_fn=ineq_jac_fn,
+        mask_l=xp.asarray([True, False, False], dtype=xp.bool),
+    )
+    x_dense, s_dense, dense_exit = restore(**kwargs)
+    x_krylov, s_krylov, krylov_exit = restore(
+        **kwargs, linear_solver=_krylov_solver(rtol=1e-10)
+    )
+
+    assert dense_exit is krylov_exit
+    assert_allclose(xp, x_krylov, x_dense, rtol=1e-8, atol=1e-8)
+    assert_allclose(xp, s_krylov, s_dense, rtol=1e-8, atol=1e-8)
+
+
+def test_matrix_free_restoration_requires_an_adjoint(namespace):
+    xp = namespace
+    x = array(xp, [0.0])
+
+    with pytest.raises(NotImplementedError, match="adjoint"):
+        restore(
+            **_restore_kwargs(
+                xp,
+                x,
+                m_eq=1,
+                eq_fn=lambda z: z - 1.0,
+                eq_jac_fn=lambda z: MatrixFreeJacobian((1, 1), lambda v: v),
+            ),
+            linear_solver=_krylov_solver(),
+        )
+
+
+def test_solve_rejects_matrix_free_restoration_without_an_adjoint_up_front(
+    namespace,
+):
+    """A matvec-only Jacobian must be refused at entry, not hundreds of
+    iterations later when restoration first needs the adjoint."""
+    xp = namespace
+
+    class MatvecOnly(Problem):
+        @property
+        def n_vars(self) -> int:
+            return 2
+
+        def objective(self, x):
+            return xp.sum(x * x)
+
+        def gradient(self, x):
+            return 2.0 * x
+
+        def eq_constraints(self, x):
+            return xp.stack((x[0] + x[1] - 1.0,))
+
+        def eq_jacobian(self, x):
+            del x
+            return MatrixFreeJacobian((1, 2), lambda v: xp.stack((v[0] + v[1],)))
+
+    options = Options(
+        hessian="lbfgs", restoration=RestorationOptions(linear_solver="krylov")
+    )
+    with pytest.raises(ValueError, match="adjoint"):
+        solve(MatvecOnly(), array(xp, [0.0, 0.0]), options=options)
 
 
 def test_restoration_flags_inconsistent_equalities(namespace):

@@ -1216,3 +1216,39 @@ def test_auto_promotion_probe_skipped_on_fast_solves(namespace):
 
     assert solver.last_iterations <= 5  # well-conditioned: genuinely fast
     assert probes == []
+
+
+def test_non_convergence_error_carries_the_partial_iterate(namespace, tol):
+    """A work-capped solve hands its last iterate to the caller.
+
+    Feasibility restoration reuses it as a truncated-CG trial direction
+    (Steihaug 1983) instead of discarding the Krylov work and climbing the LM
+    ladder; the KKT driver keeps ignoring it and escalating ``δ_w``.
+    """
+    A, rhs, _ = _spd_system(namespace)
+    solver = _solver(method="cg", preconditioner="none", rtol=1e-14, max_iter=1)
+    solver.factor(Dense(A))
+    with pytest.raises(KrylovConvergenceError) as info:
+        solver.solve(rhs)
+    iterate = info.value.iterate
+    assert iterate is not None
+    # One unpreconditioned CG step from zero is exact-line-search steepest
+    # descent along the right-hand side: α = ⟨b, b⟩ / ⟨b, A b⟩.
+    xp = namespace
+    a_rhs = xp.matmul(A, rhs)
+    alpha = float(xp.sum(rhs * rhs)) / float(xp.sum(rhs * a_rhs))
+    assert_allclose(namespace, iterate, alpha * rhs, **tol)
+
+
+@pytest.mark.parametrize("method", ["gmres", "minres"])
+def test_non_convergence_error_carries_a_finite_iterate(namespace, method):
+    A, rhs, _ = _spd_system(namespace)
+    kwargs = {"gmres_restart": 1} if method == "gmres" else {}
+    solver = _solver(method=method, rtol=1e-14, max_iter=1, **kwargs)
+    solver.factor(Dense(A))
+    with pytest.raises(KrylovConvergenceError) as info:
+        solver.solve(rhs)
+    iterate = info.value.iterate
+    assert iterate is not None
+    assert iterate.shape == rhs.shape
+    assert bool(namespace.all(namespace.isfinite(iterate)))

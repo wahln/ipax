@@ -50,6 +50,8 @@ validated on construction.
 
 ::: ipax.options.KrylovOptions
 
+::: ipax.options.RestorationOptions
+
 ::: ipax.options.BreedveldOptions
 
 ## Results and diagnostics

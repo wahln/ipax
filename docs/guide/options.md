@@ -205,6 +205,32 @@ bounds, so they never hurt there. Tune Gondzio via
 - `"breedveld"` — a lighter Markov-filter + ratio-control step controller tuned
   for convex/RT-like problems ([`BreedveldOptions`](../reference.md#ipax.options.BreedveldOptions)).
 
+### Restoration linear solver
+
+Feasibility restoration keeps its established dense Gauss-Newton solve by
+default. For problems where an `n x n` restoration matrix is too large, enable
+the experimental product-only route:
+
+```python
+from ipax import Options
+from ipax.options import RestorationOptions
+
+options = Options(
+    restoration=RestorationOptions(linear_solver="krylov"),
+)
+```
+
+This route requires every restoration Jacobian to supply both `matvec` and
+`rmatvec`; a matvec-only Jacobian is rejected when `solve()` starts. An inner
+solve that hits its work cap still contributes its truncated Krylov iterate as
+the Levenberg-Marquardt trial direction (a descent direction of the
+Gauss-Newton model), so the damping only grows when a trial is actually
+rejected; the route never falls back to a dense allocation. Its tolerance and
+work limit live under `RestorationOptions.krylov`, isolated from the main KKT
+solver (`rtol` may be loosened freely there — with `adaptive_tol=False` the
+adaptive cap does not apply). The mode remains opt-in pending a paired S2MPJ
+correctness and performance sweep.
+
 !!! tip "Radiotherapy-scale planning: start from `slack_init_scale=0.1`"
     On large, deeply-infeasible-at-start dose-optimization problems (TROTS-scale:
     `n≈10³`, hundreds of thousands of dose constraints, a warm start that is

@@ -13,6 +13,7 @@ from ipax.options import (
     LineSearchOptions,
     OptimalityConditionOptions,
     Options,
+    RestorationOptions,
 )
 
 
@@ -24,6 +25,32 @@ def test_options_are_frozen():
 
 def test_default_hessian_is_auto():
     assert Options().hessian == "auto"
+
+
+def test_restoration_linear_solver_is_opt_in():
+    assert RestorationOptions().linear_solver == "dense"
+    assert Options().restoration.linear_solver == "dense"
+    assert RestorationOptions(linear_solver="krylov").linear_solver == "krylov"
+
+
+def test_krylov_rtol_is_free_when_adaptive_forcing_is_off():
+    # ``adaptive_rtol_max`` caps the inexact-Newton forcing only; with the
+    # forcing off it is unused, so it must not fence the fixed ``rtol`` (the
+    # restoration preset advertises an isolated, tunable tolerance).
+    assert KrylovOptions(rtol=1e-6, adaptive_tol=False).rtol == 1e-6
+    assert (
+        RestorationOptions(
+            krylov=KrylovOptions(rtol=1e-6, adaptive_tol=False)
+        ).krylov.rtol
+        == 1e-6
+    )
+    with pytest.raises(ValueError, match="adaptive_rtol_max"):
+        KrylovOptions(rtol=1e-6)
+
+
+def test_restoration_rejects_unknown_linear_solver():
+    with pytest.raises(ValueError, match="restoration linear solver"):
+        RestorationOptions(linear_solver="sparse")  # type: ignore[arg-type]
 
 
 def test_default_optimality_matches_spec():

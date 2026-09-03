@@ -62,7 +62,16 @@ class LinearSolveError(RuntimeError):
     primal regularization. Configuration errors, unsupported features, shape
     errors, and user/operator callback bugs should propagate as their original
     exceptions instead of being reclassified as numerical trouble.
+
+    ``iterate`` optionally carries the solver's last approximate solution when
+    the failure is a work limit rather than a breakdown (an iterative solver's
+    truncated iterate). The KKT driver ignores it and escalates ``δ_w``;
+    feasibility restoration uses it as a truncated-Newton trial direction.
     """
+
+    def __init__(self, message: str = "", *, iterate: Array | None = None) -> None:
+        super().__init__(message)
+        self.iterate = iterate
 
 
 @runtime_checkable
@@ -218,4 +227,25 @@ def select_solver(
     return KrylovSolver(options.krylov)
 
 
-__all__ = ["LinearSolveError", "LinearSolver", "select_solver"]
+def select_restoration_solver(options: Options) -> Callable[[], LinearSolver] | None:
+    """Factory for the opt-in iterative restoration solver; ``None`` keeps dense.
+
+    A factory rather than an instance: the driver builds a fresh solver per
+    restoration entry, so the operator a solver retains after ``factor()`` —
+    and through it the last restoration point's ``m × n`` Jacobians — is
+    released when restoration returns instead of living for the rest of the run.
+    """
+    if options.restoration.linear_solver == "dense":
+        return None
+    from ipax.linalg.krylov import KrylovSolver
+
+    krylov_options = options.restoration.krylov
+    return lambda: KrylovSolver(krylov_options)
+
+
+__all__ = [
+    "LinearSolveError",
+    "LinearSolver",
+    "select_restoration_solver",
+    "select_solver",
+]

@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Opt-in matrix-free feasibility restoration.** Set
+  `RestorationOptions(linear_solver="krylov")` to solve the reduced, damped
+  Gauss-Newton restoration model through Jacobian `matvec`/`rmatvec`
+  products, eliminating the dense `n x n` identity, Hessian, and Jacobian
+  materializations. The established dense route remains the default pending a
+  paired S2MPJ sweep; `--restoration-linear-solver` exposes that A/B in the
+  sweep runner. A work-capped inner solve contributes its truncated Krylov
+  iterate as the Levenberg-Marquardt trial direction (a descent direction of
+  the Gauss-Newton model, Steihaug 1983) instead of being discarded; only a
+  solve that yields no finite direction climbs the damping ladder, and if
+  none ever does restoration returns an uncertified failure. It never
+  silently falls back to a scale-breaking dense allocation. A matvec-only
+  Jacobian is refused at `solve()` entry rather than at the first restoration,
+  and the solver is built per restoration entry so the last restoration
+  point's Jacobians are released when it returns.
 - **Docs: bound-only RT recipe and objective/gradient work-sharing.** The
   TROTS benchmark page gains a measured recipe for bound-only fluence-map
   runs (`LBFGSOptions(seed_formula="scalar1", memory=20-50)` + the default
@@ -30,6 +45,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (5 ms per step at `n = 50k`).
 
 ### Changed
+- `KrylovOptions` no longer requires `rtol <= adaptive_rtol_max` when
+  `adaptive_tol=False`: the cap bounds the inexact-Newton forcing only, so a
+  fixed tolerance (e.g. a loosened `RestorationOptions.krylov.rtol`) is free
+  of it.
 - **L-BFGS compact applies keep their finiteness guard on device.** A
   non-finite compact solve output is replaced by zeros before the low-rank
   products, preserving the identity-seed fallback without synchronizing once

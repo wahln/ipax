@@ -33,8 +33,11 @@ from collections.abc import Callable
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from ipax.backend.operators import LinearOperator, VStack
+from ipax.linalg.solver import LinearSolveError
+
 if TYPE_CHECKING:
-    from ipax.backend.operators import LinearOperator
+    from ipax.linalg.solver import LinearSolver
     from ipax.typing import Array, Namespace
 
 _MAX_ITER = 200  # outer (Jacobian-rebuild) iterations; stalls exit via the window
@@ -57,12 +60,15 @@ class RestorationExit(Enum):
     budget exit is a mere stall: the S2MPJ restfix audit (2026-07) showed the
     trailing-window guard exiting *early* on slow problems (LAKES/NASH/SWOPF),
     and treating that as an infeasibility verdict relabels an honest
-    out-of-budget failure as a false claim about the problem.
+    out-of-budget failure as a false claim about the problem. Likewise an
+    iterative inner solve that never produced a finite direction
+    (:attr:`LINEAR_SOLVE_FAILED`) says nothing about local feasibility.
     """
 
     FEASIBLE = "feasible"  # θ_∞ reached the feasibility tolerance
     STATIONARY = "stationary"  # projected-gradient stationary point of F
     NO_DESCENT = "no_descent"  # no LM damping in [init, max] yields descent
+    LINEAR_SOLVE_FAILED = "linear_solve_failed"  # no finite LM direction was obtained
     STALL_WINDOW = "stall_window"  # trailing-window plateau (uncertified)
     BUDGET = "budget"  # iteration budget exhausted (uncertified)
 
@@ -87,6 +93,82 @@ def _dense(op: LinearOperator, xp: Namespace, dtype: object) -> Array:
     return op.matmat(xp.eye(op.shape[1], dtype=dtype))
 
 
+class _RestorationNormalOperator(LinearOperator):
+    """Reduced damped Gauss-Newton matrix ``F (Jᵀ Σ J) F + B + λI`` by products.
+
+    ``J`` stacks the equality and inequality Jacobians and ``Σ`` their row
+    weights (ones for equalities, the ``g > 0`` indicator for inequalities);
+    ``F``/``B`` are the free/blocked 0-1 masks of the projected-Newton
+    reduction. One instance serves a whole outer iteration: only ``damping``
+    moves along the Levenberg–Marquardt ladder, so the Jacobi diagonal is
+    computed once and re-shifted per rung.
+    """
+
+    def __init__(
+        self,
+        *,
+        jacobian: LinearOperator,
+        weights: Array,
+        free: Array,
+        blocked: Array,
+        damping: float,
+    ) -> None:
+        self._jacobian = jacobian
+        self._weights = weights
+        self._free = free
+        self._blocked = blocked
+        self.damping = damping
+        self._reduced_diagonal: Array | None = None
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        n = int(self._free.shape[0])
+        return n, n
+
+    def matvec(self, v: Array) -> Array:
+        jv = self._jacobian.matvec(self._free * v)
+        gram_v = self._jacobian.rmatvec(self._weights * jv)
+        return self._free * gram_v + (self._blocked + self.damping) * v
+
+    def diagonal(self, like: Array | None = None) -> Array:
+        # ``gram_diagonal`` raises NotImplementedError for Jacobians without a
+        # cheap column-energy; that propagates, and the Krylov Jacobi
+        # preconditioner treats a missing diagonal as "no preconditioning".
+        del like
+        if self._reduced_diagonal is None:
+            gram_diagonal = self._jacobian.gram_diagonal(self._weights)
+            self._reduced_diagonal = self._free * gram_diagonal + self._blocked
+        return self._reduced_diagonal + self.damping
+
+
+def _stacked_jacobian(
+    xp: Namespace,
+    eq_jac: LinearOperator | None,
+    c: Array,
+    ineq_jac: LinearOperator | None,
+    gpos: Array,
+    active: Array | None,
+) -> tuple[LinearOperator, Array, Array] | None:
+    """Stack ``(J, Σ, r)`` of the infeasibility model ``½‖Σ^½ r‖²``, or None.
+
+    Returns the stacked Jacobian, its row weights and the residual it acts on
+    (``c`` for equalities, the positive part of ``g`` for inequalities).
+    """
+    if eq_jac is not None and ineq_jac is not None:
+        assert active is not None
+        return (
+            VStack((eq_jac, ineq_jac)),
+            xp.concat((xp.ones_like(c), active)),
+            xp.concat((c, gpos)),
+        )
+    if eq_jac is not None:
+        return eq_jac, xp.ones_like(c), c
+    if ineq_jac is not None:
+        assert active is not None
+        return ineq_jac, active, gpos
+    return None
+
+
 def restore(
     *,
     xp: Namespace,
@@ -103,11 +185,12 @@ def restore(
     lower_safe: Array,
     upper_safe: Array,
     tol: float,
+    linear_solver: LinearSolver | None = None,
 ) -> tuple[Array, Array, RestorationExit]:
     """Minimize the constraint infeasibility; return ``(x, s, exit_reason)``."""
     dtype = x.dtype
     n = int(x.shape[0])
-    identity = xp.eye(n, dtype=dtype)
+    identity = xp.eye(n, dtype=dtype) if linear_solver is None else None
     feasible_tol = feasible_theta_tol(tol)
 
     margin = feasible_tol
@@ -165,19 +248,38 @@ def restore(
                 exit_reason = RestorationExit.STALL_WINDOW
                 break
 
-        hessian = xp.zeros((n, n), dtype=dtype)
-        grad = xp.zeros((n,), dtype=dtype)
-        if m_eq > 0:
-            jc = _dense(eq_jac_fn(x), xp, dtype)
-            jc_t = xp.permute_dims(jc, (1, 0))
-            hessian = hessian + xp.matmul(jc_t, jc)
-            grad = grad + xp.matmul(jc_t, c)
-        if m > 0:
-            jg = _dense(ineq_jac_fn(x), xp, dtype)
-            active = xp.astype(g > 0.0, dtype)
-            jg_w = jg * xp.expand_dims(active, axis=1)
-            hessian = hessian + xp.matmul(xp.permute_dims(jg, (1, 0)), jg_w)
-            grad = grad + xp.matmul(xp.permute_dims(jg, (1, 0)), gpos)
+        eq_jac = eq_jac_fn(x) if m_eq > 0 else None
+        ineq_jac = ineq_jac_fn(x) if m > 0 else None
+        active = xp.astype(g > 0.0, dtype) if m > 0 else None
+        stacked = (
+            None
+            if linear_solver is None
+            else _stacked_jacobian(xp, eq_jac, c, ineq_jac, gpos, active)
+        )
+        hessian: Array | None = None
+        if linear_solver is None:
+            # Dense reference route: materialize ``Jᵀ Σ J`` block by block
+            # (kept verbatim so its round-off, and the sweep it was tuned on,
+            # stay put).
+            hessian = xp.zeros((n, n), dtype=dtype)
+            grad = xp.zeros((n,), dtype=dtype)
+            if eq_jac is not None:
+                jc = _dense(eq_jac, xp, dtype)
+                jc_t = xp.permute_dims(jc, (1, 0))
+                hessian = hessian + xp.matmul(jc_t, jc)
+                grad = grad + xp.matmul(jc_t, c)
+            if ineq_jac is not None:
+                assert active is not None
+                jg = _dense(ineq_jac, xp, dtype)
+                jg_w = jg * xp.expand_dims(active, axis=1)
+                jg_t = xp.permute_dims(jg, (1, 0))
+                hessian = hessian + xp.matmul(jg_t, jg_w)
+                grad = grad + xp.matmul(jg_t, gpos)
+        elif stacked is None:
+            grad = xp.zeros((n,), dtype=dtype)
+        else:
+            jacobian, _, residual = stacked
+            grad = jacobian.rmatvec(residual)
 
         # First-order stationarity for the BOUND-CONSTRAINED infeasibility
         # problem: a component whose descent direction points out of the box is
@@ -211,10 +313,26 @@ def restore(
         # 200-iteration budget, vs 8e-4 with the reduction).
         blocked_f = xp.astype(blocked, dtype)
         free_f = 1.0 - blocked_f
-        hessian = (
-            hessian * (xp.expand_dims(free_f, axis=1) * xp.expand_dims(free_f, axis=0))
-            + identity * blocked_f
-        )
+        normal: _RestorationNormalOperator | None = None
+        if linear_solver is None:
+            assert hessian is not None and identity is not None
+            hessian = (
+                hessian
+                * (xp.expand_dims(free_f, axis=1) * xp.expand_dims(free_f, axis=0))
+                + identity * blocked_f
+            )
+        else:
+            # ``stacked`` is set: a missing Jacobian means a zero gradient,
+            # which exited as STATIONARY above.
+            assert stacked is not None
+            jacobian, weights, _ = stacked
+            normal = _RestorationNormalOperator(
+                jacobian=jacobian,
+                weights=weights,
+                free=free_f,
+                blocked=blocked_f,
+                damping=lam,
+            )
         grad = pg
 
         # Damped Gauss-Newton step with an INNER damping loop: the normal
@@ -224,20 +342,39 @@ def restore(
         # A rank-deficient or extreme-scale normal matrix (e.g. the (1+x1²)²
         # Jacobian of HS7 reaching ~1e201 at a bad iterate) can make the
         # backend's solve raise or return a non-finite step; both count as a
-        # rejected trial. The exception type is backend-specific (numpy
+        # rejected trial. The dense exception type is backend-specific (numpy
         # ``LinAlgError``, torch ``_LinAlgError``, …) and cannot be named
         # without importing a concrete library (invariant #1), so it is caught
-        # broadly.
+        # broadly. The iterative route raises ``LinearSolveError`` only for
+        # numerical trouble — any other exception is an operator-callback or
+        # configuration bug and propagates — and a work-capped solve hands
+        # back its truncated iterate, which is a descent direction for the SPD
+        # Gauss-Newton model (Steihaug 1983): it is tried like any direction
+        # rather than discarded, so the ladder is not climbed on Krylov work
+        # limits alone.
         accepted = False
+        direction_tried = False
         while lam <= _LM_MAX:
+            dx: Array | None
             try:
-                dx = xp.linalg.solve(hessian + lam * identity, -grad)
-                step_ok = bool(xp.all(xp.isfinite(dx)))
+                if normal is None:
+                    assert hessian is not None and identity is not None
+                    dx = xp.linalg.solve(hessian + lam * identity, -grad)
+                else:
+                    assert linear_solver is not None
+                    normal.damping = lam
+                    linear_solver.factor(normal)
+                    dx = linear_solver.solve(-grad)
             except MemoryError:  # a genuine resource failure must propagate
                 raise
-            except Exception:  # backend-specific singular-solve error
-                step_ok = False
-            if step_ok:
+            except LinearSolveError as exc:
+                dx = exc.iterate
+            except Exception:
+                if normal is not None:
+                    raise
+                dx = None  # backend-specific dense singular-solve error
+            if dx is not None and bool(xp.all(xp.isfinite(dx))):
+                direction_tried = True
                 x_trial = project(x + dx)
                 f_trial, _, _, _ = infeasibility(x_trial)
                 if f_trial < f:
@@ -247,9 +384,18 @@ def restore(
                     break
             lam = lam * _LM_GROW
         if not accepted:
-            # No damping in [_LM_INIT, _LM_MAX] yields descent: numerically
-            # stationary, which certifies like the gradient test above.
-            exit_reason = RestorationExit.NO_DESCENT
+            # A finite direction rejected at every damping is numerical
+            # stationarity, which certifies like the gradient test above. On
+            # the iterative route, never obtaining a direction at all is not a
+            # certificate (a Krylov breakdown says nothing about local
+            # feasibility). The dense route keeps its established
+            # exception-to-NO_DESCENT semantics: its λ = 1e16 rung is always
+            # solvable, so that case is a non-finite Jacobian.
+            exit_reason = (
+                RestorationExit.NO_DESCENT
+                if normal is None or direction_tried
+                else RestorationExit.LINEAR_SOLVE_FAILED
+            )
             break
 
     _, c, g, _ = infeasibility(x)

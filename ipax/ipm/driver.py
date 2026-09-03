@@ -28,7 +28,9 @@ normal-equations route (Breedveld 2017, eq. 18); equalities border it into the
 Friedlander–Orban quasidefinite saddle. Globalization is the filter line-search
 (default) or the Breedveld step controller, with a Gauss-Newton feasibility
 restoration phase. The injected ``LinearSolver`` is the dense reference solver,
-the matrix-free Krylov solver, or the sparse-direct route.
+the matrix-free Krylov solver, or the sparse-direct route; restoration keeps
+its dense reference solve unless a second solver factory is injected for it
+(``RestorationOptions``).
 """
 
 from __future__ import annotations
@@ -437,10 +439,14 @@ class IPMDriver:
         callback: IterationCallback | None = None,
         record_transform: Callable[[IterationRecord], IterationRecord] | None = None,
         warm_start: WarmStart | None = None,
+        restoration_solver_factory: Callable[[], LinearSolver] | None = None,
     ) -> None:
         self._problem = problem
         self._xp = xp
         self._solver = solver
+        # A factory, built per restoration entry: the solver's retained operator
+        # (and the Jacobians behind it) must not outlive the restoration call.
+        self._restoration_solver_factory = restoration_solver_factory
         self._options = options
         self._lower = lower
         self._upper = upper
@@ -950,6 +956,8 @@ class IPMDriver:
         x, s = start.x, start.s
         y_ineq, z_lower, z_upper = start.y_ineq, start.z_lower, start.z_upper
         y_eq = xp.zeros((m_eq,), dtype=dtype)
+        if self._restoration_solver_factory is not None:
+            self._check_restoration_adjoints(x, m, m_eq)
 
         if self._warm_start is not None:
             s, y_eq, y_ineq, z_lower, z_upper = apply_warm_start(
@@ -3121,7 +3129,38 @@ class IPMDriver:
             lower_safe=lower_safe,
             upper_safe=upper_safe,
             tol=self._options.optimality.kkt_tol,
+            linear_solver=(
+                None
+                if self._restoration_solver_factory is None
+                else self._restoration_solver_factory()
+            ),
         )
+
+    def _check_restoration_adjoints(self, x: Array, m: int, m_eq: int) -> None:
+        """Refuse a matvec-only Jacobian at entry, not at the first restoration.
+
+        The iterative restoration route applies ``Jᵀ Σ J`` through ``matvec``
+        and ``rmatvec``; a Jacobian without an adjoint would otherwise abort the
+        run — with no ``Result`` — hundreds of iterations in, when restoration
+        is first entered. One adjoint product with a zero vector per Jacobian
+        at the first iterate (whose Jacobians the point cache reuses) is the
+        price.
+        """
+        xp = self._xp
+        probes: list[tuple[str, LinearOperator, int]] = []
+        if m_eq > 0:
+            probes.append(("equality", self._eq_jac(x), m_eq))
+        if m > 0:
+            probes.append(("inequality", self._ineq_jac(x), m))
+        for name, jacobian, rows in probes:
+            try:
+                jacobian.rmatvec(xp.zeros((rows,), dtype=x.dtype))
+            except NotImplementedError as exc:
+                raise ValueError(
+                    "RestorationOptions(linear_solver='krylov') applies the "
+                    f"{name} Jacobian through matvec and rmatvec, but this "
+                    f"problem's {name} Jacobian has no adjoint: {exc}"
+                ) from exc
 
 
 __all__ = ["IPMDriver"]

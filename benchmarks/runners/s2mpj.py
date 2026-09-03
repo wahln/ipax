@@ -67,6 +67,7 @@ from ipax.options import (
     LBFGSOptions,
     LineSearchOptions,
     RegularizationOptions,
+    RestorationOptions,
 )
 from ipax.testing.backends import import_namespace
 
@@ -110,6 +111,7 @@ def default_configs(
     lbfgs_seed: str | None = None,
     backtrack_interpolation: bool | None = None,
     exact_lbfgs_inverse: bool | None = None,
+    restoration_linear_solver: str | None = None,
 ) -> list[ConfigSpec]:
     """The regular sweep matrix: both Hessian routes over the solver routes.
 
@@ -130,6 +132,10 @@ def default_configs(
         "max_time": max_time,
         "scaling": scaling,
     }
+    if restoration_linear_solver is not None:
+        common["restoration"] = RestorationOptions(
+            linear_solver=restoration_linear_solver  # type: ignore[arg-type]
+        )
     if mu_schedule is not None:
         # μ-oracle A/B lever (e.g. probing-default vs monotone); None keeps
         # the solver default so ordinary sweeps track it automatically.
@@ -601,6 +607,14 @@ def main(argv: list[str] | None = None) -> int:
         "exact-inverse-vs-Jacobi A/B; only observable on the Krylov configs.",
     )
     parser.add_argument(
+        "--restoration-linear-solver",
+        choices=("dense", "krylov"),
+        default=None,
+        help="override the feasibility-restoration linear solver on every config "
+        "(default: keep the solver default 'dense'); use 'krylov' for the "
+        "paired matrix-free restoration sweep.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="keep rows from an existing --out report and skip problems already in "
@@ -684,6 +698,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.exact_lbfgs_inverse is None
             else args.exact_lbfgs_inverse == "on"
         ),
+        restoration_linear_solver=args.restoration_linear_solver,
     )
     if args.config:
         wanted = {c.strip() for c in args.config.split(",") if c.strip()}

@@ -32,6 +32,7 @@ MuFallback = Literal["kkt-error", "never"]
 FreeModeAcceptance = Literal["obj-constr-filter", "rigorous"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
+RestorationLinearSolver = Literal["dense", "krylov"]
 DenseKKTRoute = Literal["condensed", "augmented"]
 SparseKKTRoute = Literal["auto", "augmented", "normal_equations"]
 ScalingMethod = Literal["none", "gradient-based"]
@@ -459,9 +460,45 @@ class KrylovOptions:
         if self.adaptive_eta <= 0.0:
             raise ValueError("adaptive_eta must be positive")
         # Equal floor/cap is allowed (adaptive collapses to the fixed rtol); the cap
-        # must not be below the floor or above 1.
-        if not self.rtol <= self.adaptive_rtol_max <= 1.0:
+        # must not be below the floor or above 1. The cap only bounds the adaptive
+        # forcing, so with it off the fixed ``rtol`` is free of it (the restoration
+        # preset advertises an isolated tolerance that may be loosened).
+        if self.adaptive_tol and not self.rtol <= self.adaptive_rtol_max <= 1.0:
             raise ValueError("adaptive_rtol_max must lie in [rtol, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class RestorationOptions:
+    """Feasibility-restoration linear algebra.
+
+    The dense mode preserves the established reference implementation. The
+    opt-in krylov route applies the damped Gauss-Newton normal operator through
+    Jacobian products, avoiding every n-by-n allocation. It remains opt-in until
+    a paired S2MPJ sweep shows that inexact inner solves do not regress
+    restoration exits or final solver verdicts.
+
+    Restoration has its own Krylov settings because it solves a feasibility
+    least-squares model rather than the main KKT system: nothing feeds it an
+    outer KKT residual, so the inexact-Newton forcing is switched off
+    explicitly (the solver would fall back to the fixed ``rtol`` anyway), and
+    the finite iteration cap bounds the Jacobian products one
+    Levenberg–Marquardt trial may spend. A work-capped inner solve is not
+    wasted: its truncated iterate is the trial direction (Steihaug 1983).
+    """
+
+    linear_solver: RestorationLinearSolver = "dense"
+    krylov: KrylovOptions = field(
+        default_factory=lambda: KrylovOptions(
+            rtol=1e-8,
+            max_iter=200,
+            preconditioner="jacobi",
+            adaptive_tol=False,
+        )
+    )
+
+    def __post_init__(self) -> None:
+        if self.linear_solver not in ("dense", "krylov"):
+            raise ValueError("restoration linear solver must be 'dense' or 'krylov'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -872,6 +909,7 @@ class Options:
     breedveld: BreedveldOptions = field(default_factory=BreedveldOptions)
     lbfgs: LBFGSOptions = field(default_factory=LBFGSOptions)
     krylov: KrylovOptions = field(default_factory=KrylovOptions)
+    restoration: RestorationOptions = field(default_factory=RestorationOptions)
     dense: DenseOptions = field(default_factory=DenseOptions)
     sparse: SparseOptions = field(default_factory=SparseOptions)
     scaling: ScalingOptions | ScalingMethod = field(default_factory=ScalingOptions)
@@ -927,6 +965,8 @@ __all__ = [
     "OptimalityConditionOptions",
     "Options",
     "RegularizationOptions",
+    "RestorationLinearSolver",
+    "RestorationOptions",
     "ScalingMethod",
     "ScalingOptions",
     "SparseKKTRoute",
