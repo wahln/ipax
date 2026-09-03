@@ -93,6 +93,24 @@ class _IndefiniteOperatorError(Exception):
     """Internal signal: CG hit non-positive curvature; retry with MINRES."""
 
 
+def _is_resource_failure(exc: BaseException) -> bool:
+    """Whether a backend exception is an allocation failure, not numerics.
+
+    Device backends raise their own types (torch's CUDA ``OutOfMemoryError`` is
+    a ``RuntimeError``, JAX reports ``RESOURCE_EXHAUSTED``) which cannot be
+    named in the core (invariant #1); recognise them by class name and message.
+    """
+    if isinstance(exc, MemoryError):
+        return True
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return (
+        "outofmemory" in name
+        or "out of memory" in message
+        or ("resource_exhausted" in message)
+    )
+
+
 # Woodbury-apply budget for the direct exact-inverse solve: one apply plus up
 # to two working-precision iterative-refinement rounds (they converge when
 # cond(N)·u ≲ 1 — Carson & Higham 2018; the exact-inverse case is the
@@ -417,6 +435,11 @@ class KrylovSolver:
             try:
                 return raw_apply(v)
             except Exception as exc:  # backend-native LinAlgError and kin
+                if _is_resource_failure(exc):
+                    # Out-of-memory is not a singular window: relabeling it
+                    # would sticky-disable the fast path and hide the cause
+                    # behind a slower Jacobi retry.
+                    raise
                 raise KrylovConvergenceError(
                     f"exact Woodbury apply failed: {exc}"
                 ) from exc

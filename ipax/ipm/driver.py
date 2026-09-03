@@ -447,6 +447,13 @@ class IPMDriver:
         # A factory, built per restoration entry: the solver's retained operator
         # (and the Jacobians behind it) must not outlive the restoration call.
         self._restoration_solver_factory = restoration_solver_factory
+        # Whether the solver's retained factorization is the iteration's
+        # *unregularized* KKT matrix (δ_w = 0, base δ_c). Recorded by
+        # ``_solve_step`` at factor time — the only place the main solver is
+        # factored — so every consumer (the SOC reuse gate) reads the truth
+        # rather than reconstructing it from flags kept in step with each
+        # refactoring site.
+        self._factor_unregularized = False
         self._options = options
         self._lower = lower
         self._upper = upper
@@ -1366,12 +1373,6 @@ class IPMDriver:
             }
 
             step_solve_failed = False
-            # Whether the solver's retained factorization is the one that
-            # produced ``step``. The two failure branches below (corrected-step
-            # descent fallback, descent-enforcement re-solve) can leave the
-            # solver factored at an escalated δ_w while keeping the *earlier*
-            # direction; SOC must not correct against that mismatched matrix.
-            factor_matches_step = True
             if self._corrector.active:
                 # Mehrotra/Gondzio/probing: the affine and correction directions
                 # share one KKT operator. Sparse-direct reuses its factorization;
@@ -1439,11 +1440,10 @@ class IPMDriver:
                                 dx, mu=mu, dy_eq=dy_eq, **recover_kwargs
                             )
                             reg_applied = max(reg_applied, reg_fallback)
-                        else:
-                            # The failed fallback ladder refactored the solver
-                            # past the matrix that produced the (kept)
-                            # corrected direction.
-                            factor_matches_step = False
+                        # else: the failed fallback ladder left the solver
+                        # factored past the matrix that produced the (kept)
+                        # corrected direction; ``_solve_step`` recorded that,
+                        # so SOC will not re-solve against it.
             else:
                 mu = self._next_mu(
                     mu,
@@ -1595,11 +1595,10 @@ class IPMDriver:
                     )
                     if not ok:
                         # The failed escalation refactored the solver past the
-                        # matrix that produced the (kept) earlier direction.
-                        factor_matches_step = False
+                        # matrix that produced the (kept) earlier direction;
+                        # ``_solve_step`` recorded that for the SOC gate.
                         break
                     step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
-                    factor_matches_step = True  # step and factorization re-aligned
                     reg_applied = max(reg_applied, reg_descent)
                     descent_floor = max(descent_floor, reg_descent)
 
@@ -1734,31 +1733,30 @@ class IPMDriver:
                 w: LinearOperator = w,
                 sigma_x: Array = sigma_x,
                 eq_jac: LinearOperator = eq_jac,
-                factor_matches_step: bool = factor_matches_step,
-                reg_applied: float = reg_applied,
             ) -> tuple[float, float] | None:
                 """Second-order correction for nonlinear constraint residuals.
 
-                At an *unregularized* step (``δ_w = 0`` — the common case) each
-                correction re-solves the solver's retained factorization: that
-                matrix is exactly Wächter & Biegler 2006's choice (§2.4,
-                eq. (26): "the same matrix as in (13)", "to avoid additional
-                matrix factorizations"), so conformance and reuse coincide.
-                (The right-hand side keeps ipax's pre-existing residual
-                convention — ``c`` at the accumulated corrected point — rather
-                than the eq. (27) blend.)
+                While the solver's retained factorization is the iteration's
+                *unregularized* matrix (``δ_w = 0``, base ``δ_c`` — the common
+                case; ``_factor_unregularized``, recorded at factor time) each
+                correction re-solves it: that matrix is exactly Wächter &
+                Biegler 2006's choice (§2.4, eq. (26): "the same matrix as in
+                (13)", "to avoid additional matrix factorizations"), so
+                conformance and reuse coincide. (The right-hand side keeps
+                ipax's pre-existing residual convention — ``c`` at the
+                accumulated corrected point — rather than the eq. (27) blend.)
 
-                At a *regularized* step (``δ_w > 0``) ipax deliberately
-                deviates and re-solves fresh at ``δ_w = 0``, as it always has:
-                reusing the δ_w-inflated matrix degrades the feasibility
-                correction enough to reroute whole runs — measured 2026-09-02,
-                ZAMB2/ZAMB2m11 (exact/dense) and ACOPP30/TWIRIMD1
-                (lbfgs/dense) all left their baseline trajectories for
-                restoration-heavy paths 10-60× more expensive per iteration
-                when SOC used the step's δ_w. The fresh solve is also the
-                fallback when the re-solve fails or when a failed re-solve
-                ladder left the solver factored past the matrix that produced
-                ``step`` (``factor_matches_step``), so trajectories are
+                Whenever the retained factorization is *regularized* (a
+                ``δ_w > 0`` step, a δ_c-escalated saddle, a failed re-solve
+                ladder, or a fallback solve inside this loop that ended
+                regularized) ipax deliberately deviates and re-solves fresh at
+                ``δ_w = 0``, as it always has: reusing the δ_w-inflated matrix
+                degrades the feasibility correction enough to reroute whole
+                runs — measured 2026-09-02, ZAMB2/ZAMB2m11 (exact/dense) and
+                ACOPP30/TWIRIMD1 (lbfgs/dense) all left their baseline
+                trajectories for restoration-heavy paths 10-60× more expensive
+                per iteration when SOC used the step's δ_w. The fresh solve is
+                also the fallback when the re-solve fails, so trajectories are
                 unchanged relative to the pre-reuse code in every case.
                 """
                 nonlocal soc_point
@@ -1784,11 +1782,12 @@ class IPMDriver:
                         rhs_soc = rhs_soc - ineq_jac.rmatvec(sigma_s * r_pi_c)
 
                     sol_c = None
-                    if factor_matches_step and reg_applied == 0.0:
-                        # W&B-exact fast path (see the docstring): the step's
-                        # matrix IS the δ_w = 0 matrix here, so the re-solve
-                        # is bitwise the fresh solve below, minus the rebuild
-                        # and factorization.
+                    if self._factor_unregularized:
+                        # W&B-exact fast path (see the docstring): the retained
+                        # matrix IS the δ_w = 0 matrix here, so the re-solve is
+                        # bitwise the fresh solve below, minus the rebuild and
+                        # factorization. Read per round: the fresh solve below
+                        # may leave the solver factored regularized.
                         sol_c = self._resolve_reused_factorization(rhs_soc, -c_c, m_eq)
                     if sol_c is not None:
                         dx_c = sol_c[: self._n]
@@ -2658,9 +2657,15 @@ class IPMDriver:
             if bool(xp.all(xp.isfinite(sol))):
                 dx = sol[: self._n]
                 dy = sol[self._n :] if m_eq > 0 else empty
+                # The returned δ_w alone does not identify the retained matrix:
+                # a phase-2 success reports δ_w = 0 with an escalated δ_c.
+                self._factor_unregularized = (
+                    reg.delta_w == 0.0 and current_delta_c == delta_c
+                )
                 return dx, dy, reg.delta_w, True
             escalate()
             logger.debug("non-finite step; escalating delta_w to %.2e", reg.delta_w)
+        self._factor_unregularized = False  # left factored past the ladder's end
         return rhs_x, empty, reg.delta_w, False
 
     def _alpha_primal(

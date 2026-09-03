@@ -33,8 +33,13 @@ from __future__ import annotations
 import pytest
 
 from ipax import Options, Status, solve
+from ipax.backend.operators import Dense
 from ipax.ipm.driver import IPMDriver
 from ipax.ipm.filter_ls import FilterLineSearch
+from ipax.linalg.dense import DenseSolver
+from ipax.linalg.solver import LinearSolveError
+from ipax.options import RegularizationOptions
+from ipax.problem.base import Problem
 from ipax.testing.problems import HS71
 from tests._helpers import array
 
@@ -101,3 +106,181 @@ def test_soc_solves_reuse_the_step_factorization(namespace, linsolve, monkeypatc
     # guard above actually saw SOC solves — and they took the reuse path.
     assert soc_invoked["n"] > 0
     assert reused["n"] > 0
+
+
+def test_soc_gate_follows_a_regularized_fallback_inside_the_soc_loop(
+    namespace, monkeypatch
+):
+    """After an in-loop fresh solve that ended at δ_w > 0, later SOC rounds
+    must not re-solve against that inflated factorization.
+
+    Round 1's re-solve can fail (Krylov non-convergence on the SOC rhs); the
+    fallback ladder then refactors the solver, possibly at δ_w > 0. The reuse
+    gate has to follow the *retained* factorization, not the step's.
+    """
+    state = {"in_search": False, "done": False, "force_floor": False}
+    events: list[str] = []  # KKT-solve events inside the first SOC search
+    orig_reuse = IPMDriver._resolve_reused_factorization
+
+    def failing_first_reuse(self, *args, **kwargs):
+        if state["in_search"] and not state["done"]:
+            events.append("reuse")
+            if len(events) == 1:
+                state["force_floor"] = True
+                return None  # simulate a failed re-solve on the SOC rhs
+        return orig_reuse(self, *args, **kwargs)
+
+    orig_step = IPMDriver._solve_step
+
+    def regularizing_step(self, *args, **kwargs):
+        if state["force_floor"]:
+            # The fallback ladder ends at δ_w = 1e-4: the retained factorization
+            # is no longer the unregularized matrix.
+            state["force_floor"] = False
+            args = (*args[:9], 1e-4)
+        out = orig_step(self, *args, **kwargs)
+        if state["in_search"] and not state["done"]:
+            events.append(f"step:{out[2]:g}")
+        return out
+
+    orig_search = FilterLineSearch.search
+
+    def marked_search(self, *args, **kwargs):
+        if state["done"]:
+            return orig_search(self, *args, **kwargs)
+        state["in_search"] = True
+        try:
+            return orig_search(self, *args, **kwargs)
+        finally:
+            state["in_search"] = False
+            if events:
+                state["done"] = True
+
+    monkeypatch.setattr(IPMDriver, "_resolve_reused_factorization", failing_first_reuse)
+    monkeypatch.setattr(IPMDriver, "_solve_step", regularizing_step)
+    monkeypatch.setattr(FilterLineSearch, "search", marked_search)
+
+    result = solve(
+        HS71(namespace),
+        array(namespace, [1.0, 5.0, 5.0, 1.0]),
+        options=Options(linsolve="krylov"),
+    )
+
+    assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
+    # Round 1: the re-solve failed and the fallback ended regularized. Round 2
+    # must then be a *fresh* solve (the retained matrix is δ_w = 1e-4), which
+    # re-establishes the unregularized factorization — later rounds may reuse
+    # it again. The old gate reused the δ_w = 1e-4 factorization in round 2.
+    assert events[:3] == ["reuse", "step:0.0001", "step:0"]
+
+
+class _EqualityOnly(Problem):
+    """``min ‖x‖²`` s.t. ``x0 + x1 = 1`` — a saddle with a one-row Jacobian."""
+
+    def __init__(self, xp):
+        self.xp = xp
+
+    @property
+    def n_vars(self) -> int:
+        return 2
+
+    def objective(self, x):
+        return self.xp.sum(x * x)
+
+    def gradient(self, x):
+        return 2.0 * x
+
+    def eq_constraints(self, x):
+        return self.xp.stack((x[0] + x[1] - 1.0,))
+
+    def eq_jacobian(self, x):
+        del x
+        return array(self.xp, [[1.0, 1.0]])
+
+
+class _FailsUntilDualPhase:
+    """Raise on every saddle whose δ_c is still the iteration's base value.
+
+    Drives ``_solve_step`` through phase 1 (δ_w alone) into phase 2, where
+    δ_w is reset to 0 and δ_c escalated — the retained factorization is then
+    regularized even though the returned δ_w reads 0.
+    """
+
+    def __init__(self, base_delta_c: float) -> None:
+        self._base = base_delta_c
+        self._inner = DenseSolver()
+
+    def factor(self, operator):
+        if operator._delta_c <= self._base:
+            raise LinearSolveError("synthetic saddle failure")
+        self._inner.factor(operator)
+
+    def solve(self, rhs):
+        return self._inner.solve(rhs)
+
+
+def _equality_driver(xp, solver, **regularization):
+    driver = IPMDriver(
+        _EqualityOnly(xp),
+        xp=xp,
+        solver=solver,
+        options=Options(
+            hessian="lbfgs",
+            linsolve="dense",
+            regularization=RegularizationOptions(**regularization),
+        ),
+        lower=None,
+        upper=None,
+        has_ineq=False,
+        has_eq=True,
+    )
+    driver._has_lower = driver._has_upper = False  # set by run(); no bounds here
+    return driver
+
+
+def _saddle_operands(xp):
+    dtype = xp.float64
+    return {
+        "w": Dense(xp.eye(2, dtype=dtype)),
+        "sigma_x": xp.zeros((2,), dtype=dtype),
+        "sigma_s": xp.zeros((0,), dtype=dtype),
+        "ineq_jac": Dense(xp.zeros((0, 2), dtype=dtype)),
+        "rhs_x": xp.ones((2,), dtype=dtype),
+        "eq_jac": Dense(array(xp, [[1.0, 1.0]])),
+        "m_eq": 1,
+        "r_y": xp.zeros((1,), dtype=dtype),
+        "delta_c": 1e-8,
+    }
+
+
+def test_step_solve_records_whether_the_retained_factorization_is_unregularized(
+    namespace,
+):
+    xp = namespace
+    ops = _saddle_operands(xp)
+
+    driver = _equality_driver(xp, DenseSolver())
+    _, _, delta_w, ok = driver._solve_step(**ops)
+    assert ok and delta_w == 0.0
+    assert driver._factor_unregularized
+
+    _, _, delta_w, ok = driver._solve_step(**ops, delta_w_floor=1e-4)
+    assert ok and delta_w == 1e-4
+    assert not driver._factor_unregularized
+
+
+def test_a_delta_c_escalated_solve_is_not_an_unregularized_factorization(namespace):
+    """δ_w = 0 is not proof the retained matrix is the step's unregularized
+    saddle: phase 2 of the ladder resets δ_w while escalating δ_c."""
+    xp = namespace
+    ops = _saddle_operands(xp)
+    # δ_w reaches the dual-phase trigger after one rung (δ_w_init = 1e-6).
+    driver = _equality_driver(
+        xp, _FailsUntilDualPhase(ops["delta_c"]), delta_c_trigger=1e-6
+    )
+
+    _, _, delta_w, ok = driver._solve_step(**ops)
+
+    assert ok
+    assert delta_w == 0.0  # the trap: the returned δ_w alone looks unregularized
+    assert not driver._factor_unregularized

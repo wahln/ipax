@@ -35,6 +35,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   bound-constrained composite least-squares solve).
 
 ### Fixed
+- **SOC factorization reuse follows the retained factorization.** The reuse
+  gate read two hand-maintained flags (`factor_matches_step`, the step's
+  `δ_w`) that went stale inside the SOC loop: after a failed re-solve, the
+  fresh fallback could leave the solver factored at `δ_w > 0` and later
+  rounds still re-solved against that inflated matrix; and a phase-2 ladder
+  success (δ_w reset to 0, δ_c escalated) reported `δ_w = 0` and was reused
+  as if unregularized. `_solve_step` now records at factor time whether the
+  retained matrix is the unregularized one, and the gate reads that per round.
+- **Out-of-memory inside the exact L-BFGS Woodbury apply propagates.** It was
+  relabeled as a Krylov convergence failure, which sticky-disabled the exact
+  inverse and hid the cause behind a slower Jacobi retry (torch's CUDA OOM is
+  a `RuntimeError`, not a `MemoryError`).
 - **Bound-only L-BFGS problems no longer materialize the dense condensed
   block.** Before the first curvature pair `LBFGSOperator.compact_form` raised,
   the structured Woodbury solve propagated the error and `DenseSolver` fell

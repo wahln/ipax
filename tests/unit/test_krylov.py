@@ -1252,3 +1252,39 @@ def test_non_convergence_error_carries_a_finite_iterate(namespace, method):
     assert iterate is not None
     assert iterate.shape == rhs.shape
     assert bool(namespace.all(namespace.isfinite(iterate)))
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        MemoryError("host allocation failed"),
+        type("OutOfMemoryError", (RuntimeError,), {})("CUDA out of memory"),
+    ],
+    ids=["MemoryError", "cuda-oom"],
+)
+def test_exact_inverse_apply_resource_failures_propagate(namespace, failure):
+    """A resource failure inside the Woodbury apply is not a singular window.
+
+    Relabeling it as ``KrylovConvergenceError`` would sticky-disable the exact
+    inverse and retry on Jacobi CG — hiding an out-of-memory condition behind a
+    "slow solve" for the rest of the run (torch's CUDA OOM is a RuntimeError,
+    not a MemoryError).
+    """
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+
+    def _raising():
+        def apply(v):
+            del v
+            raise failure
+
+        return apply
+
+    K.lbfgs_inverse_apply = _raising  # type: ignore[method-assign]
+    solver = _solver()
+    solver.factor(K)
+
+    with pytest.raises(type(failure)):
+        solver.solve(rhs)
+    assert not solver._exact_inverse_blocked
