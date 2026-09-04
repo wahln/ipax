@@ -228,8 +228,11 @@ Gauss-Newton model), so the damping only grows when a trial is actually
 rejected; the route never falls back to a dense allocation. Its tolerance and
 work limit live under `RestorationOptions.krylov`, isolated from the main KKT
 solver (`rtol` may be loosened freely there — with `adaptive_tol=False` the
-adaptive cap does not apply). The mode remains opt-in pending a paired S2MPJ
-correctness and performance sweep.
+adaptive cap does not apply). The mode is opt-in by design: on the S2MPJ
+corpus of mostly small problems the paired sweep (v29) scored it −12 of 6600
+rows against the dense reference, since an `n x n` solve is cheaper there
+than a Krylov ladder per damping trial; it is the route for problems where
+that matrix cannot be formed.
 
 !!! tip "Radiotherapy-scale planning: start from `slack_init_scale=0.1`"
     On large, deeply-infeasible-at-start dose-optimization problems (TROTS-scale:

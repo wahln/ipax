@@ -11,9 +11,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `RestorationOptions(linear_solver="krylov")` to solve the reduced, damped
   Gauss-Newton restoration model through Jacobian `matvec`/`rmatvec`
   products, eliminating the dense `n x n` identity, Hessian, and Jacobian
-  materializations. The established dense route remains the default pending a
-  paired S2MPJ sweep; `--restoration-linear-solver` exposes that A/B in the
-  sweep runner. A work-capped inner solve contributes its truncated Krylov
+  materializations. The dense route stays the default: the paired S2MPJ sweep
+  (v29, 2026-09-04) put the Krylov route at −12 correct of 6600 rows on a
+  corpus of mostly small problems, where an n×n dense solve is cheaper than a
+  Krylov ladder per damping trial (HYDCAR20-class `restoration_failed` rows
+  and `max_time` at similar iteration counts); `--restoration-linear-solver`
+  exposes the A/B in the sweep runner. A work-capped inner solve contributes its truncated Krylov
   iterate as the Levenberg-Marquardt trial direction (a descent direction of
   the Gauss-Newton model, Steihaug 1983) instead of being discarded; only a
   solve that yields no finite direction climbs the damping ladder, and if
