@@ -94,7 +94,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (`_factor_failed`, recorded alongside the unregularized flag), skips the
   opportunistic correction instead of climbing a ladder — with the fresh
   fallback still in place, DRUGDIS's 233 failed re-solves cost 120 s. Direct
-  routes keep the fresh fallback on either event.
+  routes keep the fresh fallback on either event. Confirming S2MPJ sweep
+  (v30 vs v29, 2026-09-04, machine factor 0.99–1.01): +2 correct of 6600;
+  the Krylov routes trade 9 basin flips each way at 22 % less total wall on
+  `exact/krylov` (11.2 h → 8.7 h) with DRUGDIS/DALLASS/NET1/SPECANNE back
+  from `max_time`; the direct routes are trajectory-identical.
 - `KrylovOptions` no longer requires `rtol <= adaptive_rtol_max` when
   `adaptive_tol=False`: the cap bounds the inexact-Newton forcing only, so a
   fixed tolerance (e.g. a loosened `RestorationOptions.krylov.rtol`) is free
