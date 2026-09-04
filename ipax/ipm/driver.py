@@ -454,6 +454,16 @@ class IPMDriver:
         # rather than reconstructing it from flags kept in step with each
         # refactoring site.
         self._factor_unregularized = False
+        # Whether the most recent ``_solve_step`` ladder ended *without* a
+        # usable factorization (the solver is left factored at the ladder's
+        # last, failed rung). Split from ``_factor_unregularized`` so the
+        # iterative-route SOC reuse below never re-solves a failed system.
+        self._factor_failed = False
+        # Direct vs iterative solver (``LinearSolver.is_direct``, optional —
+        # absent means direct): decides whether the second-order corrections
+        # re-solve a *regularized* retained system or solve fresh at δ_w = 0.
+        is_direct = getattr(solver, "is_direct", None)
+        self._solver_is_direct = bool(is_direct()) if callable(is_direct) else True
         self._options = options
         self._lower = lower
         self._upper = upper
@@ -1442,8 +1452,9 @@ class IPMDriver:
                             reg_applied = max(reg_applied, reg_fallback)
                         # else: the failed fallback ladder left the solver
                         # factored past the matrix that produced the (kept)
-                        # corrected direction; ``_solve_step`` recorded that,
-                        # so SOC will not re-solve against it.
+                        # corrected direction; ``_solve_step`` recorded that
+                        # (``_factor_failed``), so SOC solves fresh instead of
+                        # re-solving against it on either route.
             else:
                 mu = self._next_mu(
                     mu,
@@ -1596,7 +1607,8 @@ class IPMDriver:
                     if not ok:
                         # The failed escalation refactored the solver past the
                         # matrix that produced the (kept) earlier direction;
-                        # ``_solve_step`` recorded that for the SOC gate.
+                        # ``_solve_step`` recorded that (``_factor_failed``)
+                        # for the SOC gate.
                         break
                     step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
                     reg_applied = max(reg_applied, reg_descent)
@@ -1748,25 +1760,44 @@ class IPMDriver:
 
                 When the *step's* retained factorization is regularized (a
                 ``δ_w > 0`` step, a δ_c-escalated saddle, a failed re-solve
-                ladder) ipax deliberately deviates and solves the first
-                correction fresh at ``δ_w = 0``, as it always has: reusing the
-                step's δ_w-inflated matrix degrades the feasibility correction
-                enough to reroute whole runs — measured 2026-09-02,
-                ZAMB2/ZAMB2m11 (exact/dense) and ACOPP30/TWIRIMD1 (lbfgs/dense)
-                all left their baseline trajectories for restoration-heavy
-                paths 10-60× more expensive per iteration when SOC used the
-                step's δ_w. The fresh solve is also the fallback when the
-                re-solve fails.
+                ladder) the policy depends on the solver kind
+                (``LinearSolver.is_direct``):
 
-                A factorization produced by *this loop's own* fresh solve is
-                reused by the later rounds even when its ladder ended
-                regularized: that ladder already established that ``δ_w = 0``
-                does not solve this rhs family, and re-climbing it per round
-                is a full Krylov ladder each time (v29 sweep, 2026-09-03:
-                DRUGDIS/DALLASS/NET1/SPECANNE on the Krylov routes ran
-                10-15× slower per iteration and hit ``max_time`` when every
-                round re-solved fresh; 161 of 170 in-SOC ladders on DRUGDIS
-                ended regularized).
+                * **Direct** routes deviate and solve the first correction
+                  fresh at ``δ_w = 0``, as they always have: reusing the
+                  step's δ_w-inflated matrix degrades the feasibility
+                  correction enough to reroute whole runs — measured
+                  2026-09-02, ZAMB2/ZAMB2m11 (exact/dense) and
+                  ACOPP30/TWIRIMD1 (lbfgs/dense) all left their baseline
+                  trajectories for restoration-heavy paths 10-60× more
+                  expensive per iteration when SOC used the step's δ_w — and
+                  a fresh factorization per ladder rung is cheap there.
+                * **Iterative** routes reuse the step's system verbatim
+                  (eq. (26) as written) and never solve fresh inside SOC:
+                  a fresh δ_w = 0 solve is a full Krylov ladder per SOC
+                  round. Restricting reuse to unregularized steps (682f0fa)
+                  turned DRUGDIS lbfgs/krylov from 21 s into ``max_time``
+                  and cost DALLASS/NET1/SPECANNE alike in the v29 sweep;
+                  and with the fresh-ladder fallback still in place the
+                  route-aware gate alone left DRUGDIS at 120 s (233 failed
+                  re-solves each climbed a ladder). A failed re-solve — or a
+                  step whose own ladder failed (``_factor_failed``) — just
+                  skips the correction: it is opportunistic (§2.4).
+
+                On direct routes the fresh solve is also the fallback when
+                the re-solve fails, and the only option when the step's last
+                ladder *failed* (``_factor_failed``: the solver then holds a
+                factorization that produced no direction at all).
+
+                On direct routes a factorization produced by *this loop's
+                own* fresh solve is reused by the later rounds even when its
+                ladder ended regularized: that ladder already established
+                that ``δ_w = 0`` does not solve this rhs family, so
+                re-climbing it per round would only repeat the same rungs
+                (a factorization each) to land on the same matrix. (First
+                measured on the Krylov routes — v29 sweep, DRUGDIS: 161 of
+                170 in-SOC ladders ended regularized — where the policy
+                above now subsumes it.)
                 """
                 nonlocal soc_point
                 if opts.line_search.max_soc <= 0:
@@ -1792,15 +1823,27 @@ class IPMDriver:
                         rhs_soc = rhs_soc - ineq_jac.rmatvec(sigma_s * r_pi_c)
 
                     sol_c = None
-                    if self._factor_unregularized or own_factor:
+                    if (
+                        self._factor_unregularized
+                        or own_factor
+                        or not (self._solver_is_direct or self._factor_failed)
+                    ):
                         # W&B-exact fast path (see the docstring): the retained
                         # matrix IS the δ_w = 0 matrix here, so the re-solve is
                         # bitwise the fresh solve below, minus the rebuild and
                         # factorization — or it is this loop's own fallback
-                        # factorization, reused rather than re-climbed.
+                        # factorization, reused rather than re-climbed — or
+                        # the solver is iterative and a fresh solve costs a
+                        # ladder of full Krylov runs.
                         sol_c = self._resolve_reused_factorization(rhs_soc, -c_c, m_eq)
                     if sol_c is not None:
                         dx_c = sol_c[: self._n]
+                    elif not self._solver_is_direct:
+                        # Iterative route: the correction is opportunistic
+                        # (W&B §2.4) and a fresh solve here is the δ_w
+                        # ladder — a full Krylov run per rung — that the
+                        # reuse exists to avoid. Skip the correction.
+                        return None
                     else:
                         dx_c, _, _, ok = solve_step_timed(
                             w,
@@ -2673,10 +2716,12 @@ class IPMDriver:
                 self._factor_unregularized = (
                     reg.delta_w == 0.0 and current_delta_c == delta_c
                 )
+                self._factor_failed = False
                 return dx, dy, reg.delta_w, True
             escalate()
             logger.debug("non-finite step; escalating delta_w to %.2e", reg.delta_w)
         self._factor_unregularized = False  # left factored past the ladder's end
+        self._factor_failed = True
         return rhs_x, empty, reg.delta_w, False
 
     def _alpha_primal(

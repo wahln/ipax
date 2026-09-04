@@ -22,10 +22,13 @@ fresh factorization per round. This pins the re-solve fast path on a
 problem whose SOC iterations are all unregularized (HS71): no
 ``_solve_step`` re-entry during the line search, and the reuse helper
 actually running there. (At ``δ_w > 0`` steps SOC deliberately keeps the
-fresh δ_w = 0 solve — reusing the inflated matrix rerouted
-ZAMB2/ACOPP30/TWIRIMD1 onto restoration-heavy trajectories, measured
-2026-09-02 — so the in-search ladder stays legitimate on such iterations;
-HS71 has none.)
+fresh δ_w = 0 solve on *direct* routes — reusing the inflated matrix
+rerouted ZAMB2/ACOPP30/TWIRIMD1 onto restoration-heavy trajectories, measured
+2026-09-02, and a fresh factorization per rung is cheap there — so the
+in-search ladder stays legitimate on such iterations; HS71 has none. Iterative
+routes reuse the step's system regardless: a fresh solve is a full Krylov
+ladder per round, which timed DRUGDIS/DALLASS/NET1 out in the v29 sweep. The
+driver asks the solver which it is through the optional ``is_direct`` hook.)
 """
 
 from __future__ import annotations
@@ -108,18 +111,21 @@ def test_soc_solves_reuse_the_step_factorization(namespace, linsolve, monkeypatc
     assert reused["n"] > 0
 
 
+@pytest.mark.parametrize("linsolve", ["dense", "krylov"])
 def test_soc_gate_follows_a_regularized_fallback_inside_the_soc_loop(
-    namespace, monkeypatch
+    namespace, monkeypatch, linsolve
 ):
     """After round 1's re-solve fails and its fallback ladder ends at δ_w > 0,
     the later rounds reuse *that* factorization instead of re-climbing the
     ladder per round.
 
-    The ladder established that δ_w = 0 does not solve this rhs family, and a
-    fresh ladder per round is a full Krylov solve per rung (v29 sweep:
-    DRUGDIS/DALLASS/NET1 ran 10-15x slower per iteration when every round
-    solved fresh). The step's own regularized matrix is a different matter —
-    see ``test_soc_never_reuses_the_steps_regularized_factorization``.
+    The ladder established that δ_w = 0 does not solve this rhs family, so a
+    fresh ladder per round only repeats the same rungs. The dense arm is the
+    one that isolates this clause; on the iterative arm a failed re-solve
+    must *skip* the correction — no ``_solve_step`` ladder inside SOC at all
+    (v29 sweep: DRUGDIS's 233 in-SOC ladders cost 120 s). The step's own
+    regularized matrix on a direct route is a different matter —
+    ``test_direct_soc_never_reuses_the_steps_regularized_factorization``.
     """
     state = {"in_search": False, "done": False, "force_floor": False}
     events: list[str] = []  # KKT-solve events inside the first SOC search
@@ -166,13 +172,19 @@ def test_soc_gate_follows_a_regularized_fallback_inside_the_soc_loop(
     result = solve(
         HS71(namespace),
         array(namespace, [1.0, 5.0, 5.0, 1.0]),
-        options=Options(linsolve="krylov"),
+        options=Options(linsolve=linsolve),
     )
 
     assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
-    # Round 1: the re-solve failed and the fallback ended at δ_w = 1e-4; the
-    # remaining rounds re-solve that own factorization (max_soc = 4 rounds).
-    assert events[:5] == ["reuse", "step:0.0001", "reuse", "reuse", "reuse"]
+    if linsolve == "dense":
+        # Round 1: the re-solve failed and the fallback ended at δ_w = 1e-4;
+        # the remaining rounds re-solve that own factorization (max_soc = 4).
+        assert events[:5] == ["reuse", "step:0.0001", "reuse", "reuse", "reuse"]
+    else:
+        # The failed round-1 re-solve ends this correction; later SOC
+        # invocations in the same search re-solve the step's system again.
+        assert events[0] == "reuse"
+        assert not any(e.startswith("step:") for e in events)
 
 
 class _EqualityOnly(Problem):
@@ -270,6 +282,38 @@ def test_step_solve_records_whether_the_retained_factorization_is_unregularized(
     assert not driver._factor_unregularized
 
 
+class _AlwaysFails:
+    def factor(self, operator):
+        raise LinearSolveError("synthetic: every rung fails")
+
+    def solve(self, rhs):  # pragma: no cover - factor always raises first
+        raise LinearSolveError("unreachable")
+
+    def is_direct(self) -> bool:
+        return False
+
+
+def test_step_solve_records_a_failed_ladder(namespace):
+    """A ladder that ends without a usable factorization is recorded as
+    *failed*, distinct from merely regularized: the iterative-route SOC reuse
+    must not re-solve a system whose every rung just failed. A later success
+    clears it."""
+    xp = namespace
+    ops = _saddle_operands(xp)
+    driver = _equality_driver(xp, _AlwaysFails())
+    assert not driver._solver_is_direct
+
+    _, _, _, ok = driver._solve_step(**ops)
+    assert not ok
+    assert driver._factor_failed
+    assert not driver._factor_unregularized
+
+    driver = _equality_driver(xp, DenseSolver())
+    _, _, _, ok = driver._solve_step(**ops)
+    assert ok
+    assert not driver._factor_failed
+
+
 def test_a_delta_c_escalated_solve_is_not_an_unregularized_factorization(namespace):
     """δ_w = 0 is not proof the retained matrix is the step's unregularized
     saddle: phase 2 of the ladder resets δ_w while escalating δ_c."""
@@ -287,10 +331,9 @@ def test_a_delta_c_escalated_solve_is_not_an_unregularized_factorization(namespa
     assert not driver._factor_unregularized
 
 
-def test_soc_never_reuses_the_steps_regularized_factorization(namespace, monkeypatch):
-    """A δ_w > 0 *step* factorization is not reused for the first correction
-    (the measured ZAMB2/ACOPP30 reroute); the fresh round-1 solve then leaves
-    an unregularized factorization that the later rounds reuse."""
+def _regularized_step_soc_events(namespace, monkeypatch, linsolve: str) -> list[str]:
+    """KKT-solve events inside the first SOC search when every *step* solve
+    is forced to end at δ_w = 1e-4 (the retained factorization is regularized)."""
     state = {"in_search": False, "done": False}
     events: list[str] = []
     orig_reuse = IPMDriver._resolve_reused_factorization
@@ -328,10 +371,60 @@ def test_soc_never_reuses_the_steps_regularized_factorization(namespace, monkeyp
     result = solve(
         HS71(namespace),
         array(namespace, [1.0, 5.0, 5.0, 1.0]),
-        options=Options(linsolve="krylov"),
+        options=Options(linsolve=linsolve),
     )
 
     assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
     assert events, "the first search never ran a second-order correction"
+    return events
+
+
+def test_direct_soc_never_reuses_the_steps_regularized_factorization(
+    namespace, monkeypatch
+):
+    """On a direct route a δ_w > 0 *step* factorization is not reused for the
+    first correction (the measured ZAMB2/ACOPP30 reroute; a fresh factorization
+    per rung is cheap); the fresh round-1 solve then leaves an unregularized
+    factorization that the later rounds reuse."""
+    events = _regularized_step_soc_events(namespace, monkeypatch, "dense")
     assert events[0] == "step:0"  # round 1 is fresh, not a reuse of δ_w = 1e-4
     assert all(e == "reuse" for e in events[1:4])
+
+
+def test_iterative_soc_reuses_the_steps_regularized_factorization(
+    namespace, monkeypatch
+):
+    """On an iterative route every correction re-solves the step's retained
+    system even at δ_w > 0 (Wächter & Biegler 2006 eq. (26) verbatim): a
+    fresh δ_w = 0 solve there is a full Krylov ladder per SOC round — v29
+    sweep, DRUGDIS 21 s (reuse) vs `max_time` (fresh), DALLASS/NET1 alike."""
+    events = _regularized_step_soc_events(namespace, monkeypatch, "krylov")
+    assert events[:4] == ["reuse"] * 4
+
+
+class _NoKindSolver:
+    """A third-party solver that predates ``is_direct``: treated as direct."""
+
+    def __init__(self) -> None:
+        self._inner = DenseSolver()
+
+    def factor(self, operator):
+        self._inner.factor(operator)
+
+    def solve(self, rhs):
+        return self._inner.solve(rhs)
+
+
+def test_builtin_solvers_report_their_kind():
+    from ipax.linalg.krylov import KrylovSolver
+    from ipax.linalg.sparse import SparseDirectSolver
+    from ipax.options import KrylovOptions
+
+    assert DenseSolver().is_direct() is True
+    assert SparseDirectSolver().is_direct() is True
+    assert KrylovSolver(KrylovOptions()).is_direct() is False
+
+
+def test_driver_defaults_a_solver_without_is_direct_to_the_direct_policy(namespace):
+    assert _equality_driver(namespace, DenseSolver())._solver_is_direct is True
+    assert _equality_driver(namespace, _NoKindSolver())._solver_is_direct is True

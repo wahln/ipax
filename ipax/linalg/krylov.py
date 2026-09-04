@@ -184,6 +184,16 @@ class KrylovSolver:
         if math.isfinite(residual) and residual > 0.0:
             self._outer_residual = residual
 
+    def is_direct(self) -> bool:
+        """``False``: ``factor`` binds the operator; each solve is a Krylov run.
+
+        The bound-only L-BFGS exact-inverse dispatch (``_exact_inverse_solve``)
+        is the one solve that is not, but it applies only to problems without
+        constraints — which never run a second-order correction — so the
+        driver's use of this hook is unaffected by it.
+        """
+        return False
+
     def _effective_rtol(self) -> float:
         """Inner relative tolerance for this solve — fixed, or the forcing term.
 

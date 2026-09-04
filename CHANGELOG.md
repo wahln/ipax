@@ -54,8 +54,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   re-solve fails and its fresh ladder ends regularized, the later rounds now
   re-solve that factorization instead of re-climbing the ladder per round —
   on the Krylov routes every rung is a full CG solve, and DRUGDIS spent 161
-  of 170 in-SOC ladders re-deriving the same δ_w (v29 sweep). The step's own
-  regularized matrix is still never reused for the first correction.
+  of 170 in-SOC ladders re-deriving the same δ_w (v29 sweep). Whether the
+  step's own regularized matrix is reused for the first correction depends
+  on the solver kind — see "SOC reuse policy follows the solver kind" under
+  Changed.
 - **SOC factorization reuse follows the retained factorization.** The reuse
   gate read two hand-maintained flags (`factor_matches_step`, the step's
   `δ_w`) that went stale inside the SOC loop: after a failed re-solve, the
@@ -78,6 +80,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (5 ms per step at `n = 50k`).
 
 ### Changed
+- **SOC reuse policy follows the solver kind.** `LinearSolver` gains an
+  optional `is_direct()` hook (`DenseSolver`/`SparseDirectSolver` `True`,
+  `KrylovSolver` `False`; absent = direct). Iterative routes now re-solve the
+  step's retained system for every second-order correction even when it is
+  regularized (Wächter & Biegler 2006 eq. (26) verbatim): a fresh `δ_w = 0`
+  solve there is a full Krylov ladder per round, which turned DRUGDIS
+  lbfgs/krylov from 21 s into `max_time` and cost DALLASS/NET1/SPECANNE in the
+  v29 sweep. Direct routes keep the fresh first correction at `δ_w = 0`
+  (their factorization per rung is cheap, and reusing the inflated matrix
+  rerouted ZAMB2/ACOPP30). Iterative routes also never solve fresh inside
+  SOC: a failed re-solve, or a step whose own ladder failed
+  (`_factor_failed`, recorded alongside the unregularized flag), skips the
+  opportunistic correction instead of climbing a ladder — with the fresh
+  fallback still in place, DRUGDIS's 233 failed re-solves cost 120 s. Direct
+  routes keep the fresh fallback on either event.
 - `KrylovOptions` no longer requires `rtol <= adaptive_rtol_max` when
   `adaptive_tol=False`: the cap bounds the inexact-Newton forcing only, so a
   fixed tolerance (e.g. a loosened `RestorationOptions.krylov.rtol`) is free
@@ -143,14 +160,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   like the centrality correctors; on HS71 under defaults this cuts the
   dense route from 28 factorizations to 8 (20 of 28 KKT solves per run are
   SOC re-solves), and on the sparse-direct route each avoided factorization
-  is a full LDLT. At a *regularized* step (`delta_w > 0`) SOC keeps ipax's
-  long-standing fresh `delta_w = 0` solve — a deliberate, now-documented
-  deviation from eq. (26): reusing the delta_w-inflated matrix measurably
-  degrades the feasibility correction (ZAMB2/ZAMB2m11/ACOPP30/TWIRIMD1 left
-  their baseline trajectories for restoration-heavy paths 10-60x more
-  expensive per iteration). The fresh solve is also the fallback when a
-  re-solve fails, so iterate trajectories are unchanged; this is purely a
-  per-iteration cost reduction.
+  is a full LDLT. At a *regularized* step (`delta_w > 0`) on a direct route
+  SOC keeps ipax's long-standing fresh `delta_w = 0` solve — a deliberate,
+  now-documented deviation from eq. (26): reusing the delta_w-inflated
+  matrix measurably degrades the feasibility correction there
+  (ZAMB2/ZAMB2m11/ACOPP30/TWIRIMD1 left their baseline trajectories for
+  restoration-heavy paths 10-60x more expensive per iteration), so direct
+  routes' iterate trajectories are unchanged. Iterative routes reuse the
+  step's system regardless — see "SOC reuse policy follows the solver kind"
+  under Changed. The fresh solve is also the fallback when a re-solve fails.
 - **Less redundant work around the condensed Woodbury factors.** The
   condensed
   operator memoizes its Woodbury factorization per instance (keyed on the

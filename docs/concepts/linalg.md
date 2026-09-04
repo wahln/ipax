@@ -24,6 +24,17 @@ Selection is automatic (size, constraint shape, Jacobian density, estimated
 Gram fill, namespace capabilities) and user-overridable via `Options.linsolve`.
 Adding a solver never touches `ipm/driver.py` (invariant #3).
 
+Beyond `factor`/`solve`, the protocol has optional hooks the driver reads
+through duck typing: `set_outer_residual` (inexact-Newton forcing for
+iterative solvers), `describe`/`kkt_form` (reported in `Result.routes`), and
+`is_direct` — `True` when `factor` does the work and `solve` back-substitutes,
+`False` when every `solve` is a Krylov run (a solver without it counts as
+direct). The driver uses `is_direct` to decide whether second-order
+corrections re-solve the step's *regularized* retained system (iterative: a
+fresh solve is a ladder of full Krylov runs) or solve fresh at `δ_w = 0`
+(direct: a fresh factorization per rung is cheap, and reusing the inflated
+matrix measurably rerouted runs).
+
 ### Mixed-precision Gram accumulation (dense route)
 
 For tall inequality problems the dense condensed route spends 80–90% of its

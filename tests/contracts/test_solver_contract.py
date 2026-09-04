@@ -50,3 +50,15 @@ class LinearSolverContract:
 
         assert norm_inf(namespace, K.matvec(first) - rhs) <= 1e-8
         assert norm_inf(namespace, K.matvec(second) - 2.0 * rhs) <= 1e-7
+
+    def test_is_direct_is_a_bool_method_when_exposed(self):
+        # Optional capability hook: the driver's SOC reuse policy reads it
+        # through duck typing (absent = direct). When present it must be a
+        # method returning a plain bool, and it must not depend on factor().
+        solver = self.make_solver()
+        is_direct = getattr(solver, "is_direct", None)
+        if is_direct is None:
+            return
+        assert callable(is_direct)
+        assert is_direct() in (True, False)
+        assert type(is_direct()) is bool

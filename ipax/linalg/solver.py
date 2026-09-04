@@ -103,6 +103,23 @@ class LinearSolver(Protocol):
         """
         ...
 
+    def is_direct(self) -> bool:
+        """Whether ``factor`` does the work and ``solve`` back-substitutes it.
+
+        ``True`` for direct solvers (Cholesky/LU/LDLᵀ: a fresh factorization
+        costs one factor, a re-solve almost nothing), ``False`` for iterative
+        ones (``factor`` only binds the operator; every ``solve`` is a full
+        Krylov run). The driver reads it to choose between re-solving a
+        *regularized* retained system and re-solving fresh at ``δ_w = 0``
+        for the second-order corrections: fresh where a factorization is
+        cheap, reuse where each solve is the cost. Optional, like
+        ``set_outer_residual`` (the driver reads both through duck typing,
+        so a solver may omit them; ``isinstance`` checks against this
+        protocol do require them) — a solver without it is treated as
+        direct. Must be a method, not a class attribute.
+        """
+        ...
+
 
 def select_solver(
     *,
