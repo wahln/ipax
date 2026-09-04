@@ -234,6 +234,24 @@ rows against the dense reference, since an `n x n` solve is cheaper there
 than a Krylov ladder per damping trial; it is the route for problems where
 that matrix cannot be formed.
 
+The one knob to know is the work cap, `RestorationOptions.krylov.max_iter`
+(default 200). Conjugate gradients on the Gauss-Newton normal operator sees
+the *squared* conditioning of the Jacobian, and on an ill-conditioned one it
+needs far more than `n` iterations in floating point. The signature is a
+restoration that exits on its iteration budget call after call while the
+infeasibility shrinks only by 10-20 % per call — every inner solve was
+truncated, and a truncated iterate is a poor direction, so the damped loop
+crawls until the driver gives up with `restoration_failed`. S2MPJ HYDCAR20
+(`n = 99`, a distillation-column equality system) is the reference case:
+at the default cap every one of the first call's 403 solves is truncated and
+the run fails on five of six configurations (measured 2026-09-04, v29 paired
+sweep); `max_iter=1000` solves it (optimal, 75 s, about 1000 CG iterations
+per solve ≈ 10 n) and so does 5000 (68 s), against 1.2 s for the dense
+reference. Neither a looser `rtol` nor holding or raising the damping after
+a truncated accept helps — the budget is the lever. On a problem this small
+the dense default is the right route; raise the cap when the matrix-free
+route shows this pattern at a size where dense is not an option.
+
 !!! tip "Radiotherapy-scale planning: start from `slack_init_scale=0.1`"
     On large, deeply-infeasible-at-start dose-optimization problems (TROTS-scale:
     `n≈10³`, hundreds of thousands of dose constraints, a warm start that is

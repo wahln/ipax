@@ -483,7 +483,15 @@ class RestorationOptions:
     explicitly (the solver would fall back to the fixed ``rtol`` anyway), and
     the finite iteration cap bounds the Jacobian products one
     Levenberg–Marquardt trial may spend. A work-capped inner solve is not
-    wasted: its truncated iterate is the trial direction (Steihaug 1983).
+    wasted: its truncated iterate is the trial direction (Steihaug 1983) —
+    but a *persistently* truncated solve is a poor one: CG on the Gauss-Newton
+    normal operator sees the Jacobian's squared conditioning and can need
+    ≫ n iterations in floating point (S2MPJ HYDCAR20, n = 99: every solve
+    truncated at the default cap of 200 and the run fails; ~10 n iterations
+    per solve at ``max_iter=1000`` solves it). When restoration exits on its
+    budget call after call with slowly shrinking infeasibility, raise
+    ``krylov.max_iter`` — neither the tolerance nor the damping policy is
+    the lever there.
     """
 
     linear_solver: RestorationLinearSolver = "dense"
