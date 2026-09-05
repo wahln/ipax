@@ -207,9 +207,13 @@ bounds, so they never hurt there. Tune Gondzio via
 
 ### Restoration linear solver
 
-Feasibility restoration keeps its established dense Gauss-Newton solve by
-default. For problems where an `n x n` restoration matrix is too large, enable
-the experimental product-only route:
+Feasibility restoration solves a damped Gauss-Newton model of the constraint
+violation. `RestorationOptions.linear_solver` picks how: `"dense"` is the
+established reference (it materializes the `n x n` normal matrix and solves it
+per damping trial), `"krylov"` applies that operator through Jacobian products
+only, and the default `"auto"` follows the main KKT route's dense size cutoff:
+dense below 10 000 variables, Krylov at and above it. Force either route
+explicitly when you want it regardless of size:
 
 ```python
 from ipax import Options
@@ -228,11 +232,22 @@ Gauss-Newton model), so the damping only grows when a trial is actually
 rejected; the route never falls back to a dense allocation. Its tolerance and
 work limit live under `RestorationOptions.krylov`, isolated from the main KKT
 solver (`rtol` may be loosened freely there — with `adaptive_tol=False` the
-adaptive cap does not apply). The mode is opt-in by design: on the S2MPJ
-corpus of mostly small problems the paired sweep (v29) scored it −12 of 6600
-rows against the dense reference, since an `n x n` solve is cheaper there
-than a Krylov ladder per damping trial; it is the route for problems where
-that matrix cannot be formed.
+adaptive cap does not apply). The cutoff is where the evidence points: on
+the S2MPJ corpus of mostly small problems the paired sweep (v29) scored the
+Krylov route −12 of 6600 rows against the dense reference, since an `n x n`
+solve is cheaper there than a Krylov ladder per damping trial, and every
+problem that flipped had `n ≤ 1247` — so `"auto"` reproduces the dense
+results on that whole corpus. Above the cutoff the dense route's two `n x n`
+arrays and `O(n³)` solve per trial are the same non-starter they are for the
+main route (a trivial 8-constraint restoration at `n = 12 000` took 22 s and
+2.3 GB dense, and milliseconds matrix-free). The cutoff is a validation
+boundary rather than a speed crossover: measured per restoration call on
+synthetic problems, the matrix-free route was faster at *every* size — 100×
+at `n = 500` and 300× at `n = 16 000` on a sparse RT-like Jacobian, 2-7× on
+dense random Jacobians of condition 10³ and 10⁶ from `n = 100` to `4 000`,
+both routes reaching the same feasibility. What the dense reference buys
+below the cutoff is robustness on Jacobians so ill-conditioned that CG
+truncates (see the work-cap note below), which does not depend on `n`.
 
 The one knob to know is the work cap, `RestorationOptions.krylov.max_iter`
 (default 200). Conjugate gradients on the Gauss-Newton normal operator sees

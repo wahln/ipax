@@ -7,16 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
-- **Opt-in matrix-free feasibility restoration.** Set
-  `RestorationOptions(linear_solver="krylov")` to solve the reduced, damped
+- **Matrix-free feasibility restoration, auto-selected by size.**
+  `RestorationOptions(linear_solver="krylov")` solves the reduced, damped
   Gauss-Newton restoration model through Jacobian `matvec`/`rmatvec`
   products, eliminating the dense `n x n` identity, Hessian, and Jacobian
-  materializations. The dense route stays the default: the paired S2MPJ sweep
-  (v29, 2026-09-04) put the Krylov route at −12 correct of 6600 rows on a
-  corpus of mostly small problems, where an n×n dense solve is cheaper than a
-  Krylov ladder per damping trial (HYDCAR20-class `restoration_failed` rows
-  and `max_time` at similar iteration counts); `--restoration-linear-solver`
-  exposes the A/B in the sweep runner. A work-capped inner solve contributes its truncated Krylov
+  materializations. The new default `"auto"` follows the main route's dense
+  size cutoff — dense below 10 000 variables, Krylov at and above — because
+  the paired S2MPJ sweep (v29, 2026-09-04) put the Krylov route at −12
+  correct of 6600 rows on that corpus of small problems (an n×n dense solve
+  is cheaper there than a Krylov ladder per damping trial; every flipped
+  problem had n ≤ 1247, so `"auto"` reproduces the dense results on the whole
+  corpus), while at n = 12 000 the dense route spends 22 s and 2.3 GB on a
+  trivial restoration that the matrix-free route finishes in milliseconds.
+  `"dense"` and `"krylov"` force a route regardless of size;
+  `--restoration-linear-solver` exposes all three in the sweep runner. A
+  work-capped inner solve contributes its truncated Krylov
   iterate as the Levenberg-Marquardt trial direction (a descent direction of
   the Gauss-Newton model, Steihaug 1983) instead of being discarded; only a
   solve that yields no finite direction climbs the damping ladder, and if

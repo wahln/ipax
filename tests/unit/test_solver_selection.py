@@ -7,8 +7,8 @@ import pytest
 from ipax.backend.namespace import Capabilities
 from ipax.linalg.dense import DenseSolver
 from ipax.linalg.krylov import KrylovSolver
-from ipax.linalg.solver import select_solver
-from ipax.options import DenseOptions, Options
+from ipax.linalg.solver import select_restoration_solver, select_solver
+from ipax.options import DenseOptions, Options, RestorationOptions
 from tests._helpers import implemented
 
 
@@ -420,3 +420,31 @@ def test_sparse_explicit_routes_bypass_the_auto_gate():
         )
         assert isinstance(solver, SparseDirectSolver)
         assert solver.form == route
+
+
+def _restoration(mode: str) -> Options:
+    return Options(restoration=RestorationOptions(linear_solver=mode))
+
+
+def test_restoration_auto_follows_the_dense_size_cutoff():
+    # Same cutoff as the main route's linsolve="auto": the dense reference
+    # restoration materializes two n×n arrays and solves them per damping
+    # trial, which stops being viable exactly where the dense KKT route does.
+    assert select_restoration_solver(_restoration("auto"), n_vars=9_999) is None
+    factory = select_restoration_solver(_restoration("auto"), n_vars=10_000)
+    assert factory is not None
+    assert isinstance(factory(), KrylovSolver)
+
+
+@pytest.mark.parametrize("n_vars", [10, 10_000, 100_000])
+def test_restoration_explicit_modes_ignore_size(n_vars):
+    assert select_restoration_solver(_restoration("dense"), n_vars=n_vars) is None
+    factory = select_restoration_solver(_restoration("krylov"), n_vars=n_vars)
+    assert factory is not None
+    assert isinstance(factory(), KrylovSolver)
+
+
+def test_restoration_factory_builds_a_fresh_solver_per_call():
+    factory = select_restoration_solver(_restoration("krylov"), n_vars=10)
+    assert factory is not None
+    assert factory() is not factory()

@@ -608,7 +608,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--restoration-linear-solver",
-        choices=("dense", "krylov"),
+        choices=("auto", "dense", "krylov"),
         default=None,
         help="override the feasibility-restoration linear solver on every config "
         "(default: keep the solver default 'dense'); use 'krylov' for the "

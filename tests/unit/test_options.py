@@ -27,9 +27,10 @@ def test_default_hessian_is_auto():
     assert Options().hessian == "auto"
 
 
-def test_restoration_linear_solver_is_opt_in():
-    assert RestorationOptions().linear_solver == "dense"
-    assert Options().restoration.linear_solver == "dense"
+def test_restoration_linear_solver_modes():
+    assert RestorationOptions().linear_solver == "auto"
+    assert Options().restoration.linear_solver == "auto"
+    assert RestorationOptions(linear_solver="dense").linear_solver == "dense"
     assert RestorationOptions(linear_solver="krylov").linear_solver == "krylov"
 
 

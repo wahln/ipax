@@ -244,15 +244,25 @@ def select_solver(
     return KrylovSolver(options.krylov)
 
 
-def select_restoration_solver(options: Options) -> Callable[[], LinearSolver] | None:
-    """Factory for the opt-in iterative restoration solver; ``None`` keeps dense.
+def select_restoration_solver(
+    options: Options, *, n_vars: int
+) -> Callable[[], LinearSolver] | None:
+    """Factory for the iterative restoration solver; ``None`` keeps dense.
+
+    ``"auto"`` applies the same size cutoff as the main route's
+    ``linsolve="auto"`` (``_DENSE_AUTO_MAX_VARS``): the dense restoration
+    materializes two ``n × n`` arrays and solves them per damping trial, so
+    it stops being viable exactly where the dense KKT route does, while the
+    v29 paired S2MPJ sweep showed the matrix-free route losing only on small
+    problems (every flipped row had ``n ≤ 1247``).
 
     A factory rather than an instance: the driver builds a fresh solver per
     restoration entry, so the operator a solver retains after ``factor()`` —
     and through it the last restoration point's ``m × n`` Jacobians — is
     released when restoration returns instead of living for the rest of the run.
     """
-    if options.restoration.linear_solver == "dense":
+    mode = options.restoration.linear_solver
+    if mode == "dense" or (mode == "auto" and n_vars < _DENSE_AUTO_MAX_VARS):
         return None
     from ipax.linalg.krylov import KrylovSolver
 

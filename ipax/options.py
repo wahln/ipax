@@ -32,7 +32,7 @@ MuFallback = Literal["kkt-error", "never"]
 FreeModeAcceptance = Literal["obj-constr-filter", "rigorous"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
-RestorationLinearSolver = Literal["dense", "krylov"]
+RestorationLinearSolver = Literal["auto", "dense", "krylov"]
 DenseKKTRoute = Literal["condensed", "augmented"]
 SparseKKTRoute = Literal["auto", "augmented", "normal_equations"]
 ScalingMethod = Literal["none", "gradient-based"]
@@ -471,11 +471,17 @@ class KrylovOptions:
 class RestorationOptions:
     """Feasibility-restoration linear algebra.
 
-    The dense mode preserves the established reference implementation. The
-    opt-in krylov route applies the damped Gauss-Newton normal operator through
-    Jacobian products, avoiding every n-by-n allocation. It remains opt-in until
-    a paired S2MPJ sweep shows that inexact inner solves do not regress
-    restoration exits or final solver verdicts.
+    The dense mode is the established reference implementation: it
+    materializes the ``n × n`` Gauss-Newton normal matrix and solves it per
+    damping trial. The krylov route applies that operator through Jacobian
+    products instead, avoiding every ``n × n`` allocation. ``"auto"`` (the
+    default) follows the main KKT route's dense size cutoff: dense below
+    10 000 variables, krylov at and above it. The paired S2MPJ sweep (v29)
+    measured the krylov route −12 of 6600 rows on that corpus of small
+    problems (every flipped problem had ``n ≤ 1247``), so below the cutoff
+    the dense reference is kept; above it the dense route's two ``n × n``
+    arrays and ``O(n³)`` solve per trial are the same non-starter they are
+    for the main route.
 
     Restoration has its own Krylov settings because it solves a feasibility
     least-squares model rather than the main KKT system: nothing feeds it an
@@ -494,7 +500,7 @@ class RestorationOptions:
     the lever there.
     """
 
-    linear_solver: RestorationLinearSolver = "dense"
+    linear_solver: RestorationLinearSolver = "auto"
     krylov: KrylovOptions = field(
         default_factory=lambda: KrylovOptions(
             rtol=1e-8,
@@ -505,8 +511,10 @@ class RestorationOptions:
     )
 
     def __post_init__(self) -> None:
-        if self.linear_solver not in ("dense", "krylov"):
-            raise ValueError("restoration linear solver must be 'dense' or 'krylov'")
+        if self.linear_solver not in ("auto", "dense", "krylov"):
+            raise ValueError(
+                "restoration linear solver must be 'auto', 'dense' or 'krylov'"
+            )
 
 
 @dataclass(frozen=True, slots=True)

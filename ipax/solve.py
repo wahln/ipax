@@ -286,7 +286,9 @@ def solve(
         ineq_density=_ineq_density if has_ineq else None,
         ineq_gram_fill=_ineq_gram_fill if ne_foldable else None,
     )
-    restoration_solver_factory = select_restoration_solver(opts)
+    restoration_solver_factory = select_restoration_solver(
+        opts, n_vars=int(resolved.n_vars)
+    )
 
     # Pre-solve diagnostics (verbosity tiers 3–5; gated by the logger threshold
     # so an application's own handlers still receive every record).
