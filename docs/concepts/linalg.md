@@ -196,3 +196,9 @@ libraries allow — onto the SciPy adapter for host arrays and the CuPy/cuDSS
 adapter for CUDA arrays. So Torch-CPU and JAX-CPU factor through Feral/SuperLU,
 and Torch-CUDA and JAX-GPU factor through cuDSS, with results handed back in the
 caller's namespace. Routing is by *device*, not by library name.
+
+## Further performance work
+
+Proposed compact-factor reuse adapters and JIT kernels are described in
+[Performance proposals](../development/performance.md). They retain this
+operator/solver boundary and are not current solver options.

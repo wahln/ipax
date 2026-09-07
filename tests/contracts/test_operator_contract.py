@@ -75,6 +75,19 @@ class LinearOperatorContract:
 
         assert_allclose(namespace, actual, dense, **tol)
 
+    def test_positive_definite_hint_is_honest(self, namespace):
+        # ``positive_definite_hint`` defaults to False; an operator that claims
+        # PD by construction must materialize to a matrix Cholesky accepts.
+        with implemented(self.implementation_reason):
+            op = self.make_operator(namespace)
+            hint = op.positive_definite_hint()
+            assert isinstance(hint, bool)
+            if not hint:
+                return
+            dense = self.make_dense(namespace)
+            factor = namespace.linalg.cholesky(dense)
+        assert bool(namespace.all(namespace.isfinite(factor)))
+
     def test_exact_lbfgs_inverse_claim_is_honest(self, namespace, tol):
         # ``lbfgs_inverse_is_exact`` defaults to False; an operator that claims
         # exactness must back it with an apply that inverts it to round-off.

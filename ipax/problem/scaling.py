@@ -78,6 +78,10 @@ class _RowScaled(LinearOperator):
         xp = array_namespace(self._d, V)
         return xp.expand_dims(self._d, axis=1) * self._jac.matmat(V)
 
+    def rmatmat(self, V: Array) -> Array:
+        xp = array_namespace(self._d, V)
+        return self._jac.rmatmat(xp.expand_dims(self._d, axis=1) * V)
+
     def gram_diagonal(self, weights: Array) -> Array:
         # diag((DJ)ᵀ W (DJ))_k = Σ_i W_i d_i² J_ik² = J.gram_diagonal(d²·W).
         return self._jac.gram_diagonal(self._d * self._d * weights)

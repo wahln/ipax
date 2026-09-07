@@ -310,6 +310,23 @@ class LinearOperator(ABC):
         """
         return None
 
+    def positive_definite_hint(self) -> bool:
+        """Declare ``A = Aᵀ ≻ 0`` when known by construction; ``False`` if not.
+
+        Optional capability alongside :meth:`symmetry_hint` (two-valued: an
+        unknown folds into ``False``). A block that is *symmetric* positive
+        definite by construction — the Powell-damped compact L-BFGS Hessian,
+        and the condensed Newton block built on it — returns ``True`` so a
+        dense solver that has already materialized it can take a Cholesky
+        (half the LU flops) and keep the factor for every later right-hand
+        side, without treating that Cholesky as an indefiniteness *guard*: a
+        numerical failure falls back to LU rather than escalating δ_w.
+        Consumers require :meth:`symmetry_hint` to be ``True`` as well — a
+        Cholesky reads one triangle, so an asymmetric ``A`` with a positive
+        quadratic form would be silently solved as its symmetrization.
+        """
+        return False
+
     def preferred_krylov_method(self) -> Literal["cg", "minres"] | None:
         """Return the Krylov method this operator should use, when constrained.
 
@@ -402,11 +419,21 @@ class Dense(LinearOperator):
 
     def gram_diagonal(self, weights: Array) -> Array:
         xp = array_namespace(self._A, weights)
-        return xp.sum(xp.expand_dims(weights, axis=1) * self._A * self._A, axis=0)
+        # Own this temporary: reuse its storage on mutable backends, without
+        # touching A or weights. Keep (weights * A) * A in this order: A * A
+        # can overflow even when the weighted result is representable.
+        weighted = xp.expand_dims(weights, axis=1) * self._A
+        weighted *= self._A
+        return xp.sum(weighted, axis=0)
 
     def row_gram_diagonal(self, weights: Array) -> Array:
         xp = array_namespace(self._A, weights)
-        return xp.sum(self._A * self._A * xp.expand_dims(weights, axis=0), axis=1)
+        # Same owned-temporary reuse as gram_diagonal; the order was changed to
+        # (A * weights) * A from (A * A) * weights, which overflowed where the
+        # weighted product is representable.
+        weighted = self._A * xp.expand_dims(weights, axis=0)
+        weighted *= self._A
+        return xp.sum(weighted, axis=1)
 
     def row_inf_norms(self, like: Array | None = None) -> Array:
         del like

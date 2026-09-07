@@ -32,6 +32,10 @@ repos:
     rev: v0.7.3
     hooks:
       - id: kacl-verify
+        # python-kacl 0.7.3 opens the UTF-8 changelog with the locale encoding.
+        # Force UTF-8 on Windows too; invoke the same kacl-cli entrypoint.
+        entry: >-
+          python -X utf8 -c "from kacl.kacl_cli import start; start()" verify
 
   - repo: https://github.com/Lucas-C/pre-commit-hooks
     rev: v1.5.6

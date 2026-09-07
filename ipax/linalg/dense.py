@@ -31,7 +31,11 @@ Cholesky factor is kept and every solve back-substitutes it through the
 extension has no triangular solve), replacing the redundant O(n³) LU refactor
 with an O(n²) solve — this also makes corrector/SOC back-solves against the
 same factorization cheap. Backends without the gap-filler (array-api-strict,
-JAX) keep the original LU path.
+JAX) keep the original LU path. A block the guard deliberately skips but that
+is PD *by construction* (the L-BFGS condensed block with an inequality Gram
+term, ``positive_definite_hint()``) is Cholesky-factored on the same terms
+once it has been materialized — as a reuse optimization, never as a guard: a
+numerical failure there falls back to LU instead of escalating δ_w.
 
 ``DenseOptions(kkt_route="augmented")`` selects an alternative route: instead
 of condensing the inequality Gram term into ``N`` (a normal-equations step),
@@ -601,12 +605,13 @@ class DenseSolver:
         saddle's probe covers only the leading ``N`` block of the indefinite
         bordered matrix, so nothing is kept there.
         """
+        cholesky = getattr(xp.linalg, "cholesky", None)
+        if cholesky is None:
+            return
         primal_block = getattr(self._operator, "primal_block", None)
         block = primal_block() if primal_block is not None else None
         if block is None:
-            return
-        cholesky = getattr(xp.linalg, "cholesky", None)
-        if cholesky is None:
+            self._keep_pd_hinted_factor(matrix, xp, cholesky)
             return
         n = block.shape[0]
         # For the condensed (no-equality) operator the materialized matrix *is*
@@ -620,6 +625,40 @@ class DenseSolver:
         # otherwise it would be dead n×n memory next to the LU path.
         if primal is matrix and self._lookup_cholesky_solve(xp) is not None:
             self._cholesky_factor = factor
+
+    def _keep_pd_hinted_factor(self, matrix: Array, xp: Any, cholesky: Any) -> None:
+        """Cholesky-factor a block that is PD *by construction*, purely to reuse it.
+
+        The guard skips an L-BFGS condensed block (``primal_block() is None``):
+        it is PD by Powell damping, so probing it would be a wasted O(n³) on the
+        matrix-free routes. But once the dense route has materialized it anyway
+        (an inequality Gram term rules out the Woodbury structured solve), the
+        same Cholesky is *cheaper* than the LU it would otherwise pay per solve
+        — and the factor serves every later RHS (corrector/SOC) at O(n²). So
+        when the operator declares ``positive_definite_hint()`` (and, since a
+        Cholesky reads one triangle, ``symmetry_hint()``) and the backend can
+        back-substitute, keep the factor. Unlike the guard, a factorization
+        failure here is not an indefiniteness signal: the claim was structural,
+        so a numerical breakdown simply leaves the LU path as it was.
+
+        The silent fallback relies on ``cholesky`` *raising* on a non-PD input,
+        which the Array API does not mandate (JAX returns NaN). The three
+        backends with a back-substitution gap-filler (NumPy/SciPy, Torch,
+        CuPy) all raise; JAX is excluded by that same lookup — a JAX adapter
+        would need an ``isfinite`` acceptance check here (one host sync).
+        """
+        hint = getattr(self._operator, "positive_definite_hint", None)
+        if hint is None or not hint():
+            return
+        symmetric = getattr(self._operator, "symmetry_hint", None)
+        if symmetric is None or symmetric() is not True:
+            return
+        if self._lookup_cholesky_solve(xp) is None:
+            return  # no back-substitution ⇒ a factor would be dead n×n memory
+        try:
+            self._cholesky_factor = cholesky(matrix)
+        except Exception:
+            return  # numerically not PD after all: the LU path, as before
 
 
 __all__ = ["DenseSolver"]

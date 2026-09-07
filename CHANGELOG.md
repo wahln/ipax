@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Linear-inequality L-BFGS performance review and benchmark.** Document
+  dense, Krylov, and sparse costs, portable candidates, and optional adapter/JIT
+  proposals for bounded problems with affine inequalities.
+- **Performance proposals in the contributor documentation.** Record optional
+  compact-factor/BLAS adapters and JIT experiments for bound-only L-BFGS,
+  including dependency candidates, numerical safeguards, and validation criteria.
 - **Matrix-free feasibility restoration, auto-selected by size.**
   `RestorationOptions(linear_solver="krylov")` solves the reduced, damped
   Gauss-Newton restoration model through Jacobian `matvec`/`rmatvec`
@@ -43,6 +49,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   bound-constrained composite least-squares solve).
 
 ### Fixed
+- **`Dense.row_gram_diagonal` no longer overflows on large entries.** It
+  squared the matrix before weighting (`(A·A)·w`); it now weights first
+  (`(A·w)·A`, matching `gram_diagonal`), so the equality-saddle Schur diagonal
+  stays finite whenever the weighted product is representable.
+- **Row scaling preserves batched adjoint products.** Forward `rmatmat` to
+  the wrapped operator, including supported empty batches, instead of looping
+  over columns.
+- **Changelog verification on Windows.** Run `kacl-verify` in Python UTF-8 mode
+  so mathematical symbols in `CHANGELOG.md` do not trigger a CP1252 decoding
+  error in python-kacl's locale-dependent file reader.
 - **Restoration probes for a saddle before certifying local infeasibility.**
   On a symmetry-invariant subspace (equal components at a permutation-symmetric
   start — S2MPJ POWERSUMNE, HADAMARD — or the cyclic ring of CYCLOOCT) every
@@ -85,6 +101,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (5 ms per step at `n = 50k`).
 
 ### Changed
+- **Dense Cholesky reuse for the L-BFGS block with inequalities.** A new
+  optional `LinearOperator.positive_definite_hint()` (declared by the
+  Powell-damped L-BFGS Hessian and the condensed block built on it) lets
+  `DenseSolver` Cholesky-factor the materialized block it previously solved by
+  LU on every right-hand side, keeping the factor for corrector/SOC back-solves
+  through the existing back-substitution gap-filler. A numerical Cholesky
+  failure falls back to LU; the PD guard for explicit Hessians is unchanged.
+- **Lower temporary memory for dense Gram diagonals.** Reuse the owned
+  weighted-Jacobian buffer on mutable backends in `Dense.gram_diagonal` and
+  `Dense.row_gram_diagonal` (one `m×n` temporary instead of two), leaving
+  caller arrays unchanged; `gram_diagonal` keeps its `(w·A)·A` order.
+- **L-BFGS compact setup reuse.** Check the generation-keyed Woodbury cache
+  before rebuilding diagonal/Gram arrays, and share the cached-Gram shortcut
+  for fully unbounded systems between dense and Krylov consumers. Bound-only
+  arithmetic and cache invalidation are preserved. Add a three-route review
+  and reproducible NumPy/Torch/CuPy measurements under `benchmarks/`.
 - **SOC reuse policy follows the solver kind.** `LinearSolver` gains an
   optional `is_direct()` hook (`DenseSolver`/`SparseDirectSolver` `True`,
   `KrylovSolver` `False`; absent = direct). Iterative routes now re-solve the

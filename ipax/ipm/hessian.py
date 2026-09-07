@@ -318,6 +318,12 @@ class LBFGSOperator(LinearOperator):
         d = xi * xp.ones((self._n,), dtype=u.dtype)
         return d, u, m
 
+    def positive_definite_hint(self) -> bool:
+        """``True``: Powell damping keeps ``δᵀγ > 0`` for every accepted pair,
+        so ``B ≻ 0`` (Nocedal & Wright 2006, §18.3); before the first pair
+        ``B = ξI`` with ``ξ > 0``."""
+        return True
+
     def update(self, delta: Array, gamma: Array) -> None:
         """Push a curvature pair, applying Powell damping to keep ``δᵀγ > 0``.
 

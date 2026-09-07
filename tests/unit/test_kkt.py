@@ -1503,3 +1503,32 @@ def test_condensed_woodbury_without_generation_token_is_never_cached(
 
     assert len(builds) == 2
     assert bool(namespace.all(first == second))
+
+
+def test_condensed_positive_definite_hint_follows_hessian(namespace):
+    # N = W + Σ_x + δ_w I + ∇gᵀ Σ_s ∇g is PD by construction exactly when W is:
+    # the Powell-damped L-BFGS Hessian declares it (with or without pairs), an
+    # explicit Hessian does not (it may be indefinite — that is the guard's job),
+    # and the indefinite equality saddle never does.
+    dtype = array(namespace, [0.0]).dtype
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    sigma_s = Diagonal(array(namespace, [2.0]))
+    jac = Dense(array(namespace, [[1.0, 2.0, 0.5]]))
+    reg = RegularizationState(delta_w=1e-6)
+    W = _lbfgs_operator(namespace)
+    assert W.positive_definite_hint()
+    lbfgs = build_condensed_operator(W, sigma_x, sigma_s, jac, reg)
+    no_pairs = build_condensed_operator(
+        LBFGSOperator(3, LBFGSOptions(memory=5)), sigma_x, sigma_s, jac, reg
+    )
+    explicit = build_condensed_operator(
+        Dense(namespace.eye(3, dtype=dtype)), sigma_x, sigma_s, jac, reg
+    )
+    saddle = build_saddle_operator(
+        lbfgs, Dense(array(namespace, [[1.0, -1.0, 0.0]])), 1e-4
+    )
+
+    assert lbfgs.positive_definite_hint()
+    assert no_pairs.positive_definite_hint()
+    assert not explicit.positive_definite_hint()
+    assert not saddle.positive_definite_hint()

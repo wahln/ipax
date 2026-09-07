@@ -621,15 +621,11 @@ class _CondensedOperator(LinearOperator):
 
     def _woodbury_blocks_cached(
         self,
-        variant: str,
-        d: Array | float,
         xi: float,
         s: Array,
         y: Array,
         m_lbfgs: Array,
         xp: Namespace,
-        *,
-        gram_u: Array | None = None,
     ) -> _WoodburyBlockFactors:
         """Memoized :func:`_woodbury_factors_blocks` for this operator instance.
 
@@ -644,11 +640,30 @@ class _CondensedOperator(LinearOperator):
         can never serve stale factors; a ``W`` without that token is never
         cached.
         """
+        # Resolve the variant from structural metadata before doing any array
+        # work. A hit must skip even the n-sized diagonal and small Gram build.
+        gram_blocks = getattr(self._W, "gram_blocks", None)
+        if self._ineq_jac.shape[0] > 0:
+            variant = "ineq"
+        elif self._sigma_x_zero and gram_blocks is not None:
+            variant = "gram"
+        else:
+            variant = "plain"
         token = getattr(self._W, "generation", None)
         if token is not None:
             hit = self._woodbury_memo.get(variant)
             if hit is not None and hit[0] == token:
                 return hit[1]
+        d: Array | float
+        gram_u = None
+        if variant == "gram":
+            # Scalar D: use the incrementally maintained U^T U in O(k^2),
+            # for both dense solves and the Krylov inverse/preconditioner.
+            d = xi + self._delta_w
+            assert gram_blocks is not None
+            gram_u = _lbfgs_gram_u(xi, gram_blocks(), xp)
+        else:
+            d = self._woodbury_diagonal(xi)
         factors = _woodbury_factors_blocks(d, xi, s, y, m_lbfgs, xp, gram_u=gram_u)
         if token is not None:
             self._woodbury_memo[variant] = (token, factors)
@@ -699,19 +714,7 @@ class _CondensedOperator(LinearOperator):
         if compact_blocks is not None:
             # Hot path: S/Y blocks, U = [ξS Y] never materialized (§5.2).
             xi, s, y, m_lbfgs = compact_blocks()
-            gram_blocks = getattr(self._W, "gram_blocks", None)
-            if self._sigma_x_zero and gram_blocks is not None:
-                # Σ_x ≡ 0 ⇒ D = (ξ + δ_w)·I: the inner factor needs only UᵀU,
-                # which the L-BFGS operator maintains incrementally (O(k²) here
-                # instead of the O(n·k²) Uᵀ D⁻¹ U product).
-                gram_u = _lbfgs_gram_u(xi, gram_blocks(), xp)
-                factors = self._woodbury_blocks_cached(
-                    "gram", xi + self._delta_w, xi, s, y, m_lbfgs, xp, gram_u=gram_u
-                )
-            else:
-                factors = self._woodbury_blocks_cached(
-                    "plain", self._woodbury_diagonal(xi), xi, s, y, m_lbfgs, xp
-                )
+            factors = self._woodbury_blocks_cached(xi, s, y, m_lbfgs, xp)
             return _woodbury_solve_blocks(factors, rhs, xp)
         assert compact_form is not None
         xi, u, m_lbfgs = compact_form()
@@ -1029,6 +1032,18 @@ class _CondensedOperator(LinearOperator):
             return None
         return self
 
+    def positive_definite_hint(self) -> bool:
+        """``N = W + Σ_x + δ_w I + ∇gᵀ Σ_s ∇g`` is PD by construction iff ``W`` is.
+
+        ``Σ_x``, ``Σ_s`` (``z/x``, ``λ/s`` — strictly positive in the interior)
+        and ``δ_w ≥ 0`` only add PSD terms, so the block inherits its Hessian's
+        declaration: ``True`` for the Powell-damped L-BFGS ``W`` (where
+        :meth:`primal_block` deliberately skips the PD *guard*), ``False`` for
+        an explicit Hessian that may be indefinite.
+        """
+        hint = getattr(self._W, "positive_definite_hint", None)
+        return bool(hint()) if hint is not None else False
+
     def lbfgs_inverse_is_exact(self) -> bool:
         """Whether :meth:`lbfgs_inverse_apply` is the *exact* ``N⁻¹``.
 
@@ -1080,24 +1095,13 @@ class _CondensedOperator(LinearOperator):
             )
         if compact_blocks is not None:
             xi, s, y, m_lbfgs = compact_blocks()
-        else:
-            assert compact_form is not None
-            xi, u, m_lbfgs = compact_form()
-        d_tilde = self._woodbury_diagonal(xi)
-
-        # Factor the 2k×2k inner block once (nonsingular for PD N); each apply is
-        # then one diagonal inverse plus one small solve via Sherman–Morrison–Woodbury.
-        xp = array_namespace(d_tilde)
-        if compact_blocks is not None:
-            # Bound-only ``D̃`` matches the structured solve's ``D`` bitwise by
-            # construction (both come from :meth:`_woodbury_diagonal`), so the
-            # two entry points share the ``"plain"`` slot; the
-            # inequality-augmented diagonal differs and gets its own.
-            variant = "ineq" if self._ineq_jac.shape[0] > 0 else "plain"
-            block_factors = self._woodbury_blocks_cached(
-                variant, d_tilde, xi, s, y, m_lbfgs, xp
-            )
+            xp = array_namespace(s)
+            block_factors = self._woodbury_blocks_cached(xi, s, y, m_lbfgs, xp)
             return lambda r: _woodbury_solve_blocks(block_factors, r, xp)
+        assert compact_form is not None
+        xi, u, m_lbfgs = compact_form()
+        d_tilde = self._woodbury_diagonal(xi)
+        xp = array_namespace(d_tilde)
         factors = _woodbury_factors(d_tilde, u, m_lbfgs, xp)
         return lambda r: _woodbury_solve(factors, r, xp)
 
@@ -1445,6 +1449,15 @@ class _SaddleOperator(LinearOperator):
             return None
         n_pos, n_neg, n_zero = target
         return (n_pos, n_neg + self._m, n_zero)
+
+    def positive_definite_hint(self) -> bool:
+        """``False`` — never forward the condensed block's claim.
+
+        The bordered saddle is indefinite by construction (``−δ_c I`` on the
+        (2,2) block), so a Cholesky of the whole system must never be
+        attempted even though its leading block is PD.
+        """
+        return False
 
     def primal_block(self) -> LinearOperator | None:
         """The condensed ``N`` block of the saddle that must be PD, or ``None``.
