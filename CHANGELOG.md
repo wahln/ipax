@@ -108,6 +108,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   LU on every right-hand side, keeping the factor for corrector/SOC back-solves
   through the existing back-substitution gap-filler. A numerical Cholesky
   failure falls back to LU; the PD guard for explicit Hessians is unchanged.
+  Such a breakdown is bookkept like the mixed route's failures: after
+  `DenseOptions.pd_hint_failure_limit` (default 3) *consecutive* breakdowns
+  the solver stops attempting the hinted Cholesky for the rest of the run
+  (any success resets the count — conditioning along an IPM run is not
+  monotone, so one hard iterate must not forfeit the reuse everywhere else),
+  and `DenseSolver.describe()` — hence `Result.routes` — carries a sticky
+  `pd-hint->lu` marker once any breakdown has occurred, so a run in which
+  the hinted factorization fell back to LU never reads as a clean `dense`
+  run. A breakdown on the mixed route's reduced-precision matrix is marked
+  but counts toward neither kill switch: it may be precision noise, and the
+  refinement pass is the certificate that judges that matrix.
 - **Lower temporary memory for dense Gram diagonals.** Reuse the owned
   weighted-Jacobian buffer on mutable backends in `Dense.gram_diagonal` and
   `Dense.row_gram_diagonal` (one `m×n` temporary instead of two), leaving
@@ -175,8 +186,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `compact_form` materializing on demand for the sparse assembly). The inner
   Woodbury factor is assembled from three n x k Gram products instead of the
   2k-wide product. The algebra is identical but the operation order differs at
-  round-off level, so knife-edge trajectories may flip (sweep pending); at
-  n = 50k the per-iteration
+  round-off level, so knife-edge trajectories may flip — the 2026-08-31 full
+  S2MPJ sweep (v24 vs v23) confirmed only knife-edge churn, +18/6600 for the
+  three L-BFGS perf commits together (see the interpolated-backtracking entry
+  below for the per-lever split); at n = 50k the per-iteration
   bookkeeping drops from ~17 to ~13 ms at memory 20 and the memory-50
   configuration falls from ~88 to ~55 ms/iteration end to end.
 - **Krylov applies the exact L-BFGS inverse on bound-only systems.** With no

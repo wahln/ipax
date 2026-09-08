@@ -85,6 +85,17 @@ not a guard: a numerical Cholesky failure falls back to the LU path unchanged,
 and backends without the back-substitution primitive (array-api-strict, JAX)
 skip the factorization rather than paying for a factor they cannot apply.
 Explicit-Hessian blocks still go through the probing guard exactly as before.
+A breakdown is bookkept the way the mixed-precision route bookkeeps its
+failures: `DenseOptions.pd_hint_failure_limit` *consecutive* breakdowns stop
+the attempts for the rest of the solver's life (a success resets the count, so
+one ill-conditioned iterate does not forfeit the reuse everywhere else), and
+`DenseSolver.describe()` carries a sticky `pd-hint->lu` marker once any
+breakdown has occurred, so `Result.routes` never reports a clean `dense` run
+when the hinted factorization fell back to LU. A breakdown under the
+mixed-precision route is marked but counts toward *neither* kill switch: the
+reduced matrix may be non-PD by precision noise alone — no evidence about the
+exact block — and the refinement pass that follows the LU solve is the
+certificate that judges it.
 
 Further candidates require broader work and remain unimplemented:
 

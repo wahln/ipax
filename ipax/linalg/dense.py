@@ -149,23 +149,40 @@ class DenseSolver:
         # Any certified mixed solve resets the counter.
         self._mixed_failures = 0
         self._mixed_label = ""  # resolved reduced dtype of the engaged route
+        # PD-hinted Cholesky reuse (``LinearOperator.positive_definite_hint``):
+        # consecutive numerical breakdowns of the hinted factorization, the
+        # kill switch after ``pd_hint_failure_limit`` of them, and a sticky
+        # marker for ``describe()``. Same reasoning as the mixed route above:
+        # κ(N) is not monotone along a run, so one breakdown must not forfeit
+        # the O(n²) back-solves everywhere else — but a block that keeps
+        # breaking down must not pay a wasted O(n³) per factorization either.
+        self._pd_hint_failures = 0
+        self._pd_hint_disabled = False
+        self._pd_hint_ever_failed = False
         self.refine_iterations = 0  # corrections applied by the last solve()
 
     def describe(self) -> str:
         """Human-readable label for diagnostics.
 
-        The mixed marker is sticky: a run that used the reduced-precision
-        Gram and later self-disabled reports ``gram=float32->native`` rather
-        than pretending it ran native throughout (``Result.routes`` captures
-        this label once, after the driver returns).
+        The markers are sticky: a run that used the reduced-precision Gram
+        and later self-disabled reports ``gram=float32->native`` rather than
+        pretending it ran native throughout, and a run in which a PD-hinted
+        Cholesky (``LinearOperator.positive_definite_hint``) ever broke down
+        numerically reports ``pd-hint->lu`` — the hinted factorization of a
+        block declared PD by construction failed at least once and that
+        factorization fell back to LU (``Result.routes`` captures this label
+        once, after the driver returns).
         """
         if self._inertia is not None:
             return "dense (augmented)"
+        markers: list[str] = []
         if self._mixed_engaged:
-            return f"dense (gram={self._mixed_label})"
-        if self._mixed_disabled and self._mixed_ever_engaged:
-            return f"dense (gram={self._mixed_label}->native)"
-        return "dense"
+            markers.append(f"gram={self._mixed_label}")
+        elif self._mixed_disabled and self._mixed_ever_engaged:
+            markers.append(f"gram={self._mixed_label}->native")
+        if self._pd_hint_ever_failed:
+            markers.append("pd-hint->lu")
+        return f"dense ({', '.join(markers)})" if markers else "dense"
 
     def kkt_form(self) -> str:
         """The KKT assembly actually factored (``Result.routes.kkt_form``).
@@ -305,7 +322,7 @@ class DenseSolver:
             if matrix is not None:
                 self._mixed_ever_engaged = True
                 try:
-                    self._guard_positive_definite(matrix, xp)
+                    self._guard_positive_definite(matrix, xp, reduced=True)
                 except LinearSolveError:
                     self._cholesky_factor = None
                     exact = self._materialize_dense_matrix(rhs, xp, n)
@@ -590,7 +607,9 @@ class DenseSolver:
         except Exception as exc:
             raise LinearSolveError("dense matrix materialization failed") from exc
 
-    def _guard_positive_definite(self, matrix: Array, xp: Any) -> None:
+    def _guard_positive_definite(
+        self, matrix: Array, xp: Any, *, reduced: bool = False
+    ) -> None:
         """Reject a non-PD condensed block so the IPM escalates δ_w.
 
         ``xp.linalg.solve`` (LU) would silently accept an indefinite ``N`` and
@@ -603,7 +622,10 @@ class DenseSolver:
         the factor is kept so ``solve`` back-substitutes it instead of paying
         a second O(n³) LU factorization of the same matrix. An equality
         saddle's probe covers only the leading ``N`` block of the indefinite
-        bordered matrix, so nothing is kept there.
+        bordered matrix, so nothing is kept there. ``reduced`` says the
+        matrix is the mixed route's reduced-precision materialization (only
+        the hinted-reuse bookkeeping cares — see
+        :meth:`_keep_pd_hinted_factor`).
         """
         cholesky = getattr(xp.linalg, "cholesky", None)
         if cholesky is None:
@@ -611,7 +633,7 @@ class DenseSolver:
         primal_block = getattr(self._operator, "primal_block", None)
         block = primal_block() if primal_block is not None else None
         if block is None:
-            self._keep_pd_hinted_factor(matrix, xp, cholesky)
+            self._keep_pd_hinted_factor(matrix, xp, cholesky, reduced=reduced)
             return
         n = block.shape[0]
         # For the condensed (no-equality) operator the materialized matrix *is*
@@ -626,7 +648,9 @@ class DenseSolver:
         if primal is matrix and self._lookup_cholesky_solve(xp) is not None:
             self._cholesky_factor = factor
 
-    def _keep_pd_hinted_factor(self, matrix: Array, xp: Any, cholesky: Any) -> None:
+    def _keep_pd_hinted_factor(
+        self, matrix: Array, xp: Any, cholesky: Any, *, reduced: bool = False
+    ) -> None:
         """Cholesky-factor a block that is PD *by construction*, purely to reuse it.
 
         The guard skips an L-BFGS condensed block (``primal_block() is None``):
@@ -646,7 +670,24 @@ class DenseSolver:
         backends with a back-substitution gap-filler (NumPy/SciPy, Torch,
         CuPy) all raise; JAX is excluded by that same lookup — a JAX adapter
         would need an ``isfinite`` acceptance check here (one host sync).
+
+        A breakdown is not free — the attempted factorization is wasted work
+        — so ``DenseOptions.pd_hint_failure_limit`` *consecutive* breakdowns
+        stop the attempts for the rest of the instance's life (a success
+        resets the count, mirroring the mixed route's kill switch), and any
+        breakdown marks ``describe()`` with ``pd-hint->lu``. Under the mixed
+        route the matrix handed in is the reduced-precision one (``reduced``),
+        so a breakdown there may be precision noise rather than a property of
+        the exact block: it is marked but does *not* count toward the kill
+        switch (the exact block may factor fine, now or after the mixed route
+        retires itself), and it is deliberately not fed to
+        :meth:`_register_mixed_failure` either — the refinement pass that
+        follows the LU solve is the certificate that judges the mixed matrix,
+        and a rejection there rebuilds the exact block and advances that
+        switch.
         """
+        if self._pd_hint_disabled:
+            return
         hint = getattr(self._operator, "positive_definite_hint", None)
         if hint is None or not hint():
             return
@@ -656,9 +697,18 @@ class DenseSolver:
         if self._lookup_cholesky_solve(xp) is None:
             return  # no back-substitution ⇒ a factor would be dead n×n memory
         try:
-            self._cholesky_factor = cholesky(matrix)
+            factor = cholesky(matrix)
         except Exception:
-            return  # numerically not PD after all: the LU path, as before
+            # Numerically not PD after all: the LU path, as before.
+            self._pd_hint_ever_failed = True
+            if reduced:
+                return  # precision noise is not evidence about the exact block
+            self._pd_hint_failures += 1
+            if self._pd_hint_failures >= self._options.pd_hint_failure_limit:
+                self._pd_hint_disabled = True
+            return
+        self._pd_hint_failures = 0
+        self._cholesky_factor = factor
 
 
 __all__ = ["DenseSolver"]

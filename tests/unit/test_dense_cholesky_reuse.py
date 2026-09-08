@@ -424,3 +424,167 @@ def test_dense_solver_pd_hint_needs_gap_filler(namespace, tol, monkeypatch):
     assert solver._cholesky_factor is None
     dense = op.matmat(namespace.eye(2, dtype=rhs.dtype))
     assert_allclose(namespace, namespace.matmul(dense, x), rhs, **tol)
+
+
+# --- breakdown bookkeeping for the PD hint -----------------------------------
+
+
+class _HintedSwitchable(_HintedIndefinite):
+    """PD claim over a matrix the test flips between indefinite and SPD."""
+
+    def __init__(self, namespace, *, pd: bool) -> None:
+        self._m = array(namespace, [[2.0, 0.0], [0.0, 3.0 if pd else -1.0]])
+
+
+def test_pd_hint_failure_limit_must_be_positive():
+    assert DenseOptions().pd_hint_failure_limit == 3
+    with pytest.raises(ValueError, match="pd_hint_failure_limit"):
+        DenseOptions(pd_hint_failure_limit=0)
+
+
+def test_dense_solver_pd_hint_retries_after_a_single_breakdown(namespace, tol):
+    # Conditioning along an IPM run is not monotone, so one numerically
+    # non-PD block must not forfeit the O(n²) back-solves for the rest of the
+    # run: the very next factorization tries the hinted Cholesky again.
+    _require_gap_filler(namespace)
+    rhs = array(namespace, [2.0, -3.0])
+    solver = DenseSolver()
+
+    solver.factor(_HintedSwitchable(namespace, pd=False))
+    solver.solve(rhs)
+    assert solver._cholesky_factor is None
+
+    solver.factor(_HintedSwitchable(namespace, pd=True))
+    x = solver.solve(rhs)
+    assert solver._cholesky_factor is not None
+    assert_allclose(namespace, x, array(namespace, [1.0, -1.0]), **tol)
+
+
+def test_dense_solver_pd_hint_disables_after_consecutive_breakdowns(
+    namespace, tol, monkeypatch
+):
+    # ``pd_hint_failure_limit`` consecutive breakdowns are the signal that
+    # the structural claim is not worth its wasted O(n³) attempt: the solver
+    # stops trying for the rest of its life and goes straight to LU — even
+    # for a block that would have factored.
+    _require_gap_filler(namespace)
+    attempts = {"n": 0}
+    original = DenseSolver._keep_pd_hinted_factor
+
+    def counting(self, matrix, xp, cholesky, *, reduced=False):
+        def spy(m):
+            attempts["n"] += 1
+            return cholesky(m)
+
+        return original(self, matrix, xp, spy, reduced=reduced)
+
+    monkeypatch.setattr(DenseSolver, "_keep_pd_hinted_factor", counting)
+    rhs = array(namespace, [2.0, -3.0])
+    solver = DenseSolver(DenseOptions(pd_hint_failure_limit=2))
+
+    for _ in range(2):
+        solver.factor(_HintedSwitchable(namespace, pd=False))
+        solver.solve(rhs)
+    assert attempts["n"] == 2
+    assert solver._pd_hint_disabled
+
+    solver.factor(_HintedSwitchable(namespace, pd=True))
+    x = solver.solve(rhs)
+    assert attempts["n"] == 2  # no further Cholesky attempt
+    assert solver._cholesky_factor is None
+    assert_allclose(namespace, x, array(namespace, [1.0, -1.0]), **tol)
+
+
+def test_dense_solver_pd_hint_success_resets_the_breakdown_count(namespace, tol):
+    # Only *consecutive* breakdowns count (the mixed route's rule): a success
+    # in between resets the counter, so alternating hard and easy blocks never
+    # trip the kill switch.
+    _require_gap_filler(namespace)
+    rhs = array(namespace, [2.0, -3.0])
+    solver = DenseSolver(DenseOptions(pd_hint_failure_limit=2))
+
+    for pd in (False, True, False, True):
+        solver.factor(_HintedSwitchable(namespace, pd=pd))
+        solver.solve(rhs)
+
+    assert not solver._pd_hint_disabled
+    assert solver._pd_hint_failures == 0
+    assert solver._cholesky_factor is not None
+
+
+def test_dense_solver_describe_marks_a_pd_hint_breakdown(namespace):
+    # ``Result.routes`` captures the label once after the run, so the marker
+    # is sticky: a block declared PD by construction that was nevertheless
+    # solved by LU at least once must not read as a clean ``dense`` run.
+    _require_gap_filler(namespace)
+    rhs = array(namespace, [2.0, -3.0])
+    solver = DenseSolver()
+    assert solver.describe() == "dense"
+
+    solver.factor(_HintedSwitchable(namespace, pd=True))
+    solver.solve(rhs)
+    assert solver.describe() == "dense"
+
+    solver.factor(_HintedSwitchable(namespace, pd=False))
+    solver.solve(rhs)
+    assert solver.describe() == "dense (pd-hint->lu)"
+
+    solver.factor(_HintedSwitchable(namespace, pd=True))
+    solver.solve(rhs)
+    assert solver.describe() == "dense (pd-hint->lu)"
+
+
+class _HintedMixedBreakdown(_HintedSwitchable):
+    """SPD exact block whose reduced-precision materialization is not PD."""
+
+    def __init__(self, namespace) -> None:
+        super().__init__(namespace, pd=True)
+        self._reduced = array(namespace, [[2.0, 0.0], [0.0, -1.0]])
+
+    def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
+        del like, gram_dtype, hinted_only
+        return self._reduced
+
+
+def test_dense_solver_reduced_matrix_breakdown_does_not_retire_the_hint(
+    namespace, tol, monkeypatch
+):
+    # Under the mixed route the hinted Cholesky sees the reduced-precision
+    # matrix, so a breakdown there may be precision noise: it is marked in
+    # describe() (that factorization did fall back to LU) but must count
+    # toward neither kill switch — not the hint's (the exact block may factor
+    # fine) and not the mixed route's (the refinement pass is the certificate
+    # that judges the reduced matrix, not the Cholesky).
+    _require_gap_filler(namespace)
+    if not hasattr(namespace, "float32"):
+        pytest.skip("backend has no float32")
+    monkeypatch.setattr(DenseSolver, "_refine", lambda self, x, rhs, xp: x)
+    rhs = array(namespace, [2.0, -3.0])
+    solver = DenseSolver(DenseOptions(gram_dtype="float32", pd_hint_failure_limit=1))
+
+    solver.factor(_HintedMixedBreakdown(namespace))
+    solver.solve(rhs)
+
+    assert solver._mixed_engaged
+    assert solver._mixed_failures == 0 and not solver._mixed_disabled
+    assert solver._pd_hint_failures == 0 and not solver._pd_hint_disabled
+    assert solver.describe() == "dense (gram=float32, pd-hint->lu)"
+
+    # ...and the exact block still gets its factor on the next factorization.
+    native = DenseSolver(DenseOptions(gram_dtype="float32", pd_hint_failure_limit=1))
+    native.factor(_HintedMixedBreakdown(namespace))
+    native.solve(rhs)
+    native.factor(_HintedSwitchable(namespace, pd=True))
+    x = native.solve(rhs)
+    assert native._cholesky_factor is not None
+    assert_allclose(namespace, x, array(namespace, [1.0, -1.0]), **tol)
+
+
+def test_dense_solver_describe_composes_retired_mixed_and_pd_hint_markers():
+    # Both sticky markers survive together after the mixed route retires.
+    solver = DenseSolver(DenseOptions(gram_dtype="float32"))
+    solver._mixed_disabled = True
+    solver._mixed_ever_engaged = True
+    solver._mixed_label = "float32"
+    solver._pd_hint_ever_failed = True
+    assert solver.describe() == "dense (gram=float32->native, pd-hint->lu)"

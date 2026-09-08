@@ -580,6 +580,20 @@ class DenseOptions:
     ``DenseSolver._materialize_and_guard``.) Applies to the inequality/bound
     **condensed** assembly; equality-constrained saddle systems currently
     assemble exactly and ignore the request.
+
+    ``pd_hint_failure_limit`` bounds the cost of a *structural* PD claim that
+    the numbers do not honour. A block the operator declares positive definite
+    by construction (``LinearOperator.positive_definite_hint`` — the
+    Powell-damped L-BFGS Hessian plus an inequality Gram term) is
+    Cholesky-factored purely so every later right-hand side back-solves at
+    O(n²); a numerical breakdown of that factorization is not an
+    indefiniteness signal and silently leaves the LU path as it was. Each
+    breakdown still wastes the attempted factorization, so after this many
+    *consecutive* breakdowns the solver stops attempting the hinted Cholesky
+    for the rest of its life; any success resets the count (conditioning
+    along an IPM run is not monotone, so one hard iteration must not forfeit
+    the reuse everywhere else). ``DenseSolver.describe()`` reports
+    ``pd-hint->lu`` once any breakdown has occurred.
     """
 
     kkt_route: DenseKKTRoute = "condensed"
@@ -590,6 +604,7 @@ class DenseOptions:
     refine_max_iters: int = 15
     refine_stall_ratio: float = 0.9
     refine_failure_limit: int = 3
+    pd_hint_failure_limit: int = 3
 
     def __post_init__(self) -> None:
         if self.kkt_route not in ("condensed", "augmented"):
@@ -608,6 +623,8 @@ class DenseOptions:
             raise ValueError("refine_stall_ratio must be in (0, 1]")
         if self.refine_failure_limit < 1:
             raise ValueError("refine_failure_limit must be a positive integer")
+        if self.pd_hint_failure_limit < 1:
+            raise ValueError("pd_hint_failure_limit must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)

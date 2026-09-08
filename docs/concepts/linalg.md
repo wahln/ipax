@@ -88,7 +88,13 @@ option applies to the inequality/bound **condensed** assembly —
 equality-constrained saddle systems currently assemble exactly and ignore it.
 `Result.routes` reports the engaged route as `dense (gram=float32)` — or
 `dense (gram=auto:float32)` when the hint chose the dtype, and
-`dense (gram=float32->native)` after a self-disable.
+`dense (gram=float32->native)` after a self-disable. A second, independent
+marker, `pd-hint->lu` (composed as `dense (gram=float32, pd-hint->lu)` when
+both apply), records that a block the operator declared positive definite by
+construction (`LinearOperator.positive_definite_hint`, the L-BFGS block with
+inequalities) broke down in its reuse-only Cholesky at least once and fell back
+to LU; `DenseOptions.pd_hint_failure_limit` consecutive breakdowns on the exact
+matrix retire that reuse for the rest of the solve.
 
 !!! warning "Known limitation: matrix-free Krylov on equality saddles"
 

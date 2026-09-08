@@ -47,11 +47,11 @@ from every problem file:
 
 | | |
 | --- | --- |
-| date | 2026-08-07 (v22) |
+| date | 2026-09-06 (v31) |
 | CPU | 13th Gen Intel Core i9-13900HX (32 logical CPUs) |
 | OS | Windows 11 (10.0.26200), AMD64 |
 | Python | 3.14.6 |
-| ipax | 0.9.0 + the 0.10.0 linalg work (develop @ `990432e`) |
+| ipax | 0.10.1 + the 0.11.0 performance/restoration arc (develop @ `761ac00`) |
 | NumPy / SciPy | 2.4.6 / 1.17.1 |
 | PyTorch | 2.12.0+cpu |
 | sparse factorization | Feral LDLᵀ (CPU) |
@@ -107,15 +107,15 @@ terminal states.
 
 | config | correct | converged | optimal | acceptable | infeasible | stalled | rest.failed | max_iter | max_time | unbounded | num.err |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `lbfgs/dense`  | 774 / 1098 | 918 | 788 | 129 | 58 | 38 | 64 | 14 | 6  | 1 | 0 |
-| `lbfgs/krylov` | 752 / 1101 | 894 | 769 | 124 | 58 | 26 | 62 | 14 | 47 | 1 | 0 |
-| `lbfgs/sparse` | 780 / 1101 | 924 | 782 | 141 | 59 | 30 | 63 | 20 | 4  | 1 | 1 |
-| `exact/dense`  | 770 / 1098 | 900 | 806 | 93  | 58 | 26 | 65 | 30 | 19 | 1 | 0 |
-| `exact/krylov` | 706 / 1101 | 852 | 794 | 57  | 58 | 41 | 53 | 22 | 76 | 0 | 0 |
-| `exact/sparse` | **796 / 1101** | **934** | **876** | 57 | 59 | 22 | 59 | 14 | 12 | 1 | 1 |
+| `lbfgs/dense`  | 779 / 1098 | 922 | 793 | 128 | 56 | 30 | 66 | 17 | 7  | 1 | 0 |
+| `lbfgs/krylov` | 764 / 1101 | 906 | 776 | 129 | 56 | 18 | 63 | 13 | 45 | 1 | 0 |
+| `lbfgs/sparse` | 785 / 1101 | 926 | 786 | 139 | 56 | 30 | 65 | 20 | 4  | 1 | 0 |
+| `exact/dense`  | 777 / 1098 | 911 | 805 | 105 | 56 | 13 | 67 | 33 | 16 | 1 | 2 |
+| `exact/krylov` | 713 / 1101 | 861 | 796 | 64  | 55 | 34 | 58 | 21 | 73 | 0 | 0 |
+| `exact/sparse` | **798 / 1101** | **936** | **877** | 58 | 56 | 17 | 62 | 16 | 13 | 1 | 1 |
 
-Solved-correct by **at least one route: 828 / 1101**; converged by at least one
-route: **963 / 1101**.
+Solved-correct by **at least one route: 834 / 1101**; converged by at least one
+route: **968 / 1101**.
 
 !!! note "Reading the two budget columns together"
 
@@ -129,10 +129,94 @@ route: **963 / 1101**.
     iterations inside the same 300 s means they got faster, not worse. The one
     correct-affecting row is `COSHFUN`, covered below.
 
-### Changes since the v20 baseline
+### Changes since the v22 baseline
 
-**+1 correct across the six configs (4577 → 4578)** — 6 fixed against 5 broken,
-with **zero linear-solver route changes**. The intervening work was the
+**+38 correct across the six configs (4578 → 4616)** — 57 fixed against 19
+broken, every config positive. The intervening work was the `0.11.0`
+performance and restoration arc, landed and gated sweep by sweep (v23 … v31;
+every default-affecting commit carries its own full-corpus gate):
+
+| config | v22 | v27 | v29 | v30 | v31 | Δ |
+| --- | --- | --- | --- | --- | --- | --- |
+| `lbfgs/dense`  | 774 | 773 | 779 | 779 | 779 | **+5** |
+| `lbfgs/krylov` | 752 | 757 | 758 | 758 | 764 | **+12** |
+| `lbfgs/sparse` | 780 | 782 | 785 | 785 | 785 | **+5** |
+| `exact/dense`  | 770 | 766 | 774 | 776 | 777 | **+7** |
+| `exact/krylov` | 706 | 711 | 712 | 712 | 713 | **+7** |
+| `exact/sparse` | 796 | 797 | 798 | 798 | 798 | **+2** |
+
+The one **route change** is deliberate and documented: on `lbfgs/krylov`
+**387 problems** report `krylov (cg, pc=lbfgs-exact)` instead of
+`pc=jacobi` — every bound-only system, where the condensed Woodbury inverse
+*is* `N⁻¹` and the Krylov route now applies it directly (one apply plus a
+true-residual check instead of ~30 CG iterations). No other config changed
+route on any problem.
+
+Sweep by sweep:
+
+- **v23 → v24 (2026-08-31), +18.** The three L-BFGS bookkeeping commits
+  (bound-only blocks stay on the structured Woodbury path; the compact factor
+  stays in `S`/`Y` block form; opt-in quadratic-interpolation backtracking).
+  Only knife-edge churn; the interpolation lever alone scored +11 but
+  non-unanimously (−1 on the Hessian-agnostic `exact/*` configs, with
+  reproducible worse-basin flips on HS97/HS98/OSBORNEB), so it stayed
+  **opt-in** — v27 (4586) is the merged default state.
+- **v27 → v29 (2026-09-03), +20 (31 fixed / 11 broken).** Restoration now
+  probes for a saddle before certifying local infeasibility: on a
+  symmetry-invariant subspace (POWERSUMNE, HADAMARD, CYCLOOCT) every
+  Gauss-Newton direction stays in the subspace and the first-order
+  certificate reported a saddle as infeasibility; a one-shot deterministic
+  kick lets the damped loop continue. Plus the SOC factorization-reuse gate
+  fix (ZAMB2/ZAMB2m10/ACOPP30/ACOPR30 back to their baseline trajectories).
+  10 of the 11 broken rows were on the two *Krylov* main routes
+  (DRUGDIS/DALLASS/NET1/SPECANNE → `max_time`): a fresh `δ_w = 0` SOC solve
+  there is a full CG ladder per round.
+- **v29 → v30 (2026-09-04), +2.** The fix for exactly that: the SOC reuse
+  policy follows the solver kind (`LinearSolver.is_direct()`). Iterative
+  routes re-solve the step's retained system for every correction (Wächter &
+  Biegler 2006 eq. (26) verbatim) and never climb a ladder inside SOC; direct
+  routes keep the fresh first correction at `δ_w = 0`. The direct routes are
+  **trajectory-identical** to v29; `exact/krylov` traded 9 basin flips each
+  way at 22 % less total wall (11.2 h → 8.7 h) with DRUGDIS/DALLASS/NET1/
+  SPECANNE back from `max_time`.
+- **v30 → v31 (2026-09-06), +8 (15 fixed / 7 broken).** Dense Cholesky reuse
+  for the L-BFGS block with inequalities (`positive_definite_hint`). Zero
+  route changes; `lbfgs/dense` — the config the change targets — has **zero
+  correct flips** and a different iteration count on only 46 of 1098 rows.
+  All 7 broken rows are Krylov churn (ORTH*/KISSING/HS111/PALMER3C/4C and the
+  DJTL cap boundary). On rows with identical `n_iter` the wall ratio is 0.966
+  overall, 0.875 on `lbfgs/dense` and 0.828 on `exact/dense`, against a ±10 %
+  machine spread — consistent with the measured per-step speedup, not proof
+  of it.
+
+Two sweeps in the series are **not** in the table because they were not
+baselines: **v28** (2026-09-03) ran on a throttled machine (2.87× slower on
+identical-`n_iter` rows), so 21 of its 26 "regressions" were `max_time`
+artefacts and v29 was re-run against v27; and the paired **v29 arm with
+matrix-free restoration forced on every problem** scored −12/6600 — on a
+corpus whose largest problem has n ≤ 4999 an `n×n` dense solve is cheaper than
+a Krylov ladder per damping trial — which is why
+`RestorationOptions(linear_solver="auto")` is size-gated (dense below 10 000
+variables, Krylov above) and reproduces the dense results on the whole corpus.
+
+Of the 19 rows broken over the whole span, 9 are on the two Krylov routes and
+7 more are the known knife-edge family on the other routes (`DJTL`'s cap
+boundary, `HS111`, `PALMER4C`, `ORTHREGA`, `CURLY20`, `DECONVB`/`DECONVBNE`);
+the notable trajectory changes are `SPANHYD` (`optimal → stalled` on
+`lbfgs/dense`, `acceptable → stalled` on `exact/krylov`), `CmRELOAD`
+(`lbfgs/dense`, `optimal → stalled`, while it *recovered* from `max_time` on
+`lbfgs/krylov`) and a different-basin `HALDMADS` on `exact/dense`. The fixed
+side is broader than churn: `HYDCAR20` went `stalled/max_time → optimal` on
+four routes, `CHANDHEU` cleared `max_time` on all three `exact/*` routes,
+`VANDERM1`/`VANDERM2`, `SPECANNE`, `CORE2`, `DEMBO7`, `SPINOP` and the
+`DMN*LS` least-squares family now certify, and `DISCS` left
+`restoration_failed` for `acceptable`.
+
+#### Changes in the v22 baseline (2026-08-07), since v20
+
+Retained for provenance: **+1 correct across the six configs (4577 → 4578)** —
+6 fixed against 5 broken, with **zero linear-solver route changes**. The
+intervening work was the
 `0.10.0` linear-algebra arc (symmetric rank-k Gram update on both the SciPy and
 CuPy adapters, the fill-certified tall sparse-NE routing gate, and
 opt-in-then-default mixed-precision Gram accumulation), none of which is
@@ -219,30 +303,35 @@ different semantics (success = found a feasible point; many are inconsistent and
 correctly report infeasible), so they are reported separately rather than mixed into
 the optimization rate. The optimization column shows `correct` (`converged`).
 
-| config | optimization (896) | feasibility (205) |
+| config | optimization (894) | feasibility (207) |
 | --- | --- | --- |
-| `lbfgs/dense`  | 685 / 893* (829) | 89 / 205 |
-| `lbfgs/krylov` | 665 / 896  (807) | 87 / 205 |
-| `lbfgs/sparse` | 690 / 896  (834) | 90 / 205 |
-| `exact/dense`  | 687 / 893* (817) | 83 / 205 |
-| `exact/krylov` | 620 / 896  (766) | 86 / 205 |
-| `exact/sparse` | **705 / 896**  (843) | **91 / 205** |
+| `lbfgs/dense`  | 687 / 891* (830) | 92 / 207 |
+| `lbfgs/krylov` | 673 / 894  (815) | 91 / 207 |
+| `lbfgs/sparse` | 691 / 894  (832) | 94 / 207 |
+| `exact/dense`  | 689 / 891* (822) | 88 / 207 |
+| `exact/krylov` | 624 / 894  (772) | 89 / 207 |
+| `exact/sparse` | **705 / 894**  (843) | **93 / 207** |
 
-<small>* dense routes ran 893 of the 896 optimization problems; three exceed the
+<small>* dense routes ran 891 of the 894 optimization problems; three exceed the
 dense variable cap.</small>
 
 Both columns were lifted by the v20 terminal certificate: the feasibility side
 because the equation systems' recorded residuals were drifted-multiplier noise
-at points that were in fact acceptably feasible (79–89 → 83–92 at v20, 83–91
-here), the optimization side through the least-squares family.
+at points that were in fact acceptably feasible (79–89 → 83–92 at v20, 88–94
+here), the optimization side through the least-squares family. The v29 saddle
+probe added a few more feasibility rows (POWERSUMNE, HADAMARD, CYCLOOCT are
+the poster children).
 
-The split is derived by building each problem and asking whether it has an
-objective at all — the same gate the runner applies when `--include-objective-free`
-is absent. Do this by *constructing the problem*, not by re-deriving the
-predicate: instantiating with an explicit `size=0` rather than `None` silently
-builds a degenerate `n = 0` instance for every *scalable* problem, which then
-has no objective groups and is miscounted as objective-free (it inflates the
-count 205 → 326, with `ARGLINA` collapsing from n=200 to n=0).
+The split here uses the objective-type letter of each problem's CUTEst
+classification (`pbclass`, recorded per row in the report; `N` = no objective),
+which yields the same 207 objective-free problems the runner's
+`--include-objective-free` gate admits. Earlier pages derived it by building
+each problem and asking whether it has an objective (205 at v22, two problems
+apart); if you re-derive it that way, do it by *constructing the problem*, not
+by re-deriving the predicate: instantiating with an explicit `size=0` rather
+than `None` silently builds a degenerate `n = 0` instance for every *scalable*
+problem, which then has no objective groups and is miscounted as objective-free
+(it inflates the count to 326, with `ARGLINA` collapsing from n=200 to n=0).
 
 ### Observations
 
@@ -277,11 +366,11 @@ count 205 → 326, with `ARGLINA` collapsing from n=200 to n=0).
     visible in the ±count. Pass `kkt_route="augmented"` to restore the previous
     form.
 
-- **`exact/sparse` is the strongest route** — most correct (796) and most
-  optimal (876). Exact-Hessian Newton steps factored by the sparse-direct route
+- **`exact/sparse` is the strongest route** — most correct (798) and most
+  optimal (877). Exact-Hessian Newton steps factored by the sparse-direct route
   (Feral LDLᵀ with inertia control) is the most robust combination here.
-- **`numerical_error` is essentially gone** (51 → 0 on `exact/dense`, and 0–1
-  on every route). A Newton step the δ_w regularization ladder cannot complete
+- **`numerical_error` is essentially gone** (51 → 0–2 on `exact/dense`, and
+  0–1 on every other route). A Newton step the δ_w regularization ladder cannot complete
   now hands to feasibility restoration (Wächter & Biegler §3.1→§3.3) instead of
   a crash-like `numerical_error`: the objective-free nonlinear-equation / NLS
   cluster (`min 0` s.t. `r(x)=0`, where the equality multipliers diverge and no
@@ -289,7 +378,7 @@ count 205 → 326, with `ARGLINA` collapsing from n=200 to n=0).
   `infeasible`/`restoration_failed`/`stalled` — the same verdict the L-BFGS
   routes already gave — and DEMBO7/KISSING recover to `optimal`.
 - **False infeasibility claims are largely gone.** The per-route `infeasible`
-  counts dropped from 110–156 to 58–59: a local-infeasibility verdict now
+  counts dropped from 110–156 to 55–56: a local-infeasibility verdict now
   requires a *stationarity certificate* from the restoration phase (projected
   gradient ≈ 0, or no descent at the Levenberg–Marquardt ceiling), gets one
   x0-anchored second-chance probe before it is believed, and is vetoed when
@@ -298,7 +387,7 @@ count 205 → 326, with `ARGLINA` collapsing from n=200 to n=0).
   new status columns — and dozens of the ex-`infeasible` rows now finish
   `optimal` outright (SNAKE, CATENARY, BT9, HS39, CRESC4, SSEBNLN, ALJAZZAF…).
 - **Budget statuses are down sharply** (`max_iter` + `max_time`: 69–182 →
-  20–98 per route). Two mechanisms: a run whose returned best iterate already
+  24–94 per route). Two mechanisms: a run whose returned best iterate already
   satisfies the relaxed (acceptable-level) KKT tolerance now reports
   `acceptable` instead of `max_time`/`max_iter` (the DIAMON2DLS/DMN
   least-squares family — oscillating at KKT ~1e-7 without ever holding it for
@@ -313,7 +402,7 @@ count 205 → 326, with `ARGLINA` collapsing from n=200 to n=0).
   KOEBHELB — whose iterate wanders past 1e22 and then converges to f = 112 —
   flipped from `unbounded` to `optimal` on the exact routes, while genuinely
   unbounded problems (INDEF) are still detected.
-- **The RT-typical `lbfgs/sparse`** route is solid (780 correct, a single
+- **The RT-typical `lbfgs/sparse`** route is solid (785 correct, zero
   `numerical_error`), validating the L-BFGS + sparse-direct path used for
   radiotherapy-scale problems.
 - **Documented-infeasible detection works**: `BURKEHAN` and the rest of the
