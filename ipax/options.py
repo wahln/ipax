@@ -32,6 +32,7 @@ MuFallback = Literal["kkt-error", "never"]
 FreeModeAcceptance = Literal["obj-constr-filter", "rigorous"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
+RestorationLinearSolver = Literal["auto", "dense", "krylov"]
 DenseKKTRoute = Literal["condensed", "augmented"]
 SparseKKTRoute = Literal["auto", "augmented", "normal_equations"]
 ScalingMethod = Literal["none", "gradient-based"]
@@ -128,6 +129,41 @@ class LineSearchOptions:
     """
 
     max_soc: int = 4
+    # Backtracking rule after a rejected trial: quadratic interpolation of the
+    # barrier merit φ along the step (Nocedal & Wright 2006, eq. 3.58) — the
+    # minimizer of the quadratic through φ(0), φ'(0) and the rejected φ(α) —
+    # safeguarded into [0.1·α, 0.5·α], so a trial is never longer than plain
+    # halving and a single bad model can never collapse the step. Falls back to
+    # halving whenever the model is unusable (non-finite trial φ, non-descent
+    # dφ, non-positive model curvature). ``search_free`` (the opt-in free
+    # mode) has no merit model and keeps plain halving regardless.
+    #
+    # OPT-IN (default ``False`` = W&B's plain ``α ← α/2``), per the 2026-08-31
+    # full S2MPJ corpus sweep (numpy, max_iter=10000, max_time=300s, incl.
+    # objective-free; see ``docs/benchmarks/s2mpj.md`` for the full table).
+    # The v23→v24 candidate delta (+18/6600) credits *three* perf commits at
+    # once, not this lever alone — isolated on its own this lever scores
+    # **+11/6600**, and not unanimously: the three ``exact/*`` configs never
+    # touch the L-BFGS code, so a direct v23→v24 comparison there isolates
+    # this lever alone (net -1/3300: exact/dense -1, exact/krylov +5,
+    # exact/sparse -5, incl. reproducible worse-basin flips on
+    # HS97/HS98/OSBORNEB on 2 of the 3 exact routes). The gain concentrates on
+    # the *default* Hessian mode instead: a same-commit A/B (this lever on vs
+    # off, the other two perf commits held fixed) scores lbfgs/* at +12/3300
+    # (39 fixed, 27 broken). Per this repo's own precedent (``gamma_alpha``
+    # scored -4 and stayed opt-in; ``lbfgs_seed="scalar1"`` scored -140 and
+    # stayed a routing hint), a mixed/non-unanimous corpus result does not
+    # flip a default here even though the net is positive and the value is
+    # real on L-BFGS problems — see the RT-style measurement above and
+    # ``benchmarks/routing_hints.py`` (e.g. HS25: acceptable at 32.8 default
+    # vs optimal at ~1.4e-16 with this lever on, all three lbfgs/* routes).
+    backtrack_interpolation: bool = False
+    # Safeguard bounds on one interpolated backtrack, as fractions of the
+    # rejected α (N&W 2006 §3.5): never above ``shrink_max`` (0.5 keeps every
+    # trial at least as short as plain halving) and never below ``shrink_min``
+    # (one wild trial φ cannot collapse the step past what the model supports).
+    backtrack_shrink_min: float = 0.1
+    backtrack_shrink_max: float = 0.5
     # The absolute step size below which the search concedes to restoration.
     # Also the floor under the opt-in eq. (23) rule (see ``gamma_alpha``), where
     # it is what keeps a feasible iterate's α_min off zero.
@@ -379,6 +415,14 @@ class KrylovOptions:
     rtol: float = 1e-10
     max_iter: int | None = None  # default: 2 * dim + 100 at the call site
     preconditioner: KrylovPreconditioner = "jacobi"
+    # ``"jacobi"`` (default) and ``"auto"`` solve with the operator's *exact*
+    # condensed Woodbury inverse instead of iterating whenever it is exact — a
+    # bound-only L-BFGS system (no inequality Gram term): one direct apply with a
+    # residual check (plus iterative refinement when round-off demands it), and
+    # the O(n·k²) L-BFGS diagonal is never formed (``pc=lbfgs-exact`` in
+    # ``Result.linear_solver``). ``False`` keeps the plain diagonal in those modes
+    # — the A/B lever; ``"none"`` disables preconditioning entirely.
+    exact_lbfgs_inverse: bool = True
     gmres_restart: int = 30  # GMRES(m) restart length
     # Inexact-Newton forcing sequence (Eisenstat–Walker 1996): the inner solve need
     # only be as accurate as the *current* outer KKT residual demands, so early
@@ -394,8 +438,9 @@ class KrylovOptions:
     # drives step-sensitive IPM problems into infeasibility) while still relaxing the
     # unreachable 1e-10 that stalls ill-conditioned initial systems.
     adaptive_rtol_max: float = 1e-8
-    # ``"auto"`` starts with the cheap Jacobi diagonal and self-promotes to the
-    # L-BFGS Woodbury/block preconditioner the first time a solve struggles —
+    # ``"auto"`` starts with the cheap Jacobi diagonal (or the exact inverse where
+    # ``exact_lbfgs_inverse`` applies) and self-promotes to the L-BFGS
+    # Woodbury/block preconditioner the first time a solve struggles —
     # either it fails to converge (then it retries the same solve promoted) or it
     # burns more than this fraction of the iteration budget. Sticky thereafter.
     auto_switch_ratio: float = 0.5
@@ -415,9 +460,61 @@ class KrylovOptions:
         if self.adaptive_eta <= 0.0:
             raise ValueError("adaptive_eta must be positive")
         # Equal floor/cap is allowed (adaptive collapses to the fixed rtol); the cap
-        # must not be below the floor or above 1.
-        if not self.rtol <= self.adaptive_rtol_max <= 1.0:
+        # must not be below the floor or above 1. The cap only bounds the adaptive
+        # forcing, so with it off the fixed ``rtol`` is free of it (the restoration
+        # preset advertises an isolated tolerance that may be loosened).
+        if self.adaptive_tol and not self.rtol <= self.adaptive_rtol_max <= 1.0:
             raise ValueError("adaptive_rtol_max must lie in [rtol, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class RestorationOptions:
+    """Feasibility-restoration linear algebra.
+
+    The dense mode is the established reference implementation: it
+    materializes the ``n × n`` Gauss-Newton normal matrix and solves it per
+    damping trial. The krylov route applies that operator through Jacobian
+    products instead, avoiding every ``n × n`` allocation. ``"auto"`` (the
+    default) follows the main KKT route's dense size cutoff: dense below
+    10 000 variables, krylov at and above it. The paired S2MPJ sweep (v29)
+    measured the krylov route −12 of 6600 rows on that corpus of small
+    problems (every flipped problem had ``n ≤ 1247``), so below the cutoff
+    the dense reference is kept; above it the dense route's two ``n × n``
+    arrays and ``O(n³)`` solve per trial are the same non-starter they are
+    for the main route.
+
+    Restoration has its own Krylov settings because it solves a feasibility
+    least-squares model rather than the main KKT system: nothing feeds it an
+    outer KKT residual, so the inexact-Newton forcing is switched off
+    explicitly (the solver would fall back to the fixed ``rtol`` anyway), and
+    the finite iteration cap bounds the Jacobian products one
+    Levenberg–Marquardt trial may spend. A work-capped inner solve is not
+    wasted: its truncated iterate is the trial direction (Steihaug 1983) —
+    but a *persistently* truncated solve is a poor one: CG on the Gauss-Newton
+    normal operator sees the Jacobian's squared conditioning and can need
+    ≫ n iterations in floating point (S2MPJ HYDCAR20, n = 99: every solve
+    truncated at the default cap of 200 and the run fails; ~10 n iterations
+    per solve at ``max_iter=1000`` solves it). When restoration exits on its
+    budget call after call with slowly shrinking infeasibility, raise
+    ``krylov.max_iter`` — neither the tolerance nor the damping policy is
+    the lever there.
+    """
+
+    linear_solver: RestorationLinearSolver = "auto"
+    krylov: KrylovOptions = field(
+        default_factory=lambda: KrylovOptions(
+            rtol=1e-8,
+            max_iter=200,
+            preconditioner="jacobi",
+            adaptive_tol=False,
+        )
+    )
+
+    def __post_init__(self) -> None:
+        if self.linear_solver not in ("auto", "dense", "krylov"):
+            raise ValueError(
+                "restoration linear solver must be 'auto', 'dense' or 'krylov'"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,6 +580,20 @@ class DenseOptions:
     ``DenseSolver._materialize_and_guard``.) Applies to the inequality/bound
     **condensed** assembly; equality-constrained saddle systems currently
     assemble exactly and ignore the request.
+
+    ``pd_hint_failure_limit`` bounds the cost of a *structural* PD claim that
+    the numbers do not honour. A block the operator declares positive definite
+    by construction (``LinearOperator.positive_definite_hint`` — the
+    Powell-damped L-BFGS Hessian plus an inequality Gram term) is
+    Cholesky-factored purely so every later right-hand side back-solves at
+    O(n²); a numerical breakdown of that factorization is not an
+    indefiniteness signal and silently leaves the LU path as it was. Each
+    breakdown still wastes the attempted factorization, so after this many
+    *consecutive* breakdowns the solver stops attempting the hinted Cholesky
+    for the rest of its life; any success resets the count (conditioning
+    along an IPM run is not monotone, so one hard iteration must not forfeit
+    the reuse everywhere else). ``DenseSolver.describe()`` reports
+    ``pd-hint->lu`` once any breakdown has occurred.
     """
 
     kkt_route: DenseKKTRoute = "condensed"
@@ -493,6 +604,7 @@ class DenseOptions:
     refine_max_iters: int = 15
     refine_stall_ratio: float = 0.9
     refine_failure_limit: int = 3
+    pd_hint_failure_limit: int = 3
 
     def __post_init__(self) -> None:
         if self.kkt_route not in ("condensed", "augmented"):
@@ -511,6 +623,8 @@ class DenseOptions:
             raise ValueError("refine_stall_ratio must be in (0, 1]")
         if self.refine_failure_limit < 1:
             raise ValueError("refine_failure_limit must be a positive integer")
+        if self.pd_hint_failure_limit < 1:
+            raise ValueError("pd_hint_failure_limit must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -828,6 +942,7 @@ class Options:
     breedveld: BreedveldOptions = field(default_factory=BreedveldOptions)
     lbfgs: LBFGSOptions = field(default_factory=LBFGSOptions)
     krylov: KrylovOptions = field(default_factory=KrylovOptions)
+    restoration: RestorationOptions = field(default_factory=RestorationOptions)
     dense: DenseOptions = field(default_factory=DenseOptions)
     sparse: SparseOptions = field(default_factory=SparseOptions)
     scaling: ScalingOptions | ScalingMethod = field(default_factory=ScalingOptions)
@@ -883,6 +998,8 @@ __all__ = [
     "OptimalityConditionOptions",
     "Options",
     "RegularizationOptions",
+    "RestorationLinearSolver",
+    "RestorationOptions",
     "ScalingMethod",
     "ScalingOptions",
     "SparseKKTRoute",

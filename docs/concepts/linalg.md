@@ -24,6 +24,17 @@ Selection is automatic (size, constraint shape, Jacobian density, estimated
 Gram fill, namespace capabilities) and user-overridable via `Options.linsolve`.
 Adding a solver never touches `ipm/driver.py` (invariant #3).
 
+Beyond `factor`/`solve`, the protocol has optional hooks the driver reads
+through duck typing: `set_outer_residual` (inexact-Newton forcing for
+iterative solvers), `describe`/`kkt_form` (reported in `Result.routes`), and
+`is_direct` — `True` when `factor` does the work and `solve` back-substitutes,
+`False` when every `solve` is a Krylov run (a solver without it counts as
+direct). The driver uses `is_direct` to decide whether second-order
+corrections re-solve the step's *regularized* retained system (iterative: a
+fresh solve is a ladder of full Krylov runs) or solve fresh at `δ_w = 0`
+(direct: a fresh factorization per rung is cheap, and reusing the inflated
+matrix measurably rerouted runs).
+
 ### Mixed-precision Gram accumulation (dense route)
 
 For tall inequality problems the dense condensed route spends 80–90% of its
@@ -77,7 +88,13 @@ option applies to the inequality/bound **condensed** assembly —
 equality-constrained saddle systems currently assemble exactly and ignore it.
 `Result.routes` reports the engaged route as `dense (gram=float32)` — or
 `dense (gram=auto:float32)` when the hint chose the dtype, and
-`dense (gram=float32->native)` after a self-disable.
+`dense (gram=float32->native)` after a self-disable. A second, independent
+marker, `pd-hint->lu` (composed as `dense (gram=float32, pd-hint->lu)` when
+both apply), records that a block the operator declared positive definite by
+construction (`LinearOperator.positive_definite_hint`, the L-BFGS block with
+inequalities) broke down in its reuse-only Cholesky at least once and fell back
+to LU; `DenseOptions.pd_hint_failure_limit` consecutive breakdowns on the exact
+matrix retire that reuse for the rest of the solve.
 
 !!! warning "Known limitation: matrix-free Krylov on equality saddles"
 
@@ -99,6 +116,15 @@ equality-constrained saddle systems currently assemble exactly and ignore it.
     same problems still solve through the **dense** route (the automatic choice
     below ~1e4 variables), so default usage is unaffected; the residual gap is for
     large, matrix-free, equality-constrained models.
+
+    On **bound-only** L-BFGS problems (no inequality rows — the radiotherapy
+    fluence-map shape) the Woodbury inverse is the *exact* `N⁻¹`, so the default
+    `jacobi` mode (and `auto`) skip the Krylov iteration entirely: one direct
+    apply verified by a true-residual check, with iterative refinement covering
+    round-off and a fallback to the CG-preconditioned route when refinement
+    stalls; `Result.linear_solver` then reads `pc=lbfgs-exact`.
+    `KrylovOptions(exact_lbfgs_inverse=False)` restores the plain diagonal
+    (and the CG loop).
 
     To get the block preconditioner *only where it pays off*, use
     `KrylovOptions(preconditioner="auto")`: it runs the cheap Jacobi diagonal
@@ -176,3 +202,9 @@ libraries allow — onto the SciPy adapter for host arrays and the CuPy/cuDSS
 adapter for CUDA arrays. So Torch-CPU and JAX-CPU factor through Feral/SuperLU,
 and Torch-CUDA and JAX-GPU factor through cuDSS, with results handed back in the
 caller's namespace. Routing is by *device*, not by library name.
+
+## Further performance work
+
+Proposed compact-factor reuse adapters and JIT kernels are described in
+[Performance proposals](../development/performance.md). They retain this
+operator/solver boundary and are not current solver options.

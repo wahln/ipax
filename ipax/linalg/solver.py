@@ -62,7 +62,16 @@ class LinearSolveError(RuntimeError):
     primal regularization. Configuration errors, unsupported features, shape
     errors, and user/operator callback bugs should propagate as their original
     exceptions instead of being reclassified as numerical trouble.
+
+    ``iterate`` optionally carries the solver's last approximate solution when
+    the failure is a work limit rather than a breakdown (an iterative solver's
+    truncated iterate). The KKT driver ignores it and escalates ``δ_w``;
+    feasibility restoration uses it as a truncated-Newton trial direction.
     """
+
+    def __init__(self, message: str = "", *, iterate: Array | None = None) -> None:
+        super().__init__(message)
+        self.iterate = iterate
 
 
 @runtime_checkable
@@ -74,7 +83,14 @@ class LinearSolver(Protocol):
         ...
 
     def solve(self, rhs: Array) -> Array:
-        """Return ``x`` such that ``K x = rhs`` to the configured tolerance."""
+        """Return ``x`` such that ``K x = rhs`` to the configured tolerance.
+
+        One ``factor`` must serve *multiple* ``solve`` calls with different
+        right-hand sides, reusing whatever the factor step prepared — the
+        driver relies on this on its default path: second-order corrections
+        and the centrality correctors re-solve the search direction's system
+        (Wächter & Biegler 2006, §2.4, eq. (26)) without re-factoring.
+        """
         ...
 
     def set_outer_residual(self, residual: float) -> None:
@@ -84,6 +100,23 @@ class LinearSolver(Protocol):
         (solve loosely while the IPM is far from optimal, tighten as it converges);
         direct solvers ignore it. Optional — the driver calls it once per iteration
         and a solver may no-op.
+        """
+        ...
+
+    def is_direct(self) -> bool:
+        """Whether ``factor`` does the work and ``solve`` back-substitutes it.
+
+        ``True`` for direct solvers (Cholesky/LU/LDLᵀ: a fresh factorization
+        costs one factor, a re-solve almost nothing), ``False`` for iterative
+        ones (``factor`` only binds the operator; every ``solve`` is a full
+        Krylov run). The driver reads it to choose between re-solving a
+        *regularized* retained system and re-solving fresh at ``δ_w = 0``
+        for the second-order corrections: fresh where a factorization is
+        cheap, reuse where each solve is the cost. Optional, like
+        ``set_outer_residual`` (the driver reads both through duck typing,
+        so a solver may omit them; ``isinstance`` checks against this
+        protocol do require them) — a solver without it is treated as
+        direct. Must be a method, not a class attribute.
         """
         ...
 
@@ -211,4 +244,35 @@ def select_solver(
     return KrylovSolver(options.krylov)
 
 
-__all__ = ["LinearSolveError", "LinearSolver", "select_solver"]
+def select_restoration_solver(
+    options: Options, *, n_vars: int
+) -> Callable[[], LinearSolver] | None:
+    """Factory for the iterative restoration solver; ``None`` keeps dense.
+
+    ``"auto"`` applies the same size cutoff as the main route's
+    ``linsolve="auto"`` (``_DENSE_AUTO_MAX_VARS``): the dense restoration
+    materializes two ``n × n`` arrays and solves them per damping trial, so
+    it stops being viable exactly where the dense KKT route does, while the
+    v29 paired S2MPJ sweep showed the matrix-free route losing only on small
+    problems (every flipped row had ``n ≤ 1247``).
+
+    A factory rather than an instance: the driver builds a fresh solver per
+    restoration entry, so the operator a solver retains after ``factor()`` —
+    and through it the last restoration point's ``m × n`` Jacobians — is
+    released when restoration returns instead of living for the rest of the run.
+    """
+    mode = options.restoration.linear_solver
+    if mode == "dense" or (mode == "auto" and n_vars < _DENSE_AUTO_MAX_VARS):
+        return None
+    from ipax.linalg.krylov import KrylovSolver
+
+    krylov_options = options.restoration.krylov
+    return lambda: KrylovSolver(krylov_options)
+
+
+__all__ = [
+    "LinearSolveError",
+    "LinearSolver",
+    "select_restoration_solver",
+    "select_solver",
+]

@@ -1280,7 +1280,19 @@ def test_condensed_dense_structured_solve_cached_gram_without_bounds(
         raise AssertionError("Uᵀ D⁻¹ U must come from the cached Gram blocks")
 
     monkeypatch.setattr(kkt_module, "_woodbury_factors", _forbidden)
+    # The block route must actually receive the cached Gram — without this spy
+    # the ban above is vacuous (the block branch never calls the legacy
+    # ``_woodbury_factors`` even when it recomputes the O(n·k²) product).
+    gram_seen: list[bool] = []
+    original_blocks = kkt_module._woodbury_factors_blocks
+
+    def _spy(*args, **kwargs):
+        gram_seen.append(kwargs.get("gram_u") is not None)
+        return original_blocks(*args, **kwargs)
+
+    monkeypatch.setattr(kkt_module, "_woodbury_factors_blocks", _spy)
     assert_allclose(namespace, op.dense_structured_solve(rhs), expected, **tol)
+    assert gram_seen and all(gram_seen)
     # Matrix right-hand sides take the same path.
     rhs2 = namespace.stack((rhs, 2.0 * rhs), axis=1)
     assert_allclose(
@@ -1316,3 +1328,221 @@ def test_condensed_dense_structured_solve_resolves_namespace_once(
     monkeypatch.setattr(kkt_module, "array_namespace", _counting)
     op.dense_structured_solve(array(namespace, [1.0, -2.0, 0.5]))
     assert calls <= 1, calls
+
+
+def test_condensed_dense_structured_solve_before_first_lbfgs_pair(namespace, tol):
+    # Iteration 0 of every L-BFGS run: no curvature pair yet, so ``W`` is the
+    # identity seed and ``N = I + Σ_x + δ_w I`` is diagonal. The structured
+    # solve must handle it instead of raising — the dense solver would
+    # otherwise materialize the full n×n block (39 GB at n = 50k).
+    W = LBFGSOperator(3, LBFGSOptions(memory=5))
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype))
+    rhs = array(namespace, [1.0, -2.0, 0.5])
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+
+    actual = op.dense_structured_solve(rhs)
+    expected = rhs / array(namespace, [1.25 + 1e-6, 1.75 + 1e-6, 2.25 + 1e-6])
+
+    assert_allclose(namespace, actual, expected, **tol)
+    matrix_rhs = namespace.stack((rhs, 2.0 * rhs), axis=1)
+    assert_allclose(
+        namespace,
+        op.dense_structured_solve(matrix_rhs),
+        namespace.stack((expected, 2.0 * expected), axis=1),
+        **tol,
+    )
+
+
+def test_condensed_lbfgs_inverse_exactness_flag(namespace):
+    # The Woodbury inverse is the *exact* N⁻¹ only without an inequality Gram
+    # term (whose off-diagonal it drops); the Krylov solver keys on this.
+    W = _lbfgs_operator(namespace)
+    dtype = array(namespace, [0.0]).dtype
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    bound_only = build_condensed_operator(
+        W,
+        sigma_x,
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 3), dtype=dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+    with_ineq = build_condensed_operator(
+        W,
+        sigma_x,
+        Diagonal(array(namespace, [2.0])),
+        Dense(array(namespace, [[1.0, 2.0, 0.5]])),
+        RegularizationState(delta_w=1e-6),
+    )
+    no_pairs = build_condensed_operator(
+        LBFGSOperator(3, LBFGSOptions(memory=5)),
+        sigma_x,
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 3), dtype=dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+
+    assert bound_only.lbfgs_inverse_is_exact()
+    assert not with_ineq.lbfgs_inverse_is_exact()
+    assert not no_pairs.lbfgs_inverse_is_exact()
+
+
+def test_condensed_woodbury_factors_memoized_per_instance(namespace, tol, monkeypatch):
+    """Repeated Woodbury applies on one operator instance reuse the factors.
+
+    The factors depend only on the instance's (immutable) blocks and the L-BFGS
+    window, so the auto-promotion probe, a promoted retry, and repeated
+    ``lbfgs_inverse_apply`` calls must not each pay the O(n·k²) build again.
+    """
+    from ipax.ipm import kkt as kkt_module
+
+    W = _lbfgs_operator(namespace)
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    op = build_condensed_operator(
+        W,
+        sigma_x,
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+    rhs = array(namespace, [1.0, -2.0, 0.5])
+
+    builds: list[int] = []
+    original = kkt_module._woodbury_factors_blocks
+
+    def _spy(*args, **kwargs):
+        builds.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kkt_module, "_woodbury_factors_blocks", _spy)
+    first = op.lbfgs_inverse_apply()(rhs)
+    second = op.lbfgs_inverse_apply()(rhs)
+
+    assert len(builds) == 1
+    # A cache hit reuses the very same factors: bitwise-identical results.
+    assert bool(namespace.all(first == second))
+    # ... and the structured dense solve shares them on a bound-only block
+    # (same ``D`` by construction: no inequality Gram term).
+    op.dense_structured_solve(rhs)
+    assert len(builds) == 1
+
+
+def test_condensed_woodbury_memo_invalidated_by_lbfgs_update(namespace, tol):
+    """A curvature update on the shared ``W`` must never serve stale factors."""
+    W = _lbfgs_operator(namespace)
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    empty_sigma_s = Diagonal(array(namespace, []))
+    empty_jac = Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype))
+    op = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+    rhs = array(namespace, [1.0, -2.0, 0.5])
+
+    before = op.lbfgs_inverse_apply()(rhs)
+    W.update(array(namespace, [0.3, 0.8, -0.2]), array(namespace, [0.9, 1.1, 0.4]))
+    after = op.lbfgs_inverse_apply()(rhs)
+
+    fresh = build_condensed_operator(
+        W, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+    )
+    expected = fresh.lbfgs_inverse_apply()(rhs)
+    assert_allclose(namespace, after, expected, **tol)
+    # The update genuinely changed the system — a stale cache would show here.
+    assert not bool(namespace.all(before == after))
+
+
+def test_condensed_woodbury_without_generation_token_is_never_cached(
+    namespace, monkeypatch
+):
+    """A duck-typed ``W`` exposing ``compact_blocks`` but no ``generation``
+    cannot be staleness-checked, so its factors must be rebuilt on every call
+    (correctness over speed for foreign compact-form operators)."""
+    from ipax.ipm import kkt as kkt_module
+
+    inner = _lbfgs_operator(namespace)
+
+    class _TokenlessCompactW(LinearOperator):
+        @property
+        def shape(self):
+            return inner.shape
+
+        def matvec(self, v):
+            return inner.matvec(v)
+
+        def rmatvec(self, v):
+            return inner.rmatvec(v)
+
+        def diagonal(self, like=None):
+            return inner.diagonal(like)
+
+        def compact_blocks(self):
+            return inner.compact_blocks()
+
+    op = build_condensed_operator(
+        _TokenlessCompactW(),
+        Diagonal(array(namespace, [0.25, 0.75, 1.25])),
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 3), dtype=array(namespace, [0.0]).dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+    rhs = array(namespace, [1.0, -2.0, 0.5])
+
+    builds: list[int] = []
+    original = kkt_module._woodbury_factors_blocks
+
+    def _spy(*args, **kwargs):
+        builds.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kkt_module, "_woodbury_factors_blocks", _spy)
+    first = op.lbfgs_inverse_apply()(rhs)
+    second = op.lbfgs_inverse_apply()(rhs)
+
+    assert len(builds) == 2
+    assert bool(namespace.all(first == second))
+
+
+def test_condensed_positive_definite_hint_follows_hessian(namespace):
+    # N = W + Σ_x + δ_w I + ∇gᵀ Σ_s ∇g is PD by construction exactly when W is:
+    # the Powell-damped L-BFGS Hessian declares it (with or without pairs), an
+    # explicit Hessian does not (it may be indefinite — that is the guard's job),
+    # and the indefinite equality saddle never does.
+    dtype = array(namespace, [0.0]).dtype
+    sigma_x = Diagonal(array(namespace, [0.25, 0.75, 1.25]))
+    sigma_s = Diagonal(array(namespace, [2.0]))
+    jac = Dense(array(namespace, [[1.0, 2.0, 0.5]]))
+    reg = RegularizationState(delta_w=1e-6)
+    W = _lbfgs_operator(namespace)
+    assert W.positive_definite_hint()
+    lbfgs = build_condensed_operator(W, sigma_x, sigma_s, jac, reg)
+    no_pairs = build_condensed_operator(
+        LBFGSOperator(3, LBFGSOptions(memory=5)), sigma_x, sigma_s, jac, reg
+    )
+    explicit = build_condensed_operator(
+        Dense(namespace.eye(3, dtype=dtype)), sigma_x, sigma_s, jac, reg
+    )
+    saddle = build_saddle_operator(
+        lbfgs, Dense(array(namespace, [[1.0, -1.0, 0.0]])), 1e-4
+    )
+
+    assert lbfgs.positive_definite_hint()
+    assert no_pairs.positive_definite_hint()
+    assert not explicit.positive_definite_hint()
+    assert not saddle.positive_definite_hint()
+
+
+def test_woodbury_solve_blocks_rejects_bad_rank(namespace):
+    from ipax.ipm.kkt import _woodbury_factors_blocks, _woodbury_solve_blocks
+
+    d = array(namespace, [2.0, 2.0])
+    s = array(namespace, [[1.0], [0.5]])
+    y = array(namespace, [[0.5], [1.0]])
+    m = array(namespace, [[3.0, 0.0], [0.0, 3.0]])
+    factors = _woodbury_factors_blocks(d, 1.0, s, y, m, namespace)
+    with pytest.raises(ValueError, match="vector or matrix"):
+        _woodbury_solve_blocks(
+            factors, namespace.zeros((2, 1, 1), dtype=d.dtype), namespace
+        )

@@ -81,6 +81,58 @@ is usually cheap to write.
     The default `hessian="lbfgs"` ignores an analytic Hessian; see
     [Configuring the solver](options.md#hessian).
 
+## Sharing work between the objective and the gradient
+
+When `f` and `∇f` share an expensive intermediate — the classic case is a
+composite `f(Ax)` whose gradient is `Aᵀ∇f(Ax)`, so both need the same `A @ x`
+product — the solver cannot know that: it calls `objective` and `gradient`
+separately, and each would pay the product again. The fix lives in *your*
+`Problem`: memoize the intermediate for the most recent point.
+
+```python
+class CompositeLS(ipax.Problem):
+    def __init__(self, A, target):
+        self._A = A
+        self._target = target
+        self._last = (None, None)  # (x it was computed at, A @ x)
+
+    def _ax(self, x):
+        key, value = self._last
+        if key is not x:  # identity, not equality — no device sync
+            value = self._A @ x
+            self._last = (x, value)
+        return value
+
+    @property
+    def n_vars(self):
+        return self._A.shape[1]
+
+    def objective(self, x):
+        r = self._ax(x) - self._target
+        return 0.5 * (r @ r)
+
+    def gradient(self, x):
+        r = self._ax(x) - self._target
+        return self._A.T @ r
+```
+
+A one-slot cache keyed on **array identity** (`is`, never `==`) is exactly
+right here, for two reasons. First, the solver evaluates callbacks once per
+visited point and carries the accepted line-search trial forward *as the same
+array object*, so the gradient at an accepted point sees the very array the
+last objective call saw — the cache hits by construction. Second, an identity
+miss merely recomputes, so the cache can never return a stale value, and the
+single slot cannot grow. On a problem where each pass over `A` dominates
+(the radiotherapy fluence-map shape: one `A @ x` per line-search trial plus
+one for the gradient), this removes one full pass per iteration — roughly
+25–30% of the per-iteration floor at `n = 5·10⁴`.
+
+The same pattern applies to a constraint value/Jacobian pair sharing a
+forward evaluation. Don't reach for value-based keys (hashing or comparing
+arrays costs a device sync and can false-hit after in-place edits); don't
+cache more than the last point (the solver revisits old points only through
+arrays it kept alive, which the identity key already serves).
+
 ## Constraints
 
 `ipax` solves the standard form

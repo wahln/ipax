@@ -6,6 +6,234 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- **Linear-inequality L-BFGS performance review and benchmark.** Document
+  dense, Krylov, and sparse costs, portable candidates, and optional adapter/JIT
+  proposals for bounded problems with affine inequalities.
+- **Performance proposals in the contributor documentation.** Record optional
+  compact-factor/BLAS adapters and JIT experiments for bound-only L-BFGS,
+  including dependency candidates, numerical safeguards, and validation criteria.
+- **Matrix-free feasibility restoration, auto-selected by size.**
+  `RestorationOptions(linear_solver="krylov")` solves the reduced, damped
+  Gauss-Newton restoration model through Jacobian `matvec`/`rmatvec`
+  products, eliminating the dense `n x n` identity, Hessian, and Jacobian
+  materializations. The new default `"auto"` follows the main route's dense
+  size cutoff — dense below 10 000 variables, Krylov at and above — because
+  the paired S2MPJ sweep (v29, 2026-09-04) put the Krylov route at −12
+  correct of 6600 rows on that corpus of small problems (an n×n dense solve
+  is cheaper there than a Krylov ladder per damping trial; every flipped
+  problem had n ≤ 1247, so `"auto"` reproduces the dense results on the whole
+  corpus), while at n = 12 000 the dense route spends 22 s and 2.3 GB on a
+  trivial restoration that the matrix-free route finishes in milliseconds.
+  `"dense"` and `"krylov"` force a route regardless of size;
+  `--restoration-linear-solver` exposes all three in the sweep runner. A
+  work-capped inner solve contributes its truncated Krylov
+  iterate as the Levenberg-Marquardt trial direction (a descent direction of
+  the Gauss-Newton model, Steihaug 1983) instead of being discarded; only a
+  solve that yields no finite direction climbs the damping ladder, and if
+  none ever does restoration returns an uncertified failure. It never
+  silently falls back to a scale-breaking dense allocation. A matvec-only
+  Jacobian is refused at `solve()` entry rather than at the first restoration,
+  and the solver is built per restoration entry so the last restoration
+  point's Jacobians are released when it returns.
+- **Docs: bound-only RT recipe and objective/gradient work-sharing.** The
+  TROTS benchmark page gains a measured recipe for bound-only fluence-map
+  runs (`LBFGSOptions(seed_formula="scalar1", memory=20-50)` + the default
+  monotone mu schedule; objective 13.4 -> 8.396 at 300 iterations on the
+  n = 50k study problem, beating SciPy L-BFGS-B at equal memory), with a
+  matching signature row on the routing-hints page. The Problem guide gains
+  a "Sharing work between the objective and the gradient" recipe: a one-slot
+  identity-keyed cache for a shared intermediate such as `A @ x`, which the
+  driver's once-per-point callback evaluation turns into a guaranteed hit at
+  every accepted point (verified: 145 callback calls -> 81 products on a
+  bound-constrained composite least-squares solve).
+
+### Fixed
+- **`Dense.row_gram_diagonal` no longer overflows on large entries.** It
+  squared the matrix before weighting (`(A·A)·w`); it now weights first
+  (`(A·w)·A`, matching `gram_diagonal`), so the equality-saddle Schur diagonal
+  stays finite whenever the weighted product is representable.
+- **Row scaling preserves batched adjoint products.** Forward `rmatmat` to
+  the wrapped operator, including supported empty batches, instead of looping
+  over columns.
+- **Changelog verification on Windows.** Run `kacl-verify` in Python UTF-8 mode
+  so mathematical symbols in `CHANGELOG.md` do not trigger a CP1252 decoding
+  error in python-kacl's locale-dependent file reader.
+- **Restoration probes for a saddle before certifying local infeasibility.**
+  On a symmetry-invariant subspace (equal components at a permutation-symmetric
+  start — S2MPJ POWERSUMNE, HADAMARD — or the cyclic ring of CYCLOOCT) every
+  Gauss-Newton direction stays in the subspace, and a critical point of the
+  restricted infeasibility is a critical point of the full one (Palais 1979): a
+  saddle, which the first-order STATIONARY/NO_DESCENT certificate reported as
+  local infeasibility. The dense reference solve escaped only through LU
+  round-off in near-null directions; the exact matrix-free route did not and
+  labelled feasible problems `infeasible`. `restore()` now kicks the iterate
+  once along a fixed, deterministic aperiodic direction before certifying and
+  lets the damped Gauss-Newton loop continue — a saddle's unstable manifold
+  amplifies the kick, a genuine local minimizer re-certifies at the same point.
+- **SOC rounds reuse the loop's own fallback factorization.** When round 1's
+  re-solve fails and its fresh ladder ends regularized, the later rounds now
+  re-solve that factorization instead of re-climbing the ladder per round —
+  on the Krylov routes every rung is a full CG solve, and DRUGDIS spent 161
+  of 170 in-SOC ladders re-deriving the same δ_w (v29 sweep). Whether the
+  step's own regularized matrix is reused for the first correction depends
+  on the solver kind — see "SOC reuse policy follows the solver kind" under
+  Changed.
+- **SOC factorization reuse follows the retained factorization.** The reuse
+  gate read two hand-maintained flags (`factor_matches_step`, the step's
+  `δ_w`) that went stale inside the SOC loop: after a failed re-solve, the
+  fresh fallback could leave the solver factored at `δ_w > 0` and later
+  rounds still re-solved against that inflated matrix; and a phase-2 ladder
+  success (δ_w reset to 0, δ_c escalated) reported `δ_w = 0` and was reused
+  as if unregularized. `_solve_step` now records at factor time whether the
+  retained matrix is the unregularized one, and the gate reads that per round.
+- **Out-of-memory inside the exact L-BFGS Woodbury apply propagates.** It was
+  relabeled as a Krylov convergence failure, which sticky-disabled the exact
+  inverse and hid the cause behind a slower Jacobi retry (torch's CUDA OOM is
+  a `RuntimeError`, not a `MemoryError`).
+- **Bound-only L-BFGS problems no longer materialize the dense condensed
+  block.** Before the first curvature pair `LBFGSOperator.compact_form` raised,
+  the structured Woodbury solve propagated the error and `DenseSolver` fell
+  through to forming and LU-factoring the full `n×n` matrix — 39 GB and
+  488 s per iteration at `n = 50k` on an RT-style box-bounded least-squares
+  problem. The pair-less seed `B = I` is now solved as the diagonal it is, so
+  `linsolve="dense"` stays on the structured path from iteration 0
+  (5 ms per step at `n = 50k`).
+
+### Changed
+- **Dense Cholesky reuse for the L-BFGS block with inequalities.** A new
+  optional `LinearOperator.positive_definite_hint()` (declared by the
+  Powell-damped L-BFGS Hessian and the condensed block built on it) lets
+  `DenseSolver` Cholesky-factor the materialized block it previously solved by
+  LU on every right-hand side, keeping the factor for corrector/SOC back-solves
+  through the existing back-substitution gap-filler. A numerical Cholesky
+  failure falls back to LU; the PD guard for explicit Hessians is unchanged.
+  Such a breakdown is bookkept like the mixed route's failures: after
+  `DenseOptions.pd_hint_failure_limit` (default 3) *consecutive* breakdowns
+  the solver stops attempting the hinted Cholesky for the rest of the run
+  (any success resets the count — conditioning along an IPM run is not
+  monotone, so one hard iterate must not forfeit the reuse everywhere else),
+  and `DenseSolver.describe()` — hence `Result.routes` — carries a sticky
+  `pd-hint->lu` marker once any breakdown has occurred, so a run in which
+  the hinted factorization fell back to LU never reads as a clean `dense`
+  run. A breakdown on the mixed route's reduced-precision matrix is marked
+  but counts toward neither kill switch: it may be precision noise, and the
+  refinement pass is the certificate that judges that matrix.
+- **Lower temporary memory for dense Gram diagonals.** Reuse the owned
+  weighted-Jacobian buffer on mutable backends in `Dense.gram_diagonal` and
+  `Dense.row_gram_diagonal` (one `m×n` temporary instead of two), leaving
+  caller arrays unchanged; `gram_diagonal` keeps its `(w·A)·A` order.
+- **L-BFGS compact setup reuse.** Check the generation-keyed Woodbury cache
+  before rebuilding diagonal/Gram arrays, and share the cached-Gram shortcut
+  for fully unbounded systems between dense and Krylov consumers. Bound-only
+  arithmetic and cache invalidation are preserved. Add a three-route review
+  and reproducible NumPy/Torch/CuPy measurements under `benchmarks/`.
+- **SOC reuse policy follows the solver kind.** `LinearSolver` gains an
+  optional `is_direct()` hook (`DenseSolver`/`SparseDirectSolver` `True`,
+  `KrylovSolver` `False`; absent = direct). Iterative routes now re-solve the
+  step's retained system for every second-order correction even when it is
+  regularized (Wächter & Biegler 2006 eq. (26) verbatim): a fresh `δ_w = 0`
+  solve there is a full Krylov ladder per round, which turned DRUGDIS
+  lbfgs/krylov from 21 s into `max_time` and cost DALLASS/NET1/SPECANNE in the
+  v29 sweep. Direct routes keep the fresh first correction at `δ_w = 0`
+  (their factorization per rung is cheap, and reusing the inflated matrix
+  rerouted ZAMB2/ACOPP30). Iterative routes also never solve fresh inside
+  SOC: a failed re-solve, or a step whose own ladder failed
+  (`_factor_failed`, recorded alongside the unregularized flag), skips the
+  opportunistic correction instead of climbing a ladder — with the fresh
+  fallback still in place, DRUGDIS's 233 failed re-solves cost 120 s. Direct
+  routes keep the fresh fallback on either event. Confirming S2MPJ sweep
+  (v30 vs v29, 2026-09-04, machine factor 0.99–1.01): +2 correct of 6600;
+  the Krylov routes trade 9 basin flips each way at 22 % less total wall on
+  `exact/krylov` (11.2 h → 8.7 h) with DRUGDIS/DALLASS/NET1/SPECANNE back
+  from `max_time`; the direct routes are trajectory-identical.
+- `KrylovOptions` no longer requires `rtol <= adaptive_rtol_max` when
+  `adaptive_tol=False`: the cap bounds the inexact-Newton forcing only, so a
+  fixed tolerance (e.g. a loosened `RestorationOptions.krylov.rtol`) is free
+  of it.
+- **L-BFGS compact applies keep their finiteness guard on device.** A
+  non-finite compact solve output is replaced by zeros before the low-rank
+  products, preserving the identity-seed fallback without synchronizing once
+  per operator application.
+- **New opt-in: quadratic-interpolation backtracking in the filter line
+  search.** After a rejected trial,
+  `LineSearchOptions(backtrack_interpolation=True)` steps to the minimizer of
+  the quadratic merit model through `phi(0)`, `phi'(0)` and the rejected
+  `phi(alpha)` (Nocedal & Wright 2006, eq. (3.58)), safeguarded into
+  `[0.1 alpha, 0.5 alpha]` (`backtrack_shrink_min`/`backtrack_shrink_max`) —
+  never longer than plain halving — falling back to halving whenever the
+  model is unusable (non-finite trial merit, non-descent direction,
+  non-positive model curvature). The opt-in free-mode search has no merit
+  model and always halves. Measured on the RT-style bound-only L-BFGS study
+  (n = 50k, `scalar1` seed): 3.3-4.1 objective evaluations per iteration drop
+  to 2.0-2.4 — each one a dose-projection `D@x` at scale — and a hopeless ray
+  concedes to restoration in ~7 trials instead of 21. **Default stays `False`
+  (plain halving)**: this lever's own contribution to the 2026-08-31 full
+  S2MPJ corpus sweep is **+11/6600**, and not unanimously — the three
+  Hessian-agnostic `exact/*` configs (which isolate this lever alone, since
+  they never touch the L-BFGS code the other changes below target) net
+  -1/3300, including reproducible worse-basin flips on HS97/HS98/OSBORNEB on
+  2 of the 3 exact routes, while the default L-BFGS Hessian mode nets +12/3300
+  (a same-commit A/B with the other L-BFGS-specific changes below held fixed).
+  See `benchmarks/routing_hints.py` (e.g. HS25) and `docs/benchmarks/s2mpj.md`
+  for the per-problem detail and the full table (the raw candidate-vs-baseline
+  delta there is +18/6600, but that credits all three perf commits at once —
+  not this lever in isolation).
+- **The L-BFGS compact factor stays in S/Y block form on the hot path.** The
+  operator no longer materializes and copies `U = [xiS Y]` (n x 2k) on every
+  curvature update; the matvec, the structured Woodbury solves and the exact
+  inverse consume the `S`/`Y` blocks directly (new `compact_blocks` hook, with
+  `compact_form` materializing on demand for the sparse assembly). The inner
+  Woodbury factor is assembled from three n x k Gram products instead of the
+  2k-wide product. The algebra is identical but the operation order differs at
+  round-off level, so knife-edge trajectories may flip — the 2026-08-31 full
+  S2MPJ sweep (v24 vs v23) confirmed only knife-edge churn, +18/6600 for the
+  three L-BFGS perf commits together (see the interpolated-backtracking entry
+  below for the per-lever split); at n = 50k the per-iteration
+  bookkeeping drops from ~17 to ~13 ms at memory 20 and the memory-50
+  configuration falls from ~88 to ~55 ms/iteration end to end.
+- **Krylov applies the exact L-BFGS inverse on bound-only systems.** With no
+  inequality Gram term the condensed Woodbury inverse is the exact `N⁻¹`, so
+  the default (`"jacobi"`) and `"auto"` preconditioner modes now use it
+  directly (`Result.linear_solver` reports `pc=lbfgs-exact`): a direct
+  one-apply solve — verified by a true-residual check, with working-precision
+  iterative refinement covering round-off, and falling back to the
+  CG-preconditioned route whenever refinement stalls, so robustness is a
+  strict superset of the old CG wrapper — instead of ~30 CG iterations, and
+  no O(n·k²) L-BFGS diagonal per solve — 34 → 6 ms per step at `n = 50k`.
+  Iterates are unchanged up to the inner tolerance. A solve that breaks down
+  under the exact inverse retries on Jacobi. `"none"` still disables
+  preconditioning entirely.
+- **Second-order corrections reuse the step's factorization at
+  unregularized steps.** Each SOC round used to rebuild the condensed/saddle
+  operator and re-run the delta_w escalation ladder from zero — a fresh
+  factorization per round — even though at a `delta_w = 0` step the retained
+  matrix is exactly the reference SOC system (Wächter & Biegler 2006, §2.4,
+  eq. (26): "the same matrix as in (13)... to avoid additional matrix
+  factorizations"). SOC now re-solves the retained factorization there,
+  like the centrality correctors; on HS71 under defaults this cuts the
+  dense route from 28 factorizations to 8 (20 of 28 KKT solves per run are
+  SOC re-solves), and on the sparse-direct route each avoided factorization
+  is a full LDLT. At a *regularized* step (`delta_w > 0`) on a direct route
+  SOC keeps ipax's long-standing fresh `delta_w = 0` solve — a deliberate,
+  now-documented deviation from eq. (26): reusing the delta_w-inflated
+  matrix measurably degrades the feasibility correction there
+  (ZAMB2/ZAMB2m11/ACOPP30/TWIRIMD1 left their baseline trajectories for
+  restoration-heavy paths 10-60x more expensive per iteration), so direct
+  routes' iterate trajectories are unchanged. Iterative routes reuse the
+  step's system regardless — see "SOC reuse policy follows the solver kind"
+  under Changed. The fresh solve is also the fallback when a re-solve fails.
+- **Less redundant work around the condensed Woodbury factors.** The
+  condensed
+  operator memoizes its Woodbury factorization per instance (keyed on the
+  L-BFGS window's new `generation` token, so a curvature update can never
+  serve stale factors): the Krylov auto-promotion probe and a promoted retry
+  reuse the factors the solve already built instead of repeating the O(n·k²)
+  product. The `"auto"` promotion check now also tests slowness *before*
+  probing availability, so a fast successful solve no longer pays a
+  build-and-discard factorization every iteration. Reused factors are
+  bitwise-identical — results do not change.
+
 ## [0.10.1] - 2026-08-27
 
 ### Changed

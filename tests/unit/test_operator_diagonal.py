@@ -115,3 +115,54 @@ def test_lowrank_has_no_cheap_diagonal(namespace):
     V = array(namespace, [[-1.0, 0.0], [2.0, 1.0]])
     with pytest.raises(NotImplementedError):
         LowRank(U, V).diagonal()
+
+
+@pytest.mark.parametrize("dtype_name", ["float32", "float64"])
+def test_dense_weighted_diagonal_preserves_inputs_and_product_order(
+    namespace, dtype_name
+):
+    # Squaring A first overflows; weighting first gives a finite answer.
+    xp = namespace
+    dtype = getattr(xp, dtype_name)
+    large, small = (1e20, 1e-20) if dtype_name == "float32" else (1e200, 1e-200)
+    A = xp.asarray([[large, -large], [2.0, 3.0]], dtype=dtype)
+    weights = xp.asarray([small, -2.0], dtype=dtype)
+    original_A = xp.asarray(A, copy=True)
+    original_weights = xp.asarray(weights, copy=True)
+    op = Dense(A)
+    for _ in range(2):
+        result = op.gram_diagonal(weights)
+        assert bool(xp.all(xp.isfinite(result)))
+        assert_allclose(xp, result, xp.asarray([large, large], dtype=dtype), rtol=2e-6)
+        assert_allclose(xp, A, original_A, rtol=0.0, atol=0.0)
+        assert_allclose(xp, weights, original_weights, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("shape", [(0, 3), (2, 0)])
+def test_dense_weighted_diagonal_empty_dimensions(namespace, shape):
+    xp = namespace
+    A = xp.zeros(shape, dtype=xp.float64)
+    result = Dense(A).gram_diagonal(xp.ones((shape[0],), dtype=A.dtype))
+    assert result.shape == (shape[1],)
+    assert bool(xp.all(result == 0.0))
+
+
+@pytest.mark.parametrize("dtype_name", ["float32", "float64"])
+def test_dense_row_weighted_diagonal_preserves_inputs_and_product_order(
+    namespace, dtype_name
+):
+    # Transposed twin of the column test: diag(A W Aᵀ) with the same overflow trap.
+    xp = namespace
+    dtype = getattr(xp, dtype_name)
+    large, small = (1e20, 1e-20) if dtype_name == "float32" else (1e200, 1e-200)
+    A = xp.asarray([[large, 2.0], [-large, 3.0]], dtype=dtype)
+    weights = xp.asarray([small, -2.0], dtype=dtype)
+    original_A = xp.asarray(A, copy=True)
+    original_weights = xp.asarray(weights, copy=True)
+    op = Dense(A)
+    for _ in range(2):
+        result = op.row_gram_diagonal(weights)
+        assert bool(xp.all(xp.isfinite(result)))
+        assert_allclose(xp, result, xp.asarray([large, large], dtype=dtype), rtol=2e-6)
+        assert_allclose(xp, A, original_A, rtol=0.0, atol=0.0)
+        assert_allclose(xp, weights, original_weights, rtol=0.0, atol=0.0)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 from ipax import FunctionProblem, Options, Status, solve
@@ -72,6 +74,19 @@ def test_lbfgs_update_drops_non_finite_curvature_pair(namespace, bad):
 
     assert bool(namespace.all(namespace.isfinite(after)))
     assert_allclose(namespace, after, before)
+
+
+def test_lbfgs_update_rejects_non_finite_pair_before_curvature_arithmetic(namespace):
+    """A rejected pair must not evaluate an invalid ``0 * inf`` product."""
+    delta = array(namespace, [1.0, 0.0])
+    gamma = array(namespace, [2.0, float("inf")])
+    op = LBFGSOperator(2, LBFGSOptions(memory=3, powell_damping=True))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        op.update(delta, gamma)
+
+    assert not op.has_curvature_pairs()
 
 
 def test_lbfgs_initial_scaling_option_controls_seed_curvature(namespace):
@@ -271,3 +286,45 @@ def test_lbfgs_apply_does_not_reresolve_namespace(namespace, monkeypatch):
     op.matvec(v)
     op.diagonal()
     op.compact_form()
+
+
+def test_lbfgs_compact_blocks_match_compact_form(namespace, tol):
+    """``compact_blocks`` returns ``(ξ, S, Y, M)`` with ``U = [ξS  Y]``.
+
+    The block form is the hot-path view (the Woodbury solves consume S and Y
+    directly, so the n×2k ``U`` is never materialized per iteration);
+    ``compact_form`` stays as the materializing view for the sparse assembly.
+    """
+    op = LBFGSOperator(3, LBFGSOptions(memory=5))
+    op.update(array(namespace, [1.0, 0.5, -0.5]), array(namespace, [2.0, 1.0, 0.5]))
+    op.update(array(namespace, [0.5, -1.0, 1.0]), array(namespace, [1.0, 1.5, 0.5]))
+
+    xi_b, s, y, m_b = op.compact_blocks()
+    xi, u, m = op.compact_form()
+
+    assert xi_b == xi
+    assert_allclose(namespace, namespace.concat((xi * s, y), axis=1), u, **tol)
+    assert_allclose(namespace, m_b, m, **tol)
+
+
+def test_lbfgs_compact_blocks_unavailable_before_first_pair(namespace):
+    op = LBFGSOperator(3, LBFGSOptions(memory=5))
+    with pytest.raises(NotImplementedError):
+        op.compact_blocks()
+
+
+def test_lbfgs_generation_tracks_window_changes(namespace):
+    """``generation`` is a cheap staleness token for factor caches downstream.
+
+    Consumers that cache work derived from the compact window (the condensed
+    Woodbury factors in ``ipm/kkt.py``) key on it; it must change on every
+    accepted curvature update and start at a stable value before the first.
+    """
+    op = LBFGSOperator(3, LBFGSOptions(memory=5))
+    g0 = op.generation
+    op.update(array(namespace, [1.0, 0.5, -0.5]), array(namespace, [2.0, 1.0, 0.5]))
+    g1 = op.generation
+    op.update(array(namespace, [0.5, -1.0, 1.0]), array(namespace, [1.0, 1.5, 0.5]))
+    g2 = op.generation
+
+    assert g0 != g1 and g1 != g2 and g0 != g2

@@ -16,6 +16,8 @@ from ipax.backend.operators import (
     VStack,
 )
 from ipax.backend.sparse import get_sparse_adapter
+from ipax.ipm.hessian import LBFGSOperator
+from ipax.options import LBFGSOptions
 from tests._helpers import array, float_dtype, transpose
 from tests.contracts.test_operator_contract import LinearOperatorContract
 
@@ -60,6 +62,21 @@ class TestLowRankOperator(LinearOperatorContract):
     def make_operator(self, namespace):
         U, V = self._factors(namespace)
         return LowRank(U, V)
+
+
+class TestLBFGSOperator(LinearOperatorContract):
+    # The compact Powell-damped Hessian after one curvature pair: the only
+    # built-in operator that answers ``positive_definite_hint()`` with True,
+    # so the battery's Cholesky-honesty check runs its positive branch here.
+    def make_operator(self, namespace):
+        op = LBFGSOperator(3, LBFGSOptions(memory=5))
+        op.update(
+            array(namespace, [1.0, 0.5, -0.25]), array(namespace, [2.0, 1.0, 0.5])
+        )
+        return op
+
+    def make_dense(self, namespace):
+        return self.make_operator(namespace).dense_matrix(array(namespace, [0.0]))
 
 
 class TestMatrixFreeJacobian(LinearOperatorContract):

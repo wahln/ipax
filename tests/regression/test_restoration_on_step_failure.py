@@ -18,8 +18,15 @@ makes feasibility progress or terminates with an honest infeasibility verdict.
 
 from __future__ import annotations
 
+import gc
+import weakref
+
+import pytest
+
 from ipax import Options, Status, solve
 from ipax.ipm.driver import IPMDriver
+from ipax.linalg.krylov import KrylovSolver
+from ipax.options import RestorationOptions
 from ipax.testing.problems import HS35, InfeasibleEqualities
 from tests._helpers import array
 
@@ -40,28 +47,88 @@ def _fail_step_solve_once(monkeypatch):
     return calls
 
 
+def _count_krylov_solves(monkeypatch):
+    """Count ``KrylovSolver.solve`` calls; on a dense main route only restoration
+    can make them, so the count tells whether the opt-in route was wired in."""
+    calls = {"n": 0}
+    original = KrylovSolver.solve
+
+    def counting(self, rhs):
+        calls["n"] += 1
+        return original(self, rhs)
+
+    monkeypatch.setattr(KrylovSolver, "solve", counting)
+    return calls
+
+
+_RESTORATION_ROUTES = [RestorationOptions(), RestorationOptions(linear_solver="krylov")]
+
+
+@pytest.mark.parametrize("restoration", _RESTORATION_ROUTES, ids=["dense", "krylov"])
 def test_step_solve_failure_enters_restoration_not_numerical_error(
-    namespace, monkeypatch
+    namespace, monkeypatch, restoration
 ):
-    # HS35 from an infeasible start (g = x1+x2+2x3-3 = 5 > 0). Forcing the first
-    # step solve to fail must NOT immediately report numerical_error: the driver
-    # hands to feasibility restoration, which reaches the feasible region, and
-    # the solve still converges to the optimum f* = 1/9.
     xp = namespace
     problem = HS35(xp)
     x0 = array(xp, [2.0, 2.0, 2.0])
     calls = _fail_step_solve_once(monkeypatch)
+    krylov_solves = _count_krylov_solves(monkeypatch)
 
     result = solve(
         problem,
         x0,
-        options=Options(hessian="exact", linsolve="dense", max_iter=100),
+        options=Options(
+            hessian="exact", linsolve="dense", max_iter=100, restoration=restoration
+        ),
     )
 
-    assert calls["n"] >= 1  # the forced failure actually fired
+    assert calls["n"] >= 1
     assert result.status is not Status.NUMERICAL_ERROR
     assert result.status is Status.OPTIMAL
     assert abs(float(result.objective) - 1.0 / 9.0) <= 1e-6
+    assert (krylov_solves["n"] > 0) == (restoration.linear_solver == "krylov")
+
+
+def test_matrix_free_restoration_does_not_pin_its_operator_after_returning(
+    namespace, monkeypatch
+):
+    """The restoration solver must not keep the last restoration point's
+    Jacobians (an m×n operator at scale) alive for the rest of the run."""
+    xp = namespace
+    problem = HS35(xp)
+    x0 = array(xp, [2.0, 2.0, 2.0])
+    _fail_step_solve_once(monkeypatch)
+    factored: list[weakref.ref] = []
+    original_factor = KrylovSolver.factor
+
+    def recording_factor(self, operator):
+        factored.append(weakref.ref(operator))
+        return original_factor(self, operator)
+
+    monkeypatch.setattr(KrylovSolver, "factor", recording_factor)
+    alive_after_restoration: list[int] = []
+
+    def callback(record):
+        del record
+        if factored:
+            gc.collect()
+            alive_after_restoration.append(sum(ref() is not None for ref in factored))
+
+    result = solve(
+        problem,
+        x0,
+        options=Options(
+            hessian="exact",
+            linsolve="dense",
+            max_iter=100,
+            restoration=RestorationOptions(linear_solver="krylov"),
+        ),
+        callback=callback,
+    )
+
+    assert result.status is Status.OPTIMAL
+    assert alive_after_restoration, "the run never iterated past restoration"
+    assert alive_after_restoration[-1] == 0
 
 
 def test_step_solve_failure_on_infeasible_problem_reports_honestly(

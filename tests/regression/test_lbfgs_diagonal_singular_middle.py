@@ -43,7 +43,11 @@ from tests._helpers import array, assert_allclose
 def _operator_with_middle(namespace, middle, u):
     op = LBFGSOperator(2, LBFGSOptions())
     op._xi = 1.0
-    op._u = array(namespace, u)
+    # The operator stores the compact state as S/Y blocks (``U = [xi*S  Y]``
+    # with ``xi = 1``): split the test's two-column U into one pair.
+    u_full = array(namespace, u)
+    op._s = u_full[:, :1]
+    op._y = u_full[:, 1:]
     op._m = array(namespace, middle)
     return op
 

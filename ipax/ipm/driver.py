@@ -28,7 +28,9 @@ normal-equations route (Breedveld 2017, eq. 18); equalities border it into the
 Friedlander–Orban quasidefinite saddle. Globalization is the filter line-search
 (default) or the Breedveld step controller, with a Gauss-Newton feasibility
 restoration phase. The injected ``LinearSolver`` is the dense reference solver,
-the matrix-free Krylov solver, or the sparse-direct route.
+the matrix-free Krylov solver, or the sparse-direct route; restoration keeps
+its dense reference solve unless a second solver factory is injected for it
+(``RestorationOptions``).
 """
 
 from __future__ import annotations
@@ -437,10 +439,31 @@ class IPMDriver:
         callback: IterationCallback | None = None,
         record_transform: Callable[[IterationRecord], IterationRecord] | None = None,
         warm_start: WarmStart | None = None,
+        restoration_solver_factory: Callable[[], LinearSolver] | None = None,
     ) -> None:
         self._problem = problem
         self._xp = xp
         self._solver = solver
+        # A factory, built per restoration entry: the solver's retained operator
+        # (and the Jacobians behind it) must not outlive the restoration call.
+        self._restoration_solver_factory = restoration_solver_factory
+        # Whether the solver's retained factorization is the iteration's
+        # *unregularized* KKT matrix (δ_w = 0, base δ_c). Recorded by
+        # ``_solve_step`` at factor time — the only place the main solver is
+        # factored — so every consumer (the SOC reuse gate) reads the truth
+        # rather than reconstructing it from flags kept in step with each
+        # refactoring site.
+        self._factor_unregularized = False
+        # Whether the most recent ``_solve_step`` ladder ended *without* a
+        # usable factorization (the solver is left factored at the ladder's
+        # last, failed rung). Split from ``_factor_unregularized`` so the
+        # iterative-route SOC reuse below never re-solves a failed system.
+        self._factor_failed = False
+        # Direct vs iterative solver (``LinearSolver.is_direct``, optional —
+        # absent means direct): decides whether the second-order corrections
+        # re-solve a *regularized* retained system or solve fresh at δ_w = 0.
+        is_direct = getattr(solver, "is_direct", None)
+        self._solver_is_direct = bool(is_direct()) if callable(is_direct) else True
         self._options = options
         self._lower = lower
         self._upper = upper
@@ -950,6 +973,8 @@ class IPMDriver:
         x, s = start.x, start.s
         y_ineq, z_lower, z_upper = start.y_ineq, start.z_lower, start.z_upper
         y_eq = xp.zeros((m_eq,), dtype=dtype)
+        if self._restoration_solver_factory is not None:
+            self._check_restoration_adjoints(x, m, m_eq)
 
         if self._warm_start is not None:
             s, y_eq, y_ineq, z_lower, z_upper = apply_warm_start(
@@ -1425,6 +1450,11 @@ class IPMDriver:
                                 dx, mu=mu, dy_eq=dy_eq, **recover_kwargs
                             )
                             reg_applied = max(reg_applied, reg_fallback)
+                        # else: the failed fallback ladder left the solver
+                        # factored past the matrix that produced the (kept)
+                        # corrected direction; ``_solve_step`` recorded that
+                        # (``_factor_failed``), so SOC solves fresh instead of
+                        # re-solving against it on either route.
             else:
                 mu = self._next_mu(
                     mu,
@@ -1575,6 +1605,10 @@ class IPMDriver:
                         delta_w_floor=descent_floor,
                     )
                     if not ok:
+                        # The failed escalation refactored the solver past the
+                        # matrix that produced the (kept) earlier direction;
+                        # ``_solve_step`` recorded that (``_factor_failed``)
+                        # for the SOC gate.
                         break
                     step = recover_eliminated(dx, mu=mu, dy_eq=dy_eq, **recover_kwargs)
                     reg_applied = max(reg_applied, reg_descent)
@@ -1707,12 +1741,64 @@ class IPMDriver:
                 step: NewtonStep = step,
                 ineq_jac: LinearOperator = ineq_jac,
                 sigma_s: Array = sigma_s,
-                sigma_x: Array = sigma_x,
-                w: LinearOperator = w,
-                eq_jac: LinearOperator = eq_jac,
                 mu: float = mu,
+                w: LinearOperator = w,
+                sigma_x: Array = sigma_x,
+                eq_jac: LinearOperator = eq_jac,
             ) -> tuple[float, float] | None:
-                """Second-order correction for nonlinear constraint residuals."""
+                """Second-order correction for nonlinear constraint residuals.
+
+                While the solver's retained factorization is the iteration's
+                *unregularized* matrix (``δ_w = 0``, base ``δ_c`` — the common
+                case; ``_factor_unregularized``, recorded at factor time) each
+                correction re-solves it: that matrix is exactly Wächter &
+                Biegler 2006's choice (§2.4, eq. (26): "the same matrix as in
+                (13)", "to avoid additional matrix factorizations"), so
+                conformance and reuse coincide. (The right-hand side keeps
+                ipax's pre-existing residual convention — ``c`` at the
+                accumulated corrected point — rather than the eq. (27) blend.)
+
+                When the *step's* retained factorization is regularized (a
+                ``δ_w > 0`` step, a δ_c-escalated saddle, a failed re-solve
+                ladder) the policy depends on the solver kind
+                (``LinearSolver.is_direct``):
+
+                * **Direct** routes deviate and solve the first correction
+                  fresh at ``δ_w = 0``, as they always have: reusing the
+                  step's δ_w-inflated matrix degrades the feasibility
+                  correction enough to reroute whole runs — measured
+                  2026-09-02, ZAMB2/ZAMB2m11 (exact/dense) and
+                  ACOPP30/TWIRIMD1 (lbfgs/dense) all left their baseline
+                  trajectories for restoration-heavy paths 10-60× more
+                  expensive per iteration when SOC used the step's δ_w — and
+                  a fresh factorization per ladder rung is cheap there.
+                * **Iterative** routes reuse the step's system verbatim
+                  (eq. (26) as written) and never solve fresh inside SOC:
+                  a fresh δ_w = 0 solve is a full Krylov ladder per SOC
+                  round. Restricting reuse to unregularized steps (682f0fa)
+                  turned DRUGDIS lbfgs/krylov from 21 s into ``max_time``
+                  and cost DALLASS/NET1/SPECANNE alike in the v29 sweep;
+                  and with the fresh-ladder fallback still in place the
+                  route-aware gate alone left DRUGDIS at 120 s (233 failed
+                  re-solves each climbed a ladder). A failed re-solve — or a
+                  step whose own ladder failed (``_factor_failed``) — just
+                  skips the correction: it is opportunistic (§2.4).
+
+                On direct routes the fresh solve is also the fallback when
+                the re-solve fails, and the only option when the step's last
+                ladder *failed* (``_factor_failed``: the solver then holds a
+                factorization that produced no direction at all).
+
+                On direct routes a factorization produced by *this loop's
+                own* fresh solve is reused by the later rounds even when its
+                ladder ended regularized: that ladder already established
+                that ``δ_w = 0`` does not solve this rhs family, so
+                re-climbing it per round would only repeat the same rungs
+                (a factorization each) to land on the same matrix. (First
+                measured on the Krylov routes — v29 sweep, DRUGDIS: 161 of
+                170 in-SOC ladders ended regularized — where the policy
+                above now subsumes it.)
+                """
                 nonlocal soc_point
                 if opts.line_search.max_soc <= 0:
                     return None
@@ -1721,6 +1807,7 @@ class IPMDriver:
                 corr_x = xp.zeros_like(x)
                 corr_s = xp.zeros_like(s)
                 empty_ineq = xp.zeros((0,), dtype=dtype)
+                own_factor = False  # retained factorization made by this loop
 
                 for _ in range(opts.line_search.max_soc):
                     x_c = base_x + corr_x
@@ -1735,19 +1822,43 @@ class IPMDriver:
                     if m > 0:
                         rhs_soc = rhs_soc - ineq_jac.rmatvec(sigma_s * r_pi_c)
 
-                    dx_c, _, _, ok = solve_step_timed(
-                        w,
-                        sigma_x,
-                        sigma_s,
-                        ineq_jac,
-                        rhs_soc,
-                        eq_jac,
-                        m_eq,
-                        -c_c,
-                        delta_c,
-                    )
-                    if not ok:
+                    sol_c = None
+                    if (
+                        self._factor_unregularized
+                        or own_factor
+                        or not (self._solver_is_direct or self._factor_failed)
+                    ):
+                        # W&B-exact fast path (see the docstring): the retained
+                        # matrix IS the δ_w = 0 matrix here, so the re-solve is
+                        # bitwise the fresh solve below, minus the rebuild and
+                        # factorization — or it is this loop's own fallback
+                        # factorization, reused rather than re-climbed — or
+                        # the solver is iterative and a fresh solve costs a
+                        # ladder of full Krylov runs.
+                        sol_c = self._resolve_reused_factorization(rhs_soc, -c_c, m_eq)
+                    if sol_c is not None:
+                        dx_c = sol_c[: self._n]
+                    elif not self._solver_is_direct:
+                        # Iterative route: the correction is opportunistic
+                        # (W&B §2.4) and a fresh solve here is the δ_w
+                        # ladder — a full Krylov run per rung — that the
+                        # reuse exists to avoid. Skip the correction.
                         return None
+                    else:
+                        dx_c, _, _, ok = solve_step_timed(
+                            w,
+                            sigma_x,
+                            sigma_s,
+                            ineq_jac,
+                            rhs_soc,
+                            eq_jac,
+                            m_eq,
+                            -c_c,
+                            delta_c,
+                        )
+                        if not ok:
+                            return None
+                        own_factor = True
 
                     corr_x = corr_x + dx_c
                     if m > 0:
@@ -2298,6 +2409,42 @@ class IPMDriver:
             rhs = rhs - xp.where(mask_u, target_u / u_minus_x, xp.zeros_like(grad))
         return rhs
 
+    def _resolve_reused_factorization(
+        self, rhs_x: Array, r_y: Array, m_eq: int
+    ) -> Array | None:
+        """Re-solve the most recently factored KKT system for a new RHS.
+
+        Second-order corrections and the centrality correctors solve the same
+        linear system as the search direction, only with a different
+        right-hand side; Wächter & Biegler 2006 (§2.4, eq. (26)) use "the
+        same matrix as in (13)" — same ``δ_w``/``δ_c``, same factorization —
+        explicitly "to avoid additional matrix factorizations". The
+        sparse-direct route back-solves its LDLᵀ; the dense route
+        back-substitutes the retained Cholesky factor (an LU re-solve where
+        the backend lacks the triangular-solve gap-filler); the Krylov route
+        reuses the operator — the memoized Woodbury factors on structured
+        bound-only L-BFGS blocks, a fresh iterative solve otherwise. Returns
+        ``None`` on a failed or non-finite solve — these corrections are
+        opportunistic, so the caller simply proceeds without one.
+        """
+        xp = self._xp
+        rhs = xp.concat((rhs_x, r_y)) if m_eq > 0 else rhs_x
+        # Same accounting as ``solve_step_timed``: a matrix-free re-solve can
+        # call back into problem derivatives (autodiff-HVP matvecs), whose
+        # time is already charged to the problem — don't double-count it.
+        problem_before = self._problem_time_total
+        start = perf_counter()
+        try:
+            sol = self._solver.solve(rhs)
+        except LinearSolveError:
+            sol = None
+        elapsed = perf_counter() - start
+        problem_elapsed = self._problem_time_total - problem_before
+        self._step_solve_seconds += max(0.0, elapsed - problem_elapsed)
+        if sol is None or not bool(xp.all(xp.isfinite(sol))):
+            return None
+        return sol
+
     def _solve_targets_reused_operator(
         self,
         comp_s: Array,
@@ -2311,25 +2458,17 @@ class IPMDriver:
     ) -> NewtonStep | None:
         """Solve the current condensed system for new complementarity targets.
 
-        The sparse-direct route reuses the factorization established by the
-        affine solve. Dense and Krylov solvers reuse the operator but perform a
-        fresh direct/iterative solve. Returns ``None`` on a failed/non-finite
-        solve so the corrector can fall back to the affine step.
+        A :meth:`_resolve_reused_factorization` on the system established by
+        the affine solve. Returns ``None`` on a failed/non-finite solve so
+        the corrector can fall back to the affine step.
         """
         xp = self._xp
         rhs_x = self._condensed_rhs(comp_s, comp_l, comp_u, **rhs_kwargs)
-        rhs = xp.concat((rhs_x, -c)) if m_eq > 0 else rhs_x
-        start = perf_counter()
-        try:
-            sol = self._solver.solve(rhs)
-        except LinearSolveError:
-            self._step_solve_seconds += perf_counter() - start
-            return None
-        self._step_solve_seconds += perf_counter() - start
-        if not bool(xp.all(xp.isfinite(sol))):
+        sol = self._resolve_reused_factorization(rhs_x, -c, m_eq)
+        if sol is None:
             return None
         dx_t = sol[: self._n]
-        dy_t = sol[self._n :] if m_eq > 0 else xp.zeros((0,), dtype=rhs.dtype)
+        dy_t = sol[self._n :] if m_eq > 0 else xp.zeros((0,), dtype=rhs_x.dtype)
         return recover_eliminated(
             dx_t,
             mu=0.0,
@@ -2572,9 +2711,17 @@ class IPMDriver:
             if bool(xp.all(xp.isfinite(sol))):
                 dx = sol[: self._n]
                 dy = sol[self._n :] if m_eq > 0 else empty
+                # The returned δ_w alone does not identify the retained matrix:
+                # a phase-2 success reports δ_w = 0 with an escalated δ_c.
+                self._factor_unregularized = (
+                    reg.delta_w == 0.0 and current_delta_c == delta_c
+                )
+                self._factor_failed = False
                 return dx, dy, reg.delta_w, True
             escalate()
             logger.debug("non-finite step; escalating delta_w to %.2e", reg.delta_w)
+        self._factor_unregularized = False  # left factored past the ladder's end
+        self._factor_failed = True
         return rhs_x, empty, reg.delta_w, False
 
     def _alpha_primal(
@@ -3043,7 +3190,38 @@ class IPMDriver:
             lower_safe=lower_safe,
             upper_safe=upper_safe,
             tol=self._options.optimality.kkt_tol,
+            linear_solver=(
+                None
+                if self._restoration_solver_factory is None
+                else self._restoration_solver_factory()
+            ),
         )
+
+    def _check_restoration_adjoints(self, x: Array, m: int, m_eq: int) -> None:
+        """Refuse a matvec-only Jacobian at entry, not at the first restoration.
+
+        The iterative restoration route applies ``Jᵀ Σ J`` through ``matvec``
+        and ``rmatvec``; a Jacobian without an adjoint would otherwise abort the
+        run — with no ``Result`` — hundreds of iterations in, when restoration
+        is first entered. One adjoint product with a zero vector per Jacobian
+        at the first iterate (whose Jacobians the point cache reuses) is the
+        price.
+        """
+        xp = self._xp
+        probes: list[tuple[str, LinearOperator, int]] = []
+        if m_eq > 0:
+            probes.append(("equality", self._eq_jac(x), m_eq))
+        if m > 0:
+            probes.append(("inequality", self._ineq_jac(x), m))
+        for name, jacobian, rows in probes:
+            try:
+                jacobian.rmatvec(xp.zeros((rows,), dtype=x.dtype))
+            except NotImplementedError as exc:
+                raise ValueError(
+                    "RestorationOptions(linear_solver='krylov') applies the "
+                    f"{name} Jacobian through matvec and rmatvec, but this "
+                    f"problem's {name} Jacobian has no adjoint: {exc}"
+                ) from exc
 
 
 __all__ = ["IPMDriver"]

@@ -30,7 +30,17 @@ Preconditioning (§5.2), all matrix-free:
 - ``jacobi`` — a strictly positive (SPD) diagonal: the operator's own diagonal for
   CG/GMRES, or the equality saddle's SPD *block* diagonal (PD primal Jacobi block
   plus a positive approximate-Schur dual block, ``spd_preconditioner_diagonal``)
-  applied to MINRES by symmetric scaling.
+  applied to MINRES by symmetric scaling. **Exception:** when the operator
+  reports its Woodbury inverse as *exact* (``lbfgs_inverse_is_exact`` — a
+  bound-only L-BFGS condensed block, no inequality Gram term) ``jacobi`` and
+  ``auto`` solve with that inverse *directly* (reported as ``pc=lbfgs-exact``,
+  ``last_method="direct"``): one Woodbury apply verified by a true-residual
+  check, with working-precision iterative refinement (Carson & Higham 2018)
+  covering round-off, falling back to the CG-preconditioned route when
+  refinement stalls — no CG loop on the fast path, and neither the O(n·k²)
+  L-BFGS diagonal nor its two host syncs are paid.
+  ``KrylovOptions.exact_lbfgs_inverse=False`` restores the plain diagonal
+  (the A/B lever).
 - ``lbfgs`` — an L-BFGS-aware Sherman–Morrison–Woodbury inverse. On the condensed
   (equality-free) operator it is ``N⁻¹`` (``lbfgs_inverse_apply``), an SPD operator
   used directly by CG/GMRES. On the equality **saddle** it is the block-diagonal
@@ -41,8 +51,8 @@ Preconditioning (§5.2), all matrix-free:
   is available), since MINRES admits only a diagonal. It degrades to ``jacobi``
   where no L-BFGS compact form is available (e.g. before the first curvature pair,
   or an exact/matrix-free Hessian).
-- ``auto`` — start with cheap ``jacobi`` and self-promote to ``lbfgs`` the first
-  time a solve struggles: a convergence failure the Woodbury inverse could rescue
+- ``auto`` — start with cheap ``jacobi`` (or the exact inverse where it applies,
+  as above) and self-promote to ``lbfgs`` the first time a solve struggles: a convergence failure the Woodbury inverse could rescue
   triggers an immediate promoted retry, and a merely slow success (more than
   ``auto_switch_ratio`` of the iteration budget) promotes for the next solve. The
   flag is sticky for the life of the solver, so the extra Woodbury cost is paid
@@ -83,6 +93,36 @@ class _IndefiniteOperatorError(Exception):
     """Internal signal: CG hit non-positive curvature; retry with MINRES."""
 
 
+def _is_resource_failure(exc: BaseException) -> bool:
+    """Whether a backend exception is an allocation failure, not numerics.
+
+    Device backends raise their own types (torch's CUDA ``OutOfMemoryError`` is
+    a ``RuntimeError``, JAX reports ``RESOURCE_EXHAUSTED``) which cannot be
+    named in the core (invariant #1); recognise them by class name and message.
+    """
+    if isinstance(exc, MemoryError):
+        return True
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return (
+        "outofmemory" in name
+        or "out of memory" in message
+        or ("resource_exhausted" in message)
+    )
+
+
+# Woodbury-apply budget for the direct exact-inverse solve: one apply plus up
+# to two working-precision iterative-refinement rounds (they converge when
+# cond(N)·u ≲ 1 — Carson & Higham 2018; the exact-inverse case is the
+# best-conditioned instance of their fixed-precision setting). A residual
+# still above tolerance after the budget does NOT fail the solve: the dispatch
+# falls back to CG preconditioned with the same inverse — the pre-direct route,
+# which is Galerkin-optimal per apply and therefore at least as strong — so
+# the budget is purely a fast-path/fallback split, not a robustness knob (the
+# same pattern as ``_MAX_REG_ATTEMPTS`` in the driver).
+_MAX_EXACT_APPLIES = 3
+
+
 def _inner(xp: Namespace, a: Array, b: Array) -> float:
     return float(xp.sum(a * b))
 
@@ -121,6 +161,16 @@ class KrylovSolver:
         # ``preconditioner="auto"``: sticky flag, set once a solve struggles, that
         # promotes the effective preconditioner from Jacobi to L-BFGS (§5.2).
         self._auto_promoted: bool = False
+        # Set per solve (reset at the top of ``solve``) when the default/auto
+        # mode applied the operator's *exact* condensed Woodbury inverse instead
+        # of Jacobi (bound-only L-BFGS systems); reported by ``describe``.
+        self._exact_inverse_active: bool = False
+        # Sticky opt-out (like ``_auto_promoted``): a solve that broke down
+        # under the exact inverse — a numerically singular L-BFGS middle
+        # matrix, the ``_apply`` fallback case — retries on Jacobi and this
+        # solver stays on Jacobi thereafter, so a persistently singular window
+        # never pays a failed exact-inverse CG on every IPM iteration.
+        self._exact_inverse_blocked: bool = False
         # Inexact-Newton forcing: the most recent outer KKT residual hinted by the
         # driver, or ``None`` before the first hint (then the fixed ``rtol`` is used).
         self._outer_residual: float | None = None
@@ -133,6 +183,16 @@ class KrylovSolver:
         """
         if math.isfinite(residual) and residual > 0.0:
             self._outer_residual = residual
+
+    def is_direct(self) -> bool:
+        """``False``: ``factor`` binds the operator; each solve is a Krylov run.
+
+        The bound-only L-BFGS exact-inverse dispatch (``_exact_inverse_solve``)
+        is the one solve that is not, but it applies only to problems without
+        constraints — which never run a second-order correction — so the
+        driver's use of this hook is unaffected by it.
+        """
+        return False
 
     def _effective_rtol(self) -> float:
         """Inner relative tolerance for this solve — fixed, or the forcing term.
@@ -155,6 +215,8 @@ class KrylovSolver:
         pc: str = self._options.preconditioner
         if pc == "auto":
             pc = f"auto:{self._effective_preconditioner()}"
+        if self._exact_inverse_active:
+            pc = "auto:lbfgs-exact" if pc.startswith("auto") else "lbfgs-exact"
         return f"krylov ({self._options.method}, pc={pc})"
 
     def kkt_form(self) -> str:
@@ -201,13 +263,23 @@ class KrylovSolver:
         # on a convergence failure the condensed Woodbury could rescue, promote and
         # retry the same solve once, then (on success) promote for the next solve if
         # this one was slow. In any non-auto mode this is a single ``_dispatch`` call.
+        self._exact_inverse_active = False
         try:
             solution = self._dispatch(K, rhs, xp, max_iter, rtol)
         except KrylovConvergenceError:
-            if not self._auto_can_promote(K):
+            if self._exact_inverse_active:
+                # The exact Woodbury inverse broke down (numerically singular
+                # L-BFGS middle matrix): retry this solve on plain Jacobi, the
+                # route these modes took before the exact inverse existed, and
+                # stay there for the rest of this solver's life.
+                self._exact_inverse_blocked = True
+                self._exact_inverse_active = False
+                solution = self._dispatch(K, rhs, xp, max_iter, rtol)
+            elif not self._auto_can_promote(K):
                 raise
-            self._auto_promoted = True
-            solution = self._dispatch(K, rhs, xp, max_iter, rtol)
+            else:
+                self._auto_promoted = True
+                solution = self._dispatch(K, rhs, xp, max_iter, rtol)
         else:
             self._auto_promote_if_slow(K, max_iter)
         return solution
@@ -256,6 +328,10 @@ class KrylovSolver:
             raise ValueError("Krylov method must be 'cg', 'minres', or 'gmres'")
 
         # method == "cg": prefer CG, fall back to MINRES on indefiniteness.
+        if self._exact_inverse_eligible(K):
+            # The Woodbury apply is the exact N⁻¹ here — solve directly instead
+            # of paying the CG loop's inner products and host syncs around it.
+            return self._exact_inverse_solve(K, rhs, xp, max_iter, rtol)
         precond = self._make_preconditioner(K, rhs, xp)
         try:
             return self._cg(K, rhs, xp, max_iter, rtol, precond)
@@ -284,10 +360,17 @@ class KrylovSolver:
         return self._auto_open() and self._lbfgs_condensed_available(K)
 
     def _auto_promote_if_slow(self, K: LinearOperator, max_iter: int) -> None:
-        """Promote after a slow-but-successful solve (iterations over threshold)."""
-        if not self._auto_can_promote(K):
+        """Promote after a slow-but-successful solve (iterations over threshold).
+
+        The cheap slowness test decides *first*: the availability probe inside
+        :meth:`_auto_can_promote` builds the full Woodbury factors (O(n·k²)),
+        which a fast successful solve must not pay on every iteration.
+        """
+        if not self._auto_open():
             return
-        if self.last_iterations > self._options.auto_switch_ratio * max_iter:
+        if self.last_iterations <= self._options.auto_switch_ratio * max_iter:
+            return
+        if self._lbfgs_condensed_available(K):
             self._auto_promoted = True
 
     def _lbfgs_condensed_available(self, K: LinearOperator) -> bool:
@@ -304,6 +387,89 @@ class KrylovSolver:
 
     # -- preconditioning --------------------------------------------------
 
+    def _exact_inverse_eligible(self, K: LinearOperator) -> bool:
+        """Whether this solve may use the operator's exact Woodbury ``N⁻¹``.
+
+        The same gate for the direct dispatch and the GMRES preconditioner: the
+        effective mode is the default Jacobi (an explicit ``none``/``lbfgs``
+        keeps its documented behavior), the ``exact_lbfgs_inverse`` A/B lever
+        is on, no earlier breakdown blocked it, and the operator reports its
+        Woodbury apply as the exact inverse (bound-only L-BFGS block).
+        """
+        return (
+            self._effective_preconditioner() == "jacobi"
+            and self._options.exact_lbfgs_inverse
+            and not self._exact_inverse_blocked
+            and K.lbfgs_inverse_is_exact()
+        )
+
+    def _exact_inverse_solve(
+        self, K: LinearOperator, b: Array, xp: Namespace, max_iter: int, rtol: float
+    ) -> Array:
+        """Direct solve via the exact condensed Woodbury inverse (§5.2).
+
+        Bound-only L-BFGS systems: ``x = N⁻¹ b`` in one apply (Byrd, Nocedal &
+        Schnabel 1994 compact form). Wrapping this apply in CG — the previous
+        route — paid the loop's inner products (three host syncs) and vector
+        updates just to confirm convergence; here one true-residual check does
+        that, with up to ``_MAX_EXACT_APPLIES − 1`` working-precision
+        iterative-refinement rounds ``x += N⁻¹ r`` (Carson & Higham 2018)
+        covering round-off on an ill-conditioned late-barrier ``D̃``.
+        (RT-scale study, n = 50k: 27 CG iterations + 17 ms Jacobi diagonal →
+        one verified apply; step solve 34 → 6 ms.)
+
+        Refinement is *weaker* per apply than a CG iteration (which is
+        Galerkin-optimal over the preconditioned Krylov space), so a stalled
+        or non-finite refinement never fails the solve here: it falls back to
+        exactly the pre-direct route — CG preconditioned with the same inverse
+        — whose breakdown paths keep the established semantics (sticky Jacobi
+        via :meth:`solve`). A backend-native error out of the Woodbury apply
+        (an exactly singular L-BFGS middle matrix) is converted to
+        :class:`KrylovConvergenceError` so it takes that same path instead of
+        escaping the driver's δ_w ladder.
+
+        ``last_iterations`` counts Woodbury applies on the fast path (1 in the
+        regular case) with ``last_method="direct"``; the fallback records as
+        CG/MINRES, exactly as before this fast path existed.
+        """
+        self._exact_inverse_active = True
+        b_norm = _norm(xp, b)
+        if b_norm == 0.0:
+            self._record(0, 0.0, "direct")
+            return xp.zeros_like(b)
+        tol = rtol * b_norm
+
+        raw_apply = K.lbfgs_inverse_apply()
+
+        def apply_inverse(v: Array) -> Array:
+            try:
+                return raw_apply(v)
+            except Exception as exc:  # backend-native LinAlgError and kin
+                if _is_resource_failure(exc):
+                    # Out-of-memory is not a singular window: relabeling it
+                    # would sticky-disable the fast path and hide the cause
+                    # behind a slower Jacobi retry.
+                    raise
+                raise KrylovConvergenceError(
+                    f"exact Woodbury apply failed: {exc}"
+                ) from exc
+
+        x = apply_inverse(b)
+        for applies in range(1, _MAX_EXACT_APPLIES + 1):
+            r = b - K.matvec(x)
+            r_norm = _norm(xp, r)
+            if r_norm <= tol:
+                self._record(applies, r_norm, "direct")
+                return x
+            if not math.isfinite(r_norm):
+                break  # a non-finite apply: refinement cannot recover it
+            if applies < _MAX_EXACT_APPLIES:
+                x = x + apply_inverse(r)
+        try:
+            return self._cg(K, b, xp, max_iter, rtol, apply_inverse)
+        except _IndefiniteOperatorError:
+            return self._preconditioned_minres(K, b, xp, max_iter, rtol)
+
     def _make_preconditioner(
         self, K: LinearOperator, rhs: Array, xp: Namespace
     ) -> Callable[[Array], Array]:
@@ -317,6 +483,18 @@ class KrylovSolver:
         mode = self._effective_preconditioner()
         if mode == "none":
             return lambda r: r
+        if self._exact_inverse_eligible(K):
+            # Bound-only L-BFGS block (no inequality Gram term): the
+            # Sherman–Morrison–Woodbury apply (§5.2; Byrd, Nocedal & Schnabel
+            # 1994 compact form) is the *exact* ``N⁻¹`` — strictly better than
+            # Jacobi, whose O(n·k²) L-BFGS diagonal costs the same order as
+            # the Woodbury factor plus two host syncs. The default CG dispatch
+            # short-circuits to the *direct* ``_exact_inverse_solve`` (which
+            # carries the RT-scale measurements) before ever building a
+            # preconditioner, so this branch serves the explicit
+            # ``method="gmres"`` route.
+            self._exact_inverse_active = True
+            return K.lbfgs_inverse_apply()
         if mode == "lbfgs":
             # Prefer the saddle block preconditioner diag(N⁻¹, S⁻¹) (non-diagonal,
             # GMRES-only); else the condensed Woodbury inverse; else Jacobi.
@@ -411,15 +589,20 @@ class KrylovSolver:
             if not (rz_next > 0.0 and math.isfinite(rz_next)):
                 raise KrylovConvergenceError(
                     f"CG breakdown: preconditioned inner product {rz_next:.3e} "
-                    f"at iteration {it} (residual {r_norm:.3e})"
+                    f"at iteration {it} (residual {r_norm:.3e})",
+                    iterate=x,
                 )
             beta = rz_next / rz
             p = z + beta * p
             rz = rz_next
 
+        # The truncated iterate rides along: CG minimizes the energy norm over
+        # the Krylov space it has built, so it is a descent direction for the
+        # SPD quadratic model (Steihaug 1983) even when short of ``rtol``.
         raise KrylovConvergenceError(
             f"CG did not converge in {max_iter} iterations "
-            f"(residual {r_norm:.3e}, tolerance {tol:.3e})"
+            f"(residual {r_norm:.3e}, tolerance {tol:.3e})",
+            iterate=x,
         )
 
     def _gmres(
@@ -541,7 +724,8 @@ class KrylovSolver:
             return x
         raise KrylovConvergenceError(
             f"GMRES did not converge in {max_iter} iterations "
-            f"(residual {res_norm:.3e}, tolerance {tol:.3e})"
+            f"(residual {res_norm:.3e}, tolerance {tol:.3e})",
+            iterate=x,
         )
 
     def _minres_preconditioner_diagonal(
@@ -669,13 +853,15 @@ class KrylovSolver:
                     return x
                 raise KrylovConvergenceError(
                     "MINRES Lanczos breakdown before convergence "
-                    f"(residual {true_residual:.3e}, tolerance {tol:.3e})"
+                    f"(residual {true_residual:.3e}, tolerance {tol:.3e})",
+                    iterate=x,
                 )
 
         true_residual = _true_residual_norm(xp, K, x, b)
         raise KrylovConvergenceError(
             f"MINRES did not converge in {max_iter} iterations "
-            f"(residual {true_residual:.3e}, tolerance {tol:.3e})"
+            f"(residual {true_residual:.3e}, tolerance {tol:.3e})",
+            iterate=x,
         )
 
     def _record(self, iterations: int, residual: float, method: str) -> None:

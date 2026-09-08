@@ -261,3 +261,32 @@ def test_scaling_options_validation():
             ScalingOptions(method="gradient-based", max_gradient=value)
     with pytest.raises(ValueError, match="scaling method"):
         Options(scaling="bogus")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("nrhs", [0, 1, 4])
+def test_row_scaling_preserves_batched_adjoint(namespace, tol, nrhs):
+    from ipax.backend.operators import Dense
+    from ipax.problem.scaling import _RowScaled
+
+    class BatchedOnly(Dense):
+        calls = 0
+
+        def rmatvec(self, v):
+            raise AssertionError("row scaling must preserve the batched adjoint")
+
+        def rmatmat(self, V):
+            self.calls += 1
+            return super().rmatmat(V)
+
+    xp = namespace
+    A = array(xp, [[2.0, -1.0, 3.0], [0.0, 4.0, -2.0]])
+    d = array(xp, [0.25, 0.5])
+    V = xp.reshape(xp.arange(2 * nrhs, dtype=A.dtype), (2, nrhs))
+    before = xp.asarray(V, copy=True)
+    inner = BatchedOnly(A)
+    actual = _RowScaled(inner, d).rmatmat(V)
+    expected = xp.matmul(xp.permute_dims(d[:, None] * A, (1, 0)), V)
+    assert actual.shape == (3, nrhs)
+    assert_allclose(xp, actual, expected, **tol)
+    assert_allclose(xp, V, before, **tol)
+    assert inner.calls == 1

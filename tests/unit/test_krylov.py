@@ -411,8 +411,11 @@ def test_gmres_non_convergence_raises(namespace):
         solver.solve(rhs)
 
 
-def _condensed_no_inequalities(namespace):
-    """A condensed operator ``N = B + Σ_x + δ_w I`` with an L-BFGS Hessian ``B``."""
+def _condensed_no_inequalities(namespace, ineq=None):
+    """A condensed operator ``N = B + Σ_x + δ_w I`` with an L-BFGS Hessian ``B``.
+
+    ``ineq=(jac, sigma_s)`` adds an inequality Gram term ``jacᵀ Σ_s jac``.
+    """
     from ipax.ipm.hessian import LBFGSOperator
     from ipax.ipm.kkt import build_condensed_operator
     from ipax.linalg.regularize import RegularizationState
@@ -433,11 +436,26 @@ def _condensed_no_inequalities(namespace):
     for delta, gamma in zip(deltas, gammas, strict=True):
         w.update(array(namespace, delta), array(namespace, gamma))
     sigma_x = Diagonal(array(namespace, [0.2, 0.5, 1.0, 1.5, 2.0, 0.8]))
-    empty_sigma_s = Diagonal(array(namespace, []))
-    empty_jac = Dense(namespace.zeros((0, n), dtype=array(namespace, [0.0]).dtype))
+    if ineq is not None:
+        jac, sigma_s = ineq
+    else:
+        sigma_s = Diagonal(array(namespace, []))
+        jac = Dense(namespace.zeros((0, n), dtype=array(namespace, [0.0]).dtype))
     return build_condensed_operator(
-        w, sigma_x, empty_sigma_s, empty_jac, RegularizationState(delta_w=1e-6)
+        w, sigma_x, sigma_s, jac, RegularizationState(delta_w=1e-6)
     )
+
+
+def _condensed_one_inequality(namespace):
+    """As :func:`_condensed_no_inequalities` plus one inequality Gram row.
+
+    The Woodbury inverse is then only *approximate* (it drops the Gram
+    off-diagonal), so the default/auto modes start on Jacobi — the shape the
+    auto-promotion mechanics are exercised on.
+    """
+    jac = Dense(array(namespace, [[1.0, 0.0, 2.0, 0.0, -1.0, 0.5]]))
+    sigma_s = Diagonal(array(namespace, [3.0]))
+    return _condensed_no_inequalities(namespace, ineq=(jac, sigma_s))
 
 
 def test_lbfgs_preconditioner_is_exact_inverse_without_inequalities(namespace):
@@ -543,10 +561,15 @@ def test_auto_starts_with_jacobi_and_stays_on_easy_solves(namespace, tol):
     assert "auto:jacobi" in solver.describe()  # never promoted
 
 
-def test_auto_promotes_to_lbfgs_on_convergence_failure(namespace, tol):
+def test_auto_promotes_to_lbfgs_on_convergence_failure(namespace, tol, monkeypatch):
     """A jacobi solve that cannot meet the tolerance in the iteration budget
-    promotes to the L-BFGS Woodbury preconditioner and retries — succeeding."""
+    promotes to the L-BFGS Woodbury preconditioner and retries — succeeding.
+
+    The bound-only block would apply its exact inverse outright in Jacobi
+    mode; hide that shortcut so the failure-rescue mechanics are what runs.
+    """
     operator = _condensed_no_inequalities(namespace)  # exposes lbfgs_inverse_apply
+    monkeypatch.setattr(type(operator), "lbfgs_inverse_is_exact", lambda self: False)
     x_exact = array(namespace, [1.0, -1.0, 2.0, -2.0, 0.5, -0.5])
     rhs = operator.matvec(x_exact)
 
@@ -575,8 +598,10 @@ def test_auto_stays_jacobi_and_raises_without_lbfgs_structure(namespace):
 
 def test_auto_stays_jacobi_when_fast_despite_lbfgs_structure(namespace, tol):
     """A fast Jacobi solve must not promote even when the L-BFGS Woodbury
-    inverse *is* available: promotion is reserved for solves that struggle."""
-    operator = _condensed_no_inequalities(namespace)
+    inverse *is* available: promotion is reserved for solves that struggle.
+    (With an inequality row: a bound-only block applies the exact inverse
+    outright — see ``test_default_preconditioner_uses_exact_lbfgs_inverse``.)"""
+    operator = _condensed_one_inequality(namespace)
     x_exact = array(namespace, [1.0, -1.0, 2.0, -2.0, 0.5, -0.5])
     rhs = operator.matvec(x_exact)
 
@@ -592,7 +617,7 @@ def test_auto_stays_jacobi_when_fast_despite_lbfgs_structure(namespace, tol):
 def test_auto_promotes_after_a_slow_but_successful_solve(namespace, tol):
     """A solve that succeeds but burns more than ``auto_switch_ratio`` of the
     budget promotes to L-BFGS for the *next* solve (sticky across solves)."""
-    operator = _condensed_no_inequalities(namespace)
+    operator = _condensed_one_inequality(namespace)
     x_exact = array(namespace, [1.0, -1.0, 2.0, -2.0, 0.5, -0.5])
     rhs = operator.matvec(x_exact)
 
@@ -605,12 +630,13 @@ def test_auto_promotes_after_a_slow_but_successful_solve(namespace, tol):
     first = solver.solve(rhs)  # Jacobi, several iterations → triggers promotion
     assert_allclose(namespace, first, x_exact, rtol=1e-7, atol=1e-7)
     assert first is not None
-    assert solver.last_iterations > 1
+    first_iterations = solver.last_iterations
+    assert first_iterations > 1
     assert "auto:lbfgs" in solver.describe()
 
-    second = solver.solve(rhs)  # now the exact Woodbury inverse: one step
+    second = solver.solve(rhs)  # now the Woodbury inverse (approximate here)
     assert_allclose(namespace, second, x_exact, rtol=1e-7, atol=1e-7)
-    assert solver.last_iterations == 1
+    assert solver.last_iterations < first_iterations
 
 
 def test_auto_does_not_slow_promote_the_approximate_saddle_block(namespace, tol):
@@ -868,3 +894,397 @@ def test_cg_zero_preconditioner_breakdown_raises_convergence_error(namespace):
 
     with pytest.raises(KrylovConvergenceError):
         solver._cg(Dense(A), rhs, xp, 10, 1e-12, lambda r: xp.zeros_like(r))
+
+
+def _bound_only_lbfgs_condensed(namespace, *, with_inequality: bool = False):
+    import random
+
+    from ipax.ipm.hessian import LBFGSOperator
+    from ipax.ipm.kkt import build_condensed_operator
+    from ipax.linalg.regularize import RegularizationState
+    from ipax.options import LBFGSOptions
+
+    rng = random.Random(5)
+    n = 24
+    w = LBFGSOperator(n, LBFGSOptions(memory=6))
+    for _ in range(4):
+        delta = [rng.uniform(-1.0, 1.0) for _ in range(n)]
+        gamma = [delta[k] + rng.uniform(0.0, 0.5) + 0.5 for k in range(n)]
+        w.update(array(namespace, delta), array(namespace, gamma))
+    dtype = array(namespace, [0.0]).dtype
+    sigma_x = Diagonal(
+        array(namespace, [10.0 ** (3.0 * k / (n - 1)) for k in range(n)])
+    )
+    if with_inequality:
+        jac = Dense(array(namespace, [[1.0 if k % 3 == 0 else 0.0 for k in range(n)]]))
+        sigma_s = Diagonal(array(namespace, [2.0]))
+    else:
+        jac = Dense(namespace.zeros((0, n), dtype=dtype))
+        sigma_s = Diagonal(array(namespace, []))
+    return build_condensed_operator(
+        w, sigma_x, sigma_s, jac, RegularizationState(delta_w=1e-6)
+    )
+
+
+def test_default_preconditioner_uses_exact_lbfgs_inverse_on_bound_only(namespace, tol):
+    # Bound-only L-BFGS (the RT shape): the Woodbury inverse is the exact N⁻¹,
+    # so the default (Jacobi) mode must apply it instead — one CG iteration
+    # rather than ~30, and no O(n·k²) L-BFGS diagonal.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    solver = _solver()
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.last_iterations <= 2
+    assert solver.describe() == "krylov (cg, pc=lbfgs-exact)"
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-8 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_default_preconditioner_stays_jacobi_with_inequality_gram(namespace):
+    # With an inequality Gram term the Woodbury inverse is only approximate;
+    # the default stays Jacobi (auto-promotion handles struggling solves).
+    K = _bound_only_lbfgs_condensed(namespace, with_inequality=True)
+    n = K.shape[0]
+    rhs = array(namespace, [1.0 + k / n for k in range(n)])
+    solver = _solver()
+    solver.factor(K)
+
+    solver.solve(rhs)
+
+    assert solver.last_iterations > 2
+    assert solver.describe() == "krylov (cg, pc=jacobi)"
+
+
+def test_exact_lbfgs_inverse_can_be_disabled(namespace):
+    # The A/B lever: the plain Jacobi diagonal of the pre-change default.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [1.0 + k / n for k in range(n)])
+    solver = _solver(exact_lbfgs_inverse=False)
+    solver.factor(K)
+
+    solver.solve(rhs)
+
+    assert solver.last_iterations > 2
+    assert solver.describe() == "krylov (cg, pc=jacobi)"
+
+
+def test_auto_mode_reports_exact_inverse_with_prefix(namespace):
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [1.0 + k / n for k in range(n)])
+    solver = _solver(preconditioner="auto")
+    solver.factor(K)
+
+    solver.solve(rhs)
+
+    assert solver.last_iterations <= 2
+    assert solver.describe() == "krylov (cg, pc=auto:lbfgs-exact)"
+
+
+def test_exact_inverse_breakdown_retries_on_jacobi_and_stays_there(namespace):
+    # A numerically singular L-BFGS middle matrix can make the "exact" apply
+    # return garbage; CG then breaks down (zero preconditioned inner product)
+    # and the solve must fall back to Jacobi — for this solve and all later ones.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    dispatches = []
+    original = K.lbfgs_inverse_apply
+
+    def _annihilating():
+        return lambda r: 0.0 * r
+
+    K.lbfgs_inverse_apply = _annihilating  # type: ignore[method-assign]
+    solver = _solver()
+    inner = solver._dispatch
+
+    def _counting(*args, **kwargs):
+        try:
+            return inner(*args, **kwargs)
+        finally:  # the flag is set inside the dispatch; sample it on the way out
+            dispatches.append(solver._exact_inverse_active)
+
+    solver._dispatch = _counting  # type: ignore[method-assign]
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert dispatches == [True, False]
+    assert solver.describe() == "krylov (cg, pc=jacobi)"
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-7 * float(
+        norm_inf(namespace, rhs)
+    )
+
+    # Sticky: the next solve does not try the exact inverse again even though
+    # the operator now offers a working one.
+    K.lbfgs_inverse_apply = original  # type: ignore[method-assign]
+    dispatches.clear()
+    solver.solve(rhs)
+    assert dispatches == [False]
+    assert solver.describe() == "krylov (cg, pc=jacobi)"
+
+
+def test_exact_inverse_flag_does_not_leak_across_operators(namespace):
+    # ``describe`` reflects the *last* solve: a plain operator solved after a
+    # bound-only block must not keep reporting ``lbfgs-exact`` (nor take its
+    # retry branch).
+    solver = _solver()
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    solver.factor(K)
+    solver.solve(array(namespace, [1.0 + k / n for k in range(n)]))
+    assert solver.describe() == "krylov (cg, pc=lbfgs-exact)"
+
+    A, rhs, _ = _spd_system(namespace)
+    solver.factor(Dense(A))
+    solver.solve(rhs)
+    assert solver.describe() == "krylov (cg, pc=jacobi)"
+
+
+def test_preconditioner_none_ignores_exact_lbfgs_inverse(namespace):
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [1.0 + k / n for k in range(n)])
+    solver = _solver(preconditioner="none")
+    solver.factor(K)
+
+    solver.solve(rhs)
+
+    assert solver.last_iterations > 2
+    assert solver.describe() == "krylov (cg, pc=none)"
+
+
+def test_exact_inverse_dispatches_directly_not_through_cg(namespace):
+    # The exact condensed Woodbury inverse is a *direct* solve; wrapping it in
+    # CG paid the loop's extra inner-product host syncs and vector ops just to
+    # confirm what holds algebraically. The dispatch must apply it directly.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    solver = _solver()
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.last_method == "direct"
+    assert solver.last_iterations == 1  # one Woodbury apply, verified
+    assert solver.describe() == "krylov (cg, pc=lbfgs-exact)"
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-8 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_direct_dispatch_refines_a_round_off_limited_apply(namespace):
+    # CG around the exact inverse implicitly refined when one apply's residual
+    # sat above tolerance (ill-conditioned late-barrier systems); the direct
+    # dispatch must keep that robustness via iterative refinement, not fail.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    original = K.lbfgs_inverse_apply()
+    # A slightly-off apply: first residual ~1e-6·‖b‖ (above rtol=1e-10), one
+    # refinement round lands it at ~1e-12·‖b‖.
+    K.lbfgs_inverse_apply = lambda: (  # type: ignore[method-assign]
+        lambda r: (1.0 - 1e-6) * original(r)
+    )
+    solver = _solver()
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.last_method == "direct"
+    assert solver.last_iterations == 2  # apply + one refinement round
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-8 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_direct_dispatch_falls_back_to_preconditioned_cg_on_stall(namespace):
+    # A finite-but-wrong "exact" apply must not be returned unverified: the
+    # refinement stalls and the dispatch falls back to CG preconditioned with
+    # the same apply — the pre-direct route, whose per-apply Galerkin
+    # optimality recovers cases plain refinement cannot. No sticky Jacobi
+    # block: the old route never blocked on this input either.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    # Identity apply: refinement is Richardson iteration and diverges on this
+    # ill-scaled Σ_x, but identity-preconditioned CG converges fine.
+    K.lbfgs_inverse_apply = lambda: lambda r: r  # type: ignore[method-assign]
+    solver = _solver()
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.last_method == "cg"  # the fallback ran, and it sufficed
+    assert solver.describe() == "krylov (cg, pc=lbfgs-exact)"
+    assert not solver._exact_inverse_blocked
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-7 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_direct_dispatch_converts_backend_errors_to_the_fallback(namespace):
+    # An exactly singular L-BFGS middle matrix raises a backend-native error
+    # inside the Woodbury apply (e.g. ``numpy.linalg.LinAlgError``); the direct
+    # path must convert it to KrylovConvergenceError so the established sticky
+    # Jacobi fallback handles it, instead of escaping the driver's δ_w ladder.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+
+    def _raising():
+        def _apply(r):
+            raise ValueError("singular middle matrix")
+
+        return _apply
+
+    K.lbfgs_inverse_apply = _raising  # type: ignore[method-assign]
+    solver = _solver()
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.describe() == "krylov (cg, pc=jacobi)"
+    assert solver._exact_inverse_blocked
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-7 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_direct_dispatch_zero_rhs_returns_zero(namespace):
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    solver = _solver()
+    solver.factor(K)
+
+    x = solver.solve(namespace.zeros((n,), dtype=array(namespace, [0.0]).dtype))
+
+    assert bool(namespace.all(x == 0.0))
+    assert solver.last_iterations == 0
+    assert solver.last_method == "direct"
+
+
+def test_explicit_gmres_still_uses_the_exact_inverse_as_preconditioner(namespace):
+    # The direct dispatch lives on the default CG route only; an explicit
+    # ``method="gmres"`` keeps its documented behavior — the exact inverse
+    # serves as GMRES's left preconditioner via ``_make_preconditioner``.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    solver = _solver(method="gmres")
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.last_method == "gmres"
+    assert solver.describe() == "krylov (gmres, pc=lbfgs-exact)"
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-8 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_auto_promotion_probe_skipped_on_fast_solves(namespace):
+    # The auto-mode availability probe (``lbfgs_inverse_apply``) builds the full
+    # O(n·k²) Woodbury factors; a fast successful solve must not pay it — the
+    # cheap slowness test decides first.
+    probes: list[int] = []
+
+    class _ProbeCounting(Dense):
+        def lbfgs_inverse_apply(self):
+            probes.append(1)
+            raise NotImplementedError
+
+    A, rhs, _ = _spd_system(namespace)
+    solver = _solver(preconditioner="auto")
+    solver.factor(_ProbeCounting(A))
+
+    solver.solve(rhs)
+
+    assert solver.last_iterations <= 5  # well-conditioned: genuinely fast
+    assert probes == []
+
+
+def test_non_convergence_error_carries_the_partial_iterate(namespace, tol):
+    """A work-capped solve hands its last iterate to the caller.
+
+    Feasibility restoration reuses it as a truncated-CG trial direction
+    (Steihaug 1983) instead of discarding the Krylov work and climbing the LM
+    ladder; the KKT driver keeps ignoring it and escalating ``δ_w``.
+    """
+    A, rhs, _ = _spd_system(namespace)
+    solver = _solver(method="cg", preconditioner="none", rtol=1e-14, max_iter=1)
+    solver.factor(Dense(A))
+    with pytest.raises(KrylovConvergenceError) as info:
+        solver.solve(rhs)
+    iterate = info.value.iterate
+    assert iterate is not None
+    # One unpreconditioned CG step from zero is exact-line-search steepest
+    # descent along the right-hand side: α = ⟨b, b⟩ / ⟨b, A b⟩.
+    xp = namespace
+    a_rhs = xp.matmul(A, rhs)
+    alpha = float(xp.sum(rhs * rhs)) / float(xp.sum(rhs * a_rhs))
+    assert_allclose(namespace, iterate, alpha * rhs, **tol)
+
+
+@pytest.mark.parametrize("method", ["gmres", "minres"])
+def test_non_convergence_error_carries_a_finite_iterate(namespace, method):
+    A, rhs, _ = _spd_system(namespace)
+    kwargs = {"gmres_restart": 1} if method == "gmres" else {}
+    solver = _solver(method=method, rtol=1e-14, max_iter=1, **kwargs)
+    solver.factor(Dense(A))
+    with pytest.raises(KrylovConvergenceError) as info:
+        solver.solve(rhs)
+    iterate = info.value.iterate
+    assert iterate is not None
+    assert iterate.shape == rhs.shape
+    assert bool(namespace.all(namespace.isfinite(iterate)))
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        MemoryError("host allocation failed"),
+        type("OutOfMemoryError", (RuntimeError,), {})("CUDA out of memory"),
+    ],
+    ids=["MemoryError", "cuda-oom"],
+)
+def test_exact_inverse_apply_resource_failures_propagate(namespace, failure):
+    """A resource failure inside the Woodbury apply is not a singular window.
+
+    Relabeling it as ``KrylovConvergenceError`` would sticky-disable the exact
+    inverse and retry on Jacobi CG — hiding an out-of-memory condition behind a
+    "slow solve" for the rest of the run (torch's CUDA OOM is a RuntimeError,
+    not a MemoryError).
+    """
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+
+    def _raising():
+        def apply(v):
+            del v
+            raise failure
+
+        return apply
+
+    K.lbfgs_inverse_apply = _raising  # type: ignore[method-assign]
+    solver = _solver()
+    solver.factor(K)
+
+    with pytest.raises(type(failure)):
+        solver.solve(rhs)
+    assert not solver._exact_inverse_blocked
