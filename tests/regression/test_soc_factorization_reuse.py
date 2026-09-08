@@ -36,6 +36,7 @@ from __future__ import annotations
 import pytest
 
 from ipax import Options, Status, solve
+from ipax.backend.namespace import array_namespace
 from ipax.backend.operators import Dense
 from ipax.ipm.driver import IPMDriver
 from ipax.ipm.filter_ls import FilterLineSearch
@@ -428,3 +429,107 @@ def test_builtin_solvers_report_their_kind():
 def test_driver_defaults_a_solver_without_is_direct_to_the_direct_policy(namespace):
     assert _equality_driver(namespace, DenseSolver())._solver_is_direct is True
     assert _equality_driver(namespace, _NoKindSolver())._solver_is_direct is True
+
+
+# --- the real re-solve failure path ------------------------------------------
+#
+# Every test above monkeypatches ``_resolve_reused_factorization`` itself, so
+# the production function's own failure handling — a ``LinearSolveError`` or a
+# non-finite solution from the retained factorization — was never driven
+# (patch-coverage check before 0.11.0). These exercise it directly.
+
+
+class _FailsReSolve:
+    """A dense solver whose *re-solves* fail once the test flips ``failing``."""
+
+    def __init__(self, mode: str) -> None:
+        self._inner = DenseSolver()
+        self._mode = mode
+        self.failing = False
+
+    def factor(self, operator):
+        self._inner.factor(operator)
+
+    def solve(self, rhs):
+        if not self.failing:
+            return self._inner.solve(rhs)
+        if self._mode == "raise":
+            raise LinearSolveError("synthetic re-solve failure")
+        xp = array_namespace(rhs)
+        return xp.full(rhs.shape, float("nan"), dtype=rhs.dtype)
+
+
+@pytest.mark.parametrize("mode", ["raise", "nonfinite"])
+def test_reused_factorization_resolve_reports_a_failed_re_solve_as_none(
+    namespace, mode
+):
+    xp = namespace
+    ops = _saddle_operands(xp)
+    solver = _FailsReSolve(mode)
+    driver = _equality_driver(xp, solver)
+    driver._step_solve_seconds = 0.0  # set by run(); the step accounting needs it
+    _, _, _, ok = driver._solve_step(**ops)
+    assert ok
+
+    solver.failing = True
+    assert driver._resolve_reused_factorization(ops["rhs_x"], ops["r_y"], 1) is None
+
+
+def test_reused_factorization_resolve_returns_the_finite_solution(namespace):
+    xp = namespace
+    ops = _saddle_operands(xp)
+    driver = _equality_driver(xp, DenseSolver())
+    driver._step_solve_seconds = 0.0
+    _, _, _, ok = driver._solve_step(**ops)
+    assert ok
+
+    sol = driver._resolve_reused_factorization(ops["rhs_x"], ops["r_y"], 1)
+
+    assert sol is not None
+    assert sol.shape == (3,)
+    assert bool(xp.all(xp.isfinite(sol)))
+
+
+def test_direct_soc_skips_the_correction_when_its_fresh_solve_fails(
+    namespace, monkeypatch
+):
+    """Direct route, regularized step: SOC solves fresh at δ_w = 0, and when
+    that fresh solve fails the correction is simply skipped (the search
+    continues without one) rather than aborting the iteration."""
+    state = {"in_search": False, "done": False}
+    events: list[str] = []
+    orig_step = IPMDriver._solve_step
+    orig_search = FilterLineSearch.search
+
+    def failing_fresh_soc_step(self, *args, **kwargs):
+        if not state["in_search"]:
+            args = (*args[:9], 1e-4)  # every *step* solve ends regularized
+            return orig_step(self, *args, **kwargs)
+        out = orig_step(self, *args, **kwargs)
+        if state["done"]:
+            return out
+        events.append("fresh-soc-failed")
+        return (out[0], out[1], out[2], False)
+
+    def marked_search(self, *args, **kwargs):
+        if state["done"]:
+            return orig_search(self, *args, **kwargs)
+        state["in_search"] = True
+        try:
+            return orig_search(self, *args, **kwargs)
+        finally:
+            state["in_search"] = False
+            if events:
+                state["done"] = True
+
+    monkeypatch.setattr(IPMDriver, "_solve_step", failing_fresh_soc_step)
+    monkeypatch.setattr(FilterLineSearch, "search", marked_search)
+
+    result = solve(
+        HS71(namespace),
+        array(namespace, [1.0, 5.0, 5.0, 1.0]),
+        options=Options(linsolve="dense"),
+    )
+
+    assert events, "the first search never attempted a fresh SOC solve"
+    assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
