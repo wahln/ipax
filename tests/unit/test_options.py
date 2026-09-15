@@ -256,3 +256,32 @@ def test_line_search_rejects_out_of_range_feasible_kkt_progress(value):
 def test_line_search_rejects_invalid_free_filter_margins(field, value):
     with pytest.raises(ValueError, match=field):
         LineSearchOptions(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("shrink_min", "shrink_max"),
+    [
+        (0.0, 0.5),  # min must be positive
+        (-0.1, 0.5),
+        (0.1, 1.0),  # max must stay below 1: an interpolated trial may never grow
+        (0.1, 2.0),
+        (0.6, 0.5),  # inverted pair
+        (float("nan"), 0.5),
+        (0.1, float("inf")),
+    ],
+)
+def test_line_search_rejects_invalid_backtrack_shrink_bounds(shrink_min, shrink_max):
+    # ``shrink_max ≥ 1`` would let the interpolated backtrack *lengthen* a
+    # rejected step, and the search loop has only the α_min exit — it would
+    # never terminate. Reject the pair instead of looping.
+    with pytest.raises(ValueError, match="backtrack_shrink"):
+        LineSearchOptions(
+            backtrack_shrink_min=shrink_min, backtrack_shrink_max=shrink_max
+        )
+
+
+def test_line_search_accepts_the_documented_shrink_bounds():
+    options = LineSearchOptions(backtrack_shrink_min=0.25, backtrack_shrink_max=0.25)
+    assert options.backtrack_shrink_min == options.backtrack_shrink_max == 0.25
+    assert LineSearchOptions().backtrack_shrink_min == 0.1
+    assert LineSearchOptions().backtrack_shrink_max == 0.5

@@ -103,6 +103,19 @@ class LinearSolver(Protocol):
         """
         ...
 
+
+@runtime_checkable
+class SolverKind(Protocol):
+    """Optional capability of a :class:`LinearSolver`: direct or iterative.
+
+    Kept *out* of :class:`LinearSolver` on purpose: the hook is optional, and
+    a required protocol member would make every third-party solver written
+    against the 0.10 protocol fail ``isinstance(solver, LinearSolver)`` and
+    structural type checks. The driver reads it through duck typing
+    (``getattr(solver, "is_direct", None)``); a solver without it is treated
+    as direct. The built-in solvers all implement it.
+    """
+
     def is_direct(self) -> bool:
         """Whether ``factor`` does the work and ``solve`` back-substitutes it.
 
@@ -112,11 +125,8 @@ class LinearSolver(Protocol):
         Krylov run). The driver reads it to choose between re-solving a
         *regularized* retained system and re-solving fresh at ``δ_w = 0``
         for the second-order corrections: fresh where a factorization is
-        cheap, reuse where each solve is the cost. Optional, like
-        ``set_outer_residual`` (the driver reads both through duck typing,
-        so a solver may omit them; ``isinstance`` checks against this
-        protocol do require them) — a solver without it is treated as
-        direct. Must be a method, not a class attribute.
+        cheap, reuse where each solve is the cost. Must be a method, not a
+        class attribute.
         """
         ...
 
@@ -273,6 +283,7 @@ def select_restoration_solver(
 __all__ = [
     "LinearSolveError",
     "LinearSolver",
+    "SolverKind",
     "select_restoration_solver",
     "select_solver",
 ]

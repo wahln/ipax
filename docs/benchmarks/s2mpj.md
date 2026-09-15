@@ -172,7 +172,7 @@ Sweep by sweep:
   (DRUGDIS/DALLASS/NET1/SPECANNE → `max_time`): a fresh `δ_w = 0` SOC solve
   there is a full CG ladder per round.
 - **v29 → v30 (2026-09-04), +2.** The fix for exactly that: the SOC reuse
-  policy follows the solver kind (`LinearSolver.is_direct()`). Iterative
+  policy follows the solver kind (the `SolverKind.is_direct()` hook). Iterative
   routes re-solve the step's retained system for every correction (Wächter &
   Biegler 2006 eq. (26) verbatim) and never climb a ladder inside SOC; direct
   routes keep the fresh first correction at `δ_w = 0`. The direct routes are

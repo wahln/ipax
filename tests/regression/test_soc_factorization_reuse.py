@@ -41,7 +41,7 @@ from ipax.backend.operators import Dense
 from ipax.ipm.driver import IPMDriver
 from ipax.ipm.filter_ls import FilterLineSearch
 from ipax.linalg.dense import DenseSolver
-from ipax.linalg.solver import LinearSolveError
+from ipax.linalg.solver import LinearSolveError, LinearSolver, SolverKind
 from ipax.options import RegularizationOptions
 from ipax.problem.base import Problem
 from ipax.testing.problems import HS71
@@ -533,3 +533,30 @@ def test_direct_soc_skips_the_correction_when_its_fresh_solve_fails(
 
     assert events, "the first search never attempted a fresh SOC solve"
     assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
+
+
+class _PlainProtocolSolver:
+    """A solver written against the 0.10 ``LinearSolver`` protocol: no kind hook."""
+
+    def factor(self, operator):
+        del operator
+
+    def solve(self, rhs):
+        return rhs
+
+    def set_outer_residual(self, residual: float) -> None:
+        del residual
+
+
+def test_is_direct_is_a_separate_capability_not_a_linear_solver_member():
+    # The kind hook is optional: a third-party solver that predates it must
+    # still satisfy ``LinearSolver`` (structurally and at runtime), and the
+    # built-ins additionally satisfy the ``SolverKind`` capability protocol.
+    from ipax.linalg.krylov import KrylovSolver
+    from ipax.options import KrylovOptions
+
+    plain = _PlainProtocolSolver()
+    assert isinstance(plain, LinearSolver)
+    assert not isinstance(plain, SolverKind)
+    assert isinstance(DenseSolver(), SolverKind)
+    assert isinstance(KrylovSolver(KrylovOptions()), SolverKind)

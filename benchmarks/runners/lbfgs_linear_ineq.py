@@ -54,8 +54,10 @@ class _BeforeScaled(_RowScaled):
 
 class _BeforeDenseSolver(DenseSolver):
     # c19f336: no Cholesky reuse for the (PD-by-construction) L-BFGS block.
-    def _keep_pd_hinted_factor(self, matrix: Array, xp: Any, cholesky: Any) -> None:
-        del matrix, xp, cholesky
+    def _keep_pd_hinted_factor(
+        self, matrix: Array, xp: Any, cholesky: Any, *, reduced: bool = False
+    ) -> None:
+        del matrix, xp, cholesky, reduced
 
 
 def main() -> int:

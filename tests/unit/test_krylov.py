@@ -1288,3 +1288,56 @@ def test_exact_inverse_apply_resource_failures_propagate(namespace, failure):
     with pytest.raises(type(failure)):
         solver.solve(rhs)
     assert not solver._exact_inverse_blocked
+
+
+def test_gmres_exact_preconditioner_converts_backend_errors_to_the_fallback(
+    namespace,
+):
+    # The explicit ``method="gmres"`` route applies the exact Woodbury inverse
+    # as its preconditioner rather than through the direct dispatch; a singular
+    # middle matrix there must take the same sticky Jacobi fallback instead of
+    # escaping ``solve()`` as a backend-native error and aborting the run.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+
+    def _raising():
+        def _apply(r):
+            raise ValueError("singular middle matrix")
+
+        return _apply
+
+    K.lbfgs_inverse_apply = _raising  # type: ignore[method-assign]
+    solver = _solver(method="gmres")
+    solver.factor(K)
+
+    x = solver.solve(rhs)
+
+    assert solver.describe() == "krylov (gmres, pc=jacobi)"
+    assert solver._exact_inverse_blocked
+    residual = K.matvec(x) - rhs
+    assert float(norm_inf(namespace, residual)) <= 1e-7 * float(
+        norm_inf(namespace, rhs)
+    )
+
+
+def test_gmres_exact_preconditioner_resource_failures_propagate(namespace):
+    # ...while an out-of-memory condition inside that preconditioner is still
+    # not a singular window: it propagates, exactly as on the direct path.
+    K = _bound_only_lbfgs_condensed(namespace)
+    n = K.shape[0]
+    rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+
+    def _raising():
+        def _apply(r):
+            raise MemoryError("synthetic out-of-memory")
+
+        return _apply
+
+    K.lbfgs_inverse_apply = _raising  # type: ignore[method-assign]
+    solver = _solver(method="gmres")
+    solver.factor(K)
+
+    with pytest.raises(MemoryError):
+        solver.solve(rhs)
+    assert not solver._exact_inverse_blocked
