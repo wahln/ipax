@@ -188,6 +188,24 @@ Sweep by sweep:
   overall, 0.875 on `lbfgs/dense` and 0.828 on `exact/dense`, against a ±10 %
   machine spread — consistent with the measured per-step speedup, not proof
   of it.
+- **v32 (2026-09-16), `lbfgs/dense` only, −2 (1 fixed / 3 broken) — a
+  confirming run, not a baseline.** The release-candidate commits after v31
+  (PR #13) change dense-route numerics in one place only: a hinted Cholesky
+  breakdown on the L-BFGS+inequality block is now bookkept
+  (`DenseOptions.pd_hint_failure_limit`, the sticky `pd-hint->lu` marker),
+  so this is the one config that could move. It ran on a machine **2.9×
+  slower** on identical-`n_iter` rows (507 rows; the v28 throttled-machine
+  factor), and all three broken rows are that: `max_time` at the same wall
+  in a fraction of v31's iterations (`DMN15332LS` 9934 → 4757, `TWIRIMD1`
+  239 → 131, `TAX13322` 520 → 476). The marker answers the question the run
+  was for: **12 of 1098 problems** hit a hinted breakdown (`HS13`, `HS90`,
+  `HS91`, `HS98`, `CRESC50`, `ELATTAR`, `LUKVLI12`, `OET7`, `POLAK6`, `S365`,
+  `TAX13322`, `TFI1`). Six keep v31's iteration count exactly; the rest are
+  the known knife-edge family, moved at round-off by later factorizations
+  going straight to LU after the kill switch (`ELATTAR` now lands on the
+  documented optimum, `HS98`/`HS13` converge in fewer iterations to the
+  same value, `OET7` a worse unscored basin, `CRESC50` incorrect either way).
+  No marked problem changed `correct`.
 
 Two sweeps in the series are **not** in the table because they were not
 baselines: **v28** (2026-09-03) ran on a throttled machine (2.87× slower on
