@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-17
+
 ### Added
 - **Linear-inequality L-BFGS performance review and benchmark.** Document
   dense, Krylov, and sparse costs, portable candidates, and optional adapter/JIT
@@ -128,9 +130,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   for fully unbounded systems between dense and Krylov consumers. Bound-only
   arithmetic and cache invalidation are preserved. Add a three-route review
   and reproducible NumPy/Torch/CuPy measurements under `benchmarks/`.
-- **SOC reuse policy follows the solver kind.** `LinearSolver` gains an
-  optional `is_direct()` hook (`DenseSolver`/`SparseDirectSolver` `True`,
-  `KrylovSolver` `False`; absent = direct). Iterative routes now re-solve the
+- **SOC reuse policy follows the solver kind.** A new optional capability
+  protocol `SolverKind` declares `is_direct()` (`DenseSolver`/
+  `SparseDirectSolver` `True`, `KrylovSolver` `False`); the driver reads it
+  through duck typing and treats a solver without it as direct, and it is
+  deliberately *not* a member of `LinearSolver`, so existing third-party
+  solvers keep satisfying that protocol unchanged. Iterative routes now re-solve the
   step's retained system for every second-order correction even when it is
   regularized (Wächter & Biegler 2006 eq. (26) verbatim): a fresh `δ_w = 0`
   solve there is a full Krylov ladder per round, which turned DRUGDIS
@@ -160,8 +165,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `LineSearchOptions(backtrack_interpolation=True)` steps to the minimizer of
   the quadratic merit model through `phi(0)`, `phi'(0)` and the rejected
   `phi(alpha)` (Nocedal & Wright 2006, eq. (3.58)), safeguarded into
-  `[0.1 alpha, 0.5 alpha]` (`backtrack_shrink_min`/`backtrack_shrink_max`) —
-  never longer than plain halving — falling back to halving whenever the
+  `[0.1 alpha, 0.5 alpha]` (`backtrack_shrink_min`/`backtrack_shrink_max`,
+  validated to `0 < shrink_min <= shrink_max < 1` so an interpolated trial
+  can never grow the step) — never longer than plain halving — falling back
+  to halving whenever the
   model is unusable (non-finite trial merit, non-descent direction,
   non-positive model curvature). The opt-in free-mode search has no merit
   model and always halves. Measured on the RT-style bound-only L-BFGS study
@@ -1907,7 +1914,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/wahln/ipax/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/wahln/ipax/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/wahln/ipax/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/wahln/ipax/compare/v0.8.0...v0.9.0

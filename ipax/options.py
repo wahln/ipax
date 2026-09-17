@@ -263,6 +263,20 @@ class LineSearchOptions:
             raise ValueError("gamma_alpha must lie in (0, 1) or be None")
         if not math.isfinite(self.alpha_min_frac) or self.alpha_min_frac <= 0.0:
             raise ValueError("alpha_min_frac must be finite and positive")
+        # The interpolated backtrack is clipped into
+        # ``[shrink_min·α, shrink_max·α]``: ``shrink_max ≥ 1`` could *grow* a
+        # rejected step (the search loop has only the α_min exit, so it would
+        # never terminate), ``shrink_min ≤ 0`` would let one wild trial collapse
+        # it to zero, and an inverted pair makes the clip meaningless.
+        if not (
+            math.isfinite(self.backtrack_shrink_min)
+            and math.isfinite(self.backtrack_shrink_max)
+            and 0.0 < self.backtrack_shrink_min <= self.backtrack_shrink_max < 1.0
+        ):
+            raise ValueError(
+                "backtrack_shrink_min/backtrack_shrink_max must satisfy "
+                "0 < backtrack_shrink_min <= backtrack_shrink_max < 1"
+            )
         # The rescue accepts when ``e_t ≤ (1 − γ)·e0``, so only γ ∈ (0, 1) is a
         # meaningful decrease fraction: γ ≤ 0 makes the bound ≥ e0 (an *increase*
         # in the KKT error would certify "progress"), and γ ≥ 1 demands a

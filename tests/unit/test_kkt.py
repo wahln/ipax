@@ -1532,3 +1532,17 @@ def test_condensed_positive_definite_hint_follows_hessian(namespace):
     assert no_pairs.positive_definite_hint()
     assert not explicit.positive_definite_hint()
     assert not saddle.positive_definite_hint()
+
+
+def test_woodbury_solve_blocks_rejects_bad_rank(namespace):
+    from ipax.ipm.kkt import _woodbury_factors_blocks, _woodbury_solve_blocks
+
+    d = array(namespace, [2.0, 2.0])
+    s = array(namespace, [[1.0], [0.5]])
+    y = array(namespace, [[0.5], [1.0]])
+    m = array(namespace, [[3.0, 0.0], [0.0, 3.0]])
+    factors = _woodbury_factors_blocks(d, 1.0, s, y, m, namespace)
+    with pytest.raises(ValueError, match="vector or matrix"):
+        _woodbury_solve_blocks(
+            factors, namespace.zeros((2, 1, 1), dtype=d.dtype), namespace
+        )

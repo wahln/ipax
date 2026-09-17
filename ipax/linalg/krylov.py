@@ -93,6 +93,32 @@ class _IndefiniteOperatorError(Exception):
     """Internal signal: CG hit non-positive curvature; retry with MINRES."""
 
 
+def _guarded_exact_apply(
+    raw_apply: Callable[[Array], Array],
+) -> Callable[[Array], Array]:
+    """Wrap the exact Woodbury apply so a breakdown takes the Jacobi fallback.
+
+    A backend-native error out of the apply (an exactly singular L-BFGS
+    middle matrix) becomes :class:`KrylovConvergenceError`, which
+    :meth:`KrylovSolver.solve` answers by sticky-disabling the exact inverse
+    and retrying on Jacobi — instead of escaping the driver's δ_w ladder and
+    aborting the solve. A resource failure (out-of-memory) is *not* a
+    singular window and propagates unchanged: relabeling it would hide the
+    cause behind a slower Jacobi retry. Shared by the direct dispatch and the
+    explicit-GMRES preconditioner so both routes fail the same way.
+    """
+
+    def apply_inverse(v: Array) -> Array:
+        try:
+            return raw_apply(v)
+        except Exception as exc:  # backend-native LinAlgError and kin
+            if _is_resource_failure(exc):
+                raise
+            raise KrylovConvergenceError(f"exact Woodbury apply failed: {exc}") from exc
+
+    return apply_inverse
+
+
 def _is_resource_failure(exc: BaseException) -> bool:
     """Whether a backend exception is an allocation failure, not numerics.
 
@@ -439,20 +465,7 @@ class KrylovSolver:
             return xp.zeros_like(b)
         tol = rtol * b_norm
 
-        raw_apply = K.lbfgs_inverse_apply()
-
-        def apply_inverse(v: Array) -> Array:
-            try:
-                return raw_apply(v)
-            except Exception as exc:  # backend-native LinAlgError and kin
-                if _is_resource_failure(exc):
-                    # Out-of-memory is not a singular window: relabeling it
-                    # would sticky-disable the fast path and hide the cause
-                    # behind a slower Jacobi retry.
-                    raise
-                raise KrylovConvergenceError(
-                    f"exact Woodbury apply failed: {exc}"
-                ) from exc
+        apply_inverse = _guarded_exact_apply(K.lbfgs_inverse_apply())
 
         x = apply_inverse(b)
         for applies in range(1, _MAX_EXACT_APPLIES + 1):
@@ -492,9 +505,11 @@ class KrylovSolver:
             # short-circuits to the *direct* ``_exact_inverse_solve`` (which
             # carries the RT-scale measurements) before ever building a
             # preconditioner, so this branch serves the explicit
-            # ``method="gmres"`` route.
+            # ``method="gmres"`` route — guarded exactly like the direct
+            # path, so a singular middle matrix inside GMRES's preconditioner
+            # also lands on the sticky Jacobi fallback in :meth:`solve`.
             self._exact_inverse_active = True
-            return K.lbfgs_inverse_apply()
+            return _guarded_exact_apply(K.lbfgs_inverse_apply())
         if mode == "lbfgs":
             # Prefer the saddle block preconditioner diag(N⁻¹, S⁻¹) (non-diagonal,
             # GMRES-only); else the condensed Woodbury inverse; else Jacobi.

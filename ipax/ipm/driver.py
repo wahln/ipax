@@ -459,7 +459,7 @@ class IPMDriver:
         # last, failed rung). Split from ``_factor_unregularized`` so the
         # iterative-route SOC reuse below never re-solves a failed system.
         self._factor_failed = False
-        # Direct vs iterative solver (``LinearSolver.is_direct``, optional —
+        # Direct vs iterative solver (``SolverKind.is_direct``, optional —
         # absent means direct): decides whether the second-order corrections
         # re-solve a *regularized* retained system or solve fresh at δ_w = 0.
         is_direct = getattr(solver, "is_direct", None)

@@ -27,7 +27,9 @@ Adding a solver never touches `ipm/driver.py` (invariant #3).
 Beyond `factor`/`solve`, the protocol has optional hooks the driver reads
 through duck typing: `set_outer_residual` (inexact-Newton forcing for
 iterative solvers), `describe`/`kkt_form` (reported in `Result.routes`), and
-`is_direct` — `True` when `factor` does the work and `solve` back-substitutes,
+`is_direct` — formally the separate `SolverKind` capability protocol, so a
+solver written against the plain `LinearSolver` protocol keeps satisfying it —
+`True` when `factor` does the work and `solve` back-substitutes,
 `False` when every `solve` is a Krylov run (a solver without it counts as
 direct). The driver uses `is_direct` to decide whether second-order
 corrections re-solve the step's *regularized* retained system (iterative: a
