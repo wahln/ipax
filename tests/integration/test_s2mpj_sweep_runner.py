@@ -56,6 +56,14 @@ def _args(**over):
     return tuple(base.values())
 
 
+def test_restoration_linear_solver_can_be_overridden_for_a_paired_sweep():
+    configs = runner.default_configs(10, 5.0, restoration_linear_solver="krylov")
+    assert configs
+    assert all(
+        options.restoration.linear_solver == "krylov" for _, options, _ in configs
+    )
+
+
 def test_worker_marks_the_problem_and_backend_it_is_running(monkeypatch, tmp_path):
     prefix = tmp_path / "sweep.inflight"
     seen: dict[str, str] = {}

@@ -23,3 +23,13 @@ IPAX_BACKENDS=numpy,torch,array_api_strict pytest -q
 ruff check . && ruff format --check . && mypy ipax
 python scripts/check_purity.py
 ```
+
+## Performance work
+
+See [Performance proposals](development/performance.md) for candidate backend
+adapters and JIT experiments for L-BFGS solves. These are development ideas, with
+validation requirements, rather than available solver options.
+
+The `kacl-verify` pre-commit hook explicitly enables Python's UTF-8 mode because
+the changelog contains mathematical symbols and python-kacl otherwise uses the
+platform's default text encoding.

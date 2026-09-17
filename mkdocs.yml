@@ -32,7 +32,10 @@ nav:
       - TROTS radiotherapy: benchmarks/trots.md
   - Architecture & invariants: architecture.md
   - API reference: reference.md
-  - Contributing: contributing.md
+  - Contributing:
+      - Contributor guide: contributing.md
+      - Performance proposals: development/performance.md
+      - Linear-inequality performance: development/linear-inequality-performance.md
 
 plugins:
   - search

@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The two W&B line-search refinements are OPT-IN; the defaults are inert.
+"""The line-search refinements below are OPT-IN; the defaults are inert.
 
-Both were measured on the full S2MPJ corpus and both *lost* against the shipped
-baseline — eq. (23) α_min by −4, the θ_min f-type gate by −10 (attributed
-independently; see docs/benchmarks/s2mpj.md). They stay in the tree because they
-are faithful to the paper and may suit central-path-following (radiotherapy-like)
-workloads, but they must not touch the default solver.
+The two W&B refinements were measured on the full S2MPJ corpus and both *lost*
+against the shipped baseline — eq. (23) α_min by −4, the θ_min f-type gate by
+−10 (attributed independently; see docs/benchmarks/s2mpj.md). A third,
+non-W&B lever (``backtrack_interpolation``, N&W eq. (3.58)) scored net
++11/6600 but not unanimously (−1/3300 on the Hessian-agnostic ``exact/*``
+configs, +12/3300 on ``lbfgs/*``; same page). All three stay in the tree
+because they suit specific problem signatures (see
+docs/guide/routing-hints.md), but they must not touch the default solver.
 
-These tests pin exactly that: with a default ``LineSearchOptions`` the behaviour
-is byte-for-byte the pre-eq.(23) behaviour.
+These tests pin exactly that: with a default ``LineSearchOptions`` the
+behaviour is byte-for-byte the pre-opt-in behaviour.
 """
 
 from __future__ import annotations
@@ -32,6 +35,12 @@ from ipax.ipm.filter_ls import FilterLineSearch
 from ipax.options import LineSearchOptions
 
 _DEFAULT = LineSearchOptions()
+
+
+def test_backtrack_interpolation_defaults_to_off():
+    # The N&W eq. (3.58) interpolated backtrack must not be the shipped
+    # default — see the module docstring for the (mixed) full-corpus result.
+    assert _DEFAULT.backtrack_interpolation is False
 
 
 def test_alpha_min_defaults_to_the_flat_floor():

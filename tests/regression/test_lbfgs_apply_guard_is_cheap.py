@@ -40,11 +40,18 @@ from ipax.options import LBFGSOptions
 
 
 def _healthy_operator(n: int, k: int) -> LBFGSOperator:
-    """A well-conditioned compact operator with ``n`` variables and ``k`` pairs."""
+    """A well-conditioned compact operator with ``n`` variables and ``k`` pairs.
+
+    The compact state is held as the S/Y blocks (``U = [xi*S  Y]`` with
+    ``xi = 1``), matching the operator's internal representation.
+    """
+    assert k % 2 == 0
     op = LBFGSOperator(n, LBFGSOptions())
     op._xi = 1.0
     rng = np.random.default_rng(0)
-    op._u = np.asarray(rng.standard_normal((n, k)), dtype=np.float64)
+    u = np.asarray(rng.standard_normal((n, k)), dtype=np.float64)
+    op._s = u[:, : k // 2]
+    op._y = u[:, k // 2 :]
     op._m = np.asarray(2.0 * np.eye(k), dtype=np.float64)
     return op
 
@@ -76,11 +83,14 @@ def test_the_apply_guard_cost_does_not_grow_with_the_problem(monkeypatch):
 
 def test_a_non_finite_solve_output_still_falls_back_to_the_seed():
     # The condition the guard exists for: a singular middle matrix whose solve
-    # returns inf/nan instead of raising. Keyed on the solve output, so it is
-    # caught before the correction is ever formed.
+    # returns inf/nan instead of raising. The device-side guard zeroes the
+    # solve output, so the correction is exactly zero and the result is the
+    # identity seed without a host synchronization.
     op = LBFGSOperator(2, LBFGSOptions())
     op._xi = 1.0
-    op._u = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+    # U = [S Y] = I with one pair: S the first column, Y the second.
+    op._s = np.asarray([[1.0], [0.0]], dtype=np.float64)
+    op._y = np.asarray([[0.0], [1.0]], dtype=np.float64)
     op._m = np.asarray([[1e-300, 0.0], [0.0, 1e-300]], dtype=np.float64)
     v = np.asarray([1e50, 1e50], dtype=np.float64)
 

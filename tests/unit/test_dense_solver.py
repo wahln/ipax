@@ -679,3 +679,32 @@ def test_dense_solver_augmented_eigh_route_accepts_matrix_rhs(
     condensed_solver = DenseSolver()
     condensed_solver.factor(op)
     assert_allclose(namespace, actual, condensed_solver.solve(rhs), **tol)
+
+
+def test_dense_solver_never_materializes_pairless_lbfgs_condensed(
+    namespace, tol, monkeypatch
+):
+    # Bound-only L-BFGS problems at scale: before the first curvature pair the
+    # condensed block is diagonal and must take the structured path, not the
+    # n×n materialization + LU (488 s/iteration at n = 50k).
+    dtype = array(namespace, [0.0]).dtype
+    op = build_condensed_operator(
+        LBFGSOperator(3, LBFGSOptions(memory=5)),
+        Diagonal(array(namespace, [0.5, 1.0, 1.5])),
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 3), dtype=dtype)),
+        RegularizationState(delta_w=1e-6),
+    )
+
+    def _boom(self, *args, **kwargs):
+        raise AssertionError("pair-less L-BFGS block must not be materialized")
+
+    monkeypatch.setattr(DenseSolver, "_materialize_and_guard", _boom)
+    solver = DenseSolver()
+    solver.factor(op)
+    rhs = array(namespace, [1.5, -2.0, 3.0])
+
+    actual = solver.solve(rhs)
+
+    expected = rhs / array(namespace, [1.5 + 1e-6, 2.0 + 1e-6, 2.5 + 1e-6])
+    assert_allclose(namespace, actual, expected, **tol)

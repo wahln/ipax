@@ -123,7 +123,9 @@ def test_alpha_min_survives_an_overflowing_directional_derivative():
 def test_search_hands_off_to_restoration_at_the_eq23_alpha_min():
     # An unacceptable ray backtracks only down to the eq. (23) α_min = 5e-7
     # (see the defaults test above) rather than the old flat 1e-8, so the
-    # restoration hand-off costs 21 trials instead of 27.
+    # restoration hand-off costs 21 trials instead of 27. (The opt-in
+    # interpolating backtrack pins every model minimizer of this constant-φ
+    # ray to the 0.1·α safeguard, cutting it to 7 — see test_filter_ls.py.)
     line_search = FilterLineSearch(_EQ23)
 
     result = line_search.search(

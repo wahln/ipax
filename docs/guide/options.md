@@ -205,6 +205,68 @@ bounds, so they never hurt there. Tune Gondzio via
 - `"breedveld"` — a lighter Markov-filter + ratio-control step controller tuned
   for convex/RT-like problems ([`BreedveldOptions`](../reference.md#ipax.options.BreedveldOptions)).
 
+### Restoration linear solver
+
+Feasibility restoration solves a damped Gauss-Newton model of the constraint
+violation. `RestorationOptions.linear_solver` picks how: `"dense"` is the
+established reference (it materializes the `n x n` normal matrix and solves it
+per damping trial), `"krylov"` applies that operator through Jacobian products
+only, and the default `"auto"` follows the main KKT route's dense size cutoff:
+dense below 10 000 variables, Krylov at and above it. Force either route
+explicitly when you want it regardless of size:
+
+```python
+from ipax import Options
+from ipax.options import RestorationOptions
+
+options = Options(
+    restoration=RestorationOptions(linear_solver="krylov"),
+)
+```
+
+This route requires every restoration Jacobian to supply both `matvec` and
+`rmatvec`; a matvec-only Jacobian is rejected when `solve()` starts. An inner
+solve that hits its work cap still contributes its truncated Krylov iterate as
+the Levenberg-Marquardt trial direction (a descent direction of the
+Gauss-Newton model), so the damping only grows when a trial is actually
+rejected; the route never falls back to a dense allocation. Its tolerance and
+work limit live under `RestorationOptions.krylov`, isolated from the main KKT
+solver (`rtol` may be loosened freely there — with `adaptive_tol=False` the
+adaptive cap does not apply). The cutoff is where the evidence points: on
+the S2MPJ corpus of mostly small problems the paired sweep (v29) scored the
+Krylov route −12 of 6600 rows against the dense reference, since an `n x n`
+solve is cheaper there than a Krylov ladder per damping trial, and every
+problem that flipped had `n ≤ 1247` — so `"auto"` reproduces the dense
+results on that whole corpus. Above the cutoff the dense route's two `n x n`
+arrays and `O(n³)` solve per trial are the same non-starter they are for the
+main route (a trivial 8-constraint restoration at `n = 12 000` took 22 s and
+2.3 GB dense, and milliseconds matrix-free). The cutoff is a validation
+boundary rather than a speed crossover: measured per restoration call on
+synthetic problems, the matrix-free route was faster at *every* size — 100×
+at `n = 500` and 300× at `n = 16 000` on a sparse RT-like Jacobian, 2-7× on
+dense random Jacobians of condition 10³ and 10⁶ from `n = 100` to `4 000`,
+both routes reaching the same feasibility. What the dense reference buys
+below the cutoff is robustness on Jacobians so ill-conditioned that CG
+truncates (see the work-cap note below), which does not depend on `n`.
+
+The one knob to know is the work cap, `RestorationOptions.krylov.max_iter`
+(default 200). Conjugate gradients on the Gauss-Newton normal operator sees
+the *squared* conditioning of the Jacobian, and on an ill-conditioned one it
+needs far more than `n` iterations in floating point. The signature is a
+restoration that exits on its iteration budget call after call while the
+infeasibility shrinks only by 10-20 % per call — every inner solve was
+truncated, and a truncated iterate is a poor direction, so the damped loop
+crawls until the driver gives up with `restoration_failed`. S2MPJ HYDCAR20
+(`n = 99`, a distillation-column equality system) is the reference case:
+at the default cap every one of the first call's 403 solves is truncated and
+the run fails on five of six configurations (measured 2026-09-04, v29 paired
+sweep); `max_iter=1000` solves it (optimal, 75 s, about 1000 CG iterations
+per solve ≈ 10 n) and so does 5000 (68 s), against 1.2 s for the dense
+reference. Neither a looser `rtol` nor holding or raising the damping after
+a truncated accept helps — the budget is the lever. On a problem this small
+the dense default is the right route; raise the cap when the matrix-free
+route shows this pattern at a size where dense is not an option.
+
 !!! tip "Radiotherapy-scale planning: start from `slack_init_scale=0.1`"
     On large, deeply-infeasible-at-start dose-optimization problems (TROTS-scale:
     `n≈10³`, hundreds of thousands of dose constraints, a warm start that is
@@ -236,6 +298,11 @@ regularization escalation
 ([`RegularizationOptions`](../reference.md#ipax.options.RegularizationOptions))
 are rarely-touched advanced knobs; the defaults follow Wächter & Biegler (2006)
 and Friedlander & Orban (2012).
+`LineSearchOptions(backtrack_interpolation=True)` is an opt-in deviation —
+safeguarded quadratic interpolation of the merit model (Nocedal & Wright 2006,
+eq. (3.58)) instead of plain halving after a rejected trial — see
+[S2MPJ benchmarks](../benchmarks/s2mpj.md) for when it helps and why it stays
+opt-in.
 
 ## Barrier μ schedule
 

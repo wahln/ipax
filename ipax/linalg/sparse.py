@@ -126,6 +126,10 @@ class SparseDirectSolver:
         """No-op: a direct factorization has no inner tolerance to adapt."""
         del residual
 
+    def is_direct(self) -> bool:
+        """``True``: every backend adapter factors (LDLᵀ/LU) and back-solves."""
+        return True
+
     def _emission(
         self, K: LinearOperator
     ) -> tuple[Callable[[], object | None], Callable[..., Any], Callable[..., Any]]:
