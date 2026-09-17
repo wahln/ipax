@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-17
+
 ### Added
 - **Linear-inequality L-BFGS performance review and benchmark.** Document
   dense, Krylov, and sparse costs, portable candidates, and optional adapter/JIT
@@ -1912,7 +1914,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
   regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/wahln/ipax/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/wahln/ipax/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/wahln/ipax/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/wahln/ipax/compare/v0.8.0...v0.9.0
