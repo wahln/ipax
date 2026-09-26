@@ -33,14 +33,14 @@ entries (``factor = +1`` minimise, ``-1`` maximise). Evaluated at the stored
 which is the loader's ground-truth check — see :func:`objective_at`.
 
 The **linear** blocks (elementwise dose constraints + minimax links) have a
-constant Jacobian: they are lowered once to one-sided ``G z + h ≤ 0`` rows and
-stacked *after* the smooth **nonlinear** cost-function rows in
-``ineq_constraints``/``ineq_jacobian`` (so the Lagrangian-Hessian multipliers line
-up with the curved rows, and the trailing linear rows contribute no Hessian term).
-The constant block is emitted as a cached Array-API-native sparse operator rather
-than ipax's :meth:`~ipax.problem.base.Problem.linear_ineq` because that route's
-two-sided lowering densifies the matrix — infeasible at RT row counts. Jacobians
-and the exact Lagrangian Hessian cross to the backend as Array-API-native
+constant Jacobian and are declared through ipax's public
+:meth:`~ipax.problem.base.Problem.linear_ineq` as the original two-sided rows
+``lo ≤ A z ≤ hi``. The solver lowers them to one-sided rows at the triplet level
+— never densified — and stacks them *after* the smooth **nonlinear**
+cost-function rows of ``ineq_constraints``/``ineq_jacobian``, slicing their
+multipliers off before the Lagrangian Hessian (so :class:`TROTSExactProblem`
+sees exactly the curved rows' multipliers). Jacobians, the linear block and the
+exact Lagrangian Hessian cross to the backend as Array-API-native
 :class:`~ipax.backend.operators.CSROperator` /
 :class:`~ipax.backend.operators.CSCOperator` blocks (true sparsity for the
 sparse-direct route), never a concrete backend sparse object (invariant #4).
@@ -753,70 +753,46 @@ class TROTSProblem(Problem):
             off = mat.b if mat.b.size == m else np.zeros(m)
             lo.extend([-np.inf] * m)
             hi.extend((-sgn * off).tolist())
-        # Deliberately a local, not an attribute: the two-sided block is consumed
-        # by the lowering below and never referenced again, so letting it fall out
-        # of scope at the end of ``__init__`` halves the host residency of the
-        # linear block (it is the same order of nonzeros as the lowered ``G``).
+        # Deliberately a local, not an attribute: only the precision-grouped copy
+        # below is kept, so the host holds the linear block once.
         A_lin = (
             sp.vstack(blocks, format="csr")
             if blocks
             else sp.csr_matrix((0, self._n_vars))
         )
-        self._lin_lo = np.asarray(lo, dtype=float)
-        self._lin_hi = np.asarray(hi, dtype=float)
-
-        # Lower the constant two-sided rows to one-sided form ``G z + h ≤ 0`` here
-        # (each row has exactly one finite side): a finite upper ``A z ≤ hi`` →
-        # ``A z − hi``; a finite lower ``A z ≥ lo`` → ``lo − A z``. The whole linear
-        # block is emitted through ``ineq_constraints`` as a cached sparse operator
-        # — ipax's ``linear_ineq`` lowering densifies, which is infeasible at RT
-        # scale, so we lower the sparse block ourselves and keep it sparse.
-        hi_fin = np.isfinite(self._lin_hi)
-        lo_fin = np.isfinite(self._lin_lo)
+        lin_lo = np.asarray(lo, dtype=float)
+        lin_hi = np.asarray(hi, dtype=float)
         row_f32 = (
             np.concatenate(lin_f32)
             if lin_f32
             else np.zeros((A_lin.shape[0],), dtype=bool)
         )
-        g_blocks: list[Any] = []
-        h_parts: list[Any] = []
-        n_f32 = 0
+        # Group the two-sided rows by source precision, float32-sourced first.
+        # The lin-block values are the source matrices' entries times ±1 (plus
+        # the ±1 minimax links), so a row drawn from a matrix that is float32 in
+        # the file carries only float32 information even though the assembled
+        # block is float64. Each group becomes its own block of the
+        # ``linear_ineq`` operator (see :meth:`linear_ineq`); ipax lowers a
+        # ``VStack`` block by block, so the float32 group keeps its
+        # ``values_dtype_hint`` and the solver's ``gram_dtype="auto"`` default
+        # reduces its Gram accumulate while the genuinely-float64 rows stay
+        # exact. Radiotherapy plans are routinely mixed: a VMAT plan measures
+        # ~96% float32 by nonzero, held back by a single float64 constraint
+        # matrix. Row order within a group is the assembly order.
         A_csr = A_lin.tocsr()
-        # Emit the float32-sourced rows first, so that group is *contiguous* in the
-        # lowered ``G`` and can be handed to the solver as an operator of its own
-        # carrying its own accumulate hint (see ``_linear_ineq_operator``). Row
-        # order within a group — and hence the whole block whenever the plan is not
-        # mixed — is unchanged from the ungrouped assembly.
+        self._lin_groups: list[tuple[Any, str | None]] = []
+        lo_parts: list[Any] = []
+        hi_parts: list[Any] = []
         for is_f32 in (True, False):
             group = row_f32 == is_f32
-            sel_hi = hi_fin & group
-            sel_lo = lo_fin & group
-            if bool(sel_hi.any()):
-                g_blocks.append(A_csr[sel_hi])
-                h_parts.append(-self._lin_hi[sel_hi])
-                n_f32 += int(sel_hi.sum()) if is_f32 else 0
-            if bool(sel_lo.any()):
-                g_blocks.append(-A_csr[sel_lo])
-                h_parts.append(self._lin_lo[sel_lo])
-                n_f32 += int(sel_lo.sum()) if is_f32 else 0
-        self._G = (
-            sp.vstack(g_blocks, format="csr")
-            if g_blocks
-            else sp.csr_matrix((0, self._n_vars))
-        )
-        self._h = np.concatenate(h_parts) if h_parts else np.zeros((0,), dtype=float)
-        self._n_lin_ineq = int(self._G.shape[0])
+            if bool(group.any()):
+                self._lin_groups.append((A_csr[group], "float32" if is_f32 else None))
+                lo_parts.append(lin_lo[group])
+                hi_parts.append(lin_hi[group])
+        self._lin_lo = np.concatenate(lo_parts) if lo_parts else np.zeros((0,))
+        self._lin_hi = np.concatenate(hi_parts) if hi_parts else np.zeros((0,))
+        self._n_lin_rows = int(A_lin.shape[0])  # two-sided; one finite side each
         self._n_nl_ineq = len(self._nl_con) + len(self._quad_con)
-        # The lin-block values are the source matrices' entries times ±1 (plus the
-        # ±1 minimax links), so a row drawn from a matrix that is float32 in the
-        # file carries only float32 information even though the assembled ``G`` is
-        # float64. Those rows lead the block (grouped above), and the count is what
-        # ``_linear_ineq_operator`` splits on so the solver's ``gram_dtype="auto"``
-        # default can reduce their accumulate while the genuinely-float64 rows stay
-        # exact. Radiotherapy plans are routinely mixed: a VMAT plan measures ~96%
-        # float32 by nonzero, held back by a single float64 constraint matrix.
-        self._n_lin_f32 = n_f32
-        self._G_op: LinearOperator | None = None  # cached constant sparse operator
 
         # Objective linear coefficient over z (mean terms on x; minimax on t).
         self._c_obj = np.zeros((self._n_vars,), dtype=float)
@@ -826,10 +802,10 @@ class TROTSProblem(Problem):
 
         # Device-side evaluation (CuPy namespaces): keep z and the dose matrices
         # on the device so the per-callback products run on the GPU instead of
-        # round-tripping to SciPy. The big constant ``G`` spmv runs on the device
-        # too, but through the constraint operator, which already holds it there
-        # — mirroring it a second time would double the residency of the largest
-        # array in the problem. The elementwise cost math (`_cost_value` &
+        # round-tripping to SciPy. The big constant linear block is not
+        # evaluated here at all: it is declared through ``linear_ineq`` and the
+        # solver evaluates its lowered operator, which already lives in the
+        # solve namespace. The elementwise cost math (`_cost_value` &
         # friends) is written against NumPy's public functions, which dispatch to
         # CuPy via the NEP-18/ufunc protocols, so the same code serves both
         # spaces. Host NumPy/SciPy remains the path for every non-CUDA namespace.
@@ -837,7 +813,6 @@ class TROTSProblem(Problem):
         self._cxs: Any = None  # cupyx.scipy.sparse, when active
         self._dev_mats: dict[int, Any] = {}  # id(TROTSMatrix) -> device CSR
         self._dev_vecs: dict[int, Any] = {}  # id(TROTSMatrix) -> device b
-        self._h_eval: Any = self._h
         self._c_obj_eval: Any = self._c_obj
         try:
             probe = xp.asarray(0.0)
@@ -851,11 +826,6 @@ class TROTSProblem(Problem):
             if cxs is not None:
                 self._cxs = cxs
                 self._eval_device = True
-                # ``G`` itself is deliberately *not* mirrored here: the operator
-                # handed to the solver already carries a device copy, and the
-                # constraint values are evaluated through it (see
-                # ``ineq_constraints``). One device residency, not two.
-                self._h_eval = xp.asarray(self._h)
                 self._c_obj_eval = xp.asarray(self._c_obj)
 
     # -- dimensions & bounds ------------------------------------------------
@@ -1024,43 +994,49 @@ class TROTSProblem(Problem):
             return g
         return _from_numpy(self.xp, g)
 
-    # -- inequality constraints (nonlinear cost rows first, then linear) ----
-    # The elementwise dose constraints and minimax links are constant-Jacobian
-    # rows; ipax's ``linear_ineq`` would densify them, so they are lowered in
-    # ``__init__`` to ``G z + h ≤ 0`` and stacked *after* the smooth cost-function
-    # rows here. The nonlinear rows lead so the Lagrangian-Hessian multipliers line
-    # up with them (the trailing linear multipliers carry no curvature).
-    def _linear_ineq_operator(self) -> LinearOperator:
-        if self._G_op is None:
-            k = self._n_lin_f32
-            if k in (0, self._n_lin_ineq):
-                self._G_op = self._csr_operator(
-                    self._G,
-                    symmetric=False,
-                    values_dtype_hint="float32" if k else None,
-                )
-            else:
-                from ipax.backend.operators import VStack
+    # -- linear inequalities (constant block, lowered by ipax) ---------------
+    def linear_ineq(self) -> tuple[LinearOperator, Array, Array] | None:
+        """The constant two-sided block ``lo ≤ A z ≤ hi``.
 
-                # Mixed sources: hand the two groups over separately, so a reduced
-                # Gram accumulate applies to the float32-sourced rows alone. The
-                # stack is equivalent row-for-row to the single operator — a
-                # vertical stack's Gram is the sum of its blocks' Grams.
-                self._G_op = VStack(
-                    (
-                        self._csr_operator(
-                            self._G[:k], symmetric=False, values_dtype_hint="float32"
-                        ),
-                        self._csr_operator(self._G[k:], symmetric=False),
-                    )
-                )
-        return self._G_op
+        The elementwise dose constraints and the minimax links, as an
+        Array-API-native :class:`~ipax.backend.operators.CSROperator` — a
+        :class:`~ipax.backend.operators.VStack` of the float32-sourced and the
+        float64 row groups when the plan mixes them, so each keeps its own
+        precision hint — with the original two-sided bounds (every row has
+        exactly one finite side). ipax lowers it at the triplet level into
+        one-sided rows, never densified, and appends them after the nonlinear
+        rows of :meth:`ineq_constraints`; the lowered row order is the core's
+        (per group: finite-lower rows, then finite-upper rows), not the loader's.
 
+        Built fresh on every call and deliberately not cached: the lowering
+        emits an operator of its own, so holding this one would keep a second
+        copy of the largest array in the problem (a second device copy on a
+        CUDA namespace). Only the host CSR groups are retained.
+        """
+        if not self._lin_groups:
+            return None
+        from ipax.backend.operators import VStack
+
+        ops = [
+            self._csr_operator(csr, symmetric=False, values_dtype_hint=hint)
+            for csr, hint in self._lin_groups
+        ]
+        matrix = ops[0] if len(ops) == 1 else VStack(tuple(ops))
+        return (
+            matrix,
+            _from_numpy(self.xp, self._lin_lo),
+            _from_numpy(self.xp, self._lin_hi),
+        )
+
+    # -- nonlinear inequality constraints (smooth cost-function rows) --------
+    # Only the curved rows live here; the constant linear block is declared
+    # through ``linear_ineq`` and appended after these rows by the solver, so
+    # the Lagrangian-Hessian multipliers line up with the rows below.
     def ineq_constraints(self, z: Array) -> Array:
         import numpy as np
 
-        if self._n_nl_ineq == 0 and self._n_lin_ineq == 0:
-            raise NotImplementedError
+        if self._n_nl_ineq == 0:
+            raise NotImplementedError  # the linear block alone: see linear_ineq
         zc = self._eval_z(z)
         x = zc[: self._n]
         vals: list[float] = []
@@ -1072,33 +1048,14 @@ class TROTSProblem(Problem):
             lin = float(self._eval_b(mat) @ x) if mat.b.size == self._n else 0.0
             f = 0.5 * float(x @ ax) + lin + mat.c
             vals.append(sign * (f - bound))
-        nl = np.asarray(vals, dtype=float)
-        if self._n_lin_ineq == 0:
-            return _from_numpy(self.xp, nl)
-        if self._eval_device:
-            # Device: go through the constraint operator rather than a second
-            # device copy of ``G``. Its adapter holds a device CSR of exactly
-            # these rows, so this is the same spmv on the same data — and in the
-            # mixed-source case the operator is a ``VStack`` whose blocks are the
-            # contiguous row groups, so the concatenated result is in ``G`` row
-            # order and lines up with ``_h_eval``.
-            lin_vals = self._linear_ineq_operator().matvec(zc) + self._h_eval
-            return np.concatenate([self.xp.asarray(nl), lin_vals])
-        lin_vals = self._G @ zc + self._h_eval
-        return _from_numpy(self.xp, np.concatenate([nl, lin_vals]))
+        return _from_numpy(self.xp, np.asarray(vals, dtype=float))
 
     def ineq_jacobian(self, z: Array) -> Array | LinearOperator:
         import numpy as np
         import scipy.sparse as sp
 
-        from ipax.backend.operators import VStack
-
-        if self._n_nl_ineq == 0 and self._n_lin_ineq == 0:
-            raise NotImplementedError
-        lin_op = self._linear_ineq_operator() if self._n_lin_ineq else None
         if self._n_nl_ineq == 0:
-            assert lin_op is not None
-            return lin_op
+            raise NotImplementedError  # the linear block alone: see linear_ineq
         x = self._eval_z(z)[: self._n]
         rows: list[Any] = []
         for mat, sign, ctype, par, _bound in self._nl_con:
@@ -1111,15 +1068,12 @@ class TROTSProblem(Problem):
                 gx = gx + self._eval_b(mat)
             rows.append(sign * gx)
         spx = self._cxs if self._eval_device else sp
-        J_x = np.stack(rows) if rows else np.zeros((0, self._n))
+        J_x = np.stack(rows)
         J = spx.hstack(
             [spx.csr_matrix(J_x), spx.csr_matrix((len(rows), self._n_aux))],
             format="csr",
         )
-        nl_op = self._csr_operator(J, symmetric=False)
-        if lin_op is None:
-            return nl_op
-        return VStack((nl_op, lin_op))
+        return self._csr_operator(J, symmetric=False)
 
     # -- sparse-operator helper --------------------------------------------
     def _csr_operator(

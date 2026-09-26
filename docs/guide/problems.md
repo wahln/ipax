@@ -209,7 +209,36 @@ def linear_ineq(self):
 ```
 
 `A` may be a dense array **or** a [`LinearOperator`](../reference.md#ipax.backend.operators.LinearOperator),
-so a large structured constraint matrix never has to be materialized.
+so a large structured constraint matrix never has to be materialized. The
+solver lowers the two-sided block once into one-sided rows (`l − A x ≤ 0` for
+each finite lower bound, `A x − u ≤ 0` for each finite upper bound; a range row
+contributes both) and keeps it in the operator's own form:
+
+- a `COOOperator` / `CSROperator` / `CSCOperator` is rewritten at the triplet
+  level into an operator of the same family, so the dense route forms the small
+  `n×n` Gram by sparse arithmetic and the sparse route factors true sparsity —
+  the natural choice for tall sparse sets (`m ≫ n`);
+- a `VStack` of blocks is lowered block by block, so e.g. a float32-sourced
+  block keeps its `values_dtype_hint` for `DenseOptions(gram_dtype="auto")`;
+- any other operator (matrix-free included; it must provide `rmatvec`) is
+  wrapped in a signed row selection that forwards the Gram capabilities.
+
+A source operator constructed with a `pattern_key` yields a lowered block with a
+derived key, so the sparse route keeps its symbolic-analysis reuse.
+
+The lowered rows follow any nonlinear inequalities, so their multipliers come
+last in `Result.y_ineq`: all finite-lower rows (source order), then all
+finite-upper rows (source order). A `VStack` is laid out block by block instead
+(each block's lower rows, then its upper rows).
+
+```python
+from ipax.backend.operators import CSROperator
+
+
+def linear_ineq(self):
+    A = CSROperator(indptr, indices, data, (m, n), pattern_key="dose")
+    return (A, lower, upper)  # never densified
+```
 
 ## Returning operators instead of matrices
 

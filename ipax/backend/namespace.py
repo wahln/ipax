@@ -41,6 +41,18 @@ def array_namespace(*arrays: Array) -> Namespace:
     return _ns(*arrays)
 
 
+def device(x: Array) -> object:
+    """Return the device ``x`` lives on, as accepted by ``device=`` keywords.
+
+    Thin wrapper over ``array_api_compat.device``: the standard ``x.device``
+    attribute is missing on NumPy < 2.0 (still supported) and non-conforming
+    on some other libraries, so the core must not read it directly.
+    """
+    from array_api_compat import device as _device
+
+    return _device(x)
+
+
 _ARRAY_API_LINALG_FUNCTIONS = frozenset(
     {
         "cholesky",

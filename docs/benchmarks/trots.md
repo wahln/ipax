@@ -120,16 +120,26 @@ hardware with the headroom to answer it. Note also that `auto` would not engage
 there in any case — Head-and-Neck's data is genuinely float64, so the
 reduction would have to be user-forced.
 
-**Device residency of the constant block.** The lowered `G z + h ≤ 0` block is
-by far the largest array in an RT problem — 86 M nonzeros on
-`Prostate_VMAT_101` — and the loader keeps exactly one device copy of it: the
-constraint operator it hands the solver. Evaluating the linear constraint rows
-through that operator, rather than mirroring `G` to the device a second time,
-measures 3057 MiB in the CuPy pool instead of 4040 MiB on that case (the host
-side drops the pre-lowering two-sided assembly for a comparable saving). What
-remains is the Array-API COO triplets the core holds (24 B/nnz) plus the
-adapter's device CSR (12 B/nnz) — invariant #4's cost, paid once. The
-Head-and-Neck saturation above was measured before that saving.
+**Device residency of the constant block.** The linear `lo ≤ A z ≤ hi` block
+(dose constraints + minimax links) is by far the largest array in an RT problem —
+86 M nonzeros on `Prostate_VMAT_101`. Since 2026-09 the loader declares it
+through the public `Problem.linear_ineq()` (as a `VStack` of the float32- and
+float64-sourced row groups, so `gram_dtype="auto"` still reduces per group) and
+ipax lowers it to one-sided rows at the triplet level; earlier the loader
+hand-lowered it to `G z + h ≤ 0` and appended it to `ineq_constraints`, because
+the `linear_ineq` lowering used to densify. The loader keeps only the host CSR
+groups and builds the declared operator fresh per `linear_ineq()` call, so once
+the lowering has consumed it the device holds one copy: the lowered operator's
+Array-API COO triplets (24 B/nnz) plus the adapter's device CSR (12 B/nnz) —
+invariant #4's cost, paid once, the same steady-state accounting as the
+hand-lowered layout, which measured 3057 MiB in the CuPy pool on
+`Prostate_VMAT_101` (4040 MiB before an earlier change stopped mirroring `G` a
+second time). The migrated layout has **not** been re-measured on device, and
+the one-time lowering transiently holds the declared and the lowered triplets
+together. The Head-and-Neck saturation above was measured before both changes.
+The lowered row order also differs from the old hand-lowering (per precision
+group, finite-lower rows now precede finite-upper rows); the constraint set is
+identical.
 
 Two measurement notes for anyone repeating this. The sparse adapters memoize
 the Gram per `accumulate_dtype`, keyed on weight equality (it serves `δ_w`

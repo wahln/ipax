@@ -102,7 +102,9 @@ def test_exact_hessian_matches_finite_differences():
         d = mat.matrix @ x
         z[instance.n + k] = np.max(d) if mini else np.min(d)
 
-    n_ineq = problem._n_nl_ineq + problem._n_lin_ineq
+    # The solver slices the (curvature-free) lowered linear_ineq multipliers
+    # off, so lagrangian_hessian receives the nonlinear rows' multipliers only.
+    n_ineq = problem._n_nl_ineq
     H = problem.lagrangian_hessian(z, np.zeros(0), np.zeros(n_ineq), 1.0)
     Hd = np.asarray(H.dense_matrix())
     eps = 1e-6
@@ -120,7 +122,13 @@ def test_reference_solution_is_feasible():
     instance = trots.load_trots_file(f"{_ROOT}/Liver_01.mat")
     problem = trots.TROTSExactProblem(instance, np, sparse=True)
     z = _padded_solution(problem, instance)
-    g = np.asarray(problem.ineq_constraints(z))
+    # Evaluate as the solver does: the nonlinear rows plus the lowered
+    # linear_ineq block (dose constraints and minimax links).
+    from ipax.problem.linear_ineq import lower_linear_inequalities
+
+    lowered = lower_linear_inequalities(problem, z, np)
+    g = np.asarray(lowered.ineq_constraints(z))
+    assert g.shape[0] > problem._n_nl_ineq
     # The reference plan satisfies every constraint up to the DVH smoothing slack.
     assert float(np.max(g)) <= 1e-3
 
@@ -180,7 +188,7 @@ def test_linear_block_declares_float32_source():
     # route's gram_dtype="auto" default engages the reduced accumulate.
     instance = trots.load_trots_file(f"{_ROOT}/Prostate_BT_01.mat")
     problem = trots.TROTSProblem(instance, np, sparse=True)
-    op = problem._linear_ineq_operator()
+    op = problem.linear_ineq()[0]
     assert op.gram_accumulate_dtype_hint() == "float32"
 
 
@@ -247,6 +255,20 @@ def test_device_evaluation_matches_host():
     np.testing.assert_allclose(
         cupy.asnumpy(J_dev.rmatvec(xp.asarray(u))),
         np.asarray(J_host.rmatvec(u)),
+        rtol=1e-9,
+        atol=1e-9,
+    )
+
+    # The linear_ineq block is declared in the solve namespace (device-resident
+    # operator and bounds) and agrees with the host declaration.
+    A_host, lo_host, hi_host = host.linear_ineq()
+    A_dev, lo_dev, hi_dev = dev.linear_ineq()
+    assert hasattr(lo_dev, "__cuda_array_interface__")
+    np.testing.assert_array_equal(cupy.asnumpy(lo_dev), np.asarray(lo_host))
+    np.testing.assert_array_equal(cupy.asnumpy(hi_dev), np.asarray(hi_host))
+    np.testing.assert_allclose(
+        cupy.asnumpy(A_dev.matvec(xp.asarray(z))),
+        np.asarray(A_host.matvec(z)),
         rtol=1e-9,
         atol=1e-9,
     )

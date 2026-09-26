@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- **Operator-valued `linear_ineq` matrices, lowered without densifying.**
+  `Problem.linear_ineq()` now accepts any `LinearOperator`, not only a rank-2
+  array (an operator previously raised `NotImplementedError`). The two-sided
+  block is lowered by the kind of matrix: `COOOperator`/`CSROperator`/
+  `CSCOperator` are rewritten at the triplet level into an operator of the
+  same family (Array-API index/value arithmetic only; the data-precision hint
+  is kept and a pattern key is derived from the source's, so symbolic reuse
+  survives); a `VStack` is lowered block by block so each block keeps its own
+  `gram_accumulate_dtype_hint` for `DenseOptions(gram_dtype="auto")`; any
+  other operator (matrix-free included) is wrapped in a signed row selection
+  whose `gram`/`gram_diagonal`/`gram_coo` fold the selection into the weights.
+  Tall sparse inequality sets (`m ≫ n`) declared through `linear_ineq` now
+  stay on the condensed routes' sparse-Gram fast path. Arrays lower exactly
+  as before, and a `Dense` operator lowers bit-for-bit like its array.
+  Lowered rows are laid out lower-rows-then-upper-rows (block by block for a
+  `VStack`), after any nonlinear inequalities in `Result.y_ineq`.
+  `VStack.blocks` exposes the stacked operators.
+- **Tracked tall linear-inequality benchmark** (`benchmarks/runners/bench_tall_linear_ineq.py`,
+  asv). It tracks time, peak memory, iterations, KKT residual, success, and a
+  stable route code over six tall cells. The cells straddle the dense and
+  sparse normal-equations boundary. Each cell runs with the rows declared
+  through `linear_ineq` and through a hand-lowered operator Jacobian.
+  `TallSparseQP` gains `declaration=` and `two_sided=` (range rows) parameters.
+
 ## [0.11.0] - 2026-09-17
 
 ### Added

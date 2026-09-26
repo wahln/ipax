@@ -287,6 +287,13 @@ def _lin_problem(sources, *, n=3):
     )
 
 
+def _lowered(problem):
+    """The problem as the solver sees it: ``linear_ineq`` lowered by ipax."""
+    from ipax.problem.linear_ineq import lower_linear_inequalities
+
+    return lower_linear_inequalities(problem, np.zeros(problem.n_vars), np)
+
+
 @pytest.mark.parametrize(
     ("sources", "hint"),
     [
@@ -297,36 +304,45 @@ def _lin_problem(sources, *, n=3):
 )
 def test_linear_block_declares_its_source_precision(sources, hint):
     # gram_dtype="auto" reduces the Gram accumulate only where the operator says
-    # the data permits it, so the lowered G z + h ≤ 0 block must declare the
-    # precision its rows actually carry — including when the plan mixes the two.
-    op = _lin_problem(sources)._linear_ineq_operator()
+    # the data permits it, so the linear_ineq block must declare the precision
+    # its rows actually carry — including when the plan mixes the two — and the
+    # declaration must survive ipax's lowering of that block.
+    problem = _lin_problem(sources)
+    op = problem.linear_ineq()[0]
+    lowered_jac = _lowered(problem).ineq_jacobian(np.zeros(problem.n_vars))
 
     assert op.gram_accumulate_dtype_hint() == hint
+    assert lowered_jac.gram_accumulate_dtype_hint() == hint
 
 
 def test_mixed_source_block_is_split_so_only_float32_rows_reduce():
     # Radiotherapy plans are routinely mixed (a VMAT plan is ~96% float32 by
     # nonzero, held back by one float64 matrix). All-or-nothing would forfeit
     # the reduction entirely; the block is stacked instead, so the float32 rows
-    # reduce while the float64 rows stay exact.
+    # reduce while the float64 rows stay exact — before and after lowering.
     from ipax.backend.operators import VStack
 
-    op = _lin_problem(["float64", "float32"])._linear_ineq_operator()
+    problem = _lin_problem(["float64", "float32"])
+    op = problem.linear_ineq()[0]
+    lowered = _lowered(problem).ineq_jacobian(np.zeros(problem.n_vars))
 
-    assert isinstance(op, VStack)
-    f32_block, f64_block = op._ops
-    assert f32_block.gram_accumulate_dtype_hint() == "float32"
-    assert f64_block.gram_accumulate_dtype_hint() is None
+    for stack in (op, lowered):
+        assert isinstance(stack, VStack)
+        f32_block, f64_block = stack.blocks
+        assert f32_block.gram_accumulate_dtype_hint() == "float32"
+        assert f64_block.gram_accumulate_dtype_hint() is None
     # The float32-sourced rows lead the block: entry 1 carries the value 2.0.
+    f32_block, f64_block = op.blocks
     np.testing.assert_array_equal(np.asarray(f32_block.dense_matrix()), 2.0)
     np.testing.assert_array_equal(np.asarray(f64_block.dense_matrix()), 1.0)
 
 
 def test_grouping_preserves_the_constraints_it_reorders():
-    # Grouping permutes rows, so the guarantee is that the block still describes
-    # the same feasible set and that values and Jacobian rows stay aligned.
-    mixed = _lin_problem(["float64", "float32"])
-    plain = _lin_problem(["float64", "float64"])  # same data, ungrouped
+    # Grouping permutes rows, so the guarantee is that the lowered block still
+    # describes the same feasible set and that values and Jacobian rows stay
+    # aligned.
+    mixed = _lowered(_lin_problem(["float64", "float32"]))
+    plain = _lowered(_lin_problem(["float64", "float64"]))  # same data, ungrouped
     z = np.asarray([0.5, -1.0, 2.0])
 
     g_mixed = np.asarray(mixed.ineq_constraints(z))
@@ -343,8 +359,8 @@ def test_grouping_preserves_the_constraints_it_reorders():
 def test_split_block_gram_matches_the_unsplit_one():
     # A vertical stack's Gram is the sum of its blocks' Grams, so splitting must
     # be exactly neutral when no reduction is requested.
-    mixed = _lin_problem(["float64", "float32"])._linear_ineq_operator()
-    plain = _lin_problem(["float64", "float64"])._linear_ineq_operator()
+    mixed = _lin_problem(["float64", "float32"]).linear_ineq()[0]
+    plain = _lin_problem(["float64", "float64"]).linear_ineq()[0]
     w = np.asarray([1.0, 2.0, 3.0, 4.0])
 
     np.testing.assert_allclose(
@@ -352,39 +368,39 @@ def test_split_block_gram_matches_the_unsplit_one():
     )
 
 
-def test_the_lowered_block_is_retained_exactly_once():
-    # The loader used to keep the lowered block twice — once as an evaluation
-    # matrix and once inside the constraint operator — which on a CUDA namespace
-    # meant two device copies of the largest array in the problem, and it also
-    # held on to the pre-lowering two-sided assembly. The operator is now the
-    # single representation and the assembly is a local.
+def test_linear_block_operator_is_not_retained():
+    # The linear block is by far the largest array in an RT problem. ipax's
+    # lowering emits an operator of its own, so a loader-held copy of the
+    # declared operator would be a second full copy (a second *device* copy on
+    # a CUDA namespace). The loader therefore builds it fresh per call and
+    # keeps only the host CSR groups — each row exactly once.
     import scipy.sparse as sp
 
-    problem = _lin_problem(["float64", "float32"])
-    problem._linear_ineq_operator()
+    from ipax.backend.operators import LinearOperator
 
-    held = [
-        value
-        for value in vars(problem).values()
-        if sp.issparse(value) and value.shape == problem._G.shape
-    ]
-    assert len(held) == 1
-    assert held[0] is problem._G
+    problem = _lin_problem(["float64", "float32"])
+    first = problem.linear_ineq()[0]
+
+    assert problem.linear_ineq()[0] is not first
+    assert not any(isinstance(v, LinearOperator) for v in vars(problem).values())
+    groups = [csr for csr, _hint in problem._lin_groups]
+    assert all(sp.issparse(csr) for csr in groups)
+    assert sum(csr.shape[0] for csr in groups) == problem._n_lin_rows
 
 
 @pytest.mark.parametrize("sources", [["float64", "float64"], ["float64", "float32"]])
-def test_operator_evaluation_matches_the_direct_product(sources):
-    # With the second copy gone, the device path evaluates the linear rows
-    # through the constraint operator. That is only equivalent to the product it
-    # replaces if the operator's rows are G's rows in G's order — which the mixed
-    # case, where the operator is a stack of the two contiguous groups, has to
-    # earn. Verified here on the host, where both routes are available.
+def test_lowered_block_evaluates_the_two_sided_constraints(sources):
+    # Every synthetic row is upper-bounded (``A x ≤ bound``): entry i contributes
+    # two rows ``(i+1)·Σz ≤ 10(i+1)``. The lowered block must evaluate them as
+    # ``A z − bound`` in the declared (precision-grouped) row order.
     problem = _lin_problem(sources)
     z = np.asarray([0.5, -1.0, 2.0])
+    order = [1, 0] if sources == ["float64", "float32"] else [0, 1]
+    expected = [(i + 1) * z.sum() - 10.0 * (i + 1) for i in order for _ in range(2)]
 
-    through_operator = np.asarray(problem._linear_ineq_operator().matvec(z))
+    g = np.asarray(_lowered(problem).ineq_constraints(z))
 
-    np.testing.assert_allclose(through_operator, problem._G @ z, rtol=1e-14, atol=0)
+    np.testing.assert_allclose(g, expected, rtol=1e-14, atol=0)
 
 
 def test_float32_stored_matrix_records_source_dtype(tmp_path):
