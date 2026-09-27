@@ -47,6 +47,14 @@ Two representation details matter before tuning kernels:
   are lowered. Choosing `linsolve="sparse"` does not make a dense `A` sparse:
   `Dense.to_coo()` emits all entries, including numerical zeros. Use a structural
   sparse operator (e.g. a `CSROperator` in `linear_ineq`) when its sparsity is important.
+- A `CSROperator` *subclass* (or any other operator) declared through
+  `linear_ineq` is wrapped rather than rewritten, so its own `gram` override
+  survives the lowering and receives per-source-row summed weights. The TROTS
+  loader relies on this for its per-structure tiled Gram
+  (`TiledGramCSROperator`, Breedveld 2017 eq. 48), which forms the Gram 7× faster
+  on `Protons_01`. It lives at the application edge, so problem-specific Gram
+  kernels need no core change; see
+  [the TROTS page](../benchmarks/trots.md#tiled-per-structure-gram-loader-side-default).
 
 Auto-selection also uses size, aspect ratio, and available Gram/fill metadata.
 The measurements below do not establish new crossover thresholds.

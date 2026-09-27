@@ -249,6 +249,29 @@ both routes reaching the same feasibility. What the dense reference buys
 below the cutoff is robustness on Jacobians so ill-conditioned that CG
 truncates (see the work-cap note below), which does not depend on `n`.
 
+The dense route never densifies a *tall* Jacobian it does not have to.
+It assembles `Jᵀ Σ J` block by block (equality rows, inequality rows). A block
+with more than `RestorationOptions.dense_materialize_max_elements` entries
+(`m_b · n`, default 10⁷ = 80 MB of float64) whose operator can form its own
+weighted Gram (`gram_capable()`, e.g. the SciPy/CuPy sparse adapters and the
+TROTS loader's tiled operator) contributes `J_bᵀ Σ_b J_b` through `gram` and
+`J_bᵀ r_b` through `rmatvec` instead of an `m_b × n` dense copy. The matrices
+are the same; only the round-off differs. Smaller blocks, and operators
+without a Gram, keep the densified reference arithmetic: every block in the
+S2MPJ corpus is below the default (largest `m · n` ≈ 3.9·10⁶), so those
+results do not change. The motivating case is TROTS `Protons_01`, whose
+lowered dose block is 369 445 × 1101: densifying it cost 3.2 GB per restoration
+iteration, and on an 8 GB GPU a single restoration phase ran for 1127 s.
+Measured from its initial point on CuPy, `restore()` takes 560 s with the
+block densified and 9.7 s through the Gram, with the same 40 outer iterations
+to feasibility.
+
+```python
+options = Options(
+    restoration=RestorationOptions(dense_materialize_max_elements=2_000_000),
+)
+```
+
 The one knob to know is the work cap, `RestorationOptions.krylov.max_iter`
 (default 200). Conjugate gradients on the Gauss-Newton normal operator sees
 the *squared* conditioning of the Jacobian, and on an ill-conditioned one it

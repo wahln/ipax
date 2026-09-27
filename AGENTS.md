@@ -205,6 +205,17 @@ kernels*, chained dose-influence products; hard-coded RT cost-functions
 dimensionality & sparsity in mind, but the RT-specific kernels belong in a
 separate downstream layer.
 
+**Where the guardrails apply.** The scope above governs the library, i.e. the
+`ipax/` package. `benchmarks/` (corpus loaders, generators, runners) and
+`examples/` are application-edge demonstrators and *may* implement
+out-of-scope, domain-specific machinery on top of the public `Problem` /
+`LinearOperator` protocols — e.g. the TROTS loader's per-structure tiled
+dose-matrix Gram and grouped exact Hessian (Breedveld 2017; van Haveren &
+Breedveld 2019). Such code must reach the solver only through those
+protocols (an operator supplying its own `gram`, a `Problem` supplying its
+own Hessian), never through changes to `ipax/`; it is the reference for what a
+downstream RT layer would look like, not part of the solver's API.
+
 ---
 
 ## Direction
@@ -302,6 +313,12 @@ Steps:
   implementation developed and tuned for radiation therapy treatment planning."
   *Computational Optimization and Applications* 68(2), 209–242.
   <https://doi.org/10.1007/s10589-017-9919-4>. TROTS dataset <http://www.trots.eu>.
+- van Haveren, R. & Breedveld, S. (2019). "Fast and exact Hessian computation for
+  a class of nonlinear functions used in radiation therapy treatment planning."
+  *Physics in Medicine & Biology* 64, 16NT01.
+  <https://doi.org/10.1088/1361-6560/ab1e17>; corrigendum *Phys. Med. Biol.* 65
+  (2020) 079501 <https://doi.org/10.1088/1361-6560/ab7ac0> (the TROTS loader's
+  grouped exact Hessian, eqs. (8)–(9))
 - Array API `linalg` extension:
   <https://data-apis.org/array-api/latest/extensions/linear_algebra_functions.html>
 - `array-api-compat` / `array-api-extra`:

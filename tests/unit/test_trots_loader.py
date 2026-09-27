@@ -453,3 +453,120 @@ def test_cache_key_distinguishes_same_named_files_in_a_shared_cache(
     assert first.matrix[0, 0] == 5.0
     assert second.matrix[0, 0] == 9.0, "cache key aliased two distinct datasets"
     assert trots._cache_dir_for(paths[0]) != trots._cache_dir_for(paths[1])
+
+
+def _share_instance(rows_f64, rows_f32, *, n=3):
+    """A float64 and a float32 upper-bounded matrix of the given row counts."""
+    import scipy.sparse as sp
+
+    entries, cache = [], {}
+    for i, (rows, src) in enumerate(((rows_f64, "float64"), (rows_f32, "float32"))):
+        cache[i + 1] = trots.TROTSMatrix(
+            name=f"m{i}",
+            mtype=0,
+            matrix=sp.csr_matrix(np.full((rows, n), float(i + 1))),
+            b=np.zeros(rows),
+            c=0.0,
+            source_dtype=src,
+        )
+        entries.append(
+            trots.TROTSEntry(
+                name=f"c{i}",
+                is_constraint=True,
+                minimise=True,
+                ctype=1,
+                data_id=i + 1,
+                params=None,
+                bound=float(10 * (i + 1)),
+                weight=1.0,
+                priority=1,
+                active=True,
+            )
+        )
+    inst = trots.TROTSInstance(
+        identifier="synthetic", n=n, real=n, entries=entries, solution=None
+    )
+    inst._matrix_cache = cache
+    return inst
+
+
+def test_negligible_float32_share_folds_into_the_float64_group():
+    # Protons_01 is 0.07% float32 by nnz: a hinted group that small buys no
+    # Gram reduction but puts every dense solve on the refinement route. Below
+    # the threshold (default 5%) the float32 rows fold into one unhinted group
+    # in assembly order; at or above it (and with the gate off) they split.
+    from ipax.backend.operators import VStack
+
+    inst = _share_instance(98, 2)  # 2% float32 by nnz
+    folded = trots.TROTSProblem(inst, np)
+    split = trots.TROTSProblem(inst, np, float32_group_min_share=0.0)
+
+    assert folded.float32_nnz_share == pytest.approx(0.02)
+    assert [hint for _csr, hint in folded._lin_groups] == [None]
+    op = folded.linear_ineq()[0]
+    assert not isinstance(op, VStack)
+    assert op.gram_accumulate_dtype_hint() is None
+    lowered = _lowered(folded).ineq_jacobian(np.zeros(folded.n_vars))
+    assert lowered.gram_accumulate_dtype_hint() is None
+    # Assembly order kept: the float64 rows (value 1) lead, then the float32 ones.
+    np.testing.assert_array_equal(
+        np.asarray(op.dense_matrix())[:, 0], [1.0] * 98 + [2.0] * 2
+    )
+    np.testing.assert_array_equal(
+        np.asarray(folded.linear_ineq()[2]), [10.0] * 98 + [20.0] * 2
+    )
+
+    assert [hint for _csr, hint in split._lin_groups] == ["float32", None]
+    w = np.random.default_rng(3).uniform(0.1, 2.0, 100)
+    order = np.r_[98:100, 0:98]  # the split block leads with its float32 group
+    np.testing.assert_allclose(
+        np.asarray(split.linear_ineq()[0].gram(w[order])),
+        np.asarray(op.gram(w)),
+        rtol=1e-14,
+    )
+
+
+@pytest.mark.parametrize(
+    ("rows_f32", "grouped"), [(4, False), (5, True), (6, True), (100, True)]
+)
+def test_float32_share_threshold_is_the_gate(rows_f32, grouped):
+    # 4/100 = 4% < 5% folds; exactly 5% (a share equal to the threshold)
+    # splits, as does 6%; a float32-only block keeps its hint (Prostate_BT_02
+    # is 100% float32, VMAT 96%).
+    rows_f64 = 100 - rows_f32
+    problem = trots.TROTSProblem(_share_instance(rows_f64, rows_f32), np)
+    hints = [hint for _csr, hint in problem._lin_groups]
+    if rows_f64 == 0:
+        assert hints == ["float32"]
+    elif grouped:
+        assert hints == ["float32", None]
+    else:
+        assert hints == [None]
+    assert problem.linear_ineq()[0].gram_accumulate_dtype_hint() == (
+        "float32" if grouped else None
+    )
+
+
+def test_all_empty_float32_group_is_folded_too():
+    # Float32 rows with no stored entries (share 0) are folded like any share
+    # below the threshold, instead of forming an empty hinted group; with the
+    # gate off they still split.
+    import scipy.sparse as sp
+
+    inst = _share_instance(10, 4)
+    mat = inst._matrix_cache[2]
+    inst._matrix_cache[2] = trots.TROTSMatrix(
+        mat.name, mat.mtype, sp.csr_matrix(mat.matrix.shape), mat.b, mat.c, "float32"
+    )
+    folded = trots.TROTSProblem(inst, np)
+    assert folded.float32_nnz_share == 0.0
+    assert folded.float32_group_folded
+    assert [hint for _csr, hint in folded._lin_groups] == [None]
+    split = trots.TROTSProblem(inst, np, float32_group_min_share=0.0)
+    assert not split.float32_group_folded
+    assert [hint for _csr, hint in split._lin_groups] == ["float32", None]
+
+
+def test_float32_share_threshold_is_validated():
+    with pytest.raises(ValueError, match="float32_group_min_share"):
+        trots.TROTSProblem(_share_instance(10, 10), np, float32_group_min_share=1.5)

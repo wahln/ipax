@@ -98,6 +98,67 @@ def _dense(op: LinearOperator, xp: Namespace, dtype: object) -> Array:
     return op.matmat(xp.eye(op.shape[1], dtype=dtype))
 
 
+def _through_operator(op: LinearOperator, max_elements: int) -> bool:
+    """Whether the dense route forms ``op``'s block by ``gram``/``rmatvec``.
+
+    Only a block too large to densify (``m_b · n > max_elements``) whose
+    operator can form its weighted Gram itself; everything else keeps the
+    verbatim densified arithmetic (see ``RestorationOptions``).
+    """
+    rows, cols = op.shape
+    return rows * cols > max_elements and op.gram_capable()
+
+
+def _dense_gauss_newton(
+    xp: Namespace,
+    *,
+    n: int,
+    dtype: object,
+    eq_jac: LinearOperator | None,
+    c: Array,
+    ineq_jac: LinearOperator | None,
+    active: Array | None,
+    gpos: Array,
+    max_elements: int,
+) -> tuple[Array, Array]:
+    """Dense Gauss-Newton matrix ``Jᵀ Σ J`` and gradient ``Jᵀ Σ r`` of ``F``.
+
+    ``F(x) = ½‖c‖² + ½‖max(g, 0)‖²`` (module docstring; Wächter & Biegler
+    2006, §3.3), so ``Σ`` is the identity on equality rows and the 0-1
+    indicator ``active = [g > 0]`` on inequality rows, and
+    ``Σ r = (c, gpos)``. Each block is either densified
+    (the reference arithmetic, kept verbatim so its round-off — and the S2MPJ
+    sweep it was tuned on — stay put) or, when ``_through_operator`` says so,
+    formed by the operator: ``J_bᵀ Σ_b J_b = J_b.gram(Σ_b)`` and
+    ``J_bᵀ Σ_b r_b = J_b.rmatvec(r_b)`` (``Σ_b r_b = r_b`` as ``gpos`` vanishes
+    off the active set). Same matrices, different round-off, and no
+    ``m_b × n`` copy of a tall Jacobian (TROTS ``Protons_01``: 3.2 GB).
+    """
+    hessian = xp.zeros((n, n), dtype=dtype)
+    grad = xp.zeros((n,), dtype=dtype)
+    if eq_jac is not None:
+        if _through_operator(eq_jac, max_elements):
+            hessian = hessian + eq_jac.gram(xp.ones_like(c))
+            grad = grad + eq_jac.rmatvec(c)
+        else:
+            jc = _dense(eq_jac, xp, dtype)
+            jc_t = xp.permute_dims(jc, (1, 0))
+            hessian = hessian + xp.matmul(jc_t, jc)
+            grad = grad + xp.matmul(jc_t, c)
+    if ineq_jac is not None:
+        assert active is not None
+        if _through_operator(ineq_jac, max_elements):
+            hessian = hessian + ineq_jac.gram(active)
+            grad = grad + ineq_jac.rmatvec(gpos)
+        else:
+            jg = _dense(ineq_jac, xp, dtype)
+            jg_w = jg * xp.expand_dims(active, axis=1)
+            jg_t = xp.permute_dims(jg, (1, 0))
+            hessian = hessian + xp.matmul(jg_t, jg_w)
+            grad = grad + xp.matmul(jg_t, gpos)
+    return hessian, grad
+
+
 class _RestorationNormalOperator(LinearOperator):
     """Reduced damped Gauss-Newton matrix ``F (Jᵀ Σ J) F + B + λI`` by products.
 
@@ -211,8 +272,21 @@ def restore(
     upper_safe: Array,
     tol: float,
     linear_solver: LinearSolver | None = None,
+    dense_materialize_max_elements: int | None = None,
 ) -> tuple[Array, Array, RestorationExit]:
-    """Minimize the constraint infeasibility; return ``(x, s, exit_reason)``."""
+    """Minimize the constraint infeasibility; return ``(x, s, exit_reason)``.
+
+    ``dense_materialize_max_elements`` is
+    :attr:`~ipax.options.RestorationOptions.dense_materialize_max_elements`
+    (``None``: that option's default); it only affects the dense route
+    (``linear_solver is None``).
+    """
+    if dense_materialize_max_elements is None:
+        from ipax.options import RestorationOptions
+
+        max_elements = RestorationOptions().dense_materialize_max_elements
+    else:
+        max_elements = dense_materialize_max_elements
     dtype = x.dtype
     n = int(x.shape[0])
     identity = xp.eye(n, dtype=dtype) if linear_solver is None else None
@@ -288,23 +362,19 @@ def restore(
         )
         hessian: Array | None = None
         if linear_solver is None:
-            # Dense reference route: materialize ``Jᵀ Σ J`` block by block
-            # (kept verbatim so its round-off, and the sweep it was tuned on,
-            # stay put).
-            hessian = xp.zeros((n, n), dtype=dtype)
-            grad = xp.zeros((n,), dtype=dtype)
-            if eq_jac is not None:
-                jc = _dense(eq_jac, xp, dtype)
-                jc_t = xp.permute_dims(jc, (1, 0))
-                hessian = hessian + xp.matmul(jc_t, jc)
-                grad = grad + xp.matmul(jc_t, c)
-            if ineq_jac is not None:
-                assert active is not None
-                jg = _dense(ineq_jac, xp, dtype)
-                jg_w = jg * xp.expand_dims(active, axis=1)
-                jg_t = xp.permute_dims(jg, (1, 0))
-                hessian = hessian + xp.matmul(jg_t, jg_w)
-                grad = grad + xp.matmul(jg_t, gpos)
+            # Dense reference route: materialize ``Jᵀ Σ J`` block by block;
+            # a tall Gram-capable block is formed by its operator instead.
+            hessian, grad = _dense_gauss_newton(
+                xp,
+                n=n,
+                dtype=dtype,
+                eq_jac=eq_jac,
+                c=c,
+                ineq_jac=ineq_jac,
+                active=active,
+                gpos=gpos,
+                max_elements=max_elements,
+            )
         elif stacked is None:
             grad = xp.zeros((n,), dtype=dtype)
         else:

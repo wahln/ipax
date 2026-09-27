@@ -35,7 +35,9 @@ from ipax.testing.problems import (
 )
 
 if TYPE_CHECKING:
+    from ipax.options import Options
     from ipax.problem.base import Problem
+    from ipax.result import WarmStart
     from ipax.typing import Array, Namespace
 
 
@@ -57,6 +59,17 @@ class BenchmarkProblem:
     ``optimum(problem)`` returns ``x*`` when known (else ``None``), used to score
     accuracy. ``backends`` restricts the case to specific namespaces (the RT
     generator is NumPy-only); ``None`` means every available backend.
+
+    ``prepare_solve(problem, x0, options)``, when set, runs after ``build`` and
+    returns the ``(x0, warm_start, options)`` triple the solve uses — a
+    per-case initialisation that needs the built problem (e.g. the TROTS
+    runner's Breedveld et al. 2017 §3.1 start: the primal point of eqs.
+    (23)–(24), the dual start of eqs. (26)–(28) and ``μ0``). The harness times
+    the hook as initialisation and counts it in the solve time, so ``build``
+    should leave every step a paper would count as initialisation (a
+    least-squares start, a multiplier solve) to the hook and return only a
+    cheap placeholder ``x0``. ``None`` (the default) solves from ``build``'s
+    ``x0`` with the given options and no warm start.
     """
 
     name: str
@@ -68,6 +81,10 @@ class BenchmarkProblem:
     )
     backends: tuple[str, ...] | None = None
     exclude_configs: tuple[str, ...] = ()  # config labels the QC sweep skips here
+    prepare_solve: (
+        Callable[[Problem, Array, Options], tuple[Array, WarmStart | None, Options]]
+        | None
+    ) = None
 
 
 def _known(problem: Problem) -> Array | None:

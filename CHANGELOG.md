@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **TROTS runner `--corrections` lever** (`benchmarks/runners/trots.py`):
+  overrides `Options.corrections` (`none`/`mehrotra`/`gondzio`) like the
+  existing `--mu-schedule`/`--globalization` levers. The TROTS docs record
+  the `Protons_01` convergence study it reproduces: with the tiled Gram,
+  `hessian="exact"` + `corrections="mehrotra"` certifies below the
+  published reference in 181 iterations where plain L-BFGS stalls.
 - **Operator-valued `linear_ineq` matrices, lowered without densifying.**
   `Problem.linear_ineq()` now accepts any `LinearOperator`, not only a rank-2
   array (an operator previously raised `NotImplementedError`). The two-sided
@@ -30,6 +36,182 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   sparse normal-equations boundary. Each cell runs with the rows declared
   through `linear_ineq` and through a hand-lowered operator Jacobian.
   `TallSparseQP` gains `declaration=` and `two_sided=` (range rows) parameters.
+- **Tiled per-structure Gram in the TROTS loader** (`benchmarks/corpus/trots.py`,
+  default on). Each precision group of the linear block is now declared as a
+  `TiledGramCSROperator`: a `CSROperator` subclass whose `gram` follows
+  Breedveld et al. 2017, §4.2 eq. (48) and §5.2. It plans each structure once
+  with RCM row ordering and 2048-row tiles compacted to their active columns.
+  Row sets sharing a structure matrix are merged into a single weight vector,
+  and the minimax columns add rank-1 borders. Dense tiles use `syrk` on
+  `√w`-scaled data (`gemm` for signed weights); nearly empty tiles use a sparse
+  product. Tiles run on a thread pool, and the result is mirrored once so it is
+  exactly symmetric.
+  A flop-ratio gate (with a cheap pre-gate) keeps dense groups on the plain
+  operator (non-NumPy namespaces: see the device entry below). Results agree with the plain Gram
+  to ~1e-15 relative.
+  - `Protons_01`: lowered-block Gram 2.32 s → 0.33 s; 35 L-BFGS/dense iterations
+    2.8–3.2 → 0.66–0.70 s per iteration.
+  - `Prostate_VMAT_101`: unchanged.
+  - `TROTSProblem(..., tiled_gram=False)` restores the plain block;
+    `TiledGramConfig` exposes the knobs.
+  - No change under `ipax/`.
+- **Grouped exact Hessian in the TROTS loader** (`benchmarks/corpus/trots.py`,
+  default for `TROTSExactProblem`). `lagrangian_hessian` now returns a
+  `TROTSExactHessian`: one tiled product `A_kᵀ diag(w_k) A_k` per unique curved
+  structure, with the dose-space diagonals of all its terms summed (van Haveren
+  & Breedveld 2019, eqs. (8)–(9); Breedveld et al. 2017, eq. (48)). The gEUD
+  rank-1 terms are a `LowRank` factor and the quadratic terms a re-weighted
+  constant sum. It reuses the linear block's tiled kernels (signed-weight
+  `gemm` fallback; dense row chunks for gated-off structures) and shares tile
+  plans with the linear block through a per-problem registry. The exact
+  `matvec`, `diagonal` and a SciPy `to_coo` are also provided.
+  - `Prostate_CK_01` Hessian: 287–300 s → 1.3–1.5 s per call. `Liver_01`:
+    6.5 s → 0.52 s. The Hessian is now ~11% of an `exact/dense` iteration.
+  - Agrees with the per-term Hessian to ≤ 1e-10 relative. `Protons_01` has no
+    curved term, so its exact Hessian is zero on both paths.
+  - `TROTSExactProblem(..., grouped_hessian=False)` keeps the per-term path.
+- **TROTS runner A/B flags**: `--plain-gram` (`tiled_gram=False`) and
+  `--per-term-hessian` (`grouped_hessian=False` on the `exact/*` configs).
+- **Device tiled Gram in the TROTS loader** (`benchmarks/corpus/trots.py`,
+  CuPy and Torch namespaces). The tiled plan now also drives a kernel in the
+  solve namespace instead of falling back to the plain `CSROperator`.
+  - Tiles are materialized once on the operator's device as a flat
+    dense-scatter index plus values (~12 B/nnz, 195 MiB on `Protons_01`),
+    shared per problem.
+  - Each tile is multiplied on the device (cuBLAS `syrk` on CuPy; `matmul` on
+    Torch), scatter-added, and the result is mirrored once so it is exactly
+    symmetric.
+  - Sparse tiles use cuSPARSE on CuPy for exact Grams.
+  - `TROTSExactProblem` on those namespaces returns a
+    `TROTSDeviceExactHessian` that runs its tiled structures through the same
+    device tiles. It keeps the `CSCOperator` crossing when no structure is
+    tiled.
+  - The gate, `tiled_gram=False` and the NumPy path are unchanged.
+  - `Protons_01` on an RTX 4070 Laptop (CuPy): lowered-block Gram
+    2.91 s → 0.22 s in float64 and 0.19 s → 0.057 s in float32; 36 L-BFGS/dense
+    iterations 2.87 → 0.29 s per iteration on the same trajectory.
+  - Torch-CUDA is untested; Torch is validated on CPU tensors.
+
+### Changed
+- **TROTS float32 precision grouping is gated on its nonzero share**
+  (`benchmarks/corpus/trots.py`). The float32-sourced rows of the linear block
+  form their own hinted group only when they hold at least 5% of its nonzeros
+  (`TROTSProblem(..., float32_group_min_share=0.05)`; `0` always splits).
+  Below that they fold into the float64 group unhinted, so a negligible share
+  no longer puts every dense solve on the refinement route.
+  - This changes the NumPy default for cases under 5%, not only the device
+    kernels: the dense solve leaves the mixed-precision refinement route,
+    the lowered block is one group (so its row order, and the multiplier
+    order in `y_ineq`, differ from the split layout), and the float32
+    structures join the float64 group's tiled plan and gate statistic.
+    Every product stays exact.
+  - `Protons_01` (0.07% float32): 0.91 → 0.82 s/iter at identical iterations
+    (`exact` + `mehrotra`, NumPy).
+  - `Prostate_BT_02` (100%) and VMAT (96%) are unchanged.
+- **The TROTS runner defaults to Breedveld et al. 2017's solver setup**
+  (`benchmarks/runners/trots.py`). `--solve` now runs `exact/dense` with
+  `--corrections mehrotra`, `--globalization breedveld`, monotone μ
+  (`--mu-schedule probing`, Mehrotra's predictor-based μ, is the proton lever:
+  104 vs 227 iterations on `Protons_01`, but 430 vs 74 on `Liver_01`), a new
+  `--tol` (default `1e-8`, the three KKT tolerances) and a new `--init
+  breedveld`: the paper's §3.1 initialisation.
+  - The loader gains `TROTSProblem.initial_point(strategy="breedveld")`: the
+    least-squares fluence pulled halfway to its mean and floored at 5
+    (eqs. (23)–(24)). `strategy="ipax"` stays the default and is unchanged.
+  - `TROTSProblem.breedveld_warm_start(x0, scaling=...)` returns the dual
+    start and `μ0`. It computes LSQR multipliers on the problem as ipax lowers
+    it (`atol = btol = 1e-6`: every `Protons_01` multiplier lands on the floor,
+    so `1e-8` only cost 24 s instead of 3 s), floors them and the bound
+    multipliers and slacks at 5 (eqs. (26)–(28)), and takes `μ0` as their
+    average complementarity (eq. (10)) in *solver* units — multiplied by the
+    objective scale factor `s_f` that `ipax.solve`'s gradient-based scaling
+    applies to every complementarity pair (pass the solve's `Options.scaling`).
+    It runs on the host (a NumPy twin of the problem off NumPy) and returns
+    arrays on `x0`'s device.
+  - `BenchmarkProblem` gains an optional `prepare_solve` hook returning the
+    solve's `(x0, warm_start, options)`. `run_case` times it as the
+    initialisation, reports the time as `CaseResult.prepare_time` and counts
+    it in the row's `solve_time`; the TROTS runner produces both starts in
+    the hook, so the least-squares fluence solve of eq. (23) is counted too
+    (1 s on `Protons_01`, 3.5 s on `Liver_01`, 18 s on `Prostate_VMAT_101`,
+    30 s on `Prostate_CK_01`; an earlier cut of this branch ran it in the
+    untimed build and counted only the dual start).
+  - `--slack-init-scale` applies to `--init ipax` only; combined with
+    `--init breedveld` (whose slacks come from eq. (28)) the runner errors out
+    instead of silently ignoring it.
+  - The previous recipe is still available:
+    `--config lbfgs/dense --init ipax --mu-schedule quality --globalization
+    filter --corrections none --slack-init-scale 0.1` rebuilds its options
+    exactly. `--slack-init-scale` applies only with `--init ipax`.
+
+### Fixed
+- **TROTS device tiled Gram on the raw `cupy` module** (`benchmarks/corpus/trots.py`).
+  The device kernels use Array API `device=` keywords that plain `cupy` (as
+  opposed to the compat wrapper the test fixtures hand out) does not accept,
+  so a problem built on `cupy` itself failed at its first lowered-block Gram;
+  the solver swallowed that as a step-solve failure and the error surfaced
+  from restoration. The device context now normalizes its namespace through
+  `array_namespace`. Regression test on Protons_01.
+- **Restoration no longer densifies a tall Gram-capable Jacobian**
+  (`ipax/ipm/restoration.py`). The dense restoration route (taken by
+  `RestorationOptions(linear_solver="auto")` below 10 000 variables, and by
+  `"dense"`) built the Gauss-Newton matrix from full dense copies of the
+  equality and inequality Jacobians. On TROTS `Protons_01` (inequality block
+  369 445 × 1101) that is 3.2 GB of float64 per restoration iteration; on an
+  8 GB GPU one restoration phase ran for 1127 s. A block with more than the new
+  `RestorationOptions.dense_materialize_max_elements` entries (`m_b · n`,
+  default 10⁷) whose operator is Gram-capable now contributes
+  `J_bᵀ Σ_b J_b = J_b.gram(Σ_b)` and `J_bᵀ r_b = J_b.rmatvec(r_b)` instead.
+  The matrices are the same and only the round-off differs. Smaller blocks, and
+  operators without a Gram, keep the verbatim densified arithmetic. Every
+  S2MPJ block is below the default (largest `m · n` ≈ 3.9·10⁶), so the corpus
+  results do not change. The Krylov restoration route already worked through
+  products only and is unchanged. Measured on CuPy (RTX 4070 Laptop, 8 GB),
+  `restore()` from the `Protons_01` initial point reaches feasibility in the
+  same 40 outer iterations: 560 s (14.0 s per iteration) densified vs 9.7 s
+  (0.23 s per iteration) through the Gram.
+- **TROTS cost-function singular points** (`benchmarks/corpus/trots.py`).
+  - The gEUD gradient/Hessian at zero dose with `a < 2` returned `inf`/`nan`;
+    the negative-exponent powers now use `max(|d|, 1e-12)`.
+  - An all-zero structure dose raised `ZeroDivisionError`; it now gives a zero
+    gradient and zero curvature.
+  - The LTCP exponent is clipped at 500 so it cannot overflow.
+  - Values away from these points are bitwise unchanged.
+  - The fixed 1e-12 floor still overflowed for strongly negative gEUD
+    exponents (`a < ≈ -23.7`, `0·∞ = nan`); the floor now rises with the
+    exponent so the floored power stays finite, and a cold voxel with `a < 0`
+    (`S = ∞`) gives a zero gradient and curvature.
+- **TROTS tiled Gram / grouped exact Hessian review fixes**
+  (`benchmarks/corpus/trots.py`).
+  - Tiles were stored in float32 under a float32 hint without checking the
+    values, and those tiles also serve exact float64 requests; a structure
+    whose values are not exact float32 widenings is now stored in float64.
+  - On Torch/CuPy/JAX the grouped Hessian round-tripped to the host on every
+    matvec; it is now formed once per call and crossed as a `CSCOperator`.
+  - A segment/row mismatch in the linear block now falls back to the plain
+    operator with a logged warning instead of aborting the load; segment
+    signs other than ±1 are rejected.
+- **TROTS device tiled Gram review fixes** (`benchmarks/corpus/trots.py`).
+  - CuPy sparse tiles no longer pay a canonical-format check (a kernel plus
+    a host sync) per tile and call, and float32-stored tiles no longer have
+    their transpose recast to float64 on every exact call. The memo
+    comparison and the weight-flag transfer are one host read per Gram
+    call. The docs now state the real sync inventory, including the
+    unavoidable SpGEMM output-size read per sparse tile on exact CuPy Grams.
+  - `TROTSDeviceExactHessian.matvec` on Torch used a host bridge that cannot
+    read CUDA tensors; it now downloads through the context. Torch-CUDA is
+    documented as unsupported and untested.
+  - New `TiledGramConfig.device_densify_budget_bytes` (default 256 MiB): a
+    sparse tile whose densified `b×c` temporary would exceed it is never
+    densified on a device (CuPy: SpGEMM at every precision; Torch: the host
+    SciPy product). The docs note that on Torch and for float32 requests the
+    gate statistic underestimates the cost of densified sparse tiles.
+  - When the share gate folds a float32 structure that is also curved, the
+    exact Hessian now plans it under the same key as the linear block, so
+    they share one tile set instead of holding two.
+  - An all-empty float32 group is folded too; `float32_group_folded` reports
+    the decision. The device tile cache key includes the namespace, device
+    and kernel knobs; the device `diagonal` uploads once.
 
 ## [0.11.0] - 2026-09-17
 

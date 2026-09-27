@@ -512,6 +512,25 @@ class RestorationOptions:
     budget call after call with slowly shrinking infeasibility, raise
     ``krylov.max_iter`` — neither the tolerance nor the damping policy is
     the lever there.
+
+    ``dense_materialize_max_elements`` bounds what the *dense* route may
+    densify. It forms ``Jᵀ Σ J`` block by block (equality rows, inequality
+    rows); a block whose ``m_b · n`` exceeds this bound and whose operator is
+    Gram-capable (:meth:`~ipax.backend.operators.LinearOperator.gram_capable`)
+    contributes ``J_bᵀ Σ_b J_b`` through its own ``gram`` and ``J_bᵀ r_b``
+    through ``rmatvec`` instead of through an ``m_b × n`` dense copy.
+    Mathematically identical; the round-off differs (the Gram is accumulated
+    by the operator's kernel, not by a dense GEMM). Blocks at or below the
+    bound, and blocks without a Gram, keep the verbatim densified arithmetic.
+    Motivation (TROTS 2026-09): ``Protons_01``'s inequality block is
+    369 445 × 1101, i.e. 3.2 GB of float64 per restoration iteration; on an
+    8 GB GPU one restoration spent 1127 s inside ``restore()``; from the
+    initial point, ``restore()`` took 560 s densified vs 9.7 s through the
+    Gram (CuPy, same 40 outer iterations to feasibility). The default
+    of 10⁷ elements (80 MB of float64) lies above every block of the S2MPJ
+    corpus the dense route was tuned on (largest ``m · n`` ≈ 3.9·10⁶,
+    TWIRIBG1, ≈ 7.7·10⁶ even if every row were two-sided), so that corpus
+    stays on the identical arithmetic.
     """
 
     linear_solver: RestorationLinearSolver = "auto"
@@ -523,11 +542,17 @@ class RestorationOptions:
             adaptive_tol=False,
         )
     )
+    dense_materialize_max_elements: int = 10_000_000
 
     def __post_init__(self) -> None:
         if self.linear_solver not in ("auto", "dense", "krylov"):
             raise ValueError(
                 "restoration linear solver must be 'auto', 'dense' or 'krylov'"
+            )
+        limit = self.dense_materialize_max_elements
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError(
+                "dense_materialize_max_elements must be a positive integer"
             )
 
 

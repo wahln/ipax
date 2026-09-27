@@ -140,3 +140,93 @@ def test_report_round_trips_json_and_markdown(namespace):
     assert "# ipax quality-control benchmark" in markdown
     assert "bound_qp" in markdown
     assert "converged" in markdown  # the KKT-convergence tier is reported
+
+
+def test_run_case_applies_prepare_solve(namespace, monkeypatch):
+    # A case's ``prepare_solve`` hook runs after ``build`` and its start,
+    # warm start and options are what ``ipax.solve`` receives; its wall time
+    # counts toward the row's solve_time (the TROTS Breedveld initialisation).
+    import time
+    from dataclasses import replace
+
+    from ipax.result import WarmStart
+
+    seen: dict[str, object] = {}
+    warm = WarmStart()
+    tuned = ipax.Options(hessian="exact", linsolve="dense", max_iter=50)
+
+    def prepare(problem, x0, options):
+        seen["prepare"] = (problem, x0, options)
+        time.sleep(0.05)
+        started = x0 * 1.0  # a fresh array: the hook's start, not build's
+        seen["start"] = started
+        return started, warm, tuned
+
+    real_solve = ipax.solve
+
+    def spy_solve(problem, x0, **kwargs):
+        seen["solve"] = (problem, x0, kwargs)
+        return real_solve(problem, x0, **kwargs)
+
+    monkeypatch.setattr(ipax, "solve", spy_solve)
+    base = ipax.Options(hessian="exact", linsolve="dense")
+    result = run_case(
+        replace(_bound_qp_case(), prepare_solve=prepare),
+        config="exact/dense",
+        options=base,
+        xp=namespace,
+        backend="test",
+    )
+
+    problem, _x0, given = seen["prepare"]
+    assert given is base
+    solved_problem, solved_x0, kwargs = seen["solve"]
+    assert solved_problem is problem
+    assert solved_x0 is seen["start"]  # the solve starts from the hook's x0
+    assert kwargs["options"] is tuned
+    assert kwargs["warm_start"] is warm
+    assert result.error is None and result.correct
+    # prepare_time attributes the hook's share; solve_time is the combined
+    # (paper-accounting) figure.
+    assert result.prepare_time >= 0.05
+    assert result.solve_time >= result.prepare_time
+    row = json.loads(json.dumps(to_payload([result], capture_environment())))
+    assert row["results"][0]["prepare_time"] == result.prepare_time
+
+
+def test_run_case_without_prepare_solve_passes_no_warm_start(namespace, monkeypatch):
+    seen: dict[str, object] = {}
+    real_solve = ipax.solve
+
+    def spy_solve(problem, x0, **kwargs):
+        seen.update(kwargs)
+        return real_solve(problem, x0, **kwargs)
+
+    monkeypatch.setattr(ipax, "solve", spy_solve)
+    options = ipax.Options(hessian="exact", linsolve="dense")
+    result = run_case(
+        _bound_qp_case(),
+        config="exact/dense",
+        options=options,
+        xp=namespace,
+        backend="test",
+    )
+    assert seen == {"options": options}
+    assert result.prepare_time == 0.0
+
+
+def test_run_case_records_a_failing_prepare_solve(namespace):
+    from dataclasses import replace
+
+    def boom(problem, x0, options):
+        raise RuntimeError("init failed")
+
+    result = run_case(
+        replace(_bound_qp_case(), prepare_solve=boom),
+        config="exact/dense",
+        options=ipax.Options(hessian="exact", linsolve="dense"),
+        xp=namespace,
+        backend="test",
+    )
+    assert result.status == "prepare_error"
+    assert "init failed" in (result.error or "")

@@ -1,0 +1,598 @@
+# Copyright 2026 Niklas Wahl
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Breedveld et al. 2017 §3.1 initialisation of the TROTS loader + runner wiring.
+
+The primal start is the dataset's least-squares fluence (eq. (23)) rescaled
+towards its mean (eq. (24)) and floored at 5; the dual start solves
+``∇g(x0)ᵀ y0 = −∇f(x0)`` by LSQR (eq. (26)) on the problem *as the solver sees
+it* (``linear_ineq`` lowered by ipax) and floors ``y0``, ``z0`` (eq. (27)) and
+the slacks ``w0`` (eq. (28)) at 5; ``μ0`` is the resulting average
+complementarity (eq. (10)). No dataset is needed: the instance is synthetic.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+
+import numpy as np
+import pytest
+
+sp = pytest.importorskip("scipy.sparse")
+spla = pytest.importorskip("scipy.sparse.linalg")
+trots = pytest.importorskip("benchmarks.corpus.trots")
+
+import ipax  # noqa: E402
+from ipax.options import BarrierOptions  # noqa: E402
+from ipax.problem.linear_ineq import lower_linear_inequalities  # noqa: E402
+from ipax.result import WarmStart  # noqa: E402
+
+N = 12
+
+
+def _instance(ref_dose=6.0):
+    """Init (LS-fluence) data, curved objectives/constraints, a minimax
+    objective (one aux variable) and a two-sided linear block. ``ref_dose``
+    is the LS target dose: at 6 every rescaled fluence entry lands on the
+    floor of 5, at 50 about half of them clear it."""
+    rng = np.random.default_rng(0)
+    ptv = sp.csr_matrix(rng.uniform(0.5, 1.5, (20, N)))
+    oar = sp.random(15, N, density=0.5, format="csr", random_state=rng)
+    oar.data = rng.uniform(0.1, 1.0, oar.nnz)
+    cache = {
+        1: trots.TROTSMatrix("ptv", 0, ptv, np.zeros(0), 0.0, "float64"),
+        2: trots.TROTSMatrix("oar", 0, oar, np.zeros(0), 0.0, "float32"),
+    }
+
+    def entry(name, is_con, minimise, ctype, data_id, params, bound, weight=1.0):
+        return trots.TROTSEntry(
+            name=name,
+            is_constraint=is_con,
+            minimise=minimise,
+            ctype=ctype,
+            data_id=data_id,
+            params=None if params is None else np.asarray(params, dtype=float),
+            bound=bound,
+            weight=weight,
+            priority=1,
+            active=True,
+        )
+
+    # Objective weights large enough that some LSQR multipliers (and some
+    # stationarity residuals) clear the floor of 5 while others do not.
+    entries = [
+        entry("ptv ltcp", False, True, 4, 1, [6.0, 0.8], 0.0, 5000.0),
+        entry("oar geud", False, True, 3, 2, [6.0], 0.0, 2000.0),
+        entry("oar max", False, True, 1, 2, None, 0.0, 50.0),  # minimax aux
+        entry("oar geud con", True, True, 3, 2, [4.0], 40.0),
+        entry("ptv min", True, False, 1, 1, None, 4.0),  # A x ≥ 4 (lower rows)
+        entry("oar max con", True, True, 1, 2, None, 60.0),  # A x ≤ 60
+    ]
+    inst = trots.TROTSInstance(
+        identifier="synthetic-breedveld",
+        n=N,
+        real=N,
+        entries=entries,
+        solution=None,
+        init_matrix_ids=np.asarray([1]),
+        init_reference_dose=np.asarray([ref_dose]),
+    )
+    inst._matrix_cache = cache
+    return inst
+
+
+def _host(x):
+    return trots._to_numpy_nd(x)
+
+
+def _lowered_host(inst, x0):
+    """The reference: a NumPy problem lowered exactly as ``ipax.solve`` does."""
+    return lower_linear_inequalities(trots.TROTSProblem(inst, np), x0, np)
+
+
+def _lsqr_reference(low, x0):
+    jac = low.ineq_jacobian(x0)
+    m, nv = jac.shape
+    jt = spla.LinearOperator(
+        (nv, m),
+        matvec=lambda y: np.asarray(jac.rmatvec(np.ravel(y))),
+        rmatvec=lambda v: np.asarray(jac.matvec(np.ravel(v))),
+        dtype=float,
+    )
+    grad = np.asarray(low.gradient(x0))
+    tol, iters = trots._BREEDVELD_LSQR_TOL, trots._BREEDVELD_LSQR_ITER
+    return spla.lsqr(jt, -grad, atol=tol, btol=tol, iter_lim=iters)[0]
+
+
+def _sparse_capable(namespace):
+    """Whether the namespace can apply the TROTS CSR linear block itself."""
+    from ipax.backend.sparse import get_sparse_adapter
+
+    return isinstance(namespace.asarray(0.0), np.ndarray) or (
+        get_sparse_adapter(namespace) is not None
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Primal start: eq. (24) + floor 5
+# --------------------------------------------------------------------------- #
+def test_breedveld_initial_point_rescales_and_floors_the_ls_fluence():
+    problem = trots.TROTSProblem(_instance(), np)
+    ls = problem.least_squares_fluence()
+    expected_x = np.maximum(0.5 * ls + 0.5 * np.mean(ls), 5.0)  # eq. (24)
+
+    z0 = _host(problem.initial_point(strategy="breedveld"))
+
+    assert z0.shape == (problem.n_vars,)
+    np.testing.assert_array_equal(z0[:N], expected_x)
+    np.testing.assert_array_equal(z0, problem._pad_aux(expected_x))
+    assert problem.n_vars == N + 1  # one minimax aux, consistent with x
+    # The floor bites on this instance (reference dose 6 → fluence ~0.3).
+    assert np.all(z0[:N] == 5.0)
+
+
+def test_breedveld_initial_point_keeps_eq_24_above_the_floor():
+    # A higher target dose lifts part of the rescaled fluence above 5: those
+    # entries are exactly eq. (24), the rest sit on the floor.
+    problem = trots.TROTSProblem(_instance(ref_dose=50.0), np)
+    ls = problem.least_squares_fluence()
+    rescaled = 0.5 * ls + 0.5 * np.mean(ls)  # eq. (24)
+    above = rescaled > 5.0
+    assert 0 < int(above.sum()) < N  # both branches are exercised
+
+    z0 = _host(problem.initial_point(strategy="breedveld"))
+
+    np.testing.assert_array_equal(z0[:N][above], rescaled[above])
+    assert np.all(z0[:N][~above] == 5.0)
+    np.testing.assert_array_equal(z0, problem._pad_aux(z0[:N]))
+
+
+def test_ipax_strategy_is_the_default_and_unchanged():
+    problem = trots.TROTSProblem(_instance(), np)
+    default = _host(problem.initial_point())
+    np.testing.assert_array_equal(
+        _host(problem.initial_point(strategy="ipax")), default
+    )
+    ls = problem.least_squares_fluence()
+    x = np.maximum(ls, 1e-6 * float(np.max(ls)))
+    np.testing.assert_array_equal(default, problem._pad_aux(x))
+
+
+def test_unknown_initial_point_strategy_is_rejected():
+    with pytest.raises(ValueError, match="strategy"):
+        trots.TROTSProblem(_instance(), np).initial_point(strategy="nope")
+
+
+def test_breedveld_initial_point_on_the_namespace(namespace):
+    host = _host(
+        trots.TROTSProblem(_instance(), np).initial_point(strategy="breedveld")
+    )
+    z0 = trots.TROTSProblem(_instance(), namespace).initial_point(strategy="breedveld")
+    assert type(z0) is type(namespace.asarray(0.0))
+    np.testing.assert_array_equal(_host(z0), host)
+
+
+# --------------------------------------------------------------------------- #
+# Dual start: eqs. (26)–(28) and μ0 by eq. (10)
+# --------------------------------------------------------------------------- #
+def _check_warm_start(inst, x0_host, warm, mu0, s_f=1.0):
+    """Check eqs. (26)–(28) and (10); ``s_f`` is the solver's objective factor
+    the returned μ0 carries (1 for ``scaling="none"``)."""
+    low = _lowered_host(inst, x0_host)
+    m = int(np.asarray(low.ineq_constraints(x0_host)).shape[0])
+    s, y, zl = _host(warm.s), _host(warm.y_ineq), _host(warm.z_lower)
+    assert warm.y_eq is None and warm.z_upper is None
+    assert s.shape == (m,) and y.shape == (m,) and zl.shape == (low.n_vars,)
+
+    # eq. (26) + floor: y0 = max(LSQR(∇gᵀ y = −∇f), 5).
+    y_ls = _lsqr_reference(low, x0_host)
+    np.testing.assert_allclose(y, np.maximum(y_ls, 5.0), rtol=1e-10, atol=1e-10)
+    # eq. (28): w0 = max(−g(x0), 5); ipax slacks satisfy g + s = 0.
+    g = np.asarray(low.ineq_constraints(x0_host))
+    np.testing.assert_allclose(s, np.maximum(-g, 5.0), rtol=1e-12, atol=0)
+    # eq. (27) on the bounded fluence block; aux entries are free (0).
+    lo = _host(low.bounds()[0])
+    bounded = np.isfinite(lo)
+    assert bounded.sum() == N
+    raw_z = np.asarray(low.gradient(x0_host)) + np.asarray(
+        low.ineq_jacobian(x0_host).rmatvec(y)
+    )
+    np.testing.assert_allclose(
+        zl[bounded], np.maximum(raw_z[bounded], 5.0), rtol=1e-10, atol=1e-10
+    )
+    assert np.all(zl[~bounded] == 0.0)
+    assert np.all(s >= 5.0) and np.all(y >= 5.0) and np.all(zl[bounded] >= 5.0)
+    # Where the floor did not bite, z0 is exactly the stationarity residual.
+    free = bounded & (raw_z > 5.0)
+    np.testing.assert_allclose(zl[free], raw_z[free], rtol=1e-12, atol=0)
+    # eq. (10): average complementarity over slacks and bounded variables.
+    expected_mu = (float(s @ y) + float(zl[bounded] @ (x0_host - lo)[bounded])) / (
+        m + int(bounded.sum())
+    )
+    assert mu0 == pytest.approx(s_f * expected_mu, rel=1e-12)
+    return y_ls, raw_z, bounded
+
+
+def test_breedveld_warm_start_matches_eqs_26_to_28_and_10():
+    inst = _instance()
+    problem = trots.TROTSProblem(inst, np)
+    x0 = problem.initial_point(strategy="breedveld")
+
+    warm, mu0 = problem.breedveld_warm_start(x0, scaling="none")
+
+    assert isinstance(warm, WarmStart)
+    y_ls, raw_z, bounded = _check_warm_start(inst, _host(x0), warm, mu0)
+    # The instance exercises both sides of every floor.
+    assert np.any(y_ls > 5.0) and np.any(y_ls < 5.0)
+    assert np.any(raw_z[bounded] > 5.0) and np.any(raw_z[bounded] < 5.0)
+
+
+def test_breedveld_warm_start_on_the_exact_problem_matches_the_base():
+    # The exact-Hessian subclass lowers the same rows in the same order.
+    inst = _instance()
+    base = trots.TROTSProblem(inst, np)
+    exact = trots.TROTSExactProblem(inst, np)
+    x0 = base.initial_point(strategy="breedveld")
+    wb, mb = base.breedveld_warm_start(x0)
+    we, me = exact.breedveld_warm_start(x0)
+    for a, b in ((wb.s, we.s), (wb.y_ineq, we.y_ineq), (wb.z_lower, we.z_lower)):
+        np.testing.assert_allclose(_host(a), _host(b), rtol=1e-12, atol=1e-12)
+    assert mb == pytest.approx(me, rel=1e-12)
+
+
+def test_breedveld_warm_start_on_the_namespace(namespace):
+    # Host-side computation regardless of the namespace (a NumPy twin of the
+    # problem supplies the lowered Jacobian); results cross back to it, on
+    # x0's device.
+    from ipax.backend.namespace import device
+
+    inst = _instance()
+    problem = trots.TROTSProblem(inst, namespace)
+    x0 = problem.initial_point(strategy="breedveld")
+
+    warm, mu0 = problem.breedveld_warm_start(x0, scaling="none")
+
+    kind = type(namespace.asarray(0.0))
+    assert all(type(a) is kind for a in (warm.s, warm.y_ineq, warm.z_lower))
+    assert all(device(a) == device(x0) for a in (warm.s, warm.y_ineq, warm.z_lower))
+    assert isinstance(mu0, float)
+    _check_warm_start(inst, _host(x0), warm, mu0)
+    if _sparse_capable(namespace):
+        # The solver-order claim, directly: the slacks line up with the
+        # namespace problem's own lowered rows (as ipax.solve lowers them).
+        g_ns = lower_linear_inequalities(problem, x0, namespace).ineq_constraints(x0)
+        np.testing.assert_allclose(
+            _host(warm.s), np.maximum(-_host(g_ns), 5.0), rtol=1e-12, atol=1e-12
+        )
+
+
+def test_host_twin_keeps_the_multiplier_order_of_a_folded_float32_group(namespace):
+    # The float32 share gate decides the lowered row order; the host twin
+    # (built off NumPy) must be built with the same threshold as the problem.
+    if isinstance(namespace.asarray(0.0), np.ndarray):
+        pytest.skip("on NumPy the problem is its own host twin")
+    if not _sparse_capable(namespace):
+        pytest.skip("the TROTS linear block needs a sparse adapter to be applied")
+    inst = _instance()
+    folded = trots.TROTSProblem(inst, namespace, float32_group_min_share=1.0)
+    split = trots.TROTSProblem(inst, np, float32_group_min_share=0.0)
+    assert folded.float32_group_folded and not split.float32_group_folded
+    twin = folded._host_twin()
+    assert twin is not folded
+    assert twin.float32_group_folded
+    x0_ns = folded.initial_point(strategy="breedveld")
+    x0 = _host(x0_ns)
+
+    g_ns = _host(
+        lower_linear_inequalities(folded, x0_ns, namespace).ineq_constraints(x0_ns)
+    )
+    g_twin = np.asarray(lower_linear_inequalities(twin, x0, np).ineq_constraints(x0))
+    g_split = np.asarray(lower_linear_inequalities(split, x0, np).ineq_constraints(x0))
+
+    np.testing.assert_allclose(g_twin, g_ns, rtol=1e-12, atol=1e-12)
+    # The two layouts order the rows differently, so the check can tell them
+    # apart (same rows, other order).
+    np.testing.assert_allclose(np.sort(g_split), np.sort(g_ns), rtol=1e-12)
+    assert not np.allclose(g_split, g_ns)
+
+
+def test_mu0_is_in_the_solver_scaled_space(namespace):
+    # ipax.solve scales every warm-start complementarity pair by the objective
+    # factor s_f = min(1, 100/‖∇f(x0)‖∞) but takes mu_init as given, so μ0 is
+    # returned in that space; the warm-start arrays stay in original units.
+    from ipax.options import ScalingOptions
+
+    inst = _instance()
+    problem = trots.TROTSProblem(inst, namespace)
+    x0 = problem.initial_point(strategy="breedveld")
+    grad_norm = float(np.max(np.abs(_host(problem.gradient(x0)))))
+    assert grad_norm > 100.0  # the scaling is active on this instance
+    s_f = min(1.0, 100.0 / grad_norm)
+
+    warm_none, mu_none = problem.breedveld_warm_start(x0, scaling="none")
+    _check_warm_start(inst, _host(x0), warm_none, mu_none)  # unscaled eq. (10)
+    for scaling in (None, "gradient-based", ScalingOptions()):
+        warm, mu0 = problem.breedveld_warm_start(x0, scaling=scaling)
+        assert mu0 == pytest.approx(s_f * mu_none, rel=1e-12)
+        _check_warm_start(inst, _host(x0), warm, mu0, s_f=s_f)
+        np.testing.assert_array_equal(_host(warm.y_ineq), _host(warm_none.y_ineq))
+    _, mu_loose = problem.breedveld_warm_start(
+        x0, scaling=ScalingOptions(max_gradient=1e6)
+    )
+    assert mu_loose == pytest.approx(mu_none, rel=1e-12)
+
+
+def test_mu0_scale_factor_matches_the_core_scaling():
+    # The loader mirrors ipax's gradient-based objective factor; check it
+    # against the core's own computation on the lowered problem.
+    from ipax.problem.scaling import compute_scaling
+
+    problem = trots.TROTSProblem(_instance(), np)
+    x0 = problem.initial_point(strategy="breedveld")
+    low = lower_linear_inequalities(problem, x0, np)
+    core = compute_scaling(
+        low, x0, np, has_eq=False, has_ineq=True, max_gradient=100.0
+    ).obj
+    _, mu_none = problem.breedveld_warm_start(x0, scaling="none")
+    _, mu0 = problem.breedveld_warm_start(x0)
+    assert core < 1.0
+    assert mu0 == pytest.approx(core * mu_none, rel=1e-12)
+
+
+def test_lsqr_iteration_limit_is_logged(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(trots, "_BREEDVELD_LSQR_ITER", 1)
+    problem = trots.TROTSProblem(_instance(), np)
+    x0 = problem.initial_point(strategy="breedveld")
+    with caplog.at_level(logging.WARNING, logger=trots.__name__):
+        problem.breedveld_warm_start(x0)
+    assert "iteration limit" in caplog.text
+
+
+def test_undefined_mu0_raises(monkeypatch):
+    # No inequalities and no finite lower bounds: eq. (10) has no terms.
+    inst = _instance()
+    inst.entries = [e for e in inst.entries if e.name == "ptv ltcp"]
+    problem = trots.TROTSProblem(inst, np)
+    free = np.full((problem.n_vars,), -np.inf)
+    monkeypatch.setattr(problem, "bounds", lambda: (free, -free))
+    x0 = problem.initial_point(strategy="breedveld")
+    with pytest.raises(ValueError, match="undefined"):
+        problem.breedveld_warm_start(x0)
+
+
+def test_tiled_linear_block_lowers_in_the_host_twin_row_order():
+    # ipax lowers a tiled-Gram block (a CSROperator subclass) through a signed
+    # row selection, the plain block at the triplet level; the NumPy problem
+    # uses itself (tiled) and every other namespace a plain host twin, so the
+    # two lowerings must order the rows — and hence y_ineq — identically.
+    from ipax.backend.operators import VStack
+
+    forced = trots.TiledGramConfig(block_rows=4, flop_ratio_threshold=1e9, threads=1)
+    inst = _instance()
+    tiled = trots.TROTSProblem(inst, np, tiled_gram=forced)
+    plain = trots.TROTSProblem(inst, np, tiled_gram=False)
+    op = tiled.linear_ineq()[0]
+    blocks = op.blocks if isinstance(op, VStack) else (op,)
+    assert all(isinstance(b, trots.TiledGramCSROperator) for b in blocks)
+    x0 = tiled.initial_point(strategy="breedveld")
+
+    wt, mt = tiled.breedveld_warm_start(x0)
+    wp, mp = plain.breedveld_warm_start(x0)
+
+    for a, b in ((wt.s, wp.s), (wt.y_ineq, wp.y_ineq), (wt.z_lower, wp.z_lower)):
+        np.testing.assert_allclose(_host(a), _host(b), rtol=1e-12, atol=1e-12)
+    assert mt == pytest.approx(mp, rel=1e-12)
+
+
+def test_solve_accepts_the_breedveld_start(namespace):
+    from ipax.backend.sparse import get_sparse_adapter
+
+    if not isinstance(namespace.asarray(0.0), np.ndarray) and (
+        get_sparse_adapter(namespace) is None
+    ):
+        pytest.skip("the TROTS linear block needs a sparse adapter to be applied")
+    problem = trots.TROTSExactProblem(_instance(), namespace)
+    x0 = problem.initial_point(strategy="breedveld")
+    warm, mu0 = problem.breedveld_warm_start(x0)
+    opts = ipax.Options(
+        hessian="exact",
+        linsolve="dense",
+        barrier=BarrierOptions(mu_init=mu0),
+        max_iter=3,
+    )
+
+    result = ipax.solve(problem, x0, warm_start=warm, options=opts)
+
+    assert result.n_iter >= 1
+    assert np.all(np.isfinite(_host(result.x)))
+
+
+# --------------------------------------------------------------------------- #
+# Runner: Breedveld's setup is the default; the old recipe stays reachable
+# --------------------------------------------------------------------------- #
+def test_runner_defaults_are_breedveld_setup():
+    # Breedveld et al. 2017's setup, except μ: monotone by default (probing,
+    # the closest transcription of his Mehrotra μ, is the proton lever).
+    from benchmarks.runners import trots as runner
+
+    args = runner._build_parser().parse_args([])
+    assert args.config == "exact/dense"
+    assert args.corrections == "mehrotra"
+    assert args.globalization == "breedveld"
+    assert args.mu_schedule == "monotone"
+    assert args.init == "breedveld"
+    assert args.tol == 1e-8
+
+    opts = runner._solve_options(args, "exact/dense")
+    assert opts.hessian == "exact" and opts.linsolve == "dense"
+    assert opts.corrections.method == "mehrotra"
+    assert opts.globalization == "breedveld"
+    assert opts.mu_schedule == "monotone"
+    assert opts.optimality.dual_inf_tol == 1e-8
+    assert opts.optimality.constr_viol_tol == 1e-8
+    assert opts.optimality.compl_inf_tol == 1e-8
+
+
+def test_runner_tol_sets_the_three_kkt_tolerances():
+    from benchmarks.runners import trots as runner
+
+    args = runner._build_parser().parse_args(["--tol", "1e-6"])
+    opt = runner._solve_options(args, "exact/dense").optimality
+    assert (opt.dual_inf_tol, opt.constr_viol_tol, opt.compl_inf_tol) == (1e-6,) * 3
+
+
+def test_runner_reproduces_the_previous_default_options():
+    # The pre-Breedveld default: both condensed dense configs, the loader's
+    # start, monotone μ, the filter line search, no corrector — which the old
+    # runner built as ``Options(max_iter, max_time, **config)`` alone.
+    from benchmarks.runners import trots as runner
+
+    parser = runner._build_parser()
+    args = runner._parse_args(
+        parser,
+        [
+            "--config",
+            "lbfgs/dense,exact/dense",
+            "--init",
+            "ipax",
+            "--mu-schedule",
+            "monotone",
+            "--globalization",
+            "filter",
+            "--corrections",
+            "none",
+        ],
+    )
+    labels = args.config.split(",")
+    assert labels == ["lbfgs/dense", "exact/dense"]
+    for label in labels:
+        previous = ipax.Options(max_iter=300, max_time=120.0, **runner._CONFIGS[label])
+        assert runner._solve_options(args, label) == previous
+
+
+def test_runner_slack_init_scale_is_an_ipax_init_lever():
+    from benchmarks.runners import trots as runner
+
+    parser = runner._build_parser()
+    args = runner._parse_args(
+        parser,
+        ["--init", "ipax", "--slack-init-scale", "0.1", "--kappa-centrality", "1e-4"],
+    )
+    barrier = runner._solve_options(args, "lbfgs/dense").barrier
+    assert barrier.slack_init_scale == 0.1
+    assert barrier.kappa_centrality == 1e-4
+
+
+def test_runner_rejects_slack_init_scale_under_breedveld_init(capsys):
+    # The Breedveld start sets the slacks itself (eq. (28)), so the flag would
+    # be ignored: an argument error, raised before any dataset lookup.
+    from benchmarks.runners import trots as runner
+
+    with pytest.raises(SystemExit) as excinfo:
+        runner.main(["--slack-init-scale", "0.1"])
+    assert excinfo.value.code == 2
+    assert "--slack-init-scale" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("init", ["breedveld", "ipax"])
+def test_runner_case_wires_the_initialisation(monkeypatch, init):
+    from benchmarks.runners import trots as runner
+
+    inst = _instance()
+    monkeypatch.setattr(runner, "load_trots_file", lambda path: inst)
+    monkeypatch.setattr(runner, "reference_for", lambda case, root: None)
+    captured = {}
+
+    def fake_run_case(bench, **kwargs):
+        captured["bench"] = bench
+        captured.update(kwargs)
+        return "row"
+
+    monkeypatch.setattr(runner, "run_case", fake_run_case)
+    args = runner._build_parser().parse_args(["--init", init])
+    opts = runner._solve_options(args, "exact/dense")
+
+    assert runner._solve_case("root", "Synthetic", "exact/dense", opts, np, init=init)
+    bench = captured["bench"]
+    problem, placeholder = bench.build(np)
+    assert isinstance(problem, trots.TROTSExactProblem)
+    # ``build`` returns the loader's uniform placeholder; the start itself is
+    # initialisation and comes out of the timed hook.
+    np.testing.assert_array_equal(
+        _host(placeholder), _host(problem.initial_point(warm_start=False))
+    )
+    x0, warm, new_opts = bench.prepare_solve(problem, placeholder, opts)
+    np.testing.assert_array_equal(
+        _host(x0), _host(problem.initial_point(strategy=init))
+    )
+    if init == "ipax":
+        assert warm is None and new_opts is opts
+        return
+    ref_warm, mu0 = problem.breedveld_warm_start(x0, scaling=opts.scaling)
+    np.testing.assert_allclose(_host(warm.y_ineq), _host(ref_warm.y_ineq))
+    assert new_opts == dataclasses.replace(
+        opts, barrier=dataclasses.replace(opts.barrier, mu_init=mu0)
+    )
+    # The hook forwards the solve's own scaling (μ0 lives in solver space).
+    unscaled = dataclasses.replace(opts, scaling="none")
+    _, _, none_opts = bench.prepare_solve(problem, placeholder, unscaled)
+    mu_none = problem.breedveld_warm_start(x0, scaling="none")[1]
+    assert none_opts.barrier.mu_init == mu_none != mu0
+
+
+@pytest.mark.parametrize("init", ["breedveld", "ipax"])
+def test_runner_times_the_least_squares_start_as_initialisation(monkeypatch, init):
+    # Review finding (2026-09-27): the least-squares fluence solve of eq. (23)
+    # ran inside ``build``, outside both timers, so a slow primal start left
+    # the reported solve time unchanged. It now runs in the timed hook: a
+    # 0.2 s solve shows up in ``prepare_time`` and hence in ``solve_time``.
+    import time
+
+    from benchmarks.harness import run_case
+    from benchmarks.runners import trots as runner
+
+    inst = _instance()
+    monkeypatch.setattr(runner, "load_trots_file", lambda path: inst)
+    monkeypatch.setattr(runner, "reference_for", lambda case, root: None)
+    calls: list[str] = []
+    phase = ["build"]
+    real_ls = trots.TROTSProblem.least_squares_fluence
+
+    def slow_ls(self, *args, **kwargs):
+        calls.append(phase[0])
+        time.sleep(0.2)
+        return real_ls(self, *args, **kwargs)
+
+    monkeypatch.setattr(trots.TROTSProblem, "least_squares_fluence", slow_ls)
+    captured = {}
+    monkeypatch.setattr(
+        runner, "run_case", lambda bench, **kw: captured.setdefault("bench", bench)
+    )
+    args = runner._build_parser().parse_args(["--init", init, "--max-iter", "2"])
+    opts = runner._solve_options(args, "exact/dense")
+    runner._solve_case("root", "Synthetic", "exact/dense", opts, np, init=init)
+    bench = captured["bench"]
+
+    bench.build(np)
+    assert calls == []  # the untimed build does not solve for the start
+
+    phase[0] = "prepare"
+    result = run_case(bench, config="exact/dense", options=opts, xp=np, backend="numpy")
+
+    assert result.error is None, result.error
+    assert calls == ["prepare"]  # one least-squares solve, inside the timed hook
+    assert result.prepare_time >= 0.2
+    assert result.solve_time >= result.prepare_time

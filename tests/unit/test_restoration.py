@@ -7,8 +7,9 @@ from dataclasses import replace
 import pytest
 
 from ipax import Options, solve
-from ipax.backend.operators import MatrixFreeJacobian, as_operator
-from ipax.ipm.restoration import RestorationExit, restore
+from ipax.backend.namespace import array_namespace
+from ipax.backend.operators import Dense, MatrixFreeJacobian, as_operator
+from ipax.ipm.restoration import RestorationExit, _dense_gauss_newton, restore
 from ipax.linalg.krylov import KrylovSolver
 from ipax.linalg.solver import LinearSolveError
 from ipax.options import RestorationOptions
@@ -744,3 +745,257 @@ def test_restoration_still_certifies_a_genuine_local_minimum(namespace):
         linear_solver=_krylov_solver(),
     )
     assert exit_reason.certifies_infeasibility
+
+
+# --------------------------------------------------------------------------- #
+# Dense reference route: large Gram-capable blocks are not densified
+# --------------------------------------------------------------------------- #
+class _SpyDense(Dense):
+    """A ``Dense`` Jacobian recording the products the restoration route uses."""
+
+    def __init__(self, A, calls):
+        super().__init__(A)
+        self.calls = calls
+
+    def matmat(self, V):
+        self.calls.append("matmat")
+        return super().matmat(V)
+
+    def rmatvec(self, v):
+        self.calls.append("rmatvec")
+        return super().rmatvec(v)
+
+
+class _GramSpyDense(_SpyDense):
+    """``_SpyDense`` that also exposes the weighted Gram ``Aᵀ diag(w) A``."""
+
+    def gram(self, weights, *, accumulate_dtype=None, hinted_only=False):
+        del accumulate_dtype, hinted_only
+        self.calls.append("gram")
+        A = self.dense_matrix()
+        xp = array_namespace(A, weights)
+        weighted = A * xp.expand_dims(weights, axis=1)
+        return xp.matmul(xp.permute_dims(A, (1, 0)), weighted)
+
+
+def _tall_blocks(xp):
+    """A 7x3 inequality block and a 2x3 equality block with mixed signs."""
+    jg = array(
+        xp,
+        [
+            [1.0, -2.0, 0.5],
+            [0.0, 3.0, -1.0],
+            [2.5, 0.0, 1.0],
+            [-1.0, 1.0, 1.0],
+            [0.3, -0.7, 2.0],
+            [4.0, 1.0, -3.0],
+            [0.0, 0.0, 1.5],
+        ],
+    )
+    g = array(xp, [0.4, -0.2, 1.3, 0.0, 2.2, -1.0, 0.7])
+    jc = array(xp, [[1.0, 1.0, 0.0], [0.5, -2.0, 3.0]])
+    c = array(xp, [0.25, -1.5])
+    return jg, g, jc, c
+
+
+def _old_dense_gauss_newton(xp, n, jc, c, jg, active, gpos):
+    """The pre-change dense assembly, verbatim, as the byte-identity oracle."""
+    dtype = jg.dtype
+    hessian = xp.zeros((n, n), dtype=dtype)
+    grad = xp.zeros((n,), dtype=dtype)
+    jc = xp.matmul(jc, xp.eye(n, dtype=dtype))
+    jc_t = xp.permute_dims(jc, (1, 0))
+    hessian = hessian + xp.matmul(jc_t, jc)
+    grad = grad + xp.matmul(jc_t, c)
+    jg = xp.matmul(jg, xp.eye(n, dtype=dtype))
+    jg_w = jg * xp.expand_dims(active, axis=1)
+    jg_t = xp.permute_dims(jg, (1, 0))
+    hessian = hessian + xp.matmul(jg_t, jg_w)
+    grad = grad + xp.matmul(jg_t, gpos)
+    return hessian, grad
+
+
+def _assemble(xp, eq_op, c, ineq_op, g, max_elements):
+    dtype = g.dtype
+    active = xp.astype(g > 0.0, dtype)
+    gpos = xp.maximum(g, xp.zeros_like(g))
+    hessian, grad = _dense_gauss_newton(
+        xp,
+        n=3,
+        dtype=dtype,
+        eq_jac=eq_op,
+        c=c,
+        ineq_jac=ineq_op,
+        active=active,
+        gpos=gpos,
+        max_elements=max_elements,
+    )
+    return hessian, grad, active, gpos
+
+
+def test_dense_route_forms_a_large_gram_capable_block_through_the_operator(
+    namespace,
+):
+    xp = namespace
+    jg, g, jc, c = _tall_blocks(xp)
+    eq_calls: list[str] = []
+    ineq_calls: list[str] = []
+    eq_op = _GramSpyDense(jc, eq_calls)
+    ineq_op = _GramSpyDense(jg, ineq_calls)
+
+    # Threshold below both m*n (7*3 = 21, 2*3 = 6): both blocks switch.
+    hessian, grad, active, gpos = _assemble(xp, eq_op, c, ineq_op, g, 5)
+
+    assert "matmat" not in ineq_calls
+    assert "matmat" not in eq_calls
+    assert sorted(ineq_calls) == ["gram", "rmatvec"]
+    assert sorted(eq_calls) == ["gram", "rmatvec"]
+    ref_h, ref_g = _old_dense_gauss_newton(xp, 3, jc, c, jg, active, gpos)
+    assert_allclose(xp, hessian, ref_h, rtol=1e-12, atol=1e-12)
+    assert_allclose(xp, grad, ref_g, rtol=1e-12, atol=1e-12)
+
+
+def test_dense_route_keeps_small_blocks_byte_identical(namespace):
+    xp = namespace
+    jg, g, jc, c = _tall_blocks(xp)
+    eq_calls: list[str] = []
+    ineq_calls: list[str] = []
+    eq_op = _GramSpyDense(jc, eq_calls)
+    ineq_op = _GramSpyDense(jg, ineq_calls)
+
+    # Threshold at the larger m*n (a block switches only strictly above it).
+    hessian, grad, active, gpos = _assemble(xp, eq_op, c, ineq_op, g, 21)
+
+    assert ineq_calls == ["matmat"]
+    assert eq_calls == ["matmat"]
+    ref_h, ref_g = _old_dense_gauss_newton(xp, 3, jc, c, jg, active, gpos)
+    assert bool(xp.all(hessian == ref_h))
+    assert bool(xp.all(grad == ref_g))
+
+
+def test_dense_route_decides_per_block_by_size(namespace):
+    # 6 < threshold < 21: only the tall inequality block switches.
+    xp = namespace
+    jg, g, jc, c = _tall_blocks(xp)
+    eq_calls: list[str] = []
+    ineq_calls: list[str] = []
+    hessian, grad, active, gpos = _assemble(
+        xp, _GramSpyDense(jc, eq_calls), c, _GramSpyDense(jg, ineq_calls), g, 10
+    )
+    assert eq_calls == ["matmat"]
+    assert sorted(ineq_calls) == ["gram", "rmatvec"]
+    ref_h, ref_g = _old_dense_gauss_newton(xp, 3, jc, c, jg, active, gpos)
+    assert_allclose(xp, hessian, ref_h, rtol=1e-12, atol=1e-12)
+    assert_allclose(xp, grad, ref_g, rtol=1e-12, atol=1e-12)
+
+
+def test_dense_route_densifies_a_block_that_is_not_gram_capable(namespace):
+    xp = namespace
+    jg, g, jc, c = _tall_blocks(xp)
+    ineq_calls: list[str] = []
+    ineq_op = _SpyDense(jg, ineq_calls)  # plain Dense: no Gram override
+    assert not ineq_op.gram_capable()
+
+    def matvec(v):
+        return xp.matmul(jc, v)
+
+    def rmatvec(v):
+        return xp.matmul(xp.permute_dims(jc, (1, 0)), v)
+
+    eq_op = MatrixFreeJacobian((2, 3), matvec, rmatvec)
+    assert not eq_op.gram_capable()
+    hessian, grad, active, gpos = _assemble(xp, eq_op, c, ineq_op, g, 1)
+
+    assert ineq_calls == ["matmat"]
+    ref_h, ref_g = _old_dense_gauss_newton(xp, 3, jc, c, jg, active, gpos)
+    assert_allclose(xp, hessian, ref_h, rtol=1e-14, atol=1e-14)
+    assert_allclose(xp, grad, ref_g, rtol=1e-14, atol=1e-14)
+
+
+def test_restore_never_densifies_a_large_gram_capable_block(namespace):
+    # End to end: the same restoration on the operator path and on the
+    # densified path reaches the same point (round-off aside).
+    xp = namespace
+    jg, _, _, _ = _tall_blocks(xp)
+    rhs = array(xp, [-1.0, 2.0, -0.5, 0.0, -2.0, 1.0, -0.25])
+    x0 = array(xp, [1.0, -1.0, 2.0])
+
+    def ineq_fn(z):
+        return xp.matmul(jg, z) + rhs
+
+    def run(max_elements):
+        calls: list[str] = []
+
+        def ineq_jac_fn(z):
+            del z
+            return _GramSpyDense(jg, calls)
+
+        out = restore(
+            **_restore_kwargs(
+                xp,
+                x0,
+                s=xp.ones((7,), dtype=x0.dtype),
+                m=7,
+                ineq_fn=ineq_fn,
+                ineq_jac_fn=ineq_jac_fn,
+            ),
+            dense_materialize_max_elements=max_elements,
+        )
+        return out, calls
+
+    (x_op, s_op, exit_op), op_calls = run(20)
+    (x_ref, s_ref, exit_ref), ref_calls = run(21)
+
+    assert "gram" in op_calls
+    assert "matmat" not in op_calls
+    assert "matmat" in ref_calls
+    assert "gram" not in ref_calls
+    assert exit_op is exit_ref
+    assert exit_op is RestorationExit.FEASIBLE
+    assert_allclose(xp, x_op, x_ref, rtol=1e-10, atol=1e-10)
+    assert_allclose(xp, s_op, s_ref, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize("wrap", ["coo", "row_scaled", "signed_selection"])
+def test_dense_route_real_sparse_gram_operators_match_the_densified_reference(
+    namespace, wrap
+):
+    # The production Gram-capable operators, not a test double: the sparse
+    # adapter's Gram, the gradient-scaling wrapper (folds d² into the 0-1
+    # weights) and the lowered two-sided linear_ineq selection (folds |S|ᵀ).
+    from ipax.backend.operators import COOOperator, _SignedRowSelection
+    from ipax.problem.scaling import _RowScaled
+
+    xp = namespace
+    jg, _, _, _ = _tall_blocks(xp)
+    rows, cols, values, shape = Dense(jg).to_coo()
+    op = COOOperator(rows, cols, values, shape)
+    if wrap == "row_scaled":
+        op = _RowScaled(op, array(xp, [0.5, 2.0, 1.0, 3.0, 0.25, 1.5, 4.0]))
+    elif wrap == "signed_selection":
+        sel_lower = xp.asarray([True, False, True, False, True, False, True])
+        sel_upper = xp.asarray([True, True, False, False, True, True, False])
+        op = _SignedRowSelection(op, sel_lower, sel_upper)
+    if not op.gram_capable():
+        pytest.skip("no sparse Gram adapter for this backend")
+    m = op.shape[0]
+    g = array(xp, [0.4, -0.2, 1.3, 0.0, 2.2, -1.0, 0.7, 0.9][:m])
+    c = xp.zeros((0,), dtype=g.dtype)
+
+    hessian, grad, _, _ = _assemble(xp, None, c, op, g, 1)
+    ref_h, ref_g, _, _ = _assemble(xp, None, c, op, g, 10**9)
+
+    assert_allclose(xp, hessian, ref_h, rtol=1e-12, atol=1e-12)
+    assert_allclose(xp, grad, ref_g, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, True, "big"])
+def test_dense_materialize_max_elements_is_validated(bad):
+    with pytest.raises(ValueError, match="dense_materialize_max_elements"):
+        RestorationOptions(dense_materialize_max_elements=bad)
+
+
+def test_dense_materialize_max_elements_default():
+    assert RestorationOptions().dense_materialize_max_elements == 10_000_000
+    options = RestorationOptions(dense_materialize_max_elements=1)
+    assert options.dense_materialize_max_elements == 1
