@@ -35,6 +35,27 @@ inflate under CPU oversubscription, so pin BLAS threads (e.g.
 native crash in a worker breaks the whole pool — each worker records what it is
 running in a pid-suffixed ``.inflight`` marker, so at most N candidates are named
 and ``--resume --exclude <name>`` steps past the culprit.
+
+``--backends cupy`` runs the solver's linear algebra on the GPU (the model is
+still evaluated on the host through the bridge, so it measures correctness, not
+GPU speed): the sparse configs factor with cuDSS through the CuPy adapter.
+``--cupy-certificates`` additionally records, per CuPy case, how often the
+adapter's silent-failure certificates fired (cuDSS ``NPIVOTS > 0`` residual
+certificate, dense pivot-checked Cholesky) into pid-suffixed
+``<out>.certs.<pid>.jsonl`` side files — see
+:mod:`benchmarks.runners._cupy_certificates`. ``--cudss-refinement-steps``
+and ``--cudss-max-residual`` override the perturbed-pivot solve policy the
+CuPy rows run with (``SparseOptions.perturbed_pivot_refinement_steps`` /
+``perturbed_pivot_max_residual``: maximum iterative-refinement steps,
+post-refinement certificate threshold), for A/B sweeps of those defaults.
+``--cudss-deterministic`` runs the CuPy rows with
+``SparseOptions(deterministic=True)`` (cuDSS ``DETERMINISTIC_MODE``), which
+removes the factorization's run-to-run noise from an A/B. The CuPy
+adapter's own products and COO builds are reproducible in every mode, so
+with it a CuPy row repeats bit for bit, except a row that stops on
+``max_time`` (see the backends guide).
+The report records all three under
+``environment.cudss_policy``; ``--resume`` refuses to mix policies.
 """
 
 from __future__ import annotations
@@ -43,6 +64,7 @@ import argparse
 import dataclasses
 import json
 import os
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -312,6 +334,9 @@ def _run_problem_cases(
     global_max_vars: int,
     max_build_seconds: float,
     inflight_prefix: str | None = None,
+    certificate_prefix: str | None = None,
+    cudss_policy: tuple[int | None, float | None]
+    | tuple[int | None, float | None, bool] = (None, None),
 ) -> tuple[list[CaseResult], str | None]:
     """Run one problem across the config matrix; ``(rows, skip_reason)``.
 
@@ -342,6 +367,8 @@ def _run_problem_cases(
             configs,
             global_max_vars,
             max_build_seconds,
+            certificate_prefix,
+            cudss_policy,
         )
     finally:
         if marker is not None:
@@ -357,9 +384,17 @@ def _run_problem_cases_inner(
     configs: list[ConfigSpec],
     global_max_vars: int,
     max_build_seconds: float,
+    certificate_prefix: str | None = None,
+    cudss_policy: tuple[int | None, float | None]
+    | tuple[int | None, float | None, bool] = (None, None),
 ) -> tuple[list[CaseResult], str | None]:
     """The sweep proper; see :func:`_run_problem_cases`."""
     xp = import_namespace(backend)
+    # ``(steps, max_residual[, deterministic])``; None/False = the default.
+    if backend == "cupy" and any(
+        v is not None and v is not False for v in cudss_policy
+    ):
+        configs = _with_cudss_policy(configs, *cudss_policy)
 
     # Optional build guard: abandon a problem whose sized build is too slow
     # (pure-Python O(n²)) before it stalls an unattended sweep.
@@ -409,16 +444,74 @@ def _run_problem_cases_inner(
         cap = _effective_cap(route_cap, global_max_vars)
         if cap and n_vars > cap:
             continue
-        rows.append(
-            run_case(
-                cases_by_mode[_problem_mode(options)],
-                config=label,
-                options=options,
-                xp=xp,
-                backend=backend,
+        case = cases_by_mode[_problem_mode(options)]
+        if certificate_prefix is None or backend != "cupy":
+            rows.append(
+                run_case(case, config=label, options=options, xp=xp, backend=backend)
             )
-        )
+            continue
+        # Count CuPy's silent-failure certificates for this one solve; one
+        # pid-suffixed side file per worker, so concurrent workers never
+        # interleave writes.
+        from benchmarks.runners._cupy_certificates import CertificateCounter
+
+        started = time.time()
+        with CertificateCounter() as counter:
+            row = run_case(case, config=label, options=options, xp=xp, backend=backend)
+        rows.append(row)
+        record = {
+            "backend": backend,
+            "problem": row.problem,
+            "config": label,
+            "status": row.status,
+            # Wall-clock span (epoch seconds): lets a GPU reset (a Windows TDR
+            # kills every CUDA context on the device) be matched to the
+            # cases it overlapped, which must then be re-run.
+            "t_start": started,
+            "t_end": time.time(),
+            **counter.summary(),
+        }
+        with open(
+            f"{certificate_prefix}.{os.getpid()}.jsonl", "a", encoding="utf-8"
+        ) as fh:
+            fh.write(json.dumps(record) + "\n")
     return rows, None if rows else "too_large"
+
+
+def _with_cudss_policy(
+    configs: list[ConfigSpec],
+    steps: int | None,
+    max_residual: float | None,
+    deterministic: bool = False,
+) -> list[ConfigSpec]:
+    """``configs`` with the cuDSS policy overridden in ``Options.sparse``.
+
+    ``None`` keeps a config's own value (the ``SparseOptions`` default), and so
+    does ``deterministic=False``. The policy reaches the cuDSS adapter through
+    the public options path (``SparseDirectSolver`` → the adapter's
+    ``configure_perturbed_pivots`` / ``configure_deterministic``), and is
+    validated by ``SparseOptions`` itself. Only the sparse-route configs read
+    it; the others carry it inertly.
+    """
+    overrides: dict[str, object] = {}
+    if steps is not None:
+        overrides["perturbed_pivot_refinement_steps"] = steps
+    if max_residual is not None:
+        overrides["perturbed_pivot_max_residual"] = max_residual
+    if deterministic:
+        overrides["deterministic"] = True
+    if not overrides:
+        return configs
+    return [
+        (
+            label,
+            dataclasses.replace(
+                options, sparse=dataclasses.replace(options.sparse, **overrides)
+            ),
+            cap,
+        )
+        for label, options, cap in configs
+    ]
 
 
 def _row_to_case_result(row: dict[str, object]) -> CaseResult:
@@ -441,7 +534,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--backends",
         default="numpy",
-        help="comma-separated host backends to bridge (numpy,torch)",
+        help="comma-separated backends to bridge (numpy,torch; cupy runs the "
+        "solver on the GPU with host-evaluated models, cuDSS on the sparse configs)",
     )
     parser.add_argument(
         "--names",
@@ -641,6 +735,35 @@ def main(argv: list[str] | None = None) -> int:
         "skipping them",
     )
     parser.add_argument(
+        "--cupy-certificates",
+        action="store_true",
+        help="on the cupy backend, record per case how often the cuDSS "
+        "perturbed-pivot residual certificate and the dense pivot-checked "
+        "Cholesky fired, into <out>.certs.<pid>.jsonl side files",
+    )
+    parser.add_argument(
+        "--cudss-refinement-steps",
+        type=int,
+        default=None,
+        help="on the cupy backend, override the maximum iterative-refinement "
+        "steps on perturbed-pivot factorizations "
+        "(SparseOptions.perturbed_pivot_refinement_steps; default 10; 0 = off)",
+    )
+    parser.add_argument(
+        "--cudss-max-residual",
+        type=float,
+        default=None,
+        help="on the cupy backend, override the post-refinement certificate "
+        "threshold (SparseOptions.perturbed_pivot_max_residual; default 1e-2)",
+    )
+    parser.add_argument(
+        "--cudss-deterministic",
+        action="store_true",
+        help="on the cupy backend, factor with cuDSS's run-to-run reproducible "
+        "mode (SparseOptions.deterministic=True; costs factorization time), "
+        "removing the factorization's run-to-run noise from an A/B",
+    )
+    parser.add_argument(
         "--jobs",
         type=int,
         default=1,
@@ -705,18 +828,52 @@ def main(argv: list[str] | None = None) -> int:
         configs = [spec for spec in configs if spec[0] in wanted]
         if not configs:
             parser.error(f"--config {args.config!r} matched no known config labels")
+    # Validate the cuDSS policy flags here (the same bounds SparseOptions
+    # enforces) so a bad value fails the parse instead of the first worker
+    # mid-sweep.
+    if args.cudss_refinement_steps is not None and args.cudss_refinement_steps < 0:
+        parser.error("--cudss-refinement-steps must be >= 0")
+    if args.cudss_max_residual is not None and not (
+        0.0 < args.cudss_max_residual < float("inf")
+    ):
+        parser.error("--cudss-max-residual must be finite and > 0")
     environment = capture_environment()
+    # The cuDSS policy the CuPy rows ran with (None = the SparseOptions
+    # default at this commit), so an A/B arm is identifiable from its report
+    # and a resume cannot silently mix two policies. The keys keep the
+    # adapter's parameter names so earlier reports still resume.
+    cudss_policy = {
+        "max_refinement_steps": args.cudss_refinement_steps,
+        "perturbed_max_residual": args.cudss_max_residual,
+        "deterministic": args.cudss_deterministic,
+    }
+    if "cupy" in backends:
+        environment["cudss_policy"] = cudss_policy
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     json_path = out.with_suffix(".json")
     md_path = out.with_suffix(".md")
     inflight_path = out.with_suffix(".inflight")
+    certificate_prefix = (
+        str(out.with_suffix(".certs")) if args.cupy_certificates else None
+    )
 
     results: list[CaseResult] = []
     if args.resume and json_path.exists():
         prior = json.loads(json_path.read_text())
         environment = prior.get("environment", environment)
+        if "cupy" in backends:
+            ran = dict(environment.get("cudss_policy", dict.fromkeys(cudss_policy)))
+            # Reports from before --cudss-deterministic ran in the default mode.
+            if ran.get("deterministic") is None:
+                ran["deterministic"] = False
+            if ran != cudss_policy:
+                parser.error(
+                    f"--resume of {json_path} would mix cuDSS policies: the "
+                    f"report ran {ran}, this run asks for {cudss_policy}"
+                )
+            environment["cudss_policy"] = cudss_policy
         results = [_row_to_case_result(row) for row in prior.get("results", [])]
         print(f"resuming from {json_path}: {len(results)} rows kept")
     # ``done`` is keyed by (backend, name) so a multi-backend resume re-runs the
@@ -757,6 +914,12 @@ def main(argv: list[str] | None = None) -> int:
             args.max_vars,
             args.max_build_seconds,
             str(inflight_path),
+            certificate_prefix,
+            (
+                args.cudss_refinement_steps,
+                args.cudss_max_residual,
+                args.cudss_deterministic,
+            ),
         )
 
     def _record(

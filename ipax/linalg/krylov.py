@@ -72,7 +72,7 @@ from typing import TYPE_CHECKING
 
 from ipax.backend.namespace import array_namespace
 from ipax.backend.operators import MatrixFreeJacobian
-from ipax.linalg.solver import LinearSolveError
+from ipax.linalg.solver import LinearSolveError, numerical_failure_types
 
 if TYPE_CHECKING:
     from ipax.backend.operators import LinearOperator
@@ -98,43 +98,26 @@ def _guarded_exact_apply(
 ) -> Callable[[Array], Array]:
     """Wrap the exact Woodbury apply so a breakdown takes the Jacobi fallback.
 
-    A backend-native error out of the apply (an exactly singular L-BFGS
-    middle matrix) becomes :class:`KrylovConvergenceError`, which
+    A numerical failure out of the apply (:func:`numerical_failure_types`:
+    the backend's ``LinAlgError`` on an exactly singular L-BFGS middle
+    matrix) becomes :class:`KrylovConvergenceError`, which
     :meth:`KrylovSolver.solve` answers by sticky-disabling the exact inverse
     and retrying on Jacobi — instead of escaping the driver's δ_w ladder and
-    aborting the solve. A resource failure (out-of-memory) is *not* a
-    singular window and propagates unchanged: relabeling it would hide the
-    cause behind a slower Jacobi retry. Shared by the direct dispatch and the
-    explicit-GMRES preconditioner so both routes fail the same way.
+    aborting the solve. Anything else propagates unchanged: a resource
+    failure (``MemoryError``, torch's CUDA ``OutOfMemoryError``, JAX's
+    ``RESOURCE_EXHAUSTED``) is not a singular window, and relabeling it —
+    or a programming error — would hide the cause behind a slower Jacobi
+    retry. Shared by the direct dispatch and the explicit-GMRES
+    preconditioner so both routes fail the same way.
     """
 
     def apply_inverse(v: Array) -> Array:
         try:
             return raw_apply(v)
-        except Exception as exc:  # backend-native LinAlgError and kin
-            if _is_resource_failure(exc):
-                raise
+        except numerical_failure_types() as exc:
             raise KrylovConvergenceError(f"exact Woodbury apply failed: {exc}") from exc
 
     return apply_inverse
-
-
-def _is_resource_failure(exc: BaseException) -> bool:
-    """Whether a backend exception is an allocation failure, not numerics.
-
-    Device backends raise their own types (torch's CUDA ``OutOfMemoryError`` is
-    a ``RuntimeError``, JAX reports ``RESOURCE_EXHAUSTED``) which cannot be
-    named in the core (invariant #1); recognise them by class name and message.
-    """
-    if isinstance(exc, MemoryError):
-        return True
-    name = type(exc).__name__.lower()
-    message = str(exc).lower()
-    return (
-        "outofmemory" in name
-        or "out of memory" in message
-        or ("resource_exhausted" in message)
-    )
 
 
 # Woodbury-apply budget for the direct exact-inverse solve: one apply plus up

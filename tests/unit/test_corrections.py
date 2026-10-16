@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 from ipax.backend.operators import Dense
@@ -10,6 +12,8 @@ from ipax.ipm.corrections import (
     GondzioCorrector,
     MehrotraCorrector,
     NoCorrection,
+    _breedveld_correction,
+    mehrotra_probing_mu,
     probing_mu,
     select_corrector,
 )
@@ -161,6 +165,287 @@ def test_probing_mu_respects_floor(namespace):
         mu_min=2.0,
     )
     assert probing_mu(context) == 2.0
+
+
+# -- unclipped Mehrotra σ rule (probing_sigma="mehrotra") -------------------
+
+
+def test_mehrotra_probing_mu_matches_sigma_rule_against_measured_gap(namespace):
+    # Mehrotra 1992; Breedveld 2017 supplement, eqs. (4)–(7) with μ_prev read
+    # as the eq. (10) gap: μ_gap = 2·3 = 6; α = 0.5 ⇒ μ_aff = 1.5·2.5 = 3.75;
+    # σ = (μ_aff/μ_gap)³, target σ·μ_gap — equal to the NWW rule when σ < 1.
+    xp = namespace
+    context = _context(
+        xp,
+        _step(xp, ds=-1.0, dy=-1.0),
+        solve=lambda *args: None,
+        alpha_primal=lambda step, *, tau: 0.5,
+        alpha_dual=lambda step, *, tau: 0.5,
+    )
+    expected = (3.75 / 6.0) ** 3 * 6.0
+    assert_scalar_close(mehrotra_probing_mu(context, tau=0.995), expected)
+    assert_scalar_close(probing_mu(context), expected)
+
+
+def test_mehrotra_probing_mu_probes_with_the_given_tau(namespace):
+    # The probe step is his §2.1 fraction-to-boundary step (τ = 0.995), not
+    # the NWW rule's maximal τ = 1 step.
+    xp = namespace
+    seen: list[float] = []
+
+    def alpha(step, *, tau):
+        seen.append(tau)
+        return 0.5
+
+    context = _context(
+        xp,
+        _step(xp, ds=-1.0, dy=-1.0),
+        solve=lambda *args: None,
+        alpha_primal=alpha,
+        alpha_dual=alpha,
+    )
+    mehrotra_probing_mu(context, tau=0.995)
+    assert seen == [0.995, 0.995]
+
+
+def test_mehrotra_probing_mu_is_unclipped(namespace):
+    # Unlike the NWW rule (σ ≤ 1), σ is not clipped: trial products
+    # (2+1)(3+1) = 12 against the gap 6 give σ = 8 and μ = 48 — above the
+    # current gap.
+    xp = namespace
+    context = _context(
+        xp,
+        _step(xp, ds=1.0, dy=1.0),
+        solve=lambda *args: None,
+        alpha_primal=lambda step, *, tau: 1.0,
+        alpha_dual=lambda step, *, tau: 1.0,
+    )
+    assert_scalar_close(mehrotra_probing_mu(context, tau=0.995), 48.0)
+    assert_scalar_close(probing_mu(context), 6.0)
+
+
+def test_probing_rules_survive_overflowing_sigma(namespace):
+    # Regression: σ = (μ_aff/μ_gap)³ was a Python-float ``**``, which raises
+    # OverflowError for ratios above ~5.6e102. Trial products (2+1e75)(3+1e75)
+    # ≈ 1e150 against the gap 6: the cube saturates to inf. The unclipped
+    # Mehrotra rule then holds μ at the measured gap (non-finite target
+    # fallback); the NWW rule clips σ at 1 ⇒ the same μ = 6.
+    xp = namespace
+    context = _context(
+        xp,
+        _step(xp, ds=1e75, dy=1e75),
+        solve=lambda *args: None,
+        alpha_primal=lambda step, *, tau: 1.0,
+        alpha_dual=lambda step, *, tau: 1.0,
+    )
+    assert mehrotra_probing_mu(context, tau=0.995) == 6.0
+    assert probing_mu(context) == 6.0
+
+
+def test_mehrotra_probing_mu_respects_floor(namespace):
+    xp = namespace
+    context = _context(
+        xp,
+        _step(xp, ds=-1.0, dy=-1.0),
+        solve=lambda *args: None,
+        alpha_primal=lambda step, *, tau: 0.5,
+        alpha_dual=lambda step, *, tau: 0.5,
+        mu_min=2.5,
+    )
+    assert mehrotra_probing_mu(context, tau=0.995) == 2.5
+
+
+def test_breedveld_gondzio_variant_targets_and_acceptance(namespace):
+    # Breedveld 2017 supplement A.2: after the full Mehrotra corrector, probe
+    # the trial step α̌ = min(1.1·α, 1), target the trial products by the
+    # two-tier rule of eqs. (13)–(14), and keep a correction only when the
+    # step length grows to ≥ 1.07·α.
+    xp = namespace
+    affine = _step(xp, ds=-1.0, dy=-1.0)
+    mehrotra = _step(xp, ds=10.0, dy=10.0)
+    first = _step(xp, ds=0.1, dy=0.1)
+    second = _step(xp, ds=0.2, dy=0.2)
+    solves = []
+    returns = [mehrotra, first, second]
+
+    def solve(comp_s, comp_l, comp_u):
+        solves.append(float(comp_s[0]))
+        return returns[len(solves) - 1]
+
+    alphas = {id(affine): 0.5, id(mehrotra): 0.5, id(first): 0.6, id(second): 0.61}
+
+    def alpha(step, *, tau):
+        return alphas[id(step)]
+
+    context = _context(xp, affine, solve=solve, alpha_primal=alpha, alpha_dual=alpha)
+    corrector = GondzioCorrector(
+        CorrectionsOptions(
+            method="gondzio", gondzio_max_corrections=3, gondzio_variant="breedveld"
+        )
+    )
+    result = corrector.correct(context, 1.0)
+
+    # Mehrotra target: μ − ΔsΔλ = 1 − 1 = 0, clipped into [0.1, 10] ⇒ 0.1.
+    assert_scalar_close(solves[0], 0.1)
+    # Trial α̌ = 0.55: product (2+5.5)(3+5.5) = 63.75; 8 − 63.75 < −5·8 ⇒ the
+    # downward correction is capped at −40 ⇒ new target 0.1 − 40.
+    assert_scalar_close(solves[1], 0.1 - 40.0)
+    # first: 0.6 + 0.6 ≥ 1.07·(0.5 + 0.5) ⇒ kept; second: 1.22 < 1.07·1.2 ⇒
+    # rejected, the loop stops with the first correction.
+    assert len(solves) == 3
+    assert result.step is first
+    assert result.mu == 1.0
+
+
+@pytest.mark.parametrize(
+    ("ds", "dy", "expected_correction"),
+    [
+        (10.0, 10.0, -40.0),  # 8 − t < −5·β_max·μ ⇒ capped at −40
+        (1.0, 1.0, 8.0 - 2.55 * 3.55),  # β_max·μ < t, uncapped ⇒ β_max·μ − t
+        (-1.0, -1.0, 0.0),  # inside [β_min·μ, β_max·μ] ⇒ untouched
+        (-3.5, -5.0, 0.2 - 0.075 * 0.25),  # t < β_min·μ ⇒ β_min·μ − t
+    ],
+)
+def test_breedveld_gondzio_capped_corrections(namespace, ds, dy, expected_correction):
+    # Breedveld 2017 supplement A.2, eqs. (13)–(14) in the capped reading
+    # (μ = 1, β = 0.2 / 8, trial α̌ = 1.1·0.5 = 0.55; the Mehrotra target
+    # clips to 0.1).
+    xp = namespace
+    affine = _step(xp, ds=-1.0, dy=-1.0)
+    mehrotra = _step(xp, ds=ds, dy=dy)
+    solves = []
+
+    def solve(comp_s, comp_l, comp_u):
+        solves.append(float(comp_s[0]))
+        return mehrotra if len(solves) == 1 else None
+
+    context = _context(
+        xp,
+        affine,
+        solve=solve,
+        alpha_primal=lambda step, *, tau: 0.5,
+        alpha_dual=lambda step, *, tau: 0.5,
+    )
+    GondzioCorrector(
+        CorrectionsOptions(
+            method="gondzio", gondzio_max_corrections=1, gondzio_variant="breedveld"
+        )
+    ).correct(context, 1.0)
+
+    assert len(solves) == 2
+    assert_scalar_close(solves[1], 0.1 + expected_correction)
+
+
+def test_breedveld_correction_is_monotone_in_the_product(namespace):
+    # Breedveld 2017 supplement A.2, eqs. (13)–(14): the literal two-tier
+    # reading is non-monotone (t = 39 → −31, t = 41 → −1, t = 1000 → −960);
+    # the capped reading (Gondzio 1996's outlier cap) is non-increasing in t:
+    # 0 inside [0.2, 8], 8 − t above it, never below −5·8 = −40 (μ = 1).
+    xp = namespace
+    products = [7.0, 8.0, 9.0, 39.0, 40.0, 41.0, 48.0, 49.0, 1000.0]
+    got = _breedveld_correction(xp, array(xp, products), 1.0)
+    values = [float(got[i]) for i in range(len(products))]
+    assert values == [0.0, 0.0, -1.0, -31.0, -32.0, -33.0, -40.0, -40.0, -40.0]
+    assert all(a >= b for a, b in itertools.pairwise(values))
+    below = _breedveld_correction(xp, array(xp, [0.05, 0.2]), 1.0)
+    assert_allclose(xp, below, array(xp, [0.15, 0.0]))
+
+
+def test_breedveld_gondzio_corrects_bound_blocks(namespace):
+    # The bound blocks get the same capped correction on their finite
+    # entries and stay zero off the masks (Breedveld 2017 supplement A.2,
+    # eq. (14) for the upper block). μ = 1; α = 0.5 ⇒ trial α̌ = 0.55.
+    xp = namespace
+    zero2 = array(xp, [0.0, 0.0])
+    affine = NewtonStep(
+        dx=zero2,
+        ds=array(xp, [-1.0]),
+        dy_eq=array(xp, []),
+        dy_ineq=array(xp, [-1.0]),
+        dz_lower=zero2,
+        dz_upper=zero2,
+    )
+    mehrotra = NewtonStep(
+        dx=array(xp, [1.0, 1.0]),
+        ds=array(xp, [-1.0]),
+        dy_eq=array(xp, []),
+        dy_ineq=array(xp, [-1.0]),
+        dz_lower=array(xp, [10.0, 5.0]),
+        dz_upper=array(xp, [-0.5, 3.0]),
+    )
+    solves = []
+
+    def solve(comp_s, comp_l, comp_u):
+        solves.append((comp_s, comp_l, comp_u))
+        return mehrotra if len(solves) == 1 else None
+
+    mask = array(xp, [1.0, 0.0]) > 0.5
+    context = CorrectionContext(
+        affine=affine,
+        s=array(xp, [2.0]),
+        y_ineq=array(xp, [3.0]),
+        x_minus_l=array(xp, [1.0, 1.0]),
+        u_minus_x=array(xp, [1.0, 1.0]),
+        z_lower=array(xp, [2.0, 0.0]),
+        z_upper=array(xp, [0.5, 0.0]),
+        mask_l=mask,
+        mask_u=mask,
+        solve=solve,
+        alpha_primal=lambda step, *, tau: 0.5,
+        alpha_dual=lambda step, *, tau: 0.5,
+    )
+    GondzioCorrector(
+        CorrectionsOptions(
+            method="gondzio", gondzio_max_corrections=1, gondzio_variant="breedveld"
+        )
+    ).correct(context, 1.0)
+
+    assert len(solves) == 2
+    _, mehrotra_l, mehrotra_u = solves[0]
+    assert_allclose(xp, mehrotra_l, array(xp, [1.0, 0.0]))  # μ − 0·0, masked
+    assert_allclose(xp, mehrotra_u, array(xp, [1.0, 0.0]))
+    comp_s, comp_l, comp_u = solves[1]
+    # slack: (2−0.55)(3−0.55) = 3.5525 inside the box ⇒ untouched 0.1.
+    assert_allclose(xp, comp_s, array(xp, [0.1]))
+    # lower: (1+0.55)(2+5.5) = 11.625 > 8 ⇒ 1 + (8 − 11.625).
+    assert_allclose(xp, comp_l, array(xp, [1.0 + 8.0 - 11.625, 0.0]))
+    # upper: (1−0.55)(0.5−0.275) = 0.10125 < 0.2 ⇒ 1 + (0.2 − 0.10125).
+    assert_allclose(xp, comp_u, array(xp, [1.0 + 0.2 - 0.10125, 0.0]))
+
+
+def test_breedveld_gondzio_variant_rejects_small_growth(namespace):
+    # A correction that grows the step by less than 7 % is discarded.
+    xp = namespace
+    affine = _step(xp, ds=-1.0, dy=-1.0)
+    mehrotra = _step(xp, ds=-0.5, dy=-0.5)
+    small = _step(xp, ds=-0.4, dy=-0.4)
+    returns = [mehrotra, small]
+    solves = []
+
+    def solve(comp_s, comp_l, comp_u):
+        solves.append(comp_s)
+        return returns[len(solves) - 1]
+
+    alphas = {id(affine): 0.5, id(mehrotra): 0.5, id(small): 0.53}
+    context = _context(
+        xp,
+        affine,
+        solve=solve,
+        alpha_primal=lambda step, *, tau: alphas[id(step)],
+        alpha_dual=lambda step, *, tau: alphas[id(step)],
+    )
+    corrector = GondzioCorrector(
+        CorrectionsOptions(method="gondzio", gondzio_variant="breedveld")
+    )
+    result = corrector.correct(context, 1.0)
+    assert len(solves) == 2
+    assert result.step is mehrotra
+
+
+def test_gondzio_variant_validated():
+    assert CorrectionsOptions().gondzio_variant == "ipax"
+    with pytest.raises(ValueError, match="gondzio_variant"):
+        CorrectionsOptions(gondzio_variant="colombo")  # type: ignore[arg-type]
 
 
 def test_mehrotra_second_order_targets_clipped_to_symmetric_box(namespace):

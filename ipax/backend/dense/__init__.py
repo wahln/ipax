@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-backend dense symmetric-indefinite (Bunch-Kaufman LDLT) adapters.
+"""Per-backend dense adapters: Bunch-Kaufman LDLT, Cholesky factor/back-solve.
 
 .. warning::
    These modules are the **only** place under ``backend/`` (besides
@@ -84,6 +84,54 @@ def get_dense_symmetric_indefinite_adapter(xp: Namespace) -> object | None:
     return None
 
 
+def get_dense_cholesky(xp: Namespace) -> Callable[[Array], Array] | None:
+    """Return ``matrix -> L`` (lower Cholesky factor, raising on breakdown), or ``None``.
+
+    Gap-filler for a missing Array-API guarantee: the ``linalg`` extension
+    specifies ``cholesky``'s result but not its memory layout or how many
+    copies an implementation makes, and NumPy's gufunc wraps LAPACK ``potrf``
+    in two unblocked transposing ``n x n`` copies (C-ordered in, Fortran-ordered
+    scratch, C-ordered out) that at ``n ≈ 10⁴`` cost twice the factorization
+    itself. The adapter calls ``potrf`` directly on a single cache-blocked
+    Fortran-ordered copy and returns the Fortran-ordered factor that the
+    matching :func:`get_dense_cholesky_solve` back-substitutes without a copy:
+
+    ===========  ================================================
+    backend      primitive
+    ===========  ================================================
+    numpy        ``scipy.linalg.lapack.dpotrf`` (float64, one blocked copy;
+                 other dtypes: ``numpy.linalg.cholesky``)
+    ===========  ================================================
+
+    Contract (what ``DenseSolver`` relies on): reads only the lower triangle,
+    never writes to its input, returns an exactly lower-triangular factor
+    that :func:`get_dense_cholesky_solve`'s adapter accepts, and *raises* the
+    backend's own numerical failure type on a breakdown (a member of
+    :func:`~ipax.linalg.solver.numerical_failure_types`) — so callers need no
+    silent-breakdown pivot check for it.
+
+    ``None`` for every other backend or when SciPy is unimportable: callers
+    use ``xp.linalg.cholesky``. The two other adapter backends already factor
+    without NumPy's double transposition: ``cupy.linalg.cholesky`` (CuPy 14)
+    makes one C-ordered copy, runs cuSOLVER ``potrf`` with ``uplo='U'`` on it
+    (the upper triangle of the Fortran view ``Aᵀ``, i.e. ``A``'s lower one)
+    and zeroes the other triangle in one elementwise kernel, and
+    ``cupyx.scipy.linalg`` has no other Cholesky entry point;
+    ``torch.linalg.cholesky`` returns a column-major factor computed by
+    LAPACK/MAGMA ``potrf`` in 0.87 s at ``n = 9984`` (CPU, MKL) — what
+    ``potrf`` alone costs there. Neither has a cheaper call to inject.
+    """
+    from ipax.backend.namespace import _namespace_name
+
+    if _namespace_name(xp) == "numpy":
+        try:
+            from ipax.backend.dense.numpy_scipy import cholesky as _numpy_cholesky
+        except ImportError:
+            return None
+        return _numpy_cholesky
+    return None
+
+
 def get_dense_cholesky_solve(xp: Namespace) -> Callable[[Array, Array], Array] | None:
     """Return ``(L, rhs) -> x`` solving ``(L Lᵀ) x = rhs``, or ``None``.
 
@@ -137,4 +185,56 @@ def get_dense_cholesky_solve(xp: Namespace) -> Callable[[Array, Array], Array] |
     return None
 
 
-__all__ = ["get_dense_cholesky_solve", "get_dense_symmetric_indefinite_adapter"]
+def get_dense_diagonal_adder(xp: Namespace) -> Callable[[Array, Array], Array] | None:
+    """Return ``(matrix, diagonal) -> matrix + diag(diagonal)`` in O(n), or ``None``.
+
+    Gap-filler for a missing Array-API primitive: the standard has no
+    strided diagonal setter, so a pure-standard caller must build the
+    diagonal update via ``xp.eye(n) * diagonal`` — an extra O(n²) identity
+    allocation and elementwise multiply on top of the O(n²) copy already
+    needed to return a new matrix. Per-backend adapters instead mutate a
+    writable O(n) diagonal view of a fresh copy:
+
+    ===========  ================================================
+    backend      primitive
+    ===========  ================================================
+    numpy        ``numpy.einsum("ii->i", a)`` (writable diagonal view)
+    torch        ``torch.Tensor.diagonal()`` (writable view) + ``add_``
+    ===========  ================================================
+
+    ``None`` for any other backend (CuPy, JAX, array-api-strict) or when the
+    concrete library import fails: the caller falls back to the ``eye``-based
+    formula, losing only the speedup, never correctness (both formulas are
+    bitwise identical for finite inputs, at the same promoted dtype — see
+    each adapter's docstring for the NEP 50 / Torch promotion subtlety this
+    must reproduce). CuPy is left on the fallback here: its
+    ``ndarray.diagonal()`` is documented as a writable view (unlike NumPy's
+    own method), which would make the same O(n) update correct, but this has
+    not been exercised on real CUDA hardware.
+    """
+    from ipax.backend.namespace import _namespace_name
+
+    name = _namespace_name(xp)
+    if name == "numpy":
+        try:
+            from ipax.backend.dense.numpy_scipy import (
+                add_diagonal as _numpy_add_diagonal,
+            )
+        except ImportError:
+            return None
+        return _numpy_add_diagonal
+    if name == "torch":
+        try:
+            from ipax.backend.dense.torch import add_diagonal as _torch_add_diagonal
+        except ImportError:
+            return None
+        return _torch_add_diagonal
+    return None
+
+
+__all__ = [
+    "get_dense_cholesky",
+    "get_dense_cholesky_solve",
+    "get_dense_diagonal_adder",
+    "get_dense_symmetric_indefinite_adapter",
+]

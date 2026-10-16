@@ -13,7 +13,7 @@ import pytest
 from ipax.backend.operators import Dense, Diagonal, MatrixFreeJacobian
 from ipax.linalg.krylov import KrylovConvergenceError, KrylovSolver
 from ipax.options import KrylovOptions
-from tests._helpers import array, assert_allclose, norm_inf
+from tests._helpers import array, assert_allclose, backend_linalg_error, norm_inf
 
 
 def _spd_system(namespace):
@@ -1143,10 +1143,11 @@ def test_direct_dispatch_converts_backend_errors_to_the_fallback(namespace):
     K = _bound_only_lbfgs_condensed(namespace)
     n = K.shape[0]
     rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    singular = backend_linalg_error(namespace)
 
     def _raising():
         def _apply(r):
-            raise ValueError("singular middle matrix")
+            raise singular
 
         return _apply
 
@@ -1259,16 +1260,19 @@ def test_non_convergence_error_carries_a_finite_iterate(namespace, method):
     [
         MemoryError("host allocation failed"),
         type("OutOfMemoryError", (RuntimeError,), {})("CUDA out of memory"),
+        TypeError("asarray() got an unexpected keyword argument 'device'"),
+        ValueError("operands could not be broadcast together"),
     ],
-    ids=["MemoryError", "cuda-oom"],
+    ids=["MemoryError", "cuda-oom", "TypeError-bug", "ValueError-bug"],
 )
 def test_exact_inverse_apply_resource_failures_propagate(namespace, failure):
-    """A resource failure inside the Woodbury apply is not a singular window.
+    """A resource failure or a bug inside the Woodbury apply is not a singular window.
 
     Relabeling it as ``KrylovConvergenceError`` would sticky-disable the exact
-    inverse and retry on Jacobi CG — hiding an out-of-memory condition behind a
-    "slow solve" for the rest of the run (torch's CUDA OOM is a RuntimeError,
-    not a MemoryError).
+    inverse and retry on Jacobi CG — hiding an out-of-memory condition (torch's
+    CUDA OOM is a RuntimeError, not a MemoryError) or a programming error behind
+    a "slow solve" for the rest of the run. Only the backend's numerical
+    failure types (``numerical_failure_types()``) take the fallback.
     """
     K = _bound_only_lbfgs_condensed(namespace)
     n = K.shape[0]
@@ -1300,10 +1304,11 @@ def test_gmres_exact_preconditioner_converts_backend_errors_to_the_fallback(
     K = _bound_only_lbfgs_condensed(namespace)
     n = K.shape[0]
     rhs = array(namespace, [(-1.0) ** k * (1.0 + k / n) for k in range(n)])
+    singular = backend_linalg_error(namespace)
 
     def _raising():
         def _apply(r):
-            raise ValueError("singular middle matrix")
+            raise singular
 
         return _apply
 

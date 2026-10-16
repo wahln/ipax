@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NumPy/SciPy Bunch-Kaufman LDLT dense adapter (LAPACK ``?sytrf``)."""
+"""NumPy/SciPy dense adapters: Cholesky (``?potrf``/``?potrs``) and LDLT (``?sytrf``)."""
 
 from __future__ import annotations
 
@@ -22,8 +22,114 @@ import numpy as np
 from scipy.linalg import cho_solve as _scipy_cho_solve
 from scipy.linalg import ldl as _scipy_ldl
 from scipy.linalg import solve_triangular
+from scipy.linalg.lapack import dpotrf as _dpotrf
 
 from ipax.linalg.solver import LinearSolveError
+
+
+def _float64_potrf(dtype: np.dtype[Any]) -> Any:
+    """LAPACK ``dpotrf`` for a float64 ``dtype``, else ``None``.
+
+    float64 only — the dense IPM's working precision, and the dtype on which
+    the factor was verified bit-for-bit identical to ``numpy.linalg.
+    cholesky``'s (NumPy and SciPy wheels each ship their own OpenBLAS build;
+    for float32 their ``spotrf`` results differ in the last bits, so a
+    float32 problem would see a changed trajectory for a lever nobody has
+    measured there). Every other dtype goes to ``numpy.linalg.cholesky``
+    unchanged. Resolved through the module global at call time (not a
+    per-call ``get_lapack_funcs``), so tests can spy on the factorization.
+    """
+    return _dpotrf if dtype == np.float64 else None
+
+
+# Edge of the square blocks the lower triangle is copied in (elements). Each
+# block is read row-major and written column-major; at 128 both 128 KiB fp64
+# blocks stay in a P-core's L2, so the transposing copy runs at near-streaming
+# speed (measured 0.15-0.18 s at n = 9984 for block edges 64-128 on an
+# i9-13900HX, against 0.9 s for NumPy's unblocked ``asfortranarray``).
+_TRIANGLE_COPY_BLOCK = 128
+
+_NOT_POSITIVE_DEFINITE = "Matrix is not positive definite"  # NumPy's own message
+
+
+def _copy_lower_triangle_fortran(a: np.ndarray) -> np.ndarray:
+    """A Fortran-ordered ``n x n`` buffer holding ``a``'s lower triangle.
+
+    Copies only the block lower triangle (diagonal blocks whole), in square
+    cache-sized blocks so the C-to-Fortran transposition of each block stays
+    in cache; the strictly-upper blocks are left uninitialized, which is safe
+    because ``potrf(uplo='L')`` never reads them and ``clean=1`` zeroes them.
+    Works for any input strides (a C-ordered matrix, a ``[:n, :n]`` view of an
+    equality saddle, a Fortran-ordered matrix) and never writes to ``a``.
+    """
+    n = a.shape[0]
+    work = np.empty((n, n), dtype=a.dtype, order="F")
+    block = _TRIANGLE_COPY_BLOCK
+    for j in range(0, n, block):
+        j_end = min(j + block, n)
+        for i in range(j, n, block):
+            i_end = min(i + block, n)
+            work[i:i_end, j:j_end] = a[i:i_end, j:j_end]
+    return work
+
+
+def cholesky(matrix: Any) -> np.ndarray:
+    """Lower Cholesky factor ``L`` (``A = L Lᵀ``) of a symmetric PD matrix.
+
+    Same factorization as ``numpy.linalg.cholesky`` — LAPACK ``?potrf`` with
+    ``uplo='L'`` on a Fortran-ordered copy of ``A``'s lower triangle (Golub &
+    Van Loan 2013, §4.2) — without NumPy's layout round trip. The Array-API
+    ``linalg`` extension specifies ``cholesky`` but not its memory layout, and
+    NumPy's gufunc returns a fresh C-ordered factor: it linearizes ``A`` into a
+    Fortran-ordered scratch buffer, factors, zeroes the upper triangle and
+    transposes the result back, i.e. two unblocked transposing ``n x n``
+    copies around the ``n³/3``-flop factorization. At ``n = 9984`` (TROTS
+    Head-and-Neck_01's condensed ``N``) each copy costs about as much as
+    ``potrf`` itself (0.9 s vs 0.87 s on an i9-13900HX, see
+    ``docs/benchmarks/trots.md``). Here the only copy is a cache-blocked one of
+    the lower triangle into a Fortran-ordered buffer that ``potrf`` factors in
+    place (``overwrite_a=1``), so the call allocates one ``n x n`` array
+    instead of two and returns ``L`` Fortran-ordered — the layout
+    :func:`cholesky_solve`'s ``potrs`` takes without a copy.
+
+    Contract, matching ``numpy.linalg.cholesky``:
+
+    * only the lower triangle of ``matrix`` is read, and ``matrix`` is never
+      written to (``DenseSolver`` keeps it for the LU fallback, the
+      refinement residual and the mixed-precision rebuild);
+    * the returned factor is exactly lower triangular (``clean=1``);
+    * a breakdown (``potrf`` ``INFO > 0``: a pivot ``l_kk² ≤ 0``) raises
+      ``numpy.linalg.LinAlgError("Matrix is not positive definite")`` — the
+      type and message NumPy raises, which
+      :func:`~ipax.linalg.solver.numerical_failure_types` classifies. A NaN
+      pivot is flagged only if SciPy's LAPACK flags it: reference LAPACK's
+      ``dpotrf2`` tests ``DISNAN(AJJ)``, OpenBLAS's own ``potrf`` (the
+      NumPy and SciPy wheels) does not and returns a NaN factor — as
+      ``numpy.linalg.cholesky`` does on those wheels. Either way a NaN
+      reaches the solution, which the ``LinearSolver`` contract already
+      treats as a failed solve;
+    * inputs outside the float64 2-D fast path (empty, batched, float32,
+      complex, integer and other dtypes) are passed to
+      ``numpy.linalg.cholesky``.
+
+    Both run ``dpotrf('L')`` on the same Fortran-ordered data, so the factor
+    is bit-for-bit NumPy's wherever the two OpenBLAS builds agree on it — as
+    they do for the NumPy 2.4.6 / SciPy 1.17.1 wheels (OpenBLAS 0.3.31 / 0.3.30,
+    both with Haswell kernels) this was measured on; with other builds (e.g.
+    an MKL NumPy) it agrees to round-off.
+    """
+    a = np.asarray(matrix)
+    potrf = _float64_potrf(a.dtype) if a.ndim == 2 else None
+    if potrf is None or a.shape[0] != a.shape[1] or a.shape[0] == 0:
+        result: np.ndarray = np.linalg.cholesky(a)
+        return result
+    work = _copy_lower_triangle_fortran(a)
+    factor, info = potrf(work, lower=1, overwrite_a=1, clean=1)
+    if info > 0:
+        raise np.linalg.LinAlgError(_NOT_POSITIVE_DEFINITE)
+    if info < 0:  # pragma: no cover - an illegal argument is a wrapper bug
+        raise ValueError(f"LAPACK potrf: illegal value in argument {-info}")
+    return np.asarray(factor)
 
 
 def cholesky_solve(factor: Any, rhs: Any) -> np.ndarray:
@@ -34,10 +140,65 @@ def cholesky_solve(factor: Any, rhs: Any) -> np.ndarray:
     factor cannot be back-substituted portably. Wraps ``scipy.linalg.cho_solve``
     (LAPACK ``?potrs``), O(n²) per right-hand side. ``check_finite=False``:
     the factor came from a ``cholesky`` that already succeeded on this data.
+
+    ``numpy.linalg.cholesky`` returns ``L`` C-contiguous, but LAPACK's
+    ``potrs`` wants a Fortran-ordered factor; SciPy's f2py wrapper bridges the
+    mismatch with a full ``O(n²)`` copy on *every* back-solve (measured 0.91 s
+    vs 0.053 s at n≈10⁴; see CHANGELOG). ``L``'s transpose view ``Lᵀ`` is
+    Fortran-contiguous over the same data at zero cost, and is exactly the
+    upper factor ``U`` with ``A = Uᵀ U``: passing ``(U, lower=False)`` runs
+    the mathematically identical ``potrs`` with ``uplo='U'`` (solves
+    ``Uᵀ y = b``, ``U x = y``) without the copy. If a caller ever hands in a
+    factor that is already Fortran-ordered (not the case for the
+    ``xp.linalg.cholesky`` caller today, but not guaranteed by the gap-filler
+    contract either), the plain lower-``L`` call is used instead so neither
+    orientation pays a copy. :func:`cholesky` (the NumPy route's factorization
+    since it replaced ``numpy.linalg.cholesky``) returns exactly such a
+    Fortran-ordered factor, so the dense route takes that branch.
     """
-    result: np.ndarray = _scipy_cho_solve(
-        (np.asarray(factor), True), np.asarray(rhs), check_finite=False
-    )
+    ell = np.asarray(factor)
+    b = np.asarray(rhs)
+    if ell.flags["F_CONTIGUOUS"] and not ell.flags["C_CONTIGUOUS"]:
+        result: np.ndarray = _scipy_cho_solve((ell, True), b, check_finite=False)
+    else:
+        result = _scipy_cho_solve((ell.T, False), b, check_finite=False)
+    return result
+
+
+def add_diagonal(matrix: Any, diagonal: Any) -> np.ndarray:
+    """Return ``matrix + diag(diagonal)`` in O(n) beyond the unavoidable copy.
+
+    Gap-filler for a missing Array-API primitive: the standard has no
+    strided diagonal setter (no portable way to add to a matrix's diagonal
+    without either mutating in place through non-standard fancy indexing, or
+    building a full ``eye(n) * diagonal`` term — an extra O(n²) allocation
+    and elementwise multiply on top of the O(n²) copy that is unavoidable to
+    return a new matrix). ``numpy.einsum("ii->i", a)`` is NumPy's documented
+    idiom for a writable O(n) view of ``a``'s diagonal (unlike
+    ``a.diagonal()``, which is read-only since NumPy 1.9); ``diagonal`` may
+    be a vector or a scalar (broadcasts, e.g. a ``delta_w * I`` term).
+
+    Bitwise identical (for finite inputs) to ``matrix + xp.eye(n) *
+    diagonal``: every off-diagonal term is ``x + 0 = x`` exactly, and every
+    diagonal term is the same single float addition — *at the same dtype*
+    the old expression would have promoted to. That promotion is not always
+    ``matrix.dtype``: under NEP 50, ``eye(dtype=matrix.dtype) * diagonal``
+    keeps ``matrix.dtype`` when ``diagonal`` is a Python scalar (a "weak"
+    type) but promotes to ``diagonal``'s dtype when it is a wider-precision
+    array — e.g. a float64 vector against a float32 ``matrix``. Casting
+    ``diagonal`` to ``matrix.dtype`` unconditionally silently narrows that
+    case, and double-rounds a float32 scalar delta computed via a float64
+    intermediate. ``np.result_type`` reproduces the old expression's exact
+    NEP 50 promotion decision without paying for the O(n²) multiply.
+
+    Non-finite inputs need not reproduce the old formula's off-diagonal
+    ``0 * inf/nan`` footprint. KKT assembly marks non-finite addends as NaN
+    before calling this helper: an infinite pivot alone can back-substitute
+    to a finite zero and bypass the driver's finite-solution check.
+    """
+    dtype = np.result_type(np.asarray(matrix).dtype, diagonal)
+    result = np.array(matrix, dtype=dtype, copy=True)
+    np.einsum("ii->i", result)[...] += np.asarray(diagonal, dtype=dtype)
     return result
 
 
@@ -162,4 +323,4 @@ class ScipyLDLFactorization:
         return self._inertia
 
 
-__all__ = ["ScipyLDLFactorization", "cholesky_solve"]
+__all__ = ["ScipyLDLFactorization", "add_diagonal", "cholesky", "cholesky_solve"]

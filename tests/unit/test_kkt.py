@@ -194,6 +194,90 @@ def test_condensed_dense_matrix_never_densifies_sparse_jacobian(namespace, tol):
     assert_allclose(namespace, actual, expected, **tol)
 
 
+class _FreshGramJacobian(Dense):
+    """A Jacobian whose ``gram`` returns a fresh ``n×n`` array per call."""
+
+    def gram(self, weights, *, accumulate_dtype=None, hinted_only=False):
+        del accumulate_dtype, hinted_only
+        xp = array_namespace(self._A)
+        return xp.matmul(transpose(xp, self._A), weights[:, None] * self._A)
+
+
+def _gram_condensed(namespace, n, m, *, delta_w=0.0, dense_sigma_x=False):
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    b = rng.standard_normal((n, n))
+    W_dense = namespace.asarray(b @ b.T)
+    sigma_diag = rng.uniform(0.1, 1.0, n)
+    # A Dense Σ_x takes logical_dense_block's non-diagonal branch.
+    sigma_x = (
+        Dense(namespace.asarray(np.diag(sigma_diag)))
+        if dense_sigma_x
+        else Diagonal(namespace.asarray(sigma_diag))
+    )
+    sigma_s = Diagonal(namespace.asarray(rng.uniform(0.1, 1.0, m)))
+    jac = _FreshGramJacobian(namespace.asarray(rng.standard_normal((m, n))))
+    op = build_condensed_operator(
+        Dense(W_dense), sigma_x, sigma_s, jac, RegularizationState(delta_w=delta_w)
+    )
+    return op, W_dense, sigma_x, sigma_s, jac
+
+
+@pytest.mark.parametrize("dense_sigma_x", [False, True])
+@pytest.mark.parametrize("delta_w", [0.0, 1e-4])
+def test_condensed_dense_matrix_leaves_the_hessian_untouched(
+    namespace, delta_w, dense_sigma_x
+):
+    # The Gram term is accumulated into the assembly's own buffer in place;
+    # the Hessian's dense form (``Dense.dense_matrix`` returns its backing
+    # array by reference, loader Hessians return a memo) must never be it,
+    # on either branch of logical_dense_block's Σ_x term.
+    op, W_dense, sigma_x, sigma_s, jac = _gram_condensed(
+        namespace, 6, 9, delta_w=delta_w, dense_sigma_x=dense_sigma_x
+    )
+    xp = namespace
+    before = xp.asarray(W_dense, copy=True)
+
+    first = op.dense_matrix()
+    second = op.dense_matrix()
+
+    assert first is not W_dense
+    assert bool(xp.all(W_dense == before))
+    assert bool(xp.all(first == second))
+    expected = (
+        before
+        + sigma_x.dense_matrix()
+        + delta_w * xp.eye(6, dtype=before.dtype)
+        + jac.gram(sigma_s.diagonal())
+    )
+    assert_allclose(xp, first, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_condensed_dense_matrix_accumulates_the_gram_in_place():
+    # Regression (TROTS Head-and-Neck_01, n = 9984, CuPy): ``dense + gram``
+    # allocated a third n×n array while the assembly's block and the Gram
+    # were both alive — 0.76 GB at the dense route's memory peak. The Gram
+    # term is now added into the assembly's own (fresh) block.
+    import tracemalloc
+
+    import numpy as np
+
+    n = 300
+    op, *_ = _gram_condensed(np, n, 40)
+    op.dense_matrix()  # warm-up (lazy imports, caches)
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        op.dense_matrix()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    square = n * n * 8
+    # The assembly block and the Gram: two n×n arrays, never three.
+    assert peak < 2.5 * square, peak / square
+
+
 def test_condensed_dense_matrix_uses_direct_dense_hooks(namespace, tol):
     W_dense = array(namespace, [[4.0, 0.5], [0.5, 3.0]])
     sigma_x = Diagonal(array(namespace, [0.25, 0.75]))

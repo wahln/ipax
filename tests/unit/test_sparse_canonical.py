@@ -101,11 +101,12 @@ def test_compiled_lower_triangle_keep_filters_upper_entries():
 
 
 class _CupyLikeNamespace:
-    """NumPy-backed namespace that mimics real CuPy's ``repeat`` restriction.
+    """NumPy-backed namespace that mimics real CuPy's NumPy-only gaps.
 
-    ``cupy.repeat`` rejects array-valued ``repeats`` (NumPy accepts them), so a
-    plain-NumPy test cannot catch code that relies on that NumPy-only feature.
-    Everything else delegates to NumPy.
+    ``cupy.repeat`` rejects array-valued ``repeats`` and ``cupy.bincount``
+    rejects an empty input (it sizes the output by ``max(x)``, a reduction
+    with no identity) — both of which NumPy accepts, so a plain-NumPy test
+    cannot catch code that relies on them. Everything else delegates to NumPy.
     """
 
     def __getattr__(self, name: str):
@@ -116,6 +117,15 @@ class _CupyLikeNamespace:
         if isinstance(repeats, np.ndarray):
             raise ValueError("cupy.ndaray cannot be specified as `repeats` argument.")
         return np.repeat(a, repeats, axis)
+
+    @staticmethod
+    def bincount(x, weights=None, minlength=0):
+        if x.size == 0:
+            raise ValueError(
+                "zero-size array to reduction operation CUPY_CUB_MAX which has "
+                "no identity"
+            )
+        return np.bincount(x, weights=weights, minlength=minlength)
 
 
 def _symmetric_full_csr():
@@ -229,3 +239,60 @@ def test_compiled_empty_pattern_is_well_formed():
     assert compiled.nnz == 0
     assert compiled.indptr.shape == (1,)
     assert compiled.data(np.asarray([], dtype=np.float64)).shape == (0,)
+
+
+@pytest.mark.parametrize("n_major", [0, 4])
+def test_compiled_empty_pattern_under_cupy_semantics(n_major):
+    # Regression (CuPy adapter, gram_fill_estimate of an empty Jacobian):
+    # ``cupy.bincount`` raises on an empty input where NumPy returns zeros, so
+    # the empty pattern must not reach it — its indptr is all zeros anyway.
+    empty = np.asarray([], dtype=np.int64)
+    compiled = compile_compressed(
+        _CupyLikeNamespace(),
+        _scatter_add,
+        major=empty,
+        minor=empty,
+        n_major=n_major,
+        n_minor=4,
+    )
+    assert compiled.nnz == 0
+    np.testing.assert_array_equal(compiled.indptr, np.zeros(n_major + 1))
+
+
+def test_compile_lower_triangle_of_a_strictly_upper_pattern_under_cupy_semantics():
+    # Same CuPy ``bincount`` gap on the cuDSS lower-triangle map: a pattern
+    # with no lower-triangle entry must compile to an empty, well-formed CSR.
+    full = scipy_sparse.csr_matrix(
+        (np.ones(2), (np.asarray([0, 1]), np.asarray([1, 2]))), shape=(3, 3)
+    )
+    lower = compile_lower_triangle(_CupyLikeNamespace(), full.indptr, full.indices, 3)
+    assert lower.nnz == 0
+    np.testing.assert_array_equal(lower.indptr, np.zeros(4))
+    assert lower.data(np.ones(2)).shape == (0,)
+
+
+@pytest.mark.gpu
+def test_compiled_empty_pattern_on_real_cupy():
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("no CUDA device available")
+    except Exception:
+        pytest.skip("CUDA is not available")
+
+    empty = cupy.asarray([], dtype=cupy.int64)
+    compiled = compile_compressed(
+        cupy,
+        lambda out, idx, vals: None,
+        major=empty,
+        minor=empty,
+        n_major=4,
+        n_minor=4,
+    )
+    assert compiled.nnz == 0
+    np.testing.assert_array_equal(cupy.asnumpy(compiled.indptr), np.zeros(5))
+    lower = compile_lower_triangle(
+        cupy, compiled.indptr, compiled.indices.astype(cupy.int64), 4
+    )
+    assert lower.nnz == 0
+    np.testing.assert_array_equal(cupy.asnumpy(lower.indptr), np.zeros(5))

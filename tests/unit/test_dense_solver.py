@@ -12,10 +12,15 @@ from ipax.linalg.dense import DenseSolver
 from ipax.linalg.regularize import RegularizationState
 from ipax.linalg.solver import LinearSolveError
 from ipax.options import DenseOptions, LBFGSOptions
-from tests._helpers import array, assert_allclose
+from tests._helpers import array, assert_allclose, backend_linalg_error
 
 
 def test_dense_solver_wraps_backend_singular_failure(namespace):
+    # Only a backend that raises on a singular LU has an exception to wrap;
+    # CuPy/JAX return inf/NaN instead, the other failure signal the
+    # LinearSolver contract accepts (TestDenseSolver's contract battery,
+    # ``test_numerical_failure_is_classified``, covers that on every backend).
+    backend_linalg_error(namespace)
     operator = Dense(array(namespace, [[1.0, 2.0], [2.0, 4.0]]))
     solver = DenseSolver()
     solver.factor(operator)
@@ -44,6 +49,65 @@ def test_dense_solver_rejects_indefinite_condensed_block(namespace):
 
     with pytest.raises(LinearSolveError, match="not positive definite"):
         solver.solve(array(namespace, [1.0, 1.0]))
+
+
+def test_dense_solver_rejects_indefinite_primal_block_of_a_saddle(namespace):
+    # Regression (CuPy): the PD probe must fail on an indefinite N inside an
+    # equality saddle too. There the probe's factor is discarded and the full
+    # bordered matrix is solved by LU, which happily returns a finite
+    # non-descent step — so a Cholesky that reports its breakdown silently
+    # (CuPy returns a NaN factor instead of raising) let it through unseen.
+    condensed = _condensed(namespace, array(namespace, [[1.0, 0.0], [0.0, -1.0]]))
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, 1.0]])), 1e-4
+    )
+    solver = DenseSolver()
+    solver.factor(saddle)
+
+    with pytest.raises(LinearSolveError, match="not positive definite"):
+        solver.solve(array(namespace, [1.0, 1.0, 0.5]))
+
+
+def test_dense_solver_rejects_singular_condensed_block(namespace):
+    # N = diag(1, 0) is PSD but singular. NumPy/Torch raise on the zero pivot;
+    # CuPy returns a *finite* factor with l_22 = 0, and a zero right-hand-side
+    # entry makes the triangular solves skip that pivot, so the reused factor
+    # "solved" the singular system to a finite vector (regression). The pivot
+    # check classifies the factor itself, whatever the right-hand side.
+    op = _condensed(namespace, array(namespace, [[1.0, 0.0], [0.0, 0.0]]))
+    solver = DenseSolver()
+    solver.factor(op)
+
+    with pytest.raises(LinearSolveError, match="not positive definite"):
+        solver.solve(array(namespace, [1.0, 0.0]))
+
+
+def test_dense_solver_checks_pivots_only_where_cholesky_is_silent(
+    namespace, monkeypatch
+):
+    # The pivot check costs a host sync per factorization; where the backend
+    # raises on a breakdown itself (NumPy, Torch, array-api-strict) it could
+    # never trip, so the guard must not pay it there — the PD probe then runs
+    # exactly as before (same syncs, same factor). CuPy/JAX pay it.
+    import ipax.linalg.solver as solver_mod
+
+    calls = {"n": 0}
+    original = solver_mod.cholesky_factor_ok
+
+    def spy(xp, factor):
+        calls["n"] += 1
+        return original(xp, factor)
+
+    monkeypatch.setattr(solver_mod, "cholesky_factor_ok", spy)
+    op = _condensed(namespace, array(namespace, [[2.0, 0.0], [0.0, 3.0]]))
+    rhs = array(namespace, [2.0, 3.0])
+    solver = DenseSolver()
+    for _ in range(3):
+        solver.factor(op)
+        solver.solve(rhs)
+
+    silent = solver_mod.cholesky_breakdown_is_silent(namespace, rhs)
+    assert calls["n"] == (3 if silent else 0)
 
 
 def test_dense_solver_accepts_pd_condensed_block(namespace, tol):
@@ -270,12 +334,15 @@ def test_dense_solver_rejects_bad_rhs_rank(namespace):
 
 
 def test_dense_solver_wraps_structured_solve_failure(namespace):
-    # A structured solve crashing on unexpected numerics must surface as the
+    # A structured solve hitting a numerical failure (the backend's own
+    # LinAlgError from the Woodbury/Schur solve) must surface as the
     # controlled LinearSolveError (so the IPM escalates delta_w), not the raw
     # backend exception.
+    failure = backend_linalg_error(namespace)
+
     class _StructuredBoom(Dense):
         def dense_structured_solve(self, rhs):
-            raise RuntimeError("backend blew up")
+            raise failure
 
     solver = DenseSolver()
     solver.factor(_StructuredBoom(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
@@ -296,20 +363,25 @@ def test_dense_solver_passes_structured_linear_solve_error_through(namespace):
 
 
 def test_dense_solver_wraps_dense_matrix_failure(namespace):
+    failure = FloatingPointError("overflow encountered in matmul")
+
     class _DenseMatrixBoom(Dense):
         def dense_matrix(self, like=None):
-            raise RuntimeError("assembly blew up")
+            raise failure
 
     solver = DenseSolver()
     solver.factor(_DenseMatrixBoom(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
-    with pytest.raises(LinearSolveError, match="materialization failed"):
+    with pytest.raises(LinearSolveError, match="materialization failed") as info:
         solver.solve(array(namespace, [1.0, 2.0]))
+    assert info.value.__cause__ is failure
 
 
 def test_dense_solver_wraps_matmat_probe_failure(namespace):
     # A duck-typed operator without the optional structured-solve/dense-matrix
-    # hooks: the solver skips both and probes matmat, whose failure must also
-    # be classified as a LinearSolveError.
+    # hooks: the solver skips both and probes matmat, whose numerical failure
+    # must also be classified as a LinearSolveError.
+    failure = backend_linalg_error(namespace)
+
     class _MatmatBoom:
         @property
         def shape(self):
@@ -319,12 +391,69 @@ def test_dense_solver_wraps_matmat_probe_failure(namespace):
             return v
 
         def matmat(self, V):
-            raise RuntimeError("probe blew up")
+            raise failure
 
     solver = DenseSolver()
     solver.factor(_MatmatBoom())
     with pytest.raises(LinearSolveError, match="materialization failed"):
         solver.solve(array(namespace, [1.0, 2.0]))
+
+
+class _BuggyHooks(Dense):
+    """Every materialization hook the dense solver calls raises ``exc``."""
+
+    def __init__(self, A, exc, hook):
+        super().__init__(A)
+        self._exc = exc
+        self._hook = hook
+
+    def _maybe_raise(self, name):
+        if name == self._hook:
+            raise self._exc
+
+    def dense_structured_solve(self, rhs):
+        self._maybe_raise("dense_structured_solve")
+        raise NotImplementedError
+
+    def dense_matrix(self, like=None):
+        self._maybe_raise("dense_matrix")
+        raise NotImplementedError
+
+    def matmat(self, V):
+        self._maybe_raise("matmat")
+        return super().matmat(V)
+
+    def augmented_dense_matrix(self, like=None):
+        self._maybe_raise("augmented_dense_matrix")
+        raise NotImplementedError
+
+
+_BUGS = [
+    TypeError("asarray() got an unexpected keyword argument 'device'"),
+    AttributeError("'NoneType' object has no attribute 'shape'"),
+    ValueError("operands could not be broadcast together"),
+    RuntimeError("mat1 and mat2 shapes cannot be multiplied"),
+    MemoryError(),
+]
+
+
+@pytest.mark.parametrize(
+    "hook",
+    ["dense_structured_solve", "dense_matrix", "matmat", "augmented_dense_matrix"],
+)
+@pytest.mark.parametrize("bug", _BUGS, ids=lambda e: type(e).__name__)
+def test_dense_solver_propagates_operator_callback_bugs_unchanged(namespace, hook, bug):
+    # Materialization runs the operator's own callbacks (a user Jacobian's
+    # gram, a Hessian operator's dense_matrix). A non-numerical exception
+    # there is a bug, not a singular system: it must leave the solver as
+    # itself — never as a LinearSolveError the IPM would answer with the δ_w
+    # ladder and restoration.
+    options = DenseOptions(kkt_route="augmented") if hook.startswith("aug") else None
+    solver = DenseSolver(options)
+    solver.factor(_BuggyHooks(array(namespace, [[2.0, 0.0], [0.0, 3.0]]), bug, hook))
+    with pytest.raises(type(bug)) as info:
+        solver.solve(array(namespace, [1.0, 2.0]))
+    assert info.value is bug
 
 
 # --- augmented dense route (DenseOptions(kkt_route="augmented")) -----------
@@ -575,7 +704,7 @@ def test_eigenvalue_inertia_of_empty_spectrum_is_all_zero(namespace):
 def test_dense_solver_augmented_route_wraps_materialization_failure(namespace):
     class _AugmentedBoom(Dense):
         def augmented_dense_matrix(self, like=None):
-            raise RuntimeError("assembly blew up")
+            raise ZeroDivisionError("float division by zero")
 
     solver = DenseSolver(DenseOptions(kkt_route="augmented"))
     solver.factor(_AugmentedBoom(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
@@ -623,6 +752,10 @@ def test_dense_solver_augmented_route_wraps_adapter_solve_failure(
 ):
     import ipax.backend.dense as dense_backend
 
+    # The shipped LDLᵀ adapters translate their own failures at the backend
+    # boundary; an untranslated *numerical* one must still be classified.
+    failure = backend_linalg_error(namespace)
+
     class _SolveBoomAdapter:
         def factor(self, matrix):
             self._n = int(matrix.shape[0])
@@ -631,7 +764,7 @@ def test_dense_solver_augmented_route_wraps_adapter_solve_failure(
             return (2, 2, 0)
 
         def solve(self, rhs):
-            raise RuntimeError("backend blew up")
+            raise failure
 
     monkeypatch.setattr(
         dense_backend,

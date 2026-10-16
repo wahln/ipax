@@ -47,11 +47,11 @@ from every problem file:
 
 | | |
 | --- | --- |
-| date | 2026-09-06 (v31) |
+| date | 2026-10-11 (v36; v31 of 2026-09-06 is the previous baseline) |
 | CPU | 13th Gen Intel Core i9-13900HX (32 logical CPUs) |
 | OS | Windows 11 (10.0.26200), AMD64 |
 | Python | 3.14.6 |
-| ipax | 0.10.1 + the 0.11.0 performance/restoration arc (develop @ `761ac00`) |
+| ipax | 0.11.0 + the Breedveld follow-ups chain (`feat/breedveld-followups` @ `53acd09`) |
 | NumPy / SciPy | 2.4.6 / 1.17.1 |
 | PyTorch | 2.12.0+cpu |
 | sparse factorization | Feral LDLᵀ (CPU) |
@@ -136,14 +136,14 @@ broken, every config positive. The intervening work was the `0.11.0`
 performance and restoration arc, landed and gated sweep by sweep (v23 … v31;
 every default-affecting commit carries its own full-corpus gate):
 
-| config | v22 | v27 | v29 | v30 | v31 | Δ |
-| --- | --- | --- | --- | --- | --- | --- |
-| `lbfgs/dense`  | 774 | 773 | 779 | 779 | 779 | **+5** |
-| `lbfgs/krylov` | 752 | 757 | 758 | 758 | 764 | **+12** |
-| `lbfgs/sparse` | 780 | 782 | 785 | 785 | 785 | **+5** |
-| `exact/dense`  | 770 | 766 | 774 | 776 | 777 | **+7** |
-| `exact/krylov` | 706 | 711 | 712 | 712 | 713 | **+7** |
-| `exact/sparse` | 796 | 797 | 798 | 798 | 798 | **+2** |
+| config | v22 | v27 | v29 | v30 | v31 | v36 | Δ |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `lbfgs/dense`  | 774 | 773 | 779 | 779 | 779 | 780 | **+6** |
+| `lbfgs/krylov` | 752 | 757 | 758 | 758 | 764 | 764 | **+12** |
+| `lbfgs/sparse` | 780 | 782 | 785 | 785 | 785 | 785 | **+5** |
+| `exact/dense`  | 770 | 766 | 774 | 776 | 777 | 777 | **+7** |
+| `exact/krylov` | 706 | 711 | 712 | 712 | 713 | 713 | **+7** |
+| `exact/sparse` | 796 | 797 | 798 | 798 | 798 | 798 | **+2** |
 
 The one **route change** is deliberate and documented: on `lbfgs/krylov`
 **387 problems** report `krylov (cg, pc=lbfgs-exact)` instead of
@@ -206,6 +206,25 @@ Sweep by sweep:
   documented optimum, `HS98`/`HS13` converge in fewer iterations to the
   same value, `OET7` a worse unscored basin, `CRESC50` incorrect either way).
   No marked problem changed `correct`.
+- **v31 → v36 (2026-10-11), +1 (1 fixed / 0 broken): the release gate of
+  the Breedveld follow-ups chain** (rounds 3–7 on `feat/breedveld-followups`,
+  `53acd09`: the TROTS tiled Gram and exact Hessian, the Breedveld start,
+  common step and SOC, the restoration Cholesky option, the overflow guards
+  on the dense and structured diagonals, the cuDSS refinement, inertia and
+  reproducibility work, `SparseOptions`, the `dpotrf` Cholesky, the fused
+  Hessian + Gram hook). 4617/6600 correct. Five configs have **zero flips
+  and zero route changes**; `lbfgs/dense` has the one fix (`ELATTAR`, the
+  basin move v32 already described) and the 12 `pd-hint->lu` markers, which
+  are the v32 set exactly — label-only on seven rows, and the five rows with
+  a different trajectory (`CRESC50`, `ELATTAR`, `HS13`, `HS98`, `OET7`)
+  reproduce **bit for bit on `develop` before the chain**, so none of the
+  chain's commits moves a NumPy trajectory on the corpus. Identical-`n_iter`
+  wall ratio 0.975 (1319 rows): no timing bias. The 53 objective drifts are
+  41 unscored rows (the `DMN15xxx`/`DIAMON3DLS` `max_time` family and Krylov's
+  inexact solves) and 12 scored ones under 6 % that did not change
+  `correct`; `OET7` on `exact/krylov` moved to a worse unscored basin, as it
+  does in most sweeps. Report: `benchmarks/reports/s2mpj_v36.*`, diff:
+  `s2mpj_v36_vs_v31.txt`.
 
 Two sweeps in the series are **not** in the table because they were not
 baselines: **v28** (2026-09-03) ran on a throttled machine (2.87× slower on
@@ -655,6 +674,835 @@ history and the v15 report.
     budget) versus `optimal` at `~1.4e-16` with the lever on, reproduced
     identically on all three `lbfgs/*` routes and already solved to `~1.4e-16`
     by every `exact/*` route regardless (see `benchmarks/routing_hints.py`).
+
+## CuPy sparse-direct route (2026-09-28)
+
+The first corpus run of the CuPy backend, made to validate two CuPy-only
+changes that had only been checked on HS problems and RT-like runs: the cuDSS
+adapter's **residual certificate** for perturbed-pivot factorizations
+(`cf66a86`: when cuDSS reports `NPIVOTS > 0`, a solve column with
+`‖b − A x‖∞ > 1e-2 ‖b‖∞` is rejected as a numerical failure so the δ_w/δ_c
+ladder regularizes, together with a rejection of KKT matrices with inf/NaN
+entries and the pivot-checked dense Cholesky `checked_cholesky`), and the dense
+`cholesky_solve` through the factor's transpose view (`cfd9d71`).
+
+**Setup.** `feat/trots-round-4` @ `db75a27`; RTX 4070 Laptop (8 GB), CuPy
+14.1.1, cuDSS 0.7.1.6 through nvmath-python 0.9.0. The four configs that reach
+the changed code (`lbfgs/dense`, `exact/dense`, `lbfgs/sparse`,
+`exact/sparse`) over the whole corpus at the gate budget (`--max-iter 10000
+--max-time 300 --include-objective-free`), on CuPy and — as the reference, same
+commit, same flags — on NumPy (Feral LDLᵀ on the sparse configs). The NumPy arm
+reproduces v31 to ±1 per config (780/776/784/798), so it is a sound reference.
+The model is still evaluated on the host through the S2MPJ bridge, which the
+runner now supports on CuPy (`--backends cupy`); `--cupy-certificates` counted,
+per solve, how often each certificate fired and binned every certified relative
+residual by decade. `SPECANNE` is excluded on CuPy: one `exact/dense`
+iteration (9 variables, 5000 equality rows, a 5009×5009 dense saddle) ran for
+over 85 minutes with the card's memory full, and `max_time` is only checked
+between iterations. CuPy ran 2–4 problems at a time on one GPU, and
+wall-clock times are **not** comparable: on rows with identical iteration
+counts the median CuPy/NumPy time ratio is 5.8 (`exact/dense`) to 15.5
+(`exact/sparse`). That is the host-bridged evaluation and kernel-launch cost
+at CUTEst sizes, and it is why the `max_time` column grows.
+
+| config | rows | correct NumPy → CuPy | fixed / broken | `max_time` NumPy → CuPy | rows with `NPIVOTS > 0` | perturbed-pivot solves | rejected by the certificate (rows) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `lbfgs/dense`  | 1097 | 780 → 782 (**+2**)  | 9 / 7   | 5 → 16  | — | — | — |
+| `exact/dense`  | 1097 | 775 → 766 (**−9**)  | 2 / 11  | 16 → 55 | — | — | — |
+| `lbfgs/sparse` | 1100 | 783 → 762 (**−21**) | 6 / 27  | 6 → 33  | 893 (427k of 540k factorizations) | 695 428 | 99 784 (162) |
+| `exact/sparse` | 1100 | 797 → 779 (**−18**) | 10 / 28 | 13 → 44 | 288 (111k of 565k) | 193 061 | 13 203 (72) |
+
+The dense pivot check ran 4.4 M times on `exact/dense`, where 3.76 M of those
+calls (755 problems) found the matrix not positive definite. That is the PD
+probe doing its job: NumPy's Cholesky raises on the same inputs. On
+`lbfgs/dense` it ran 20 k times (the hinted-reuse path) and found 36
+breakdowns. The non-finite-matrix rejection fired on two problems
+(`LUKVLE8`, 9 480 times, which ends in `numerical_error` on NumPy too, and
+`RAT43`, 40 times).
+
+**Where the certified residuals fall.** The residual of a perturbed-pivot solve
+does not split into "consistent, ~1e-8" and "inconsistent, O(1)". The
+distribution is continuous across the threshold:
+
+| certified relative residual | < 1e-8 | [1e-8, 1e-4) | [1e-4, 1e-3) | [1e-3, 1e-2) | [1e-2, 1e-1) | [1e-1, 1) | [1, 1e3) | ≥ 1e3 | non-finite |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `lbfgs/sparse` | 395 140 | 172 948 | 10 853 | 16 703 | *28 904* | *12 506* | *24 027* | *21 335* | *13 012* |
+| `exact/sparse` | 128 402 | 24 777 | 15 132 | 11 547 | *1 139* | *705* | *7 107* | *3 374* | *878* |
+
+(Italic columns are rejected.) About 28 k accepted solves lie within one decade
+below `1e-2` and 30 k rejected ones within one decade above it.
+
+**What the 100 correct-flips are.** Each flip was classed by what differed. A
+*timing* flip is a CuPy `max_time` stop at fewer iterations than NumPy needed,
+so the run was on its way and the wall clock is the difference. On the dense
+configs, a *dense* flip is anything else. On the sparse configs,
+*certificate fired* means at least one rejection in that solve, *pivots
+accepted* means perturbed pivots with no rejection, and *no pivots* means
+neither.
+
+| config | timing | dense route | certificate fired | pivots accepted | no pivots |
+| --- | --- | --- | --- | --- | --- |
+| `lbfgs/dense`  | 0 / 1 | 9 / 6 | — | — | — |
+| `exact/dense`  | 0 / 7 | 2 / 4 | — | — | — |
+| `lbfgs/sparse` | 0 / 6 | — | 3 / 8  | 3 / 12 | 0 / 1 |
+| `exact/sparse` | 0 / 4 | — | 2 / 11 | 5 / 10 | 3 / 3 |
+
+(fixed / broken.) Every *certificate fired* row, plus the two timing rows
+where it fired (`SPINLS`, `VANDERM3`), was then re-run alone on the idle GPU
+three times: as-is, with the threshold at `1.0`, and with the certificate off
+(a no-op). The 17 non-timing *pivots accepted* breaks were re-run as-is and
+with a strict `1e-6`, and three `exact/dense` breaks were re-run with the
+pivot check off. All re-runs used the same budget. One
+confound first: the **CuPy sparse route is not run-to-run deterministic**
+(see [Reproducibility on CUDA](../guide/backends.md#reproducibility-on-cuda)).
+Identical re-runs moved `ACOPR14` `exact/sparse` from 25 to 38 iterations,
+`YORKNET` from 2055 to 120 and `COSHFUN` from `max_time` to `optimal`. The
+dense route reproduced the sweep exactly. So the evidence below is one or two
+samples per row.
+
+- **The certificate made no difference: 11 rows.** `DEMYMALO`, `GIGOMEZ1`,
+  `HS106`, `MADSSCHJ`, `POLAK1`, `POLAK3`, `POLAK6`, `POWERSUMNE`, `SPIRAL`
+  (both sparse configs) and `ORTHREGE` fail the same way in all three arms, so
+  the failure comes from elsewhere. Most of them accept thousands of solves
+  at residuals of 1e-4–1e-2 (see the pivots-accepted group below).
+- **Run-to-run noise or timing: 7 rows.** `ARGTRIGLS`, `POWELLSQ`, `TRIGON1`,
+  `DJTL` and `VANDERM3` (`lbfgs/sparse`) are correct in every re-run arm.
+  `CURLY20` and `CURLY30` flip between arms with no pattern.
+- **True positives: 5 rows.** With the certificate off, `WOMFLET`, `YORKNET`,
+  `SPINLS`, `COSHFUN` (`exact/sparse`) and `HEART6LS` (`lbfgs/sparse`) stall or
+  hit `max_time`, and with it they converge. Off, those runs accept solves
+  with residuals from 0.2 (`HEART6LS`) up to 2e14 (`SPINLS`).
+- **False positives: 3 rows.** `ACOPR30` and `HS109` (`lbfgs/sparse`) fail as-is
+  but converge with the threshold at `1.0` or off; `ROTDISC` (`exact/sparse`)
+  converges only with the certificate off, in NumPy's 21 iterations.
+- **The `[1e-2, 1)` band cuts both ways.** Accepting it fixed `ACOPR30` and
+  `HS109`, and took `COSHFUN` from 791 iterations to 17. Rejecting it was
+  needed for `YORKNET`: at `1.0` it runs into `max_time`.
+- **Accepted-but-inaccurate solves are the larger effect.** A strict `1e-6`
+  turned **8 of the 17** re-run *pivots accepted* breaks correct: `CATENARY`,
+  `MAKELA1`, `MAKELA2`, `MIFFLIN2`, `ROSENMMX` (`exact/sparse`, e.g. `MAKELA1`
+  stalled at 291 iterations → optimal in 22), `GAUSS1LS`, `KIRBY2LS`,
+  `PALMER2E` (`lbfgs/sparse`). It left 8 unchanged and made `SBRYBND` (wrong
+  either way) worse. On these degenerate problems — the minimax family among
+  them — cuDSS's static pivoting accepts Newton steps with residuals of
+  1e-5–1e-2 at every iteration, and the IPM stalls where Feral's LDLᵀ does not.
+- **Dense route: not the changed code.** `DJTL`, `ELATTAR` and `POWERSUMNE`
+  (`exact/dense`) fail identically with the pivot check off. They are the
+  known knife-edge rows, moved by GPU round-off, and `lbfgs/dense` nets +2.
+
+**Verdict on `_PERTURBED_SOLVE_MAX_RESIDUAL = 1e-2`: keep it for now.** The
+certificate is needed: turning it off loses 5 rows that converge with it. Moving
+the threshold within `[1e-2, 1]` trades 2 rows (`ACOPR30`, `HS109`) against 1
+(`YORKNET`), and on a non-deterministic route with one sample per row that is
+not a basis for a default change. The CuPy-vs-NumPy gap on the sparse configs
+is `−39` over the two, or `−29` without the timing flips. Only 3 of those rows
+trace to the threshold's rejections. The larger part comes from solves the
+certificate *accepts*: perturbed-pivot solves whose residual is too large for
+a good Newton step, yet far below "inconsistent". A single threshold cannot
+separate these from the benign ones, and the distribution above shows why.
+For scale, IPOPT treats a KKT solve as singular when its residual ratio after
+iterative refinement stays above `residual_ratio_singular = 1e-5`. The
+principled next step is iterative refinement on perturbed-pivot
+factorizations, then certifying the refined residual. The refinement can be
+cuDSS's own refinement steps or one correction solve that reuses the residual
+the certificate already forms. That needs a core change and its own corpus A/B
+on both sparse configs, so it is out of scope for this benchmark-only pass.
+(It has since been done; see the addendum below.)
+
+The reports are `benchmarks/reports/s2mpj_v33_cupy.json` /
+`s2mpj_v33_numpy.json`, with the per-solve certificate counts in
+`s2mpj_v33_cupy_certs_all.jsonl` and the re-runs in
+`s2mpj_v33_cupy_counterfactual.jsonl`. To reproduce the CuPy arm, add
+`--backends cupy --cupy-certificates --config lbfgs/dense,exact/dense,lbfgs/sparse,exact/sparse`
+to the gate command below, and run at most a few problems at a time. A
+Windows GPU reset (TDR) during a three-process run killed every CUDA context
+on the card, and the affected rows had to be discarded and re-run.
+
+### Addendum (2026-09-29): iterative refinement on perturbed-pivot factorizations
+
+**The change** (`fix/cudss-perturbed-refinement` @ `5c8f30c`). When cuDSS
+reports `NPIVOTS > 0`, the adapter now iteratively refines each solve against
+the unperturbed matrix, `x ← x + (A+E)⁻¹ (b − A x)`, before the certificate
+judges it (Li & Demmel 2003 pair static pivoting with refinement; Higham 2002,
+ch. 12). The stopping rules are IPOPT's (`PDFullSpaceSolver::Solve`): at most
+10 steps, stop once IPOPT's residual ratio is at most `1e-10`, and stop at the
+first step that does not reduce the certified ratio. Each column keeps its best
+iterate, and the `1e-2` certificate is unchanged. cuDSS's own refinement
+(`CUDSS_CONFIG_IR_N_STEPS`) was measured and not used, because the pinned
+cuDSS 0.7 ignores `IR_TOL`. It therefore runs a fixed number of steps, and on
+a `ROTDISC` KKT system those steps diverge: the relative residual goes from
+1.3e-5 unrefined to 20 after five steps and 8e7 after ten. Factorizations
+without perturbed pivots are untouched. A perturbed one pays one cuDSS SOLVE
+phase, one SpMV and one host sync per refinement step taken.
+
+Why the unrefined solves were bad: the systems behind the stalls are not ill
+conditioned. A captured `MAKELA1` KKT matrix has condition number ≈ 4e2. Its
+epigraph variable has a zero Hessian diagonal, which a 2×2 pivot would pair
+off. cuDSS's static pivoting perturbs that entry instead, and the solve comes
+back with a relative residual of 3e-4. One or two refinement steps bring it
+to 1e-10–1e-16.
+
+**Setup.** Same machine and runtime as above. The run covers only the rows
+whose v33 CuPy solve met a perturbed pivot: 893 on `lbfgs/sparse` and 288 on
+`exact/sparse`. The other rows never reach the changed code, so they keep
+their v33 result. The run was serial on one CUDA process, at the gate budget
+(`--max-iter 10000 --max-time 300`), with `--cupy-certificates`. The baseline
+is the archived v33 CuPy report, not a re-run. Two arms:
+
+- **refined**: refinement on, `1e-2` certificate (the new default), on all
+  those rows;
+- **strict**: refinement on, certificate at `1e-5` (IPOPT's
+  `residual_ratio_singular`), via `--cudss-max-residual 1e-5`. This ran only
+  on the 178 rows (136 + 42) where the refined arm accepted a refined solve
+  with residual ≥ 1e-5. No other row can change under the tighter threshold.
+
+Every flipped row was then re-run alone once. The first re-run pass of the
+`lbfgs/sparse` flips overlapped with heavy CPU load from other jobs (per
+iteration it was 3–6× slower, since the model is evaluated on the host), so
+the rows it timed out on were re-run again on an idle machine. The v33
+baseline itself ran 2–4 CuPy processes on the one GPU. A v33 row that hit
+`max_time` after fewer iterations than the refined arm needed to converge is
+therefore a *timing* flip: it says nothing about refinement.
+
+| config | rows | correct v33 → refined | fixed / broken (sweep) | confirmed by lone re-run: fixed (of which timing) / broken | `max_time` v33 → refined | NumPy on the same rows |
+| --- | --- | --- | --- | --- | --- | --- |
+| `lbfgs/sparse` | 893 | 658 → 672 (**+14**) | 18 / 4 | 12 (4) / 2 | 31 → 19 | 678 |
+| `exact/sparse` | 288 | 196 → 211 (**+15**) | 16 / 1 | 16 (1) / 1 | 17 → 9 | 212 |
+
+| config | perturbed-pivot solves | refined (≥ 1 step) | mean steps per perturbed solve | hit the 10-step cap | rejected solves (rows), v33 → refined | rescued: rejected unrefined, accepted refined |
+| --- | --- | --- | --- | --- | --- | --- |
+| `lbfgs/sparse` | 1 220 368 | 300 047 (25 %) | 0.39 | 2 175 | 99 784 (162) → 96 463 (57) | 36 022 |
+| `exact/sparse` | 166 771 | 33 104 (20 %) | 0.32 | 35 | 13 203 (72) → 12 634 (55) | 3 383 |
+
+The rows the refinement fixes:
+
+- **The whole minimax family on `exact/sparse`.** `DEMYMALO`, `GIGOMEZ1`,
+  `MADSSCHJ`, `MAKELA1`, `MAKELA2`, `MIFFLIN2`, `POLAK1`, `POLAK3`, `POLAK6`,
+  `ROSENMMX`, `ROTDISC`, `SPIRAL`, `SPINLS`, `VANDERM4` and `DRCAVTY2` now
+  converge, most within a few iterations of NumPy. Before, `MAKELA1` stalled
+  at 291 iterations and now converges in 20; `POLAK1` hit `max_time` at 2 925
+  and now converges in 12. This covers four of the five `exact/sparse` rows
+  the earlier strict-`1e-6` re-run fixed. The fifth, `CATENARY`, has a
+  residual that refinement cannot reduce (see the strict arm below). It also
+  fixes `ROTDISC`, a false positive that before converged only with the
+  certificate off. And it fixes most of the rows listed above under "the
+  certificate made no difference"; the exceptions are `HS106`, `POWERSUMNE`
+  and `ORTHREGE`.
+- **Eight refinement fixes on `lbfgs/sparse`**, confirmed alone: `ACOPR30` (a
+  false positive of the certificate), `ARGTRIGLS`, `DMN37142LS`, `KIRBY2LS`,
+  `SPIRAL`, `TAX13322`, `TRIGON1` and `VESUVIOLS`. The other four confirmed
+  fixes are timing flips (`AIRPORT`, `DIAMON2DLS`, `POWELLSQ`, `VANDERM3`).
+  Six more did not reproduce alone: `DECONVB`, `DMN37143LS`, `HS109`, `HS116`,
+  `ORTHREGD` and `PALMER1E`.
+
+The breaks: `ACOPP30` (`lbfgs/sparse`) now needs more than the 5 696
+iterations the budget allows, where v33 converged in 3 243. `DJTL` fails in
+both re-runs but fails on NumPy too; it is a known knife-edge row. `WOMFLET`
+(`exact/sparse`) now converges in 15 iterations to the same local optimum NumPy
+finds in 14, which is not the documented one. `MSS1` and `VANDERM1` did not
+reproduce alone.
+
+**Full-corpus effect.** The rows without perturbed pivots are unchanged, so
+the gate totals move from `lbfgs/sparse` 762 → 776 and `exact/sparse`
+779 → 794, against NumPy's 783 and 797. Counting only the confirmed flips
+(net +10 and +15), the CuPy-vs-NumPy gap on these two configs goes from
+`−39` to `−14`. What is left of it is mostly `max_time` rows, where CuPy's
+per-iteration cost at CUTEst sizes decides the outcome.
+
+**The strict arm (`1e-5`) does not help.** Among the refined solves, 95 299
+on `lbfgs/sparse` and 2 705 on `exact/sparse` are still accepted with
+residuals in `[1e-5, 1e-2)`. Refinement cannot reduce them; `CATENARY` is the
+standard case, stagnating at 1.4e-5. Rejecting them more than doubles the
+rejected solves on the rows the arm ran: 90 112 → 198 754 on the 136
+`lbfgs/sparse` rows and 2 268 → 7 693 on the 42 `exact/sparse` rows. Every
+rejection triggers another regularized refactorization. The `lbfgs/sparse`
+solve time on those rows went from 124 to 185 minutes. Some of that may be
+host load, since five of the six breaks ran 2–3× faster alone.
+
+| config | rows | correct refined → strict | fixed / broken (sweep) | confirmed alone: fixed / broken |
+| --- | --- | --- | --- | --- |
+| `lbfgs/sparse` | 136 | 73 → 69 (−4) | 2 / 6 | 1 (`ORTHRGDM`) / 1 (`ORTHREGD`, whose refined-arm fix was itself unconfirmed) |
+| `exact/sparse` | 42 | 21 → 22 (+1) | 2 / 1 | 1 (`CATENARY`) / 1 (`YORKNET`) |
+
+Five of the six `lbfgs/sparse` breaks did not reproduce alone. Once the
+re-runs are counted the strict arm is a wash: +2 / −2. It adds rejections,
+and so δ-ladder refactorizations, on every row it touches.
+
+**Verdict: ship the refinement as the default, and keep the `1e-2`
+certificate.** Refinement removes the accepted-but-inaccurate class the v33
+run identified. It fixes 16 `exact/sparse` rows for one break that lands on
+NumPy's own optimum, and 12 `lbfgs/sparse` rows for 2 breaks. It costs 0.3–0.4
+extra solves per perturbed-pivot solve and nothing on unperturbed ones. The
+threshold stays where the v33 analysis put it: IPOPT's `1e-5` is not better
+once refinement has run. The reports are
+`benchmarks/reports/s2mpj_v34_cupy_{refine,strict}_{lbfgs,exact}.json`, with
+the lone re-runs in `s2mpj_v34_cupy_{rerun,rerun2}_refine_*` and
+`s2mpj_v34_cupy_rerun_strict_*`. The certificate counts, now binned both
+before and after refinement, are in the matching `.certs.*.jsonl` files. To
+reproduce an arm, add `--backends cupy --cupy-certificates --config
+lbfgs/sparse` (or `exact/sparse`), plus `--cudss-max-residual 1e-5` for the
+strict arm or `--cudss-refinement-steps 0` for the unrefined one, to the gate
+command below. The report records the policy under `environment.cudss_policy`,
+and `--resume` refuses to mix two policies.
+
+### cuDSS matching and pivot options (2026-09-30)
+
+**Question.** Refinement repairs perturbed-pivot solves after the fact. Can a
+cuDSS configuration avoid the perturbed pivots in the first place, for
+example the zero diagonal of the minimax epigraph variable that a 2×2 pivot
+would pair off? The candidates are the pivot-structure parameters in
+`cudssConfigParam_t`. Maximum weighted matching with scaling (Duff & Koster
+2001) permutes large entries onto the diagonal, and static pivoting then has
+fewer tiny pivots to perturb. A variant would qualify for a corpus A/B only if
+it removed the perturbations at no more than about 1.3× the default
+factorization time, both on these small systems and on a TROTS-scale
+system.
+
+**Setup.** Same machine and runtime as above (nvmath-python 0.9.0, cuDSS
+0.7.1.6), `exp/cudss-matching` @ `321b16a`, no library change. Scratch
+instrumentation captured real KKT systems (full CSR plus the first right-hand
+side of each factorization) from CuPy solves:
+
+- `exact/sparse`: `MAKELA1`, `POLAK1`, `MIFFLIN2` and `GIGOMEZ1` (minimax,
+  n = 5–6), `CATENARY` (n = 19) and `ROTDISC` (n = 1986);
+- `lbfgs/sparse`: `GAUSS1LS`, `KIRBY2LS`, `PALMER3E` (compact-border systems,
+  n = 13–28) and `ACOPR30` (n = 264).
+
+Every one of their factorizations, 30 in all (first, middle and last perturbed
+factorization of each run), had `NPIVOTS > 0` under the default configuration.
+Each system was factored under each configuration through the adapter's own
+`CuDSSSparseSolver`, with the parameter set by `config_set` before the
+analysis. The run recorded `NPIVOTS`, the unrefined relative residual, and
+the refined residual and step count under the adapter's policy. It also read
+the inertia back and compared it with a dense Bunch–Kaufman LDLᵀ of the same
+matrix. Phase times were measured on the cuDSS `ANALYSIS` / `FACTORIZATION`
+executes alone: warmed, device-synchronized, arms interleaved, median of 7.
+
+**Which parameters exist and work.** The binding exposes `USE_MATCHING`,
+`MATCHING_ALG` (there is no `MATCHING_TYPE`), `PIVOT_TYPE`,
+`PIVOT_THRESHOLD`, `PIVOT_EPSILON`, `PIVOT_EPSILON_ALG`, `REORDERING_ALG`,
+and also `DETERMINISTIC_MODE` (see below). The defaults read back as
+`PIVOT_TYPE = PIVOT_COL`, `PIVOT_THRESHOLD = 1.0`, `PIVOT_EPSILON = -1`
+(automatic), and matching off. `execute` returns `NOT_SUPPORTED` for
+`PIVOT_EPSILON_ALG` ≥ 2, `REORDERING_ALG` 4 and 5, and `REORDERING_ALG` 1 or 2
+combined with matching. Every other value was accepted on both the symmetric
+(`LOWER` view) and the general route. On the `MAKELA1` probe, `MATCHING_ALG=5`
+gave results identical to matching's default, and `MATCHING_ALG=1` left the
+perturbed pivot in place. On 24 of
+the 30 systems, `PIVOT_EPSILON = 1e-13` reproduced the default's `NPIVOTS`
+and residual to the bit.
+
+| variant | runs | factorizations with `NPIVOTS > 0` | median / max unrefined residual | max refined residual | refinement steps (sum) | inertia = Bunch–Kaufman | factorization time vs default | analysis time vs default |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| default | 30 | 30 | 2.1e-05 / 1.6e+01 | 5.3e-02 | 33 | 25 / 30 | 1.00× | 1.00× |
+| `USE_MATCHING=1` | 27 (3 failed) | 3 | 4.8e-16 / 2.9e-10 | 2.9e-10 | 0 | **0 / 27** | 1.35× | 1.01× |
+| `USE_MATCHING=1, MATCHING_ALG=4` | 30 | 10 | 3.1e-13 / 3.0e+03 | 3.2e-02 | 12 | 0 / 30 | 1.04× | 1.01× |
+| `REORDERING_ALG=1` (`=2` identical) | 30 | 5 | 3.5e-14 / 1.4e-05 | 1.4e-05 | 0 | 0 / 30 | 1.68× | 0.14× |
+| `REORDERING_ALG=3` | 30 | 24 | 3.7e-07 / 4.7e-02 | 4.7e-02 | 24 | 25 / 30 | 0.98× | 1.01× |
+| `REORDERING_ALG=3` + matching | 27 (3 failed) | 9 | 7.4e-16 / 1.2e-08 | 1.1e-08 | 1 | 0 / 27 | 1.41× | 1.01× |
+| `PIVOT_TYPE=PIVOT_NONE` | 30 | 28 | 9.6e-05 / 5.2e+01 | 4.1e-02 | 39 | 25 / 30 | 0.86× | 1.00× |
+| `PIVOT_EPSILON=1e-6` | 30 | 30 | 4.8e-07 / 1.3e-03 | 4.1e-04 | 141 | 26 / 30 | 1.01× | 1.00× |
+| `PIVOT_EPSILON=1e-8` | 30 | 30 | 2.4e-08 / 3.0e-02 | 2.6e-02 | 70 | 25 / 30 | 0.99× | 1.00× |
+| `PIVOT_EPSILON=1e-10` | 30 | 30 | 4.5e-07 / 5.0e-02 | 3.3e-02 | 21 | 26 / 30 | 0.99× | 1.00× |
+
+(`PIVOT_TYPE=PIVOT_ROW` and `PIVOT_THRESHOLD` ∈ {0, 0.01, 0.1} reproduced the
+default exactly on the `MAKELA1` probe and are omitted. The three failed runs
+are `CATENARY`'s: under matching, the solve of that structurally singular
+system comes back non-finite, where the default factorization gives a finite
+residual of 1.4e-5. The small-system times are launch-bound: 0.03–0.3 ms per
+factorization.)
+
+What the table shows:
+
+- **Matching removes the perturbed pivots, but not with a symmetric
+  factorization.** With `USE_MATCHING=1`, 24 of the 27 factorizations had no
+  perturbed pivot, and every minimax and `ROTDISC` solve was accurate to
+  about 1e-12 or better with no refinement. `ACOPR30`'s worst system, which
+  refinement cannot repair (5.3e-2 after refinement, a rejected solve), came
+  back at 2.9e-10. But cuDSS then returns `INERTIA = [0, 0]` on every
+  system, and the signs of `DataParam.DIAG` no longer match the reference
+  (`MAKELA1`: 1 positive and 4 negative, against 3 and 2). `LU_NNZ` grows
+  1.3–3.4× (`ROTDISC`: 15 114 → 51 676), and `PERM_MATCHING` and `SCALE_ROW`
+  become readable, where they return `NOT_SUPPORTED` without matching. The
+  matched matrix is evidently factored as a nonsymmetric system, and no
+  inertia comes out of it. `REORDERING_ALG` 1 and 2 behave the same way (no
+  inertia) and cost 1.7× in factorization on these systems. The IPM's
+  inertia correction on the sparse route (`_inertia_acceptable`, Wächter &
+  Biegler 2006 §3.1) would read `(0, 0, n)` as a wrong inertia and reject
+  every factorization, so neither option can be a drop-in policy. It would
+  have to report no inertia and give up that correction. The
+  symmetry-preserving alternative, a symmetric matching that selects 2×2
+  pivots (Duff & Pralet 2005, as in MA57 and MUMPS), is not among cuDSS
+  0.7's options.
+- **The other parameters do not remove the perturbation.** `PIVOT_TYPE` and
+  `PIVOT_THRESHOLD` only choose among pivots that cuDSS can reach without a
+  2×2 block, and they leave the zero diagonal where it is. `REORDERING_ALG=3`
+  keeps the symmetric factorization and its inertia. It removes the
+  perturbation on only 6 of the 30 systems (the three `GIGOMEZ1` systems, two
+  of `ACOPR30`'s and one of `KIRBY2LS`'s), and it raises `ROTDISC`'s
+  perturbed pivots (114/158/272 → 179/179/349). A larger `PIVOT_EPSILON` makes the minimax solves more
+  accurate before refinement (1e-8: median 1.1e-4 → 1.1e-8 on the
+  `exact/sparse` systems). On the L-BFGS systems it makes them worse: it
+  perturbs more pivots (39 → 93 in total), the median unrefined residual goes
+  from 5.4e-10 to 1.3e-6, and the refinement steps go from 4 to 38. It
+  changes where the error is, not how many pivots are perturbed.
+- **Refinement already closes most of the gap.** Refinement took the default
+  configuration's minimax and `ROTDISC` solves to 2e-9–3e-15 in 0–4 steps.
+  Of the 30 systems, only five stay above 1e-8: two of `ACOPR30`'s (1.7e-7,
+  and 5.3e-2 for the worst one) and the three `CATENARY` systems
+  (4.8e-7–1.4e-5, stagnating in every configuration).
+- **A perturbed factorization's inertia can be off.** The default configuration
+  matched the reference inertia on 25 of 30 systems. It did not on
+  `CATENARY`, where 7 zero pivots were reported positive; on `ACOPR30`'s worst
+  system, where one pivot flipped (81/183 against 82/182); or on one
+  `KIRBY2LS` system (13/12 against 15/10). Matching gives no inertia at all,
+  so it cannot fix this.
+
+**TROTS scale.** The sparse-route KKT systems of two TROTS cases were captured
+the same way (exact Hessian, first factorization). `Prostate_BT_01`
+(n = 6 393, nnz = 0.71 M) has no perturbed pivot. `Protons_01`
+(n = 370 546, nnz = 41.5 M) perturbs one pivot. Medians of 5 and 3
+interleaved samples:
+
+| system | variant | `NPIVOTS` | unrefined → refined residual | inertia | `LU_NNZ` | factorization | analysis |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `Protons_01` | default | 1 | 4.1e-07 → 1.8e-13 (2 steps) | (1101, 369445, 0) | 21.5 M | 0.102 s | 4.77 s |
+| `Protons_01` | `USE_MATCHING=1` | 0 | 5.0e-13 | none (`[0, 0]`) | 85.4 M | 0.362 s (**3.5×**) | 9.63 s (2.0×) |
+| `Protons_01` | `REORDERING_ALG=3` | 2 | 9.7e-08 → 1.5e-13 (2 steps) | (1101, 369445, 0) | 22.0 M | 0.126 s (1.23×) | 2.10 s (0.44×) |
+| `Prostate_BT_01` | default | 0 | 9.2e-15 | (55, 6338, 0) | 0.36 M | 1.36 ms | 42 ms |
+| `Prostate_BT_01` | `USE_MATCHING=1` | 0 | 2.6e-15 | none | 1.36 M | 2.64 ms (1.95×) | 109 ms (2.6×) |
+| `Prostate_BT_01` | `REORDERING_ALG=1` | 0 | 1.7e-15 | none | 0.88 M | 31.3 ms (23×) | 11 ms (0.25×) |
+
+At scale, matching costs 3.5× per factorization, twice the analysis time, and
+four times the factor memory, in exchange for a perturbation that two
+refinement steps already repair to 1e-13.
+
+**The solves the certificate rejects.** The one case where matching does
+something refinement cannot is a solve that the certificate still rejects
+after refinement. From seven v34 rows with rejections (`BROWNBS`, `INDEF`,
+`HS109` on `lbfgs/sparse`; `JUNKTURN`, `LINSPANH`, `CSFI2`, `ANTWERP` on
+`exact/sparse`), the first five rejected solves each were captured, 35 in
+all. Every one of those matrices is numerically singular (condition numbers
+1e16–1e30). Matching brought 20 of them to ≤ 1e-2 (all of `ANTWERP`,
+`BROWNBS`, `CSFI2` and `HS109`), left `INDEF` and `LINSPANH` rejected, and
+made `JUNKTURN` worse (≈ 1 → 4e1–7e3). `REORDERING_ALG=1` reached 30 of 35, and
+`PIVOT_EPSILON=1e-8`, which keeps the symmetric factorization, reached 26.
+On a numerically singular KKT matrix, though, the certificate's rejection
+followed by δ_w/δ_c regularization is the response the method prescribes.
+An "exact" solve of such a matrix is not evidently a better step, and the
+v33 threshold study found flips in both directions in this band.
+
+**Verdict: no configuration change; the corpus A/B was not run.** The only
+parameters that remove the perturbed pivots (`USE_MATCHING`,
+`REORDERING_ALG` 1/2) do it by giving up the symmetric indefinite
+factorization. They lose the inertia the sparse route's correction depends
+on. Every matching variant loses it, including `MATCHING_ALG=4`, which costs
+only 1.04× but also leaves 10 of the 30 factorizations perturbed. The
+default matching and `REORDERING_ALG` 1/2 also cost 1.35–1.7× on CUTEst-size
+systems and 2–23× at TROTS scale, which misses the ≤ 1.3× bar. A policy built
+on them would have to either run without inertia or pay for a second,
+matched factorization on top of the one that supplies the inertia. Neither
+is justified while refinement already brings most perturbed solves to the
+1e-10 target, at 0.3–0.4 refinement steps per perturbed solve on average
+(v34). The remainder is mostly the numerically singular solves discussed
+above. `PIVOT_EPSILON` and `REORDERING_ALG=3` are free and inertia-preserving,
+but they do not remove the perturbation. The one open lead is
+`PIVOT_EPSILON` near 1e-8. It rescues 26 of the 35 rejected singular solves
+and sharpens the minimax solves before refinement. After refinement,
+though, it is worse: 11 of the 30 systems stay above 1e-8 instead of 5
+(`ROTDISC` 3.6e-10 → 9.0e-7, `ACOPR30` 1.7e-7 → 6.7e-3, several L-BFGS
+border systems). It would need its own corpus A/B on both sparse configs,
+with that regression as the stated risk.
+
+**Side finding: `DETERMINISTIC_MODE`.** The default cuDSS factorization is not
+bitwise reproducible. Six fresh solvers on one captured system gave six
+different solutions: `ROTDISC` differs by up to 1.4e2 in absolute value on a
+perturbed system, and `ACOPR30` by 5.7e-4. That is the run-to-run
+non-determinism of the CuPy sparse route documented above. With
+`DETERMINISTIC_MODE = 1` all six were bitwise identical, with the same
+inertia and `LU_NNZ`. The cost was 1.15–2× per factorization on the small
+systems, 2.0× on `Protons_01` (0.102 → 0.208 s) and 3.0× on
+`Prostate_BT_01`, with analysis unchanged. It is not enabled: whether a
+reproducible sparse route is worth that factorization cost is a separate
+decision.
+
+The scratch scripts, captured CUTEst systems and result JSONs are in
+`benchmarks/reports/cudss_matching_2026-09-30/` (local, not committed; the
+TROTS captures, about 0.5 GB for `Protons_01`, were not kept there).
+
+### Perturbed-pivot inertia and deterministic mode (2026-10-01)
+
+**Two changes, one A/B.** First, `SparseOptions(deterministic=True)` now
+switches cuDSS to `DETERMINISTIC_MODE` (opt-in; see
+[Reproducible sparse factorizations](../guide/options.md#reproducible-sparse-factorizations)).
+Second, the question this section answers: should the adapter keep reporting
+cuDSS's inertia for a factorization with perturbed pivots? The matching study
+above found that this inertia is wrong on 5 of the 30 captured systems. The
+IPM's inertia check (`_inertia_acceptable`, Wächter & Biegler 2006 §3.1)
+compares the reported inertia with the KKT target and escalates δ_w on a
+mismatch. A wrong count therefore either hides a singular factor or triggers
+a needless escalation.
+
+**What cuDSS counts.** cuDSS's `DIAG` shows every perturbed pivot as exactly
+`±1e-13` (the automatic `PIVOT_EPSILON`). The signs of `DIAG` match `INERTIA`
+on all 30 systems. So cuDSS counts a perturbed pivot by the sign of the `±ε`
+it put in, and the count is the inertia of `A + E`. Four candidate rules
+were scored against a dense Bunch–Kaufman `LDLᵀ` (`scipy.linalg.ldl`, exact
+zero test, as in the matching study):
+
+1. *trust*: report cuDSS's count whatever `NPIVOTS` is (the current rule);
+2. *withhold*: report `None` (skip the check) whenever `NPIVOTS > 0`, leaving
+   the refined, certified solve as the only guard;
+3. *zero*: count the `NPIVOTS` perturbed pivots as zero pivots;
+4. *certified only*: report the count only if the refined solve passed the
+   certificate.
+
+| rule | reading = Bunch–Kaufman | wrong | withheld |
+| --- | --- | --- | --- |
+| 1 trust | 25 | 5 (`CATENARY` ×3: 7 zero pivots counted positive; `ACOPR30` #399: one sign flipped; `KIRBY2LS` #96: 13/12 against 15/10) | 0 |
+| 2 withhold | 0 | 0 | 30 |
+| 3 zero | 0 | 30 (Bunch–Kaufman finds no zero pivot on 27 systems; on `CATENARY` it finds 7, not 9–10) | 0 |
+| 4 certified only | 25 | 4 | 1 (`ACOPR30` #399, rejected by the certificate) |
+
+Rule 4 is a no-op inside the IPM. The driver solves before it checks the
+inertia, and a solve the certificate rejects raises `LinearSolveError` before
+the check is reached, so every inertia the driver reads already comes from a
+certified solve. Rule 3 is wrong on every system: the minimax and `ROTDISC`
+perturbations land on pivots that a 2×2 pivot would pair off, not on zero
+eigenvalues. Neither went to the corpus.
+
+The captured systems do not show what the IPM does with the reading. So each
+inertia check was also recorded during one deterministic solve of each of the
+ten captured problems, with the check's target and a Bunch–Kaufman inertia of
+the factored matrix (at most 600 checks per problem). The reference verdict
+is "accept iff Bunch–Kaufman equals the target":
+
+| rule | perturbed checks: right accept / right reject / wrong accept / wrong reject |
+| --- | --- |
+| 1 trust | 1 436 / 0 / 25 / **618** |
+| 2 withhold | 2 054 / 0 / 25 / 0 |
+| 3 zero | 0 / 25 / 0 / **2 054** |
+
+(334 unperturbed checks: 303 right accepts and 31 wrong rejects in every
+rule. The 31 are `ACOPR30` factors with `NPIVOTS = 0` whose cuDSS inertia,
+81/183, disagrees with Bunch–Kaufman's 82/182.) The 618 needless
+escalations under *trust* are almost all on the L-BFGS problems (`KIRBY2LS`
+545, `GAUSS1LS` 38, `PALMER3E` 19, `ACOPR30` 16). On these ten problems
+Bunch–Kaufman equals the target at every check except `CATENARY`'s, where
+the matrix is singular and every rule except *zero* accepts it. *Withhold*
+was the one candidate worth a corpus run.
+
+**Setup.** `fix/cudss-inertia-and-determinism` @ `58578ec`, frozen as a source
+snapshot for the run. Same machine and runtime as above. The rows are v33's
+perturbed-pivot rows (288 `exact/sparse`, 893 `lbfgs/sparse`), run serially at
+the gate budget (`--max-iter 10000 --max-time 300 --include-objective-free`)
+with `--cupy-certificates`. Every arm ran with `--cudss-deterministic`. A
+scratch harness switched the rule by patching `inertia_or_none` and counted
+each inertia check. The *withhold* arm ran in full on `exact/sparse`. On
+`lbfgs/sparse` it ran only on the 103 rows where *trust* rejected at least one
+perturbed factor on inertia, and the other 790 rows were carried over from
+*trust*. On `exact/sparse`, the 185 rows without such a rejection never
+changed correctness between the arms. Every flipped row was then re-run alone
+in both arms.
+
+| config | rows | correct trust → withhold | fixed / broken (sweep) | confirmed by lone re-run: fixed / broken | `max_time` | perturbed factors rejected on inertia | certificate-rejected solves | iterations, rows correct in both |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `exact/sparse` | 288 | 209 → 200 (**−9**) | 0 / 9 | 0 / 9 | 8 → 9 | 50 927 → 0 | 14 087 → 22 040 | 59 697 → 67 598 (194 rows) |
+| `lbfgs/sparse` | 893 | 664 → 665 (+1) | 7 / 6 | 5 / 6 | 20 → 18 | 21 325 → 0 | 131 547 → 129 362 | 209 802 → 214 749 (656 rows) |
+
+(Inertia checks under *trust*: 410 206 on `exact/sparse`, of which 34 % were
+on perturbed factors; 644 452 on `lbfgs/sparse`, of which 82 % were.)
+
+- **`exact/sparse`: every break is a nonconvex problem that needed the
+  correction.** The breaks are `BIGGS6`, `CATMIX`, `DEMBO7`, `MODBEALE`,
+  `RK23`, `YATP1CLS`, `YATP1LS`, `YATP2CLS` and `YATP2LS`. Under *trust* they
+  converge in 10–310 iterations. Under *withhold* they stall, reach
+  `max_iter`, reach `max_time`, or converge to another point. On these rows
+  the perturbed factors that *trust* rejected were genuinely indefinite. For
+  example, `YATP1LS` accepts 2 597 factors whose cuDSS inertia missed the
+  target and runs to 10 001 iterations. All nine breaks reproduced alone,
+  bitwise in iterations except the three `max_time` rows.
+- **`lbfgs/sparse` is a wash.** *Withhold* fixes `KIRBY2LS` (stalled at 81
+  → optimal in 104, the needless-escalation storm in the table above),
+  `HS109`, `GAUSS2LS`, `VESUVIALS` and `PALMER4C`. It breaks `BROYDNBDLS`,
+  `BRYBND`, `CURLY30`, `PALMER2E`, `PALMER3C` and `PALMER3E`. Two sweep
+  fixes, `GASOIL` and `TAX13322`, did not reproduce alone (wall-clock and
+  run-to-run noise).
+
+**Verdict: keep today's rule.** *Withhold* is net −10 on the confirmed flips
+(−9 / −1). It also adds 13 % iterations on the `exact/sparse` rows that both
+arms solve. A perturbed factor's count is wrong often enough to cause
+needless escalations on L-BFGS border systems. Where the factor really is
+indefinite, though, the check is what saves the exact-Hessian route, and
+cuDSS gives no way to tell the two cases apart. The adapter's
+`inertia_or_none` docstring records this. The `CATENARY` blind spot (a
+singular KKT system whose count matches the target) stays, and a GPU test
+pins that reading, so a runtime that changes it is noticed.
+
+**Deterministic mode: cost and what it does not cover.** Measured alone, both
+modes interleaved, three repeats each (wall per factorization call, i.e. the
+`factor` method including the host-side value update, device-synchronized):
+
+| problem | iterations default / deterministic | distinct objectives in 3 runs | factorization call (median) | wall per iteration (median) |
+| --- | --- | --- | --- | --- |
+| `ROTDISC` `exact/sparse` | 22, 21, 24 / 22, 22, 22 | 3 / 1 | 16.7 → 17.1 ms (+2 %) | 50.7 → 53.9 ms |
+| `ACOPR14` `exact/sparse` | 27, 36, 22 / 27, 27, 27 | 3 / 1 | 7.29 → 7.49 ms (+3 %) | 81 → 96 ms |
+
+On these CUTEst-size systems a factorization call is launch-bound, so the
+mode's 1.2–3× on the bare cuDSS phase becomes 2–3 % per call. Wall per
+iteration also depends on which trajectory a run takes. The deterministic
+`ACOPR14` trajectory needs 6.4 factorizations per iteration, against 4.3–5.8
+on the default runs. With the mode on, the 22 flipped rows of the A/B,
+re-run alone in both arms, reproduced their sweep iteration counts exactly.
+The exceptions were the rows that stopped on `max_time` and one long run,
+`GASOIL` (`lbfgs/sparse`). The mode does
+not make the whole CuPy route reproducible, though. Two other CuPy kernels
+accumulate with atomics, so their last bits vary from run to run (30
+different results in 30 repeats each): the transposed SpMV `A.T @ y` behind
+`SparseOperator.rmatvec`, and the scatter-add (`cupy.add.at`) behind the
+canonical COO→CSR sum. Three processes running `AGG` (`exact/sparse`) with
+the mode on diverged at the first right-hand side, before any factorization
+differed. A deterministic transpose product (a cached CSR transpose) and a
+deterministic duplicate sum would close that gap. Each changes the default
+route's performance and would need its own measurement, so neither is part
+of this change. (The next section closes the gap.)
+
+A side observation: the `CATENARY` solve that the certificate accepts is
+inconsistent. Its right-hand side is −100 on rows that are identically zero.
+Measured against `‖b‖∞ ≈ 7e6`, though, that residual is 1.4e-5. A residual
+relative to the largest entry of `b` cannot see an inconsistency in the
+small entries.
+
+The reports are `benchmarks/reports/s2mpj_v35_cupy_det_{trust,withhold}_{exact,lbfgs}.json`,
+with the lone re-runs in `s2mpj_v35_cupy_det_rerun_*`, the per-case
+inertia-check counts in the matching `.inertia.jsonl` files and the
+certificate counts in `.certs.*.jsonl`. The capture study, the check study,
+the A/B harness and the determinism probes are in the session scratchpad
+(`sweep_cupy_inertia/`, local, not committed). To reproduce the *trust* arm,
+add `--backends cupy --cupy-certificates --cudss-deterministic --config
+exact/sparse` (or `lbfgs/sparse`) to the gate command below. The *withhold*
+arm needs the scratch harness.
+
+### Reproducible CuPy sparse route (2026-10-02)
+
+**The gap the previous section left.** With `deterministic=True`, three
+processes running `AGG` (`exact/sparse`) diverged at the very first
+`rmatvec`: event 1 of the trace, the 452 × 163 Jacobian-transpose product of
+the first right-hand side, before any factorization. Three CuPy kernels
+outside cuDSS accumulate with atomics:
+
+- the transposed SpMV/SpMM behind `rmatvec`/`rmatmat`/`gram_diagonal`;
+- the forward CSR SpMV and SpMM of a matrix with long rows. On a 3000 × 20000
+  matrix with 15 000-entry rows, the default SpMV and every SpMM algorithm
+  (default, `CSR_ALG1/2/3`) gave 28–30 distinct results in 30 repeats;
+- `cupy.add.at` in the COO → CSR duplicate sum, once a slot has three or more
+  entries (30 distinct results in 30 repeats at about 15 entries per slot).
+
+`CUSPARSE_SPMV_CSR_ALG2`, which the cuSPARSE documentation lists as bitwise
+deterministic for the non-transposed product, gave 1 distinct result in every
+case. The CuPy adapter now uses it for every vector product. A transposed
+product runs forward on an explicit `Aᵀ`, cached per operator value array.
+A problem's Jacobian is a new operator every iteration, so it pays one
+`csr2csc` per iteration. The facade's operators on one pattern share a
+transpose plan instead, so for them `Aᵀ` is a gather. A product with several
+columns runs in an ordered kernel: one thread per output entry for rows of up
+to 1024 entries, one warp per entry beyond that. The COO build sums each slot
+in emission order. That is the SciPy adapter's `np.add.at` order, so the two
+builds agree bit for bit. These kernels are on in every mode, for reasons
+the [backends guide](../guide/backends.md#reproducibility-on-cuda) gives.
+
+**Bisection on `AGG`.** Each pre-change kernel was patched back in a scratch
+harness, with three processes per arm and `deterministic=True`. A trace of
+hashes covered every COO build, product, factorization and solve:
+
+| pre-change kernels restored | first divergence | result |
+| --- | --- | --- |
+| transposed product, forward product, COO sum | event 1 (first `rmatvec`) | 49, 48, 24 iterations |
+| forward product, COO sum | none (2647 events) | 46 iterations ×3, identical |
+| COO sum | none | identical |
+| none | none | identical |
+
+On `AGG` the transposed product was the only source. Its Jacobians have
+short rows, and no slot sums three entries. The other two fixes are pinned
+by the GPU tests (`tests/unit/test_cupy_sparse_determinism_gpu.py`) on
+matrices that do trigger them.
+
+**Corpus check.** The final code solved each of the five problems behind the
+earlier flips three times in separate processes (`exact/sparse`,
+`deterministic=True`). `YORKNET` and `COSHFUN` were capped at 150 iterations,
+because a `max_time` stop depends on the wall clock. All five traces were
+bitwise identical across the three processes:
+
+| problem | result (×3) | traced events |
+| --- | --- | --- |
+| `AGG` | restoration failed, 46 it. | 2 647 |
+| `ROTDISC` | optimal, 23 it. | 292 |
+| `ACOPR14` | optimal, 50 it. | 1 260 |
+| `YORKNET` | 150-iteration cap | 7 611 |
+| `COSHFUN` | 150-iteration cap | 2 696 |
+
+The cost was measured over whole solves: wall time per iteration and per
+cuDSS factorization call. The table gives the median of 3 interleaved runs,
+with the range in brackets, each run alone on the GPU. The arms are:
+
+- *old*: the pre-change kernels patched back, default options;
+- *default*: the new kernels, default options;
+- *deterministic*: the new kernels, `deterministic=True`.
+
+The CPU was loaded by another job throughout, so treat these as
+provisional. Wall time per iteration also depends on the trajectory's
+factorizations per iteration, which differ between runs that are not
+reproducible.
+
+| problem | iterations old / default / deterministic | ms per iteration old / default / deterministic | ms per factorization old / default / deterministic |
+| --- | --- | --- | --- |
+| `AGG` | 25, 47, 23 / 25, 25, 25 / 46 ×3 | 521 [368–791] / 740 [716–789] / 327 [306–384] | 387 / 459 / 279 |
+| `ROTDISC` | 21 ×3 / 21, 22, 21 / 23 ×3 | 77 [71–112] / 104 [74–127] / 88 [84–157] | 81 / 109 / 72 |
+| `ACOPR14` | 34, 26, 42 / 42, 31, 34 / 50 ×3 | 173 [96–174] / 166 [85–178] / 145 [90–165] | 32.4 / 31.3 / 35.0 |
+| `YORKNET` | 150 ×3 (cap) | 199 [196–250] / 177 [166–198] / 291 [286–396] | 18.9 / 17.5 / 18.9 |
+| `COSHFUN` | 150 ×3 (cap) | 102 [96–129] / 121 [88–149] / 94 [91–113] | 25.1 / 24.0 / 23.6 |
+
+Neither the new kernels nor the mode shows a cost above this noise. Two
+rows needed a closer look:
+
+- **`YORKNET` per iteration.** Its deterministic trajectory makes 15
+  factorizations per iteration, against 10 on the default runs, at the same
+  cost per factorization. That is a property of the trajectory, not of the
+  mode.
+- **`AGG`, default arm.** It repeated one trajectory in all three runs (25
+  iterations, restoration-heavy, the same final `x`). A default-mode run
+  can repeat by chance; only the deterministic arm guarantees it.
+
+**Micro-benchmarks.** These are the product kernels themselves, warmed,
+device-synchronized, with interleaved arms. Each entry is the median of 7,
+in ms.
+
+| operation | S2MPJ-size KKT (n = 1 000, nnz 1.2e4) | mid (n = 5.5e4, nnz 6.5e5) | `Protons_01` KKT (n = 3.7e5, nnz 4.1e7) |
+| --- | --- | --- | --- |
+| `A @ x`: default → `ALG2` | 0.135 → 0.129 | 0.115 → 0.114 | 2.08 → 2.09 |
+| `Aᵀ @ y`: transposed SpMV → cached `Aᵀ` | 0.132 → 0.114 | 0.125 → 0.126 | 3.41 → 2.12 |
+| build `Aᵀ` per operator value array: `csr2csc` / plan gather | 0.48 / 0.14 | 0.27 / 0.067 | 22.7 / 5.2 |
+| build a pattern's transpose plan (once per pattern and adapter) | 1.2 | 0.5 | 48 |
+| `A @ X`, 8 columns: SpMM → ordered kernel | 0.162 → 0.082 | 0.447 → 0.328 | 14.4 → 17.3 (warp) |
+| `Aᵀ @ Y`, 8 columns: SpMM → ordered kernel | 0.164 → 0.081 | 0.398 → 0.333 | 15.8 → 17.5 (warp) |
+| COO values → CSR data: `add.at` → ordered sum | 0.117 → 0.055 | 0.066 → 0.047 | 39.4 → 19.3 |
+| compile the COO map (once per pattern and adapter) | 3.1 → 3.9 | 1.5 → 2.0 | 158 → 241 |
+| memory: cached `Aᵀ` / COO map old → new (MiB) | +0.1 / 0.2 → 0.1 | +7.7 / 8.5 → 8.1 | +476 / 482 → 479 |
+
+The two ordered kernels were tuned on the same card. The thread kernel was
+at or below SpMM on rows of up to 1024 entries, but 3–6× slower on rows of
+15 000–52 000. The warp kernel was within 0.8–1.2× of SpMM on those long rows,
+but up to 3× slower than the thread kernel on short ones.
+
+**Memory, worst case.** The cached `Aᵀ` doubles a transposed operator's
+storage, so the adapter caps it at 512 MiB per transpose. Above the cap an
+operator keeps cuSPARSE's transposed product, which is the one
+non-reproducible exception. The sparse Gram's `Aᵀ` is not capped, as before. The cap comes from the largest operator at hand,
+`Head-and-Neck_01`'s 1.1e8-nonzero dose block on the CuPy dense route. These
+are 4-iteration runs, with the pool peak read from a CuPy memory hook:
+
+| arm | pool peak used / reserved (GiB) | run time |
+| --- | --- | --- |
+| before (no `Aᵀ`) | 6.51 / 7.31 | 54–56 s |
+| cache the 1.24 GiB `Aᵀ` | 7.75 / 8.91 (past the 8 GiB card) | 68 s |
+| transpose 2²⁴-entry row windows per call | 6.85 / 7.60 | 66 s |
+| cap at 512 MiB (shipped) | 6.51 / 7.31 | 48 s |
+
+Transposing row windows on every call cost about 7× a cuSPARSE transposed
+SpMV (27.0 vs 3.8 ms on the `Protons_01` KKT). That route's device-tiled Gram
+is not reproducible anyway, so the cap gives up nothing there.
+
+**A CuPy fault found on the way.** `cupy.bincount` with `minlength ≈ 4e7`
+raised `cudaErrorIllegalAddress` (CuPy 14.1.1, CUDA 12.9). The segment sum
+finds its run boundaries with `searchsorted` instead.
+
+To reproduce the trust arm of the previous section, which is now
+reproducible run to run, add `--backends cupy --cupy-certificates
+--cudss-deterministic` to the gate command below. The bisection harness, the
+probes and the logs are in the session scratchpad (`repro_sparse/`, local,
+not committed).
+
+### Dense Cholesky through `dpotrf` (2026-10-03)
+
+The NumPy dense route now factors `N` with SciPy's `dpotrf` on a single
+cache-blocked copy instead of `numpy.linalg.cholesky`; see the
+[TROTS Head-and-Neck_01 profile](trots.md#head-and-neck_01-speed-profile-2026-10-02),
+lever 8. Both run `dpotrf('L')` on the same data. The change is expected
+to be bit-identical, so it was checked with a bitwise A/B instead of the
+gate sweep. Both dense configs (`lbfgs/dense`, `exact/dense`) ran over the
+whole corpus (`--all --include-objective-free`), one arm with
+`numpy.linalg.cholesky` and one with `dpotrf`. The budget was `--max-iter
+500` with a 30–60 s cap, one BLAS thread per process, 8 processes. Every
+solve's per-iteration objective and KKT error and its final `x` were
+recorded:
+
+| rows | iterations compared | identical, final `x` included | identical up to a `max_time` stop at a different iteration | diverged |
+| ---: | ---: | ---: | ---: | ---: |
+| 2196 | 164 748 | 2132 | 64 | **0** |
+
+The 64 rows hit the time cap at different iterations, because the two
+arms ran at different times on a shared machine. Their common prefixes are
+identical. Because the trajectory does not change, verdicts do not
+either, so the v33 baseline stands. The HN A/B (24 threads) was
+bit-identical as well. The harness (`s2mpj_arm.py`,
+`compare_bitwise.py`) and the reports are in the session scratchpad
+(`sweep_potrf/`, local, not committed).
+
+### CuPy sparse route after the follow-ups chain (2026-10-16)
+
+The release gate's CuPy half: both sparse configs over the full corpus
+(`--all --include-objective-free --backends cupy --config
+lbfgs/sparse,exact/sparse --cupy-certificates --max-iter 10000 --max-time
+300 --jobs 2`) on `feat/breedveld-followups` @ `bfc2a66`, with the
+defaults a user gets — refinement on, the reproducible kernels, cuDSS
+`DETERMINISTIC_MODE` off. 6.4 h on two GPU workers, no crash, no device
+reset. Compared with the same rows of the NumPy v36 gate and with the
+pre-refinement v33 CuPy run:
+
+| config | CuPy v33 (2026-09-28) | **CuPy v37** | NumPy v36 | CuPy − NumPy |
+| --- | ---: | ---: | ---: | ---: |
+| `exact/sparse` | 779 | **797** | 798 | −1 |
+| `lbfgs/sparse` | 762 | **769** | 785 | −16 |
+
+The gap to NumPy on these two configs is −17, down from −39 at v33
+(−14 was the refinement A/B's projection on the perturbed-pivot subset).
+Against the NumPy rows: 15 fixed, 32 broken. Every broken row was re-run
+**alone** (one process, one job, same budget) after the sweep:
+
+| alone re-run of the 32 broken rows | rows | problems |
+| --- | ---: | --- |
+| recovered (correct alone: GPU-sharing timing or run-to-run noise) | 6 | `ACOPP30`, `CURLY10`, `GASOIL`, `HS109`, `HS116`, `S365` |
+| still `max_time` alone (CuPy slower per iteration on small problems) | 7 | `BATCH`, `DEMBO7`, `NUFFIELD`, `ORTHREGE`, `FLETCHBV`, `KISSING2`, `VANDERM2` |
+| confirmed, same status and (almost always) the same iteration count | 19 | `CATENARY`, `DJTL`, `HS13` (×2), `HS36`, `KOEBHELB`, `POWERSUMNE`, `SSEBNLN`, `CYCLOOCF`, `DMN15332LS`, `GAUSS1LS`, `HEART6LS`, `PALMER2E`, `PALMER4C`, `POWELLBSLS`, `SBRYBND`, `VESUVIALS`, `VESUVIOLS`, `VESUVIOULS` |
+
+Net after the re-runs: −11 against NumPy. Two things the re-runs show:
+
+- **The route is deterministic in practice now.** With the reproducible
+  products and COO builds (2026-10-02) the alone re-run reproduced the
+  sweep's status *and iteration count* on 24 of the 32 rows, cuDSS
+  `DETERMINISTIC_MODE` off. Before that work, identical re-runs of the
+  same rows differed routinely (`ACOPR14` 25 vs 38 iterations). The
+  remaining noise is GPU sharing between the two workers (the six
+  recovered rows) and the factorization itself.
+- **The 19 confirmed rows are route differences, not noise:** cuDSS's
+  static pivoting with refinement against Feral's threshold-pivoting
+  LDLᵀ on the same KKT systems. `HS36` (14 NumPy iterations, never
+  converges on CuPy), `POWERSUMNE` (restoration fails at iteration 6) and
+  `CATENARY` (the certificate's scale blind spot: a −100 residual under a
+  7e6 right-hand side) are small enough to bisect; the `VESUVI*` and
+  `PALMER*` families stall or stop `acceptable` at the same iterate every
+  time. They are offset by 15 fixes on the same configs (`DISCS`, `MSS1`,
+  `MINSURFO`, `SPINOP`, `PALMER1`/`4`, `ORTHRGDM`/`S`, …), so the per-config
+  counts are at parity on `exact/sparse` and 16 rows behind on
+  `lbfgs/sparse`.
+
+Certificates over the 2202 rows: 1188 rows met perturbed pivots
+(607k of 1.33M factorizations); refinement rescued 35,149 solves the
+unrefined certificate would have rejected, in 179 rows; 89,149 solves in
+104 rows were still rejected to the regularization ladder; two rows had
+non-finite factorizations. Reports: `benchmarks/reports/s2mpj_v37_cupy.*`,
+the alone re-runs `s2mpj_v37_cupy_rerun_{exact,lbfgs}.*`, the diff
+`s2mpj_v37_cupy_vs_v36_numpy.txt`.
 
 ## Reproducing
 

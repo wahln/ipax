@@ -78,9 +78,12 @@ keeps the original per-term SpGEMM path.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
+import itertools
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -100,7 +103,7 @@ _BREEDVELD_LSQR_TOL = 1e-6
 _BREEDVELD_LSQR_ITER = 200
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
     from benchmarks.corpus import BenchmarkProblem
     from ipax.options import ScalingMethod, ScalingOptions
@@ -744,6 +747,30 @@ class TiledGramConfig:
     finite-difference smoothing rows); SciPy's SpGEMM runs ~100× below BLAS
     rate, so the break-even measured on the TROTS tiles sits near 1%.
 
+    That 1% holds for narrow tiles only. On the host, in a Gram that runs
+    on a single lane (tiles in sequence, each with all BLAS threads: the
+    ``n ≈ 10⁴`` accumulator budget, ``threads=1``, one work item, or little
+    work), a sparse tile is also densified once its ``Σ nnz_row²`` exceeds ``host_sparse_entry_ratio``
+    times its dense entries ``b·c``, i.e. once the ratio above exceeds
+    ``host_sparse_entry_ratio / c``: SpGEMM's per-product cost grows with
+    the tile width (its accumulator spills cache), while the densified
+    tile's cost per ``b·c²`` stays at the BLAS rate. Fitted on every
+    sparse-or-near tile of ten TROTS cases (2026-10-02, i9-13900HX,
+    threaded OpenBLAS; docs/benchmarks/trots.md): the break-even falls from
+    ~1.5% at ``c ≈ 200`` to ~0.2% at ``c ≈ 2000``, and ``4/c`` is within
+    1% of picking the faster kernel on every tile set (``Head-and-Neck_01``:
+    its three 2048×3609–9684 tiles at ratio 0.4% take 0.95 s densified
+    against 2.55 s by SpGEMM; of the eleven corpus cases only that Gram
+    changes, bitwise, its exact Hessian included). The plan's ``sparse``
+    flag, its flop count
+    (the gate statistic and the lane deal) and the device kernels are
+    unchanged; ``None`` restores the plain 1% rule on the host. Multi-lane
+    Grams keep the 1% rule: there the SpGEMMs of eight lanes run in
+    parallel (SciPy releases the GIL) while densified tiles would compete
+    for the BLAS threads, and the lanes are dealt by the plan's flop counts
+    (measured: ``Protons_02`` 0.88 → 1.07 s per Gram with the width rule on
+    its lanes).
+
     ``threads`` is the number of accumulation *lanes* (§5.2: one tile per
     worker at a time, private accumulators summed at the end); ``1`` runs the
     tiles sequentially. The lane count — and with it the summation order, so
@@ -752,37 +779,149 @@ class TiledGramConfig:
     the lanes. A Gram uses fewer lanes when there is little work
     (``lane_min_flops`` of BLAS per lane amortizes its private ``n²``
     accumulator) or when the accumulators would exceed ``lane_budget_bytes``
-    (``n ≈ 10⁴`` ⇒ sequential). BLAS keeps its own threading either way
-    (measured: pinning it to one thread makes the pool slower, since the
-    compacted scatter holds the GIL).
+    (``n ≈ 10⁴`` ⇒ sequential). BLAS keeps its own threading either way.
 
-    ``device_sparse_tiles`` (CuPy namespaces) multiplies the sparse tiles of
-    exact (float64) Grams by cuSPARSE SpGEMM; ``False`` densifies them like
-    every other tile. Reduced-precision requests and Torch densify them too.
-    Host (NumPy) runs ignore it.
+    ``scatter_threads`` is the worker count of a per-call thread pool
+    (started lazily, only when some pass is large enough) for the host
+    passes around the BLAS products, which SciPy's ``csr_todense`` and
+    NumPy's fancy-index get/set and ufuncs run with the GIL released:
+
+    - the compacted scatter of a single-lane tile's ``c×c`` product into
+      the accumulator, in row chunks of its lower triangle (the only part
+      kept; the final mirror overwrites the upper one) — every entry still
+      receives the same single addition;
+    - the densify and ``√w`` scaling of a large single-lane tile, in row
+      windows — the same values and the same products;
+    - the final lower-to-upper mirror, in independent row panels — pure
+      copies.
+
+    So the result is bitwise the same for every value of this knob, ``1``
+    (the calling thread only) included. At ``n ≈ 10⁴`` these passes were
+    more than half of the Head-and-Neck_01 iteration, and the default ``8``
+    was measured there, not on Protons_01 (docs/benchmarks/trots.md,
+    "Head-and-Neck_01 speed profile (2026-10-02)").
+
+    ``compiled_scatter`` runs the compacted scatter through a Numba kernel
+    (:mod:`benchmarks.corpus._trots_kernels`; Numba is in the ``bench``
+    extra) when Numba is importable, and keeps the NumPy
+    ``acc[ix_(cols, cols)] += g`` otherwise or when ``False``. The kernel is
+    a loop over the same entries without the fancy-index temporaries; it
+    releases the GIL and runs in the same row chunks on the same
+    ``scatter_threads`` pool (Numba starts no threads of its own), and each
+    lower-triangle entry receives the same single IEEE addition, so the
+    Gram and the exact Hessian are bitwise the same either way. Measured on
+    Head-and-Neck_01-sized tiles (``c`` up to ~9700, 8 threads): about 3×
+    faster than the NumPy scatter (docs/benchmarks/trots.md).
+
+    ``device_sparse_tiles`` (CuPy namespaces) lets exact (float64) Grams
+    multiply the plan's sparse tiles by cuSPARSE SpGEMM; ``False`` densifies
+    them like every other tile. Reduced-precision requests and Torch densify
+    them too. Host (NumPy) runs ignore it. *Which* sparse tiles keep SpGEMM is
+    a size-aware choice: a sparse tile stays sparse on the device only when
+    its ``Σ nnz_row²`` is at most ``device_sparse_tile_flop_ratio`` of its
+    densified ``b·c²``. The host's 1% break-even is wrong on a device, whose
+    dense ``syrk`` runs at a very different rate relative to its SpGEMM
+    (measured on Head-and-Neck_01, RTX 4070 Laptop, float64: syrk ~250–290
+    GFLOP/s, SpGEMM 3–7·10⁷ products/s, per-tile break-evens
+    1.8–4.2·10⁻⁴; a tile at 4·10⁻³ took 24.8 s by SpGEMM against 1.9 s
+    densified). ``None`` (the
+    default) calibrates the ratio once per problem and device — one sparse
+    tile of the plan multiplied both ways (see
+    :func:`_device_break_even_ratio`) — so the choice, and with it the last
+    bits of the Gram, can differ between processes for a tile near the
+    break-even; a float pins it (``1.0`` keeps every sparse tile sparse, the
+    behaviour before the calibration; ``0.0`` densifies all but the
+    over-budget ones).
 
     Densifying a sparse tile is priced wrongly by the gate: the gate charges
     it ``Σ nnz_row²`` (its sparse-product arithmetic), but a densified tile
     costs the dense ``b·c²`` (twice that on Torch, whose ``matmul`` has no
-    one-triangle ``syrk``) and a ``b×c`` temporary. So on Torch and for
-    float32 requests the gate statistic underestimates the device cost of
-    plans with sparse tiles. ``device_densify_budget_bytes`` caps the damage:
+    one-triangle ``syrk``) and a ``b×c`` temporary. So on Torch, for
+    float32 requests, and for the CuPy sparse tiles that the device
+    break-even densifies, the gate statistic underestimates the device cost
+    of plans with sparse tiles. ``device_densify_budget_bytes`` caps the damage:
     a sparse tile whose densified ``b×c`` float64 temporary would exceed it
     is never densified on a device — CuPy multiplies it by cuSPARSE SpGEMM at
-    every precision (and whatever ``device_sparse_tiles`` says), Torch by the
+    every precision (whatever ``device_sparse_tiles`` and the device
+    break-even ratio say), Torch by the
     host SciPy SpGEMM of the plan's tile (one weight download per such tile;
     free on CPU tensors). Host (NumPy) runs ignore it (they never densify a
     sparse tile).
+
+    On a device namespace (CuPy / Torch) the exact Hessian of
+    :class:`TROTSExactProblem` ignores ``flop_ratio_threshold`` for its
+    curved structures: a structure the gate keeps off is planned anyway
+    (lazily, on the first dense Hessian), because the tiled plan never costs
+    more flops than the full-width chunks the gate compares it with, and the
+    only other device option is a host product crossed per call. The linear
+    block keeps the gate. ``tiled_gram=False`` is the only opt-out (the
+    grouped Hessian is then crossed as a ``CSCOperator``).
+
+    On the host (NumPy) the exact Hessian keeps a curved structure's plan
+    that the gate rejected *after* planning it (the pre-gate passed) when
+    the plan's flop ratio is at most ``host_hessian_flop_ratio``: the
+    alternative there is the full-width dense row chunks, which cost the
+    whole ratio's complement more ``syrk`` flops and an ``n``-wide scatter.
+    The plan was already paid for; its tile copy replaces the CSR
+    conversion the chunks need (about neutral for the CSC structures the
+    ``.mat`` files load as, about 12 B/nnz extra for a CSR source), and is
+    shared with the linear block when the structure also appears there. ``Head-and-Neck_01``'s two PTV structures sit just above the
+    linear block's gate (0.54 and 0.52): tiled, the dense Hessian drops
+    from 7.4 to 4.8 s per call (and ``Liver_01``'s 0.85 one from 0.109 to 0.100 s).
+    Dense-ish structures that the pre-gate rejects (``Prostate_CK_01``'s and
+    ``Prostate_VMAT_101``'s, 0.97–1.0 when planned anyway) are never
+    planned and keep the chunks.
+
+    ``merge_hessian_gram`` (exact Hessian only) multiplies a structure that
+    is both curved and in the linear block once per iteration, with the
+    summed weights ``h_s + σ_s`` (Breedveld 2017, eq. (48) and §4.2), instead
+    of once in the Hessian and once in the Gram. The core asks for that
+    block through the optional ``LinearOperator.dense_matrix_with_gram``
+    capability of the Hessian operator (see :class:`TROTSExactHessian`); the
+    merge runs only where the linear block's Gram is accumulated exactly
+    (float64), so the Hessian part is never reduced. The summation changes,
+    so the block agrees with the two-pass one to round-off, not bitwise.
+    ``False`` keeps the two passes (the A/B and parity switch); cases where
+    no structure is in both are unaffected either way.
     """
 
     block_rows: int = 2048
     flop_ratio_threshold: float = 0.5
     sparse_tile_flop_ratio: float = 0.01
+    host_sparse_entry_ratio: float | None = 4.0
     threads: int = 8
     lane_min_flops: float = 2.5e8
     lane_budget_bytes: int = 1 << 30
+    scatter_threads: int = 8
     device_sparse_tiles: bool = True
     device_densify_budget_bytes: int = 256 << 20
+    device_sparse_tile_flop_ratio: float | None = None
+    host_hessian_flop_ratio: float = 0.9
+    compiled_scatter: bool = True
+    merge_hessian_gram: bool = True
+
+    def __post_init__(self) -> None:
+        if int(self.scatter_threads) < 1:
+            raise ValueError(
+                f"scatter_threads must be a positive integer, got {self.scatter_threads!r}"
+            )
+        k = self.host_sparse_entry_ratio
+        if k is not None and not (math.isfinite(k) and k >= 0.0):
+            raise ValueError(
+                f"host_sparse_entry_ratio must be None or a finite number >= 0, got {k!r}"
+            )
+        h = self.host_hessian_flop_ratio
+        if not (math.isfinite(h) and h >= 0.0):
+            raise ValueError(
+                f"host_hessian_flop_ratio must be a finite number >= 0, got {h!r}"
+            )
+        r = self.device_sparse_tile_flop_ratio
+        if r is not None and not (math.isfinite(r) and r >= 0.0):
+            # NaN would silently densify every tile (s <= nan is False).
+            raise ValueError(
+                "device_sparse_tile_flop_ratio must be None or a finite "
+                f"number >= 0, got {r!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -813,6 +952,10 @@ class _Tile:
     csr_t: Any = None  # transpose (sparse tiles only)
     row_of_nnz: Any = None  # nnz → tile row (sparse tiles only)
     flops: float = 0.0
+    #: The host kernel's choice (NumPy), None = ``sparse``: a sparse tile
+    #: too wide for SciPy's SpGEMM is densified on the host only (see
+    #: ``TiledGramConfig.host_sparse_entry_ratio``).
+    host_sparse: bool | None = None
 
 
 @dataclass
@@ -904,6 +1047,9 @@ def _plan_structure(
         dense_flops = float(b) * c * c
         sparse = sparse_flops <= cfg.sparse_tile_flop_ratio * dense_flops
         tile = _Tile(start, stop, cols.astype(np.int64), csr, sparse)
+        k = cfg.host_sparse_entry_ratio
+        if sparse and k is not None:
+            tile.host_sparse = sparse_flops <= k * float(b) * c
         if sparse:
             tile.csr_t = csr.T.tocsr()
             tile.row_of_nnz = np.repeat(
@@ -916,18 +1062,237 @@ def _plan_structure(
     return perm, tiles
 
 
-def _tile_gram_into(
-    acc: Any, tile: _Tile, wp: Any, swp: Any, bad: Any, acc_dtype: Any, syrk: Any
-) -> None:
-    """Add ``tileᵀ diag(w) tile`` into ``acc``'s lower triangle (compacted scatter).
+#: Below this many entries (a tile's ``c²`` scatter or ``b·c`` densify,
+#: the mirror's ``n²``) a host pass stays on the calling thread:
+#: dispatching chunks to the pool costs more than it saves.
+_SCATTER_POOL_MIN_ENTRIES = 1 << 20
+#: Row chunks per pool worker (equal lower-triangle area for the scatter,
+#: equal row counts for the densify): more chunks than workers balance the
+#: uneven cost per row.
+_SCATTER_CHUNKS_PER_THREAD = 4
+#: Below this many entries (``c²``) the scatter is the single full-block
+#: add (one chunk): chunking a tiny block costs more call overhead than the
+#: skipped upper triangle saves (measured: c = 60 loses, c ≥ 300 wins).
+_SCATTER_CHUNK_MIN_ENTRIES = 1 << 16
 
-    Only the lower triangle of ``acc`` is meaningful; the caller mirrors once.
+
+class _HostPool:
+    """The thread pool of the host tile passes (compacted scatter, densify,
+    mirror) and its worker count. The executor is created on first use, so
+    a call whose work stays below every pool threshold starts no thread."""
+
+    def __init__(self, workers: int) -> None:
+        self.workers = int(workers)
+        self._executor: Any = None
+
+    @property
+    def executor(self) -> Any:
+        if self._executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._executor = ThreadPoolExecutor(max_workers=self.workers)
+        return self._executor
+
+    def map(self, fn: Callable[[int, int], None], bounds: Sequence[int]) -> None:
+        """``fn(r0, r1)`` over consecutive ``bounds`` on the pool (in any
+        order; the callers' ranges are disjoint), re-raising a failure."""
+        pairs = list(itertools.pairwise(bounds))
+        for _ in self.executor.map(lambda p: fn(*p), pairs):
+            pass
+
+    def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown()
+            self._executor = None
+
+
+@contextlib.contextmanager
+def _host_pool(cfg: TiledGramConfig) -> Iterator[_HostPool | None]:
+    """A :class:`_HostPool` of ``cfg.scatter_threads`` workers (capped by the
+    machine's cores), or None for one worker; shut down on exit."""
+    workers = max(1, min(int(cfg.scatter_threads), os.cpu_count() or 1))
+    if workers == 1:
+        yield None
+        return
+    pool = _HostPool(workers)
+    try:
+        yield pool
+    finally:
+        pool.close()
+
+
+@functools.cache
+def _compiled_scatter() -> Callable[..., None] | None:
+    """The Numba-compiled compacted scatter
+    (:func:`benchmarks.corpus._trots_kernels.compiled_scatter_lower_rows`,
+    compiled or loaded from Numba's on-disk cache and warmed up on the first
+    call), or None when Numba is not importable. Memoized for the process
+    (a pure function of the environment): the Numba import alone costs
+    ~0.5 s, so the host operators call this when they are built, not in
+    their first (timed) product."""
+    from benchmarks.corpus._trots_kernels import compiled_scatter_lower_rows
+
+    return compiled_scatter_lower_rows()
+
+
+def _scatter_kernel(cfg: TiledGramConfig) -> Callable[..., None] | None:
+    """The compacted-scatter kernel ``cfg`` asks for (see
+    ``TiledGramConfig.compiled_scatter``), None for the NumPy scatter."""
+    return _compiled_scatter() if cfg.compiled_scatter else None
+
+
+def _lower_row_bounds(c: int, chunks: int) -> list[int]:
+    """Row bounds splitting the lower triangle of a ``c×c`` block into
+    ``chunks`` row ranges of about equal area (row ``r`` holds ``r + 1``
+    entries, so bound ``i`` sits at ``c·√(i/chunks)``)."""
+    chunks = max(1, min(int(chunks), c))
+    return sorted({round(c * math.sqrt(i / chunks)) for i in range(chunks + 1)})
+
+
+def _scatter_lower(
+    acc: Any,
+    cols: Any,
+    g: Any,
+    pool: _HostPool | None = None,
+    kernel: Callable[..., None] | None = None,
+) -> None:
+    """``acc[ix_(cols, cols)] += g`` on the lower triangle, in row chunks.
+
+    Chunk ``[r0, r1)`` adds ``g[r0:r1, :r1]`` at ``(cols[r0:r1], cols[:r1])``:
+    every lower-triangle entry of the block, once (the diagonal block's upper
+    part rides along and is overwritten by the caller's final mirror, like
+    the zero upper triangle of a ``syrk`` product the full-block scatter
+    used to add). ``cols`` must be strictly increasing (every producer's
+    is: ``np.unique`` in :func:`_plan_structure`, ``arange`` in
+    :func:`_host_chunks`): unique, so no two chunks touch one entry, and
+    sorted, so the block's lower triangle lands in the accumulator's. Each
+    lower entry receives the same single addition as in a full-block
+    scatter: the lower triangle is bitwise the same with or without ``pool``
+    and for any chunking. NumPy's fancy-index get/set and the addition
+    release the GIL, so on ``pool`` the chunks run in parallel. Skipping the
+    strict upper triangle alone halves the work; on Head-and-Neck_01
+    (``n = 9984``, tiles up to ``c ≈ 9700``) the full-block scatter was half
+    of the iteration (docs/benchmarks/trots.md). A block under
+    ``_SCATTER_CHUNK_MIN_ENTRIES`` entries is one chunk: the full-block add.
+
+    ``kernel`` (see :func:`_scatter_kernel`) replaces the NumPy add of a
+    chunk ``[r0, r1)`` by ``kernel(acc, cols, g, r0, r1)``, which adds that
+    chunk's lower-triangle entries only (not the diagonal block's upper
+    part), in place, with the same single addition each and without the
+    gathered temporaries: the lower triangle is bitwise the NumPy
+    scatter's. When the block runs on ``pool`` (``scatter_threads > 1`` and
+    at least ``_SCATTER_POOL_MIN_ENTRIES`` entries) it runs in the same
+    chunks; otherwise it is one call over every row (it never visits the
+    upper triangle, so chunking would save nothing).
+    """
+    import numpy as np
+
+    c = int(cols.shape[0])
+    if c == 0:
+        return
+    workers = 1 if pool is None else pool.workers
+    parallel = pool is not None and workers > 1 and c * c >= _SCATTER_POOL_MIN_ENTRIES
+    if kernel is not None and not parallel:
+        kernel(acc, cols, g, 0, c)
+        return
+    if parallel:
+        chunks = workers * _SCATTER_CHUNKS_PER_THREAD
+    elif c * c >= _SCATTER_CHUNK_MIN_ENTRIES:
+        chunks = _SCATTER_CHUNKS_PER_THREAD
+    else:
+        chunks = 1
+    bounds = _lower_row_bounds(c, chunks)
+
+    def part(r0: int, r1: int) -> None:
+        if kernel is not None:
+            kernel(acc, cols, g, r0, r1)
+        else:
+            acc[np.ix_(cols[r0:r1], cols[:r1])] += g[r0:r1, :r1]
+
+    if parallel:
+        assert pool is not None
+        pool.map(part, bounds)
+    else:
+        for r0, r1 in itertools.pairwise(bounds):
+            part(r0, r1)
+
+
+def _densify(
+    csr: Any, acc_dtype: Any, scale: Any = None, pool: _HostPool | None = None
+) -> Any:
+    """``csr.toarray()`` in ``acc_dtype``, its rows multiplied by ``scale``
+    when given -- on ``pool`` in row chunks for a large tile.
+
+    The chunks are zero-copy CSR windows (as in :func:`_host_chunks`)
+    densified into their rows of one output, then scaled there: the same
+    values and the same elementwise products as the whole-tile
+    ``toarray()`` and ``*=``, so the result is bitwise the same. SciPy's
+    ``csr_todense`` and NumPy's multiply release the GIL. When the stored
+    dtype differs from ``acc_dtype`` (a float64 tile under a float32
+    accumulate request) each window is densified in its own dtype and cast
+    into its rows: the same per-element cast as the whole-tile ``astype``.
     """
     import numpy as np
     import scipy.sparse as sp
 
+    b, c = int(csr.shape[0]), int(csr.shape[1])
+    if pool is None or b * c < _SCATTER_POOL_MIN_ENTRIES:
+        dense = csr.toarray()
+        if dense.dtype != acc_dtype:
+            dense = dense.astype(acc_dtype)
+        if scale is not None:
+            dense *= scale[:, None]
+        return dense
+    dense = np.empty((b, c), dtype=acc_dtype)
+    same_dtype = np.dtype(csr.dtype) == np.dtype(acc_dtype)
+
+    def part(r0: int, r1: int) -> None:
+        lo, hi = int(csr.indptr[r0]), int(csr.indptr[r1])
+        window = sp.csr_matrix((r1 - r0, c), dtype=csr.dtype)
+        window.data = csr.data[lo:hi]
+        window.indices = csr.indices[lo:hi]
+        window.indptr = csr.indptr[r0 : r1 + 1] - lo
+        if same_dtype:
+            window.toarray(out=dense[r0:r1])  # zeroes its rows, then fills them
+        else:
+            dense[r0:r1] = window.toarray()  # the per-element astype cast
+        if scale is not None:
+            dense[r0:r1] *= scale[r0:r1, None]
+
+    chunks = pool.workers * _SCATTER_CHUNKS_PER_THREAD
+    pool.map(part, sorted({b * i // chunks for i in range(chunks + 1)}))
+    return dense
+
+
+def _tile_gram_into(
+    acc: Any,
+    tile: _Tile,
+    wp: Any,
+    swp: Any,
+    bad: Any,
+    acc_dtype: Any,
+    syrk: Any,
+    pool: _HostPool | None = None,
+    single_lane: bool = False,
+    kernel: Callable[..., None] | None = None,
+) -> None:
+    """Add ``tileᵀ diag(w) tile`` into ``acc``'s lower triangle (compacted scatter).
+
+    Only the lower triangle of ``acc`` is meaningful; the caller mirrors once.
+    ``pool`` (optional) runs the dense tile's densify and scaling
+    (:func:`_densify`) and its scatter (:func:`_scatter_lower`) in row
+    chunks; the result does not depend on it. ``single_lane`` (the tiles
+    run in sequence) applies the host width rule to sparse tiles
+    (``_Tile.host_sparse``, see ``TiledGramConfig.host_sparse_entry_ratio``).
+    ``kernel`` is the dense tiles' compiled scatter (see :func:`_scatter_lower`).
+    """
+    import scipy.sparse as sp
+
     w_t = wp[tile.start : tile.stop]
-    if tile.sparse:
+    sparse = tile.sparse
+    if single_lane and tile.host_sparse is not None:
+        sparse = tile.host_sparse
+    if sparse:
         data = tile.csr.data * w_t[tile.row_of_nnz]
         scaled = sp.csr_matrix(
             (data, tile.csr.indices, tile.csr.indptr), shape=tile.csr.shape
@@ -936,29 +1301,86 @@ def _tile_gram_into(
         keep = g.row >= g.col  # the lower triangle suffices (sorted cols)
         acc[tile.cols[g.row[keep]], tile.cols[g.col[keep]]] += g.data[keep]
         return
-    dense = tile.csr.toarray()
-    if dense.dtype != acc_dtype:
-        dense = dense.astype(acc_dtype)
     if bad is None or not bool(bad[tile.start : tile.stop].any()):
         # Σ ≥ 0: symmetric rank-k update on √w-scaled rows, one triangle.
-        dense *= swp[tile.start : tile.stop, None]
+        dense = _densify(tile.csr, acc_dtype, swp[tile.start : tile.stop], pool)
         g = syrk(1.0, dense.T, trans=0, lower=1)
     else:
         # Signed / non-finite weights (exact-Hessian nonconvex case, Breedveld
         # 2017 §5.1.2): no square root — general product for this tile.
+        dense = _densify(tile.csr, acc_dtype, None, pool)
         g = dense.T @ (w_t.astype(acc_dtype)[:, None] * dense)
-    acc[np.ix_(tile.cols, tile.cols)] += g
+    _scatter_lower(acc, tile.cols, g, pool, kernel)
 
 
-def _mirror_lower(out: Any) -> Any:
-    """Copy the lower triangle onto the upper one (bitwise-exact symmetry)."""
+#: Row-block size for the host mirror below: bounded temporaries (block²
+#: indices) and O(n/block) NumPy calls instead of either a full n² index
+#: gather (measured 4-6x slower: a 9984² index pair is itself ~1.6 GB) or a
+#: per-row Python loop (the latter cost 0.35 s at n≈1e4 on Head-and-Neck_01
+#: — see docs/benchmarks/trots.md's Head-and-Neck_01 profile). 512, 1024 and
+#: 128-2048 were measured within noise of each other at n=9984 (provisional,
+#: on a machine shared with other work); 512 keeps a block's two float64
+#: panels (block² and block·(n-block)) modest relative to host cache sizes.
+#: Mirrors :data:`_DEVICE_MIRROR_BLOCK`'s role for the device kernel and
+#: ``ipax.backend.sparse.cupy._GRAM_MIRROR_BLOCK`` for the core's own CuPy
+#: Gram, both sized for device memory instead.
+_HOST_MIRROR_BLOCK = 512
+
+
+def _mirror_lower(out: Any, pool: _HostPool | None = None) -> Any:
+    """Copy the lower triangle onto the upper one (bitwise-exact symmetry),
+    in ``_HOST_MIRROR_BLOCK`` panels: each diagonal block mirrors internally
+    via a block-sized index gather, and the panel right of it is a single
+    transposed-slice copy. Pure copies (no arithmetic), so this produces
+    exactly the same array as a per-row copy loop, including ``-0.0`` — see
+    ``test_mirror_lower_matches_row_loop_reference`` in
+    ``tests/unit/test_trots_tiled_gram.py``.
+
+    A panel writes only upper-triangle entries of its own rows and reads
+    only lower-triangle ones, so the panels are independent: on ``pool``
+    (optional) they run in parallel, with the same result.
+    """
     import numpy as np
 
     out = np.ascontiguousarray(out)
     n = out.shape[0]
-    for j in range(n):
-        out[j, j + 1 :] = out[j + 1 :, j]
+    block = _HOST_MIRROR_BLOCK
+    full = np.triu_indices(block, 1) if n >= block else None
+
+    def panel(j0: int, j1: int) -> None:
+        if full is not None and j1 - j0 == block:
+            rows, cols = full
+        else:
+            rows, cols = np.triu_indices(j1 - j0, 1)
+        diag = out[j0:j1, j0:j1]
+        diag[rows, cols] = diag[cols, rows]
+        if j1 < n:
+            out[j0:j1, j1:] = out[j1:, j0:j1].T
+
+    bounds = [*range(0, n, block), n]
+    if pool is not None and len(bounds) > 2 and n * n >= _SCATTER_POOL_MIN_ENTRIES:
+        pool.map(panel, bounds)
+    else:
+        for j0, j1 in itertools.pairwise(bounds):
+            panel(j0, j1)
     return out
+
+
+def _add_rows(out: Any, addend: Any, pool: _HostPool | None = None) -> None:
+    """``out += addend`` in place, in row panels on ``pool`` (NumPy's add
+    releases the GIL); elementwise, so the result is the plain add's."""
+    import numpy as np
+
+    n = out.shape[0]
+
+    def part(r0: int, r1: int) -> None:
+        np.add(out[r0:r1], addend[r0:r1], out=out[r0:r1])
+
+    if pool is not None and out.size >= _SCATTER_POOL_MIN_ENTRIES:
+        step = max(1, -(-n // (pool.workers * _SCATTER_CHUNKS_PER_THREAD)))
+        pool.map(part, [*range(0, n, step), n])
+    else:
+        part(0, n)
 
 
 @dataclass
@@ -973,6 +1395,13 @@ class TiledGramPlan:
     a plan before any permutation work when Σ_rows nnz_row² (per distinct
     structure) — a lower bound, since a tile is at least as wide as its widest
     row — already exceeds the threshold; ``flop_ratio`` is then that bound.
+
+    ``gated_structures`` holds the structures of a plan the gate rejected
+    after planning them (the pre-gate passed); it is empty for a tiled plan
+    and for a pre-gate rejection. The device exact Hessian reuses them
+    instead of planning the structure twice, the host one when their flop
+    ratio is at most ``TiledGramConfig.host_hessian_flop_ratio``; other
+    callers drop the plan.
     """
 
     shape: tuple[int, int]
@@ -982,6 +1411,7 @@ class TiledGramPlan:
     flop_ratio: float
     tiled: bool
     seconds: float
+    gated_structures: list[_StructurePlan] = field(default_factory=list)
 
     @classmethod
     def build(
@@ -997,10 +1427,14 @@ class TiledGramPlan:
 
         ``registry`` (optional) shares per-structure tiles between plans: it
         maps ``(segment key, requested tile storage dtype, config)`` to the
-        structure's ``(matrix, perm, tiles)``. A hit is reused instead of re-planned, and
-        the structures of a plan that passes the gate are registered, so a
-        structure matrix used by both the linear block and the exact Hessian
-        (:class:`TROTSExactProblem`) holds one tile copy.
+        structure's ``(matrix, perm, tiles)``. A hit is reused instead of
+        re-planned, and the structures of a plan that passes the gate are
+        registered. The exact Hessian of :class:`TROTSExactProblem` also
+        registers the structures it plans past the gate (device), or keeps
+        after the gate rejected them (host, see
+        :class:`TiledGramConfig`), under the same key. Either way a structure
+        matrix used by both the linear block and the exact Hessian holds one
+        tile copy, whichever side plans it first.
         """
         import time
 
@@ -1063,12 +1497,90 @@ class TiledGramPlan:
         return cls(
             shape=(m, n),
             config=cfg,
-            structures=structures if tiled else [],  # gated: drop tile copies
+            structures=structures if tiled else [],
             nx=max((p.structure.shape[1] for p in structures), default=0),
             flop_ratio=ratio,
             tiled=tiled,
             seconds=time.perf_counter() - t0,
+            # Gated after planning: handed back (callers that do not reuse
+            # them drop the tile copies with the plan).
+            gated_structures=[] if tiled else structures,
         )
+
+
+class _GramMerge:
+    """Per-problem rendezvous behind :meth:`TROTSExactHessian.dense_matrix_with_gram`.
+
+    The core hands the Hessian the solver's inequality Jacobian — the
+    lowered, row-scaled, stacked view of the loader's rows — and its weights.
+    The Hessian does not read that layout: it *offers* its per-structure
+    dose-space weights ``h_s`` (keyed by the structure's tile set) and calls
+    the Jacobian's ``gram``, whose ipax wrappers translate the weights down to
+    the loader's own rows. A :class:`TiledGramCSROperator` reached there
+    *takes* the offer for each of its planned structures with the same tile
+    set, adds ``h_s`` to its merged weights ``σ_s`` and multiplies the
+    structure once (Breedveld 2017, eq. (48)); the Hessian then forms only
+    the structures nobody took. Outside an open offer the linear block's
+    Gram is the plain one.
+
+    ``tiles`` records the tile sets of every tiled linear-block operator
+    built for the problem, so a Hessian with no shared structure declines up
+    front (the core's two-pass assembly, bit for bit) without a Gram call.
+    """
+
+    def __init__(self) -> None:
+        #: ``id(tiles)`` → ``(tiles, hint)``: the tile list (held, so its
+        #: id is never reused) and the registering operator's precision hint.
+        self.tiles: dict[int, tuple[Any, str | None]] = {}
+        self._offer: dict[int, tuple[Any, Any]] | None = None
+        self._taken: set[int] = set()
+
+    def register(self, tile_sets: Iterable[Any], hint: str | None) -> None:
+        self.tiles.update((id(t), (t, hint)) for t in tile_sets)
+
+    def mergeable(
+        self, tiles: Any, accumulate_dtype: str | None, hinted_only: bool
+    ) -> bool:
+        """Whether a linear-block operator holding ``tiles`` would take an
+        offer under this Gram request: it must have registered them, and its
+        accumulation must stay exact (the rule of ``TiledGramCSROperator.gram``:
+        under ``hinted_only`` a block whose hint differs from the request
+        accumulates exactly)."""
+        entry = self.tiles.get(id(tiles))
+        if entry is None or entry[0] is not tiles:
+            return False
+        if not _reduced_request(accumulate_dtype):
+            return True
+        return hinted_only and entry[1] != accumulate_dtype
+
+    @contextlib.contextmanager
+    def open(self, offer: dict[int, tuple[Any, Any]]) -> Iterator[set[int]]:
+        """Offer ``{id(tiles): (tiles, h)}`` for the duration of one Gram call;
+        yields the set of tile ids that were taken."""
+        self._offer, self._taken = offer, set()
+        try:
+            yield self._taken
+        finally:
+            self._offer = None
+
+    def take(self, tiles: Any) -> Any:
+        """The offered weights of the structure with tile set ``tiles``, or
+        None (no open offer, not offered, or already taken).
+
+        Taking is final: the taker's product must reach the Gram the Hessian
+        receives, i.e. each operator's ``gram`` runs once per offer and its
+        result is used. The core's Gram wrappers (``VStack``, the row
+        scaling, the lowering's signed row selection) call each block's
+        ``gram`` exactly once; a wrapper that re-requested or discarded a
+        block's Gram inside an offer would drop that structure's ``h_s``."""
+        if self._offer is None:
+            return None
+        key = id(tiles)
+        entry = self._offer.get(key)
+        if entry is None or entry[0] is not tiles or key in self._taken:
+            return None
+        self._taken.add(key)
+        return entry[1]
 
 
 class TiledGramCSROperator(CSROperator):
@@ -1099,6 +1611,15 @@ class TiledGramCSROperator(CSROperator):
     them between operators of one problem) and multiplied there — cuBLAS
     ``syrk`` on CuPy, ``matmul`` on Torch — see :func:`_device_accumulate`.
     The result is an array of the solve namespace on that device.
+
+    On NumPy a weight vector with at most half of its entries nonzero — the
+    restoration phase's active sets — is multiplied from those rows alone
+    (:class:`_ActiveRowGram`) instead of through every tile.
+
+    ``merge`` (the exact-Hessian problem's :class:`_GramMerge`) lets a Gram
+    requested by :meth:`TROTSExactHessian.dense_matrix_with_gram` take the
+    Hessian's weights of a shared structure into its own (exact requests
+    only); that merged product bypasses the memo and the active-row path.
     """
 
     def __init__(
@@ -1111,6 +1632,7 @@ class TiledGramCSROperator(CSROperator):
         config: TiledGramConfig | None = None,
         plan: TiledGramPlan | None = None,
         device_cache: dict[Any, Any] | None = None,
+        merge: _GramMerge | None = None,
     ) -> None:
         import numpy as np
         import scipy.sparse as sp
@@ -1119,14 +1641,25 @@ class TiledGramCSROperator(CSROperator):
 
         csr = sp.csr_matrix(csr)
         csr.sort_indices()
-        super().__init__(
-            xp.asarray(np.asarray(csr.indptr, dtype=np.int64)),
-            xp.asarray(np.asarray(csr.indices, dtype=np.int64)),
-            _from_numpy(xp, csr.data),
-            (int(csr.shape[0]), int(csr.shape[1])),
-            symmetric=False,
-            values_dtype_hint=values_dtype_hint,
+        #: Whether the block is held once, as the CuPy adapter's device CSR
+        #: (see :meth:`_hold_device_csr`); else as the plain COO triplets.
+        self._csr_only = (
+            not _is_host_numpy(xp)
+            and _device_kind(xp) == "cupy"
+            and int(csr.nnz) < 2**31
+            and bool(csr.has_canonical_format)
         )
+        if self._csr_only:
+            self._hold_device_csr(csr, xp, values_dtype_hint)
+        else:
+            super().__init__(
+                xp.asarray(np.asarray(csr.indptr, dtype=np.int64)),
+                xp.asarray(np.asarray(csr.indices, dtype=np.int64)),
+                _from_numpy(xp, csr.data),
+                (int(csr.shape[0]), int(csr.shape[1])),
+                symmetric=False,
+                values_dtype_hint=values_dtype_hint,
+            )
         self._xp_ns = xp
         if plan is None:
             plan = TiledGramPlan.build(
@@ -1162,9 +1695,20 @@ class TiledGramCSROperator(CSROperator):
         self.plan_seconds = plan.seconds
         self._memo: dict[str | None, tuple[Any, Any]] = {}
         self.gram_compute_count = 0  # observability: actual tiled products
+        #: The exact Hessian's merge rendezvous (see _GramMerge), or None.
+        self._merge = merge if self.tiled else None
+        if self._merge is not None:
+            self._merge.register((p.tiles for p in self._plans), values_dtype_hint)
+        #: Host restoration Grams from the active rows (see _ActiveRowGram).
+        self.active_rows = _ActiveRowGram(csr, self.config)
         #: Device execution context (CuPy / Torch namespaces), else None.
         self._device: _DeviceGramContext | None = None
         kind = None if _is_host_numpy(xp) else _device_kind(xp)
+        if kind is None and self.tiled:
+            # The host tiled Gram's compiled scatter: imported, compiled (or
+            # loaded from Numba's cache) and warmed up now, not in the first
+            # Gram of a timed iteration.
+            _scatter_kernel(self.config)
         if kind is not None:
             self._device = _DeviceGramContext(
                 xp,
@@ -1173,7 +1717,98 @@ class TiledGramCSROperator(CSROperator):
                 device_cache,
                 sparse_tiles=self.config.device_sparse_tiles,
                 densify_budget_bytes=self.config.device_densify_budget_bytes,
+                sparse_ratio=self.config.device_sparse_tile_flop_ratio,
             )
+
+    # -- the single device copy (CuPy) -------------------------------------------
+    def _hold_device_csr(
+        self, csr: Any, xp: Namespace, values_dtype_hint: str | None
+    ) -> None:
+        """Hold the block once on a CuPy device: the sparse adapter's CSR.
+
+        The plain :class:`~ipax.backend.operators.CSROperator` stores COO
+        triplets (int64 rows and columns, the values) and its CuPy adapter
+        builds a second, CSR copy from them for the products — 36 device
+        bytes per nonzero where the CSR alone is 12, and the COO→CSR
+        conversion (sort, duplicate sum) peaked at about 3.5× the block.
+        On Head-and-Neck_01 (104 M nonzeros) that was 2.5 GB of triplets
+        beside the 1.3 GB CSR and an 8.8 GB transient, past an 8 GB card.
+
+        ``csr`` is canonical (sorted, duplicate-free), so its arrays already
+        are that adapter CSR: the same indices, values and index dtypes, so
+        every product is the same computation, bit for bit (the adapter's
+        products are reproducible; its transposed ones run on an ``Aᵀ``
+        copy it builds on the first transposed product, a second device
+        copy of the block — except for a block whose transpose exceeds the
+        adapter's 512 MiB cap, such as Head-and-Neck_01's, which keeps
+        cuSPARSE's non-reproducible transposed product). They are
+        uploaded once and wrapped
+        in the adapter's operator directly (``canonical=True``); the values
+        array doubles as :meth:`coo_values`, and :meth:`to_coo` rebuilds the
+        row and column vectors on demand without keeping them. The base
+        class's COO-built delegate is thereby preset, so ``_adapter_op``
+        never converts. (An application-edge shortcut: the core's sparse
+        protocol only has ``from_coo``.)
+        """
+        import cupyx.scipy.sparse as cxs
+        import numpy as np
+
+        from ipax.backend.namespace import array_namespace
+        from ipax.backend.sparse.cupy import SparseOperator
+
+        values = _from_numpy(xp, csr.data)
+        shape = (int(csr.shape[0]), int(csr.shape[1]))
+        matrix = cxs.csr_matrix(
+            (
+                values,
+                xp.asarray(np.asarray(csr.indices, dtype=np.int32)),
+                xp.asarray(np.asarray(csr.indptr, dtype=np.int32)),
+            ),
+            shape=shape,
+        )
+        # Sorted and duplicate-free (checked by the caller): say so, as the
+        # adapter's own conversion does, or cupyx would re-check it.
+        matrix.has_canonical_format = True
+        ns = array_namespace(values)
+        # The _SparseStructured state the base constructor would set, with
+        # the adapter operator preset and no triplets. Coupled to that
+        # private class: its only readers of ``_rows``/``_cols`` are
+        # ``to_coo`` (overridden below) and ``_adapter_op`` (short-circuited
+        # by the preset delegate); the CuPy tests run every public method of
+        # this operator against the plain one.
+        self._rows = None
+        self._cols = None
+        self._values = matrix.data
+        self._shape = shape
+        self._symmetric = False
+        self._pattern_key = None
+        self._values_dtype_hint = values_dtype_hint
+        self._delegate = SparseOperator(matrix, ns, symmetric=False, canonical=True)
+
+    def to_coo(
+        self, like: Array | None = None
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        if not self._csr_only:
+            return super().to_coo(like)
+        from ipax.backend.namespace import array_namespace
+        from ipax.backend.operators import _expand_indptr
+
+        # The plain operator's triplets exactly (int64 rows expanded from the
+        # row pointer, int64 columns, the values), rebuilt on every call and
+        # not kept: the dense routes never ask. The sparse routes do, each
+        # iteration once lowered (the loader's operator carries no pattern
+        # key, so the lowering's row selection re-derives its triplets per
+        # call, as it did before); that costs two nnz-sized int64
+        # temporaries per call, and those routes are impractical at the row
+        # counts where the saving matters.
+        del like
+        ns = array_namespace(self._values)
+        matrix = self._adapter_op().cupy_matrix
+        rows = _expand_indptr(
+            ns, ns.astype(matrix.indptr, ns.int64), int(self._values.shape[0])
+        )
+        cols = ns.astype(matrix.indices, ns.int64)
+        return rows, cols, self._values, self._shape
 
     # -- the Gram ---------------------------------------------------------------
     def gram(
@@ -1195,9 +1830,25 @@ class TiledGramCSROperator(CSROperator):
             and self.gram_accumulate_dtype_hint() != accumulate_dtype
         ):
             accumulate_dtype = None  # this block's data does not support it
+        merged = self._take_merge(accumulate_dtype)
         if self._device is not None:
-            return self._device_gram(weights, accumulate_dtype)
+            return self._device_gram(weights, accumulate_dtype, merged)
         w = np.asarray(_to_numpy(weights), dtype=np.float64)
+        if merged is not None:
+            # Merged with the exact Hessian's weights (an open _GramMerge
+            # offer): not this block's Gram, so neither the active-row path
+            # nor the memo. The exact slot is released first, as below (an
+            # n×n array; δ_w retries hit the Hessian's own fused memo).
+            self._memo.pop(None, None)
+            self.gram_compute_count += 1
+            return self._xp_ns.asarray(
+                self._tiled_gram(w, np.dtype(np.float64), merged)
+            )
+        # Restoration's active-set Grams (a few nonzero weights): the active
+        # rows alone rather than every tile (see _ActiveRowGram).
+        compact = self.active_rows.gram(w, accumulate_dtype)
+        if compact is not None:
+            return self._xp_ns.asarray(compact)
         # Last-weights memo, like the adapter's: δ_w retries re-request the
         # identical Σ within one IPM iteration.
         acc_dtype = np.dtype(accumulate_dtype or np.float64)
@@ -1208,21 +1859,46 @@ class TiledGramCSROperator(CSROperator):
         memo = self._memo.get(accumulate_dtype)
         if memo is not None and np.array_equal(w, memo[0]):
             return self._xp_ns.asarray(memo[1])
+        # Superseded: release it before the new product is accumulated beside
+        # it (an n×n array; the caller holds its own reference if it needs it).
+        self._memo.pop(accumulate_dtype, None)
+        memo = None
         out = self._tiled_gram(w, acc_dtype)
         self._memo[accumulate_dtype] = (np.array(w, copy=True), out)
         self.gram_compute_count += 1
         return self._xp_ns.asarray(out)
 
-    def _tiled_gram(self, w: Any, acc_dtype: Any) -> Any:
+    def _take_merge(self, accumulate_dtype: str | None) -> dict[int, Any] | None:
+        """``{plan index: h_s}`` taken from an open :class:`_GramMerge` offer,
+        or None. A reduced (float32) accumulation never takes one: the
+        Hessian's weights would be rounded with this block's tiles."""
+        merge = self._merge
+        if merge is None or _reduced_request(accumulate_dtype):
+            return None
+        taken: dict[int, Any] = {}
+        for i, plan in enumerate(self._plans):
+            h = merge.take(plan.tiles)
+            if h is not None:
+                taken[i] = h
+        return taken or None
+
+    def _tiled_gram(
+        self, w: Any, acc_dtype: Any, merged: dict[int, Any] | None = None
+    ) -> Any:
         import numpy as np
 
         n = self.shape[1]
         nx = self._nx
         out = np.zeros((n, n), dtype=np.float64)
         work: list[tuple[_Tile, Any, Any, Any]] = []
-        for plan in self._plans:
+        for i, plan in enumerate(self._plans):
             a = plan.structure
             ws = np.zeros((a.shape[0],), dtype=np.float64)
+            if merged is not None and i in merged:
+                # The exact Hessian's dose-space weights of this structure:
+                # A_sᵀ diag(h_s + σ_s) A_s in one product (Breedveld 2017,
+                # eq. (48) across W and the Gram; see _GramMerge).
+                ws += merged[i]
             for seg in plan.uses:
                 w_u = w[seg.start : seg.stop]
                 ws += w_u  # signs square away (eq. 48)
@@ -1234,8 +1910,9 @@ class TiledGramCSROperator(CSROperator):
                     out[k, : a.shape[1]] += (seg.sign * seg.aux_coef) * border
                     out[k, k] += seg.aux_coef**2 * float(np.sum(w_u))
             work.extend(_tile_work(ws, plan.perm, plan.tiles, acc_dtype))
-        _accumulate_tiles(out[:nx, :nx], work, self.config, acc_dtype)
-        return _mirror_lower(out)
+        with _host_pool(self.config) as pool:
+            _accumulate_tiles(out[:nx, :nx], work, self.config, acc_dtype, pool)
+            return _mirror_lower(out, pool)
 
     # -- the device Gram (CuPy / Torch) -----------------------------------------
     def device_structures(self) -> list[_DeviceStructure]:
@@ -1250,8 +1927,17 @@ class TiledGramCSROperator(CSROperator):
             for p in self._plans
         ]
 
-    def _device_gram(self, weights: Array, accumulate_dtype: str | None) -> Array:
-        """The device Gram: one host read per call (see _device_accumulate)."""
+    def _device_gram(
+        self,
+        weights: Array,
+        accumulate_dtype: str | None,
+        merged: dict[int, Any] | None = None,
+    ) -> Array:
+        """The device Gram: one host read per call (see _device_accumulate).
+
+        ``merged`` (device weight vectors by plan index, see
+        :meth:`_take_merge`) adds the exact Hessian's weights of shared
+        structures; that product bypasses the memo."""
         import numpy as np
 
         ctx = self._device
@@ -1266,8 +1952,12 @@ class TiledGramCSROperator(CSROperator):
             w = xp.astype(w, xp.float64)
         items: list[tuple[_DeviceStructure, Any]] = []
         aux: list[GramSegment] = []
-        for plan, ds in zip(self._plans, self.device_structures(), strict=True):
+        for i, (plan, ds) in enumerate(
+            zip(self._plans, self.device_structures(), strict=True)
+        ):
             ws = None
+            if merged is not None and i in merged:
+                ws = merged[i]  # the exact Hessian's h_s (see _tiled_gram)
             for seg in plan.uses:
                 w_u = w[seg.start : seg.stop]
                 ws = w_u if ws is None else ws + w_u  # signs square away (eq. 48)
@@ -1275,6 +1965,17 @@ class TiledGramCSROperator(CSROperator):
                     aux.append(seg)
             items.append((ds, ws))
         prepared, flag_dev = _device_prepare(ctx, items, acc_name)
+        if merged is not None:
+            # Not this block's Gram: bypass the memo, releasing its exact
+            # slot first (see gram).
+            self._memo.pop(key, None)
+            flags = (
+                np.asarray(ctx.to_host(flag_dev), dtype=bool)
+                if flag_dev is not None
+                else np.zeros((0,), dtype=bool)
+            )
+            self.gram_compute_count += 1
+            return self._device_tiled_gram(w, acc_name, prepared, flags, aux)
         # Last-weights memo (δ_w retries). Its comparison is a device
         # reduction read back together with the per-tile weight flags, so a
         # call costs one host read whether it hits or computes (a hit wastes
@@ -1294,6 +1995,11 @@ class TiledGramCSROperator(CSROperator):
                 assert memo is not None
                 return memo[1]
             host = host[1:]
+        # Superseded: release it before the new product is accumulated beside
+        # it (an n×n device array — 0.76 GB on Head-and-Neck_01, at the
+        # Gram's peak next to its result and tile buffers).
+        self._memo.pop(key, None)
+        memo = None
         out = self._device_tiled_gram(w, acc_name, prepared, host, aux)
         self._memo[key] = (xp.asarray(w, copy=True), out)
         self.gram_compute_count += 1
@@ -1331,6 +2037,219 @@ class TiledGramCSROperator(CSROperator):
         return ctx.mirror_lower(out)
 
 
+class _ActiveRowGram:
+    """``Aᵀ diag(w) A`` from the rows of ``A`` with a nonzero weight (host).
+
+    The Gauss–Newton restoration phase asks the linear block for
+    ``Jᵀ diag(1[g > 0]) J`` (Wächter & Biegler 2006, §3.3) once per
+    Levenberg–Marquardt step, and only a handful of rows is violated: on
+    Prostate_VMAT_101 about 100 of the 81279 lowered rows. Forming the full
+    product there was ~45% of each restoration's wall. When at most
+    ``max_fraction`` of the weights are nonzero, :meth:`gram` forms the
+    product from those rows alone (:meth:`_product`) — the same matrix, since
+    a zero-weight row adds nothing, at a different round-off; otherwise it
+    returns None and the caller runs its usual product. Interior-point weights
+    (``Σ_s > 0``) never take this path, so those products are untouched — as
+    long as the lowered rows cover more than half of the source rows (a row
+    with no finite bound gets weight 0 in the core's signed row selection;
+    every TROTS linear row has exactly one finite side).
+    """
+
+    def __init__(
+        self, csr: Any, config: TiledGramConfig, max_fraction: float = 0.5
+    ) -> None:
+        self.csr = csr
+        self.config = config
+        self.max_fraction = max_fraction
+        self._memo: dict[str | None, tuple[Any, Any]] = {}
+        #: Observability: compacted products actually formed.
+        self.count = 0
+        #: Observability: compacted ``rmatvec`` calls (the operator's own).
+        self.rmatvec_count = 0
+
+    def _product(self, wa: Any, active: Any, acc_dtype: Any) -> Any:
+        """``A_Sᵀ diag(w_S) A_S`` by BLAS over ``block_rows`` chunks of the
+        active rows ``S`` (the plain adapter's chunked accumulation: one
+        ``syrk`` target — ``gemm`` for signed or non-finite weights — and the
+        lower triangle mirrored once), accumulated in ``acc_dtype`` and
+        returned in float64."""
+        import numpy as np
+        from scipy.linalg.blas import get_blas_funcs
+
+        n = int(self.csr.shape[1])
+        if active.size == 0:
+            return np.zeros((n, n), dtype=np.float64)
+        sub = self.csr[active]
+        use_syrk = bool(np.all(np.isfinite(wa) & (wa >= 0.0)))
+        if use_syrk:
+            syrk = get_blas_funcs("syrk", dtype=acc_dtype)
+            scale = np.sqrt(wa).astype(acc_dtype)
+            acc = np.zeros((n, n), dtype=acc_dtype, order="F")
+        else:
+            acc = np.zeros((n, n), dtype=acc_dtype)
+        step = self.config.block_rows
+        for start in range(0, sub.shape[0], step):
+            stop = min(sub.shape[0], start + step)
+            block = sub[start:stop].toarray().astype(acc_dtype, copy=False)
+            if use_syrk:
+                block *= scale[start:stop, None]
+                acc = syrk(
+                    1.0, block.T, beta=1.0, c=acc, trans=0, lower=1, overwrite_c=1
+                )
+            else:
+                acc += block.T @ (wa[start:stop, None].astype(acc_dtype) * block)
+        # syrk fills the lower triangle only; mirroring it also makes the
+        # gemm product exactly symmetric, like the tiled kernel's.
+        return _mirror_lower(acc.astype(np.float64))
+
+    def gram(self, w: Any, accumulate_dtype: str | None) -> Any | None:
+        """The compacted product (host NumPy ``n×n``), or None to decline.
+
+        ``w`` is the host float64 weight vector; ``accumulate_dtype`` the
+        caller's resolved request (``None`` or ``"float32"``).
+        """
+        import numpy as np
+
+        active = np.flatnonzero(w != 0.0)  # non-finite weights stay in
+        if active.size > self.max_fraction * w.shape[0]:
+            return None
+        acc_dtype = np.dtype(accumulate_dtype or np.float64)
+        if acc_dtype not in (np.float32, np.float64):
+            acc_dtype = np.dtype(np.float64)
+        key = None if acc_dtype == np.float64 else acc_dtype.name
+        # Last-weights memo: a rejected LM trial retries at a larger damping
+        # with the same active set.
+        memo = self._memo.get(key)
+        if memo is not None and np.array_equal(w, memo[0]):
+            return memo[1]
+        out = self._product(w[active], active, acc_dtype)
+        # Returned as is on a memo hit: callers treat it as read-only (the
+        # adapter's contract; restoration and VStack add out of place).
+        self._memo[key] = (np.array(w, copy=True), out)
+        self.count += 1
+        return out
+
+
+def _reduced_request(accumulate_dtype: str | None) -> bool:
+    """Whether a Gram request accumulates in float32 (the only reduced dtype
+    the tile kernels run; any other name falls back to float64)."""
+    import numpy as np
+
+    if accumulate_dtype is None:
+        return False
+    try:
+        return bool(np.dtype(accumulate_dtype) == np.float32)
+    except TypeError:
+        return False
+
+
+def _resolve_accumulate(
+    op: LinearOperator, accumulate_dtype: str | None, hinted_only: bool
+) -> str | None:
+    """The accumulate request an operator honours (``hinted_only``: only a
+    block whose data hint matches reduces)."""
+    if (
+        hinted_only
+        and accumulate_dtype is not None
+        and op.gram_accumulate_dtype_hint() != accumulate_dtype
+    ):
+        return None  # this block's data does not support it
+    return accumulate_dtype
+
+
+class ActiveRowGramCSROperator(CSROperator):
+    """A host ``CSROperator`` whose Gram skips zero-weight rows.
+
+    The linear-block group a :class:`TiledGramPlan` gates off on a NumPy
+    namespace (dense-ish rows, e.g. Prostate_VMAT_101's float32 group: 65524
+    rows at 64% density). Everything is the plain operator, :meth:`gram`
+    included — the adapter's chunked dense accumulation with its memo and
+    mixed-precision path — except for sparse weight vectors (the restoration
+    phase's active sets), which :class:`_ActiveRowGram` serves from the
+    active rows alone; :meth:`rmatvec` likewise skips the zero rows of a
+    mostly-zero vector (restoration's gradient ``Jᵀ max(g, 0)``).
+
+    Being a subclass, the operator is lowered by the core as a signed row
+    selection around it (:func:`ipax.problem.linear_ineq._lower_two_sided`),
+    which folds the selection into the Gram weights, instead of rewriting its
+    triplets (on Prostate_VMAT_101 the ``ipax.solve`` setup drops from 10.3 s
+    to 5.1 s and the Breedveld start from 31.9 s to 27.0 s, both of which
+    lowered the 82M-entry group). For a group whose rows are all
+    upper-bounded (Prostate_VMAT_101's) the folded weights are the lowered
+    ones in the same order, so the interior-point products are bit-identical
+    to the triplet-lowered plain operator's; a group mixing min and max rows
+    (Liver_01's float32 group) sums its products in the source row order
+    instead of the lowered one — round-off only.
+    """
+
+    def __init__(
+        self,
+        csr: Any,
+        xp: Namespace,
+        *,
+        values_dtype_hint: str | None = None,
+        config: TiledGramConfig | None = None,
+    ) -> None:
+        import numpy as np
+        import scipy.sparse as sp
+
+        if not _is_host_numpy(xp):
+            raise ValueError("ActiveRowGramCSROperator is host-NumPy only")
+        csr = sp.csr_matrix(csr)
+        csr.sort_indices()
+        super().__init__(
+            xp.asarray(np.asarray(csr.indptr, dtype=np.int64)),
+            xp.asarray(np.asarray(csr.indices, dtype=np.int64)),
+            _from_numpy(xp, csr.data),
+            (int(csr.shape[0]), int(csr.shape[1])),
+            symmetric=False,
+            values_dtype_hint=values_dtype_hint,
+        )
+        self._xp_ns = xp
+        self.active_rows = _ActiveRowGram(
+            csr, config if config is not None else TiledGramConfig()
+        )
+
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        import numpy as np
+
+        w = np.asarray(_to_numpy(weights), dtype=np.float64).reshape(-1)
+        out = self.active_rows.gram(
+            w, _resolve_accumulate(self, accumulate_dtype, hinted_only)
+        )
+        if out is not None:
+            return self._xp_ns.asarray(out)
+        return super().gram(
+            weights, accumulate_dtype=accumulate_dtype, hinted_only=hinted_only
+        )
+
+    def rmatvec(self, v: Array) -> Array:
+        """``Aᵀv``; a mostly-zero ``v`` from its nonzero rows alone.
+
+        Restoration's Gauss–Newton gradient ``Jᵀ max(g, 0)`` has as few
+        nonzeros as its active set. The compacted product adds the same
+        terms in the same (row) order as the full CSC product — only the
+        zero rows' ``±0`` terms are skipped — so it is the same vector.
+        """
+        import numpy as np
+
+        y = _to_numpy_nd(v)
+        if y.ndim != 1:
+            return super().rmatvec(v)
+        nz = np.flatnonzero(y)
+        if nz.size > self.active_rows.max_fraction * y.shape[0]:
+            return super().rmatvec(v)
+        out = self.active_rows.csr[nz].T @ y[nz]
+        self.active_rows.rmatvec_count += 1
+        return self._xp_ns.asarray(np.asarray(out, dtype=np.float64))
+
+
 def _tile_work(
     w: Any, perm: Any, tiles: Sequence[_Tile], acc_dtype: Any
 ) -> list[tuple[_Tile, Any, Any, Any]]:
@@ -1350,6 +2269,7 @@ def _accumulate_tiles(
     work: list[tuple[_Tile, Any, Any, Any]],
     cfg: TiledGramConfig,
     acc_dtype: Any,
+    pool: _HostPool | None = None,
 ) -> None:
     """Add every ``(tile, w_perm, sqrt_w_perm, bad)`` item's weighted Gram into
     the lower triangle of ``acc`` (an ``nx×nx`` view), on the configured lanes.
@@ -1357,12 +2277,15 @@ def _accumulate_tiles(
     Shared by the linear block's :class:`TiledGramCSROperator` and the exact
     Hessian's :class:`TROTSExactHessian`. The lane count is a function of the
     config and the data only (see :class:`TiledGramConfig`), so the round-off
-    does not depend on the machine.
+    does not depend on the machine. ``pool`` (see :func:`_host_pool`) serves
+    the row-chunked host passes of a single-lane run; it never changes the
+    result, nor does the compiled scatter (``TiledGramConfig.compiled_scatter``).
     """
     from scipy.linalg.blas import get_blas_funcs
 
     if not work:
         return
+    kernel = _scatter_kernel(cfg)
     nx = int(acc.shape[0])
     syrk = get_blas_funcs("syrk", dtype=acc_dtype)
     total_flops = sum(item[0].flops for item in work)
@@ -1373,10 +2296,25 @@ def _accumulate_tiles(
         max(1, int(cfg.lane_budget_bytes) // max(1, 8 * nx * nx)),
     )
     if threads == 1:
-        for tile, wp, swp, bad in work:  # scatter straight into the view
-            _tile_gram_into(acc, tile, wp, swp, bad, acc_dtype, syrk)
+        # One lane (small work, or n ≈ 10⁴ by the accumulator budget): the
+        # tiles run in order, scattering straight into the view; the wide
+        # ones densify and scatter in row chunks on the pool (bitwise the
+        # same result, see _densify and _scatter_lower).
+        for tile, wp, swp, bad in work:
+            _tile_gram_into(
+                acc,
+                tile,
+                wp,
+                swp,
+                bad,
+                acc_dtype,
+                syrk,
+                pool,
+                single_lane=True,
+                kernel=kernel,
+            )
     else:
-        acc += _threaded_tiles(work, nx, acc_dtype, syrk, threads)
+        acc += _threaded_tiles(work, nx, acc_dtype, syrk, threads, kernel)
 
 
 def _threaded_tiles(
@@ -1385,9 +2323,12 @@ def _threaded_tiles(
     acc_dtype: Any,
     syrk: Any,
     threads: int,
+    kernel: Callable[..., None] | None = None,
 ) -> Any:
     """One tile per worker at a time (Breedveld 2017 §5.2), private
-    accumulators summed at the end; tiles are dealt to workers by flops."""
+    accumulators summed at the end; tiles are dealt to workers by flops.
+    ``kernel`` (the compiled scatter, or None) runs on each lane's own
+    thread; it releases the GIL, so the lanes scatter in parallel."""
     from concurrent.futures import ThreadPoolExecutor
 
     import numpy as np
@@ -1402,7 +2343,7 @@ def _threaded_tiles(
     def run(items: list[tuple[_Tile, Any, Any, Any]]) -> Any:
         acc = np.zeros((nx, nx))
         for tile, wp, swp, bad in items:
-            _tile_gram_into(acc, tile, wp, swp, bad, acc_dtype, syrk)
+            _tile_gram_into(acc, tile, wp, swp, bad, acc_dtype, syrk, kernel=kernel)
         return acc
 
     workers = max(1, min(threads, os.cpu_count() or 1))
@@ -1436,8 +2377,47 @@ def _threaded_tiles(
 # filled), plus — on exact CuPy Grams — at least one per sparse tile inside
 # cuSPARSE SpGEMM, which reads the product's nnz back to size its output
 # (unavoidable through cupyx). Torch's over-budget sparse tiles add one
-# weight download each (none on CPU tensors).
+# weight download each (none on CPU tensors). Once per problem and device,
+# the sparse-tile break-even calibration (see _device_break_even_ratio)
+# synchronizes the stream around its timed calls.
 _DEVICE_MIRROR_BLOCK = 1024
+# First element of the device cache key under which a context stores the
+# measured sparse-tile break-even (tile entries are keyed by id(tiles)).
+_CALIBRATION_TAG = "device-sparse-break-even"
+
+
+def _device_break_even_ratio(
+    sparse_products: float,
+    sparse_seconds: float,
+    dense_flops: float,
+    dense_seconds: float,
+) -> float:
+    """The device's sparse-tile break-even ``Σ nnz_row² / (b·c²)``.
+
+    One tile multiplied both ways gives the SpGEMM throughput
+    ``r_s = sparse_products / sparse_seconds`` (``Σ nnz_row²`` products per
+    second) and the densified throughput ``r_d = dense_flops / dense_seconds``
+    (``b·c²`` per second). A tile is cheaper sparse when
+    ``Σ nnz_row² / r_s < b·c² / r_d``, i.e. when ``Σ nnz_row² ≤ ratio · b·c²``
+    with ``ratio = r_s / r_d`` — the host rule's statistic
+    (``TiledGramConfig.sparse_tile_flop_ratio``, Breedveld et al. 2017 §4.2
+    tiles), with the break-even measured on the device instead of assumed.
+    Degenerate timings (non-positive or non-finite) give ``0.0``: densify,
+    the kernel whose rate does not depend on the sparsity pattern.
+    """
+    parts = (sparse_products, sparse_seconds, dense_flops, dense_seconds)
+    if not all(math.isfinite(v) and v > 0.0 for v in parts):
+        return 0.0
+    return (sparse_products / sparse_seconds) / (dense_flops / dense_seconds)
+
+
+def _prefer_device_sparse(
+    sparse_products: float, rows: int, cols: int, ratio: float
+) -> bool:
+    """Whether a ``rows × cols`` tile with ``sparse_products = Σ nnz_row²``
+    keeps the device SpGEMM kernel under the break-even ``ratio``
+    (see :func:`_device_break_even_ratio`)."""
+    return float(sparse_products) <= ratio * float(rows) * cols * cols
 
 
 def _device_kind(xp: Namespace) -> str | None:
@@ -1504,6 +2484,7 @@ class _DeviceGramContext:
         *,
         sparse_tiles: bool = True,
         densify_budget_bytes: int | None = None,
+        sparse_ratio: float | None = None,
     ) -> None:
         # Normalize to the Array API compat namespace: the device kernels use
         # ``device=`` keywords (``asarray``/``zeros``) that a raw ``cupy`` module
@@ -1526,8 +2507,19 @@ class _DeviceGramContext:
             if densify_budget_bytes is not None
             else TiledGramConfig.device_densify_budget_bytes
         )
-        self.signature = (kind, str(device), self.sparse_tiles, self.densify_budget)
+        #: Pinned device sparse-tile break-even (Σ nnz_row² / b·c²), or None to
+        #: calibrate it once per cache and device; see
+        #: TiledGramConfig.device_sparse_tile_flop_ratio.
+        self.sparse_ratio_pinned = None if sparse_ratio is None else float(sparse_ratio)
+        self.signature = (
+            kind,
+            str(device),
+            self.sparse_tiles,
+            self.densify_budget,
+            self.sparse_ratio_pinned,
+        )
         self._syrk: Any = None
+        self._scatter_kernel: Any = None  # CuPy scatter_block kernel (lazy)
         if kind == "cupy":
             try:
                 from cupy import cublas
@@ -1614,35 +2606,23 @@ class _DeviceGramContext:
         data_dev = self.put(data)
         nbytes = flat.size * np.dtype(index_dtype).itemsize + data.nbytes
         nbytes += int(np.asarray(perm).size) * 8
+        # Size-aware kernel choice among the plan's sparse tiles (the
+        # over-budget ones stay sparse whatever it says): SpGEMM only below
+        # the device's own break-even (TiledGramConfig).
+        candidates = [
+            (t, dt)
+            for t, dt in zip(tiles, dtiles, strict=True)
+            if dt.sparse and not dt.capped
+        ]
+        if candidates:
+            ratio = self._sparse_break_even(candidates, flat_dev, data_dev)
+            for t, dt in candidates:
+                dt.sparse = _prefer_device_sparse(
+                    t.flops, dt.stop - dt.start, dt.width, ratio
+                )
         for t, dt in zip(tiles, dtiles, strict=True):
             if dt.sparse:
-                import cupyx.scipy.sparse as cxs
-
-                dt.csr = cxs.csr_matrix(
-                    (
-                        data_dev[dt.lo : dt.hi],
-                        self.put(t.csr.indices, np.int32),
-                        self.put(t.csr.indptr, np.int32),
-                    ),
-                    shape=t.csr.shape,
-                )
-                # The plan's tiles are canonical (sorted, duplicate-free), and
-                # so is their transpose: say so, or cupyx checks it with a
-                # kernel and a host sync. The transpose is stored in float64,
-                # the product's dtype, so cupyx does not recast a float32
-                # tile's transpose on every call.
-                dt.csr.has_canonical_format = True
-                csr_t = dt.csr.T.tocsr()
-                if csr_t.dtype != np.float64:
-                    csr_t = csr_t.astype(np.float64)
-                csr_t.has_canonical_format = True
-                dt.csr_t = csr_t
-                dt.row_of_nnz = self.put(
-                    np.repeat(
-                        np.arange(t.stop - t.start, dtype=np.int32),
-                        np.diff(t.csr.indptr),
-                    )
-                )
+                self._attach_sparse(t, dt, data_dev)
                 # csr's indices/indptr, csr_t's indices/indptr/data, row_of_nnz
                 # (csr's data is a view of the structure's values).
                 nnz = int(t.csr.nnz)
@@ -1657,25 +2637,230 @@ class _DeviceGramContext:
             nbytes=int(nbytes),
         )
 
-    # -- kernels ----------------------------------------------------------------
-    def gram_block(self, dense: Any) -> Any:
-        """``denseᵀ dense`` (c×c): lower triangle via cuBLAS ``syrk`` on CuPy
-        (upper left zero), the full product via ``matmul`` on Torch."""
-        if self._syrk is not None:
-            return self._syrk("T", dense, lower=True)
-        return self.xp.matmul(self.xp.permute_dims(dense, (1, 0)), dense)
+    def _attach_sparse(self, t: _Tile, dt: _DeviceTile, data_dev: Any) -> None:
+        """The device CSR of sparse tile ``t`` (CuPy): ``dt.csr`` over the
+        structure's device values, its float64 transpose and the nnz → row map."""
+        import cupyx.scipy.sparse as cxs
+        import numpy as np
 
-    def scatter_block(self, out: Any, cols: Any, block: Any) -> None:
-        """``out[ix_(cols, cols)] += block`` (unique ``cols``: no collisions)."""
-        rows_ix, cols_ix = cols[:, None], cols[None, :]
+        dt.csr = cxs.csr_matrix(
+            (
+                data_dev[dt.lo : dt.hi],
+                self.put(t.csr.indices, np.int32),
+                self.put(t.csr.indptr, np.int32),
+            ),
+            shape=t.csr.shape,
+        )
+        # The plan's tiles are canonical (sorted, duplicate-free), and so is
+        # their transpose: say so, or cupyx checks it with a kernel and a host
+        # sync. The transpose is stored in float64, the product's dtype, so
+        # cupyx does not recast a float32 tile's transpose on every call.
+        dt.csr.has_canonical_format = True
+        csr_t = dt.csr.T.tocsr()
+        if csr_t.dtype != np.float64:
+            csr_t = csr_t.astype(np.float64)
+        csr_t.has_canonical_format = True
+        dt.csr_t = csr_t
+        dt.row_of_nnz = self.put(
+            np.repeat(
+                np.arange(t.stop - t.start, dtype=np.int32), np.diff(t.csr.indptr)
+            )
+        )
+
+    # -- the device sparse-tile break-even --------------------------------------
+    def sparse_break_even(self) -> float | None:
+        """The ratio the kernel choice uses: the pinned one, else the one
+        calibrated for this cache and device (None until the first structure
+        with sparse tiles is materialized)."""
+        if self.sparse_ratio_pinned is not None:
+            return self.sparse_ratio_pinned
+        hit = self.cache.get(self._calibration_key())
+        return None if hit is None else float(hit)
+
+    def _calibration_key(self) -> tuple[Any, ...]:
+        return (_CALIBRATION_TAG, self.kind, str(self.device))
+
+    def _sparse_break_even(
+        self,
+        candidates: list[tuple[_Tile, _DeviceTile]],
+        flat_dev: Any,
+        data_dev: Any,
+    ) -> float:
+        """Pinned, cached, or measured now on the cheapest candidate (once per
+        cache and device, so the linear block and the exact Hessian share it)."""
+        ratio = self.sparse_break_even()
+        if ratio is not None:
+            return ratio
+        t, dt = min(
+            candidates, key=lambda p: (p[1].stop - p[1].start) * p[1].width ** 2
+        )
+        ratio = self._measure_break_even(t, dt, flat_dev, data_dev)
+        self.cache[self._calibration_key()] = ratio
+        return ratio
+
+    def _measure_break_even(
+        self, t: _Tile, dt: _DeviceTile, flat_dev: Any, data_dev: Any
+    ) -> float:
+        """Multiply one sparse tile both ways (unit weights, into a private
+        ``c×c`` block) and return :func:`_device_break_even_ratio` of the
+        timings. Both arms are the production kernels (the dense one with its
+        :class:`_DenseWorkspace`). The candidate with the least dense work is
+        used, which bounds the calibration's cost: a plan's sparse tile
+        carries at most ``sparse_tile_flop_ratio`` of its dense work in
+        sparse products (Head-and-Neck_01: a 1785×1797 tile, 0.6 ms by
+        SpGEMM, 28 ms dense).
+
+        A single probe measures a ratio of *per-call* rates, fixed launch
+        costs included; it is not a model of how either kernel scales. On
+        a small probe the SpGEMM time is mostly its fixed cost (launches and
+        the nnz host read), and SpGEMM slows down further on large tiles
+        that spill out of device memory. So ``r`` is only accurate to about
+        2× (Head-and-Neck_01's per-tile break-evens span 1.8–4.2·10⁻⁴). That
+        separates Head-and-Neck_01's tiles, which lie at least 10× from it;
+        pin ``TiledGramConfig.device_sparse_tile_flop_ratio`` where tiles
+        crowd the break-even or where runs must be reproducible. The value
+        is logged at INFO."""
+        from dataclasses import replace
+
+        xp = self.xp
+        b, c = dt.stop - dt.start, dt.width
+        probe = replace(dt, cols=xp.arange(c, dtype=xp.int64, device=self.device))
+        self._attach_sparse(t, probe, data_dev)
+        out = xp.zeros((c, c), dtype=xp.float64, device=self.device)
+        ones = xp.ones((b,), dtype=xp.float64, device=self.device)
+        work = _DenseWorkspace(
+            xp.empty((b * c,), dtype=xp.float64, device=self.device),
+            xp.empty((c * c,), dtype=xp.float64, device=self.device),
+        )
+
+        def sparse() -> None:
+            _device_sparse_tile_into(self, out, probe, ones)
+
+        def dense() -> None:
+            _device_dense_tile_into(
+                self,
+                out,
+                flat_dev,
+                data_dev,
+                probe,
+                ones,
+                ones,
+                False,
+                xp.float64,
+                work,
+            )
+
+        t_sparse = self._best_seconds(sparse)
+        t_dense = self._best_seconds(dense)
+        ratio = _device_break_even_ratio(
+            float(t.flops), t_sparse, float(b) * c * c, t_dense
+        )
+        _LOG.info(
+            "device sparse-tile break-even r = %.3g on %s (probe %d x %d, "
+            "sum nnz_row^2 = %.3g: SpGEMM %.3g s, densified %.3g s)",
+            ratio,
+            self.device,
+            b,
+            c,
+            float(t.flops),
+            t_sparse,
+            t_dense,
+        )
+        return ratio
+
+    def _best_seconds(self, run: Callable[[], None], repeats: int = 3) -> float:
+        """Minimum wall time of ``run`` over ``repeats`` synchronized calls,
+        after one warm-up call (kernel caches, cuSPARSE handles)."""
+        import time
+
+        run()
+        self.synchronize()
+        best = float("inf")
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            run()
+            self.synchronize()
+            best = min(best, time.perf_counter() - t0)
+        return best
+
+    def synchronize(self) -> None:
+        """Wait for the device's queued work (CuPy's current stream); a no-op
+        elsewhere (only CuPy has a sparse kernel to calibrate)."""
         if self.kind == "cupy":
             import cupy
 
-            cupy.add.at(out, (rows_ix, cols_ix), block)  # one kernel, casts
+            cupy.cuda.get_current_stream().synchronize()
+
+    # -- kernels ----------------------------------------------------------------
+    def gram_block(self, dense: Any, out: Any = None) -> Any:
+        """``denseᵀ dense`` (c×c): the lower triangle via cuBLAS ``syrk`` on
+        CuPy, the full product via ``matmul`` on Torch.
+
+        CuPy with ``out`` (a C-ordered ``c×c`` workspace of the tile's dtype):
+        written in place, only its lower triangle meaningful (``β = 0``, so its
+        old contents are never read). Without ``out`` CuPy allocates a zeroed
+        F-ordered result and copies the C-ordered ``dense`` to F order first
+        (both avoided with a C-ordered ``out``)."""
+        if self._syrk is not None:
+            return self._syrk("T", dense, out=out, lower=True)
+        return self.xp.matmul(self.xp.permute_dims(dense, (1, 0)), dense)
+
+    def scatter_block(self, out: Any, cols: Any, block: Any) -> None:
+        """``out[ix_(cols, cols)] += block`` on (at least) the lower triangle —
+        the only part of ``out`` the device Gram keeps; it mirrors once at
+        the end. Unique ``cols``: no collisions.
+
+        CuPy: one elementwise kernel over the ``c×c`` block that adds its
+        lower triangle at ``out[cols[r], cols[q]]`` in place — no index
+        temporaries. ``cupy.add.at`` with broadcast ``ix_`` indices, used
+        before, materialized a ``c×c`` int64 index (715 MiB at
+        Head-and-Neck_01's widest tile, c = 9684, on an 8 GB card the case
+        already overfills) and ran ~6× slower; each updated entry receives
+        the same single addition, so the lower triangle is bitwise the
+        same. Torch: ``index_put_`` over the whole block."""
+        if self.kind == "cupy":
+            import cupy
+
+            c = int(cols.shape[0])
+            if c and out.ndim == 2 and out.flags.c_contiguous:
+                self._scatter_lower()(
+                    block, cols, c, int(out.shape[1]), out, size=c * c
+                )
+            else:  # pragma: no cover - the device Gram's out is C-ordered
+                # Adds the whole block. With a workspace ``syrk`` result the
+                # upper triangle is stale memory: harmless only because every
+                # caller overwrites out's upper triangle by the final mirror.
+                cupy.add.at(out, (cols[:, None], cols[None, :]), block)
         else:
+            rows_ix, cols_ix = cols[:, None], cols[None, :]
             if block.dtype != out.dtype:
                 block = self.xp.astype(block, out.dtype)
             out.index_put_((rows_ix, cols_ix), block, accumulate=True)
+
+    def _scatter_lower(self) -> Any:
+        """The CuPy kernel of :meth:`scatter_block`, built once per context
+        (CuPy compiles it on first launch and caches the binary)."""
+        if self._scatter_kernel is None:
+            import cupy
+
+            # Thread i handles block entry (r, q) = divmod(i, c); the raw
+            # CArray index honours the block's strides (syrk may return an
+            # F-ordered block), and the cast matches add.at's promotion of a
+            # float32 block into the float64 result.
+            self._scatter_kernel = cupy.ElementwiseKernel(
+                "raw B block, raw int64 cols, int64 c, int64 n",
+                "raw T out",
+                """
+                const ptrdiff_t r = i / c;
+                const ptrdiff_t q = i - r * c;
+                if (q <= r) {
+                    const ptrdiff_t ix[] = {r, q};
+                    out[cols[r] * n + cols[q]] += (T)block[ix];
+                }
+                """,
+                "ipax_trots_tile_scatter_lower",
+            )
+        return self._scatter_kernel
 
     def scatter_coo(self, out: Any, rows: Any, cols: Any, vals: Any) -> None:
         """``out[rows[k], cols[k]] += vals[k]`` (duplicates accumulate)."""
@@ -1773,8 +2958,8 @@ def _device_run(
 ) -> None:
     """The tile products of :func:`_device_prepare`'s output, with ``flags``
     already on the host (NumPy bool, same layout)."""
-    xp = ctx.xp
     acc = ctx.dtype(acc_name)
+    work = _DenseWorkspace.for_tiles(ctx, prepared, acc_name, acc)
     offset = 0
     for ds, wp, swp in prepared:
         for t in ds.tiles:
@@ -1790,23 +2975,103 @@ def _device_run(
                 # Over budget with no device SpGEMM (Torch): the host product.
                 _host_sparse_tile_into(ctx, out, t, wp[t.start : t.stop])
                 continue
-            b, c = t.stop - t.start, t.width
-            dense = xp.zeros((b * c,), dtype=acc, device=ctx.device)
-            vals = ds.data[t.lo : t.hi]
-            if vals.dtype != acc:
-                vals = xp.astype(vals, acc)
-            dense[ds.flat[t.lo : t.hi]] = vals
-            dense = xp.reshape(dense, (b, c))
-            if not bad_tile:
-                # Σ ≥ 0: symmetric rank-k update on √w-scaled rows.
-                dense *= swp[t.start : t.stop, None]
-                block = ctx.gram_block(dense)
-            else:
-                # Signed / non-finite weights: no square root, general product.
-                w_t = xp.astype(wp[t.start : t.stop], acc)
-                block = xp.matmul(xp.permute_dims(dense, (1, 0)), w_t[:, None] * dense)
-            ctx.scatter_block(out, t.cols, block)
+            _device_dense_tile_into(
+                ctx,
+                out,
+                ds.flat,
+                ds.data,
+                t,
+                wp[t.start : t.stop],
+                swp[t.start : t.stop],
+                bad_tile,
+                acc,
+                work,
+            )
         offset += -(-ds.rows // ds.block_rows)
+
+
+@dataclass
+class _DenseWorkspace:
+    """Per-call CuPy buffers for the densified tiles: one flat ``b·c`` tile
+    buffer and one ``c×c`` product buffer, sized for the largest densified
+    tile and reused by every tile of the call.
+
+    Without them each tile allocated a zeroed ``b×c`` tile, an F-ordered copy
+    of it for ``syrk`` and a ``c×c`` result. CuPy's pool keeps every freed
+    size it has seen, so on ``Head-and-Neck_01`` (tile widths up to 9684 of
+    9984) one Gram grew the pool by ~5.8 GB beyond the 5.7 GB it keeps — past
+    an 8 GB card, into the driver's system-memory fallback.
+    """
+
+    tile: Any  # flat, >= max b·c entries, accumulate dtype
+    block: Any  # flat, >= max c² entries, accumulate dtype
+
+    @classmethod
+    def for_tiles(
+        cls,
+        ctx: _DeviceGramContext,
+        prepared: list[tuple[_DeviceStructure, Any, Any]],
+        acc_name: str,
+        acc: Any,
+    ) -> _DenseWorkspace | None:
+        if ctx.kind != "cupy":
+            return None  # Torch: matmul allocates its product anyway
+        tile = block = 0
+        for ds, _wp, _swp in prepared:
+            for t in ds.tiles:
+                if t.capped or (t.sparse and acc_name == "float64"):
+                    continue  # never densified in this call
+                b, c = t.stop - t.start, t.width
+                tile, block = max(tile, b * c), max(block, c * c)
+        if tile == 0:
+            return None
+        xp = ctx.xp
+        return cls(
+            xp.empty((tile,), dtype=acc, device=ctx.device),
+            xp.empty((block,), dtype=acc, device=ctx.device),
+        )
+
+
+def _device_dense_tile_into(
+    ctx: _DeviceGramContext,
+    out: Any,
+    flat: Any,
+    data: Any,
+    t: _DeviceTile,
+    w_t: Any,
+    sw_t: Any,
+    bad: bool,
+    acc: Any,
+    work: _DenseWorkspace | None = None,
+) -> None:
+    """Densified tile: scatter its values (``flat``/``data``, the structure's
+    device arrays) into a zeroed ``b×c`` tile in the accumulate dtype, then
+    ``syrk`` on the ``√w``-scaled rows (``sw_t``), or ``Dᵀ(w∘D)`` when the
+    tile's weights are signed or non-finite (``bad``; Breedveld 2017
+    §5.1.2), its lower triangle scatter-added at the tile's columns."""
+    xp = ctx.xp
+    b, c = t.stop - t.start, t.width
+    if work is None:
+        dense = xp.zeros((b * c,), dtype=acc, device=ctx.device)
+    else:
+        dense = work.tile[: b * c]
+        dense[...] = 0
+    vals = data[t.lo : t.hi]
+    if vals.dtype != acc:
+        vals = xp.astype(vals, acc)
+    dense[flat[t.lo : t.hi]] = vals
+    dense = xp.reshape(dense, (b, c))
+    if not bad:
+        # Σ ≥ 0: symmetric rank-k update on √w-scaled rows.
+        dense *= sw_t[:, None]
+        block = ctx.gram_block(
+            dense, None if work is None else xp.reshape(work.block[: c * c], (c, c))
+        )
+    else:
+        # Signed / non-finite weights: no square root, general product.
+        w_acc = xp.astype(w_t, acc)
+        block = xp.matmul(xp.permute_dims(dense, (1, 0)), w_acc[:, None] * dense)
+    ctx.scatter_block(out, t.cols, block)
 
 
 def _device_sparse_tile_into(
@@ -2136,6 +3401,9 @@ class TROTSProblem(Problem):
         # the L-BFGS problem keeps the linear block's plan scoped to its
         # operator, exactly as before.
         self._plan_registry: dict[Any, Any] | None = None
+        # The exact Hessian's Gram-merge rendezvous (see _GramMerge); only
+        # TROTSExactProblem creates one.
+        self._gram_merge: _GramMerge | None = None
         # Device tiled Gram (CuPy / Torch namespaces): the namespace kind, and
         # the per-problem device tile cache shared by the linear block's
         # operators (rebuilt per linear_ineq() call) and the exact Hessian.
@@ -2216,9 +3484,24 @@ class TROTSProblem(Problem):
         prescribed dose to the targets — far closer to the feasible region than a
         uniform map. Negative fluences are clipped to zero (non-negativity). Returns
         a uniform vector when the file carries no initialisation matrices.
+
+        Cost: ``A_initᵀ A_init = Σ_k A_kᵀ A_k`` is accumulated per init matrix
+        through the SciPy adapter's ``gram`` (the ``LinearOperator`` protocol),
+        which forms a dense-ish block (the tumour matrices, 10–100% dense) by
+        chunked dense-BLAS ``syrk`` rather than SpGEMM — a sparse block keeps
+        SpGEMM. ``R`` is added from its sparse entries, the ridge on the
+        diagonal in place, and the SPD system is solved by Cholesky (LU if the
+        factorization fails, e.g. an indefinite ``R``). Measured 2026-09-28 on
+        the TROTS files this takes the solve from 1–35 s (SpGEMM + ``todense``
+        + LU) to 0.1–0.3 s at n ≈ 1–2k and ~3.5 s at n ≈ 10⁴; ``x``
+        agrees with the old formulation to round-off (see
+        ``docs/benchmarks/trots.md``).
         """
         import numpy as np
+        import scipy.linalg as sla
         import scipy.sparse as sp
+
+        from ipax.backend.sparse.numpy_scipy import SparseOperator
 
         inst = self._inst
         ids = (
@@ -2229,28 +3512,49 @@ class TROTSProblem(Problem):
         if ids.size == 0:
             return np.ones((self._n,), dtype=float)
 
+        n = self._n
         dose = np.asarray(inst.init_reference_dose, dtype=float).ravel()
-        blocks: list[Any] = []
-        rhs_parts: list[Any] = []
+        normal: Any = None
+        rhs = np.zeros((n,), dtype=float)
         for k, mid in enumerate(ids):
             mat = inst.matrix(int(mid))
             a = sp.csr_matrix(mat.matrix)
-            blocks.append(a)
             target = (dose[k] if k < dose.size else 0.0) - (
                 mat.b if mat.b.size == a.shape[0] else 0.0
             )
-            rhs_parts.append(np.full(a.shape[0], 1.0) * target)
-        a_init = sp.vstack(blocks, format="csr")
-        normal = np.asarray((a_init.T @ a_init).todense())
-        rhs = a_init.T @ np.concatenate(rhs_parts)
+            # Breedveld 2017, eq. (23): the normal equations of the stacked
+            # init blocks are the sum of the per-block ones. Unit weights: the
+            # adapter's dense-BLAS Gram for dense-ish blocks (its density gate
+            # keeps SpGEMM for sparse ones). The operator is private to this
+            # call and dropped, so its (memoized) result is ours to update.
+            gram = np.asarray(SparseOperator(a, np).gram(np.ones(a.shape[0])))
+            if normal is None:
+                normal = np.asarray(gram, dtype=float)
+            else:
+                normal += gram
+            rhs += a.T @ (np.full(a.shape[0], 1.0) * target)
         if inst.init_reg_matrix_id:
             r = inst.matrix(inst.init_reg_matrix_id).matrix
-            r = np.asarray((0.5 * (r + r.T)).todense())
-            normal = normal + r
+            # Symmetric part of R added entry-wise (canonical: no duplicates),
+            # never densified into an n×n temporary.
+            r = sp.coo_matrix(0.5 * (r + r.T))
+            normal[r.row, r.col] += r.data
         # A small ridge (relative to the block's scale) keeps the solve well-posed
         # when A_init is rank-deficient or no regularisation matrix is supplied.
-        normal = normal + ridge * (np.trace(normal) / max(self._n, 1)) * np.eye(self._n)
-        x = np.linalg.solve(normal, rhs)
+        normal.flat[:: n + 1] += ridge * (np.trace(normal) / max(n, 1))
+        try:
+            # Gram + PSD R + ridge is SPD: Cholesky, half LU's arithmetic. The
+            # matrix is symmetric (bitwise for the syrk Gram, to round-off for
+            # a SpGEMM one), so its transpose is the same matrix in the Fortran
+            # order LAPACK wants — no C→F conversion. ``cho_factor`` factors a
+            # copy: ``normal`` stays intact for the fallback.
+            x = sla.cho_solve(
+                sla.cho_factor(normal.T, lower=True, check_finite=False),
+                rhs,
+                check_finite=False,
+            )
+        except np.linalg.LinAlgError:
+            x = np.linalg.solve(normal, rhs)  # indefinite R: the general solve
         return np.maximum(x, 0.0)
 
     def initial_point(
@@ -2331,11 +3635,15 @@ class TROTSProblem(Problem):
         x0: Array,
         *,
         scaling: ScalingOptions | ScalingMethod | None = None,
+        lsqr: Literal["auto", "host", "device"] = "auto",
+        lsqr_iter: int | None = None,
+        lsqr_tol: float | None = None,
+        dual_floor: float = _BREEDVELD_START_FLOOR,
     ) -> tuple[WarmStart, float]:
         """Breedveld et al. 2017 §3.1 dual start and ``μ0`` at the primal ``x0``.
 
-        Computed on the host with NumPy/SciPy whatever the namespace, on the
-        problem exactly as the solver sees it — ``linear_ineq`` lowered by
+        Computed on the problem exactly as the solver sees it —
+        ``linear_ineq`` lowered by
         :func:`ipax.problem.linear_ineq.lower_linear_inequalities`, the same
         function :func:`ipax.solve` applies — so the multipliers follow the
         solver's ``y_ineq`` order (nonlinear rows, then the lowered linear
@@ -2351,6 +3659,27 @@ class TROTSProblem(Problem):
         * ``μ0 = (w0ᵀ y0 + z0ᵀ (x0 − x_L)) / (m + n_bounded)``, the average
           complementarity (eq. (10)), for ``BarrierOptions(mu_init=μ0)``.
 
+        ``lsqr`` picks where this runs. ``"host"``: NumPy/SciPy on a host twin
+        of the problem (:meth:`_host_twin`), SciPy's LSQR. ``"device"``: in
+        the problem's CuPy namespace on the GPU, with :func:`_lsqr` (the same
+        Paige–Saunders iteration and stopping rules as SciPy's) on the
+        device-resident lowered operator — no host twin, no host copy of the
+        linear block. Both give the same start to round-off (the floored
+        arrays and ``μ0``; the unfloored LSQR iterates drift apart by LSQR's
+        own round-off amplification, well below the floor). ``"auto"``
+        (default) is ``"device"`` on CuPy namespaces and ``"host"`` otherwise
+        (NumPy, Torch, JAX, ``array_api_strict``).
+
+        ``lsqr_iter`` and ``lsqr_tol`` override the LSQR iteration cap and
+        ``atol = btol`` of eq. (26) (default ``None``: the module constants
+        ``_BREEDVELD_LSQR_ITER`` = 200, ``_BREEDVELD_LSQR_TOL`` = 1e-6).
+        An explicit ``lsqr_tol`` must be positive and finite. A lower cap
+        is opt-in, not a new default: on the measured TROTS corpus
+        every LSQR multiplier is floored anyway regardless (see
+        ``docs/benchmarks/trots.md``'s "LSQR dual start" note), but that is a
+        corpus fact, not something a smaller cap can be shown to preserve in
+        general (see ``test_truncating_lsqr_is_not_safe_in_general``).
+
         The floor of 5 and eq. (10) are in the problem's original units (the
         paper's μ0 has no centering factor σ). ``scaling`` is the solve's
         ``Options.scaling`` (a :class:`~ipax.options.ScalingOptions` or a
@@ -2364,70 +3693,47 @@ class TROTSProblem(Problem):
         exactly as the solver does (Wächter & Biegler 2006, §3.8; ``s_f = 1``
         for ``method="none"``). The warm-start arrays stay in original units.
 
+        ``dual_floor`` (default: the paper's 5) replaces the floor of the
+        *multipliers* ``y0`` and ``z0`` (eqs. (26)–(27)); the slacks ``w0``
+        keep the floor of 5 (eq. (28)). The paper's floor is not
+        units-aware: on Head-and-Neck_01 (2026-09-28 diagnosis) every LSQR
+        multiplier is ``|y| < 2e-5``, so all 100 246 of them land on 5 and
+        ``μ0 = 665``, a barrier force ~2.5e8 × ‖∇f‖; ``dual_floor=1e-6``
+        (the diagnosis' lever, which likewise left the slacks at 5) gives
+        ``μ0 = 1.8e-4``. Must be positive and finite.
+
         Returns ``(WarmStart(s, y_ineq, z_lower), μ0)`` with the arrays in
         ``x0``'s namespace and on its device. Raises ``ValueError`` when the
         problem has neither inequalities nor finite lower bounds (eq. (10) is
-        then undefined).
+        then undefined), or for ``lsqr="device"`` on a non-CuPy namespace.
         """
+        if not (math.isfinite(dual_floor) and dual_floor > 0.0):
+            raise ValueError(
+                f"dual_floor must be positive and finite, got {dual_floor!r}"
+            )
         import numpy as np
-        import scipy.sparse.linalg as spla
 
         from ipax.backend.namespace import array_namespace, device
-        from ipax.problem.linear_ineq import lower_linear_inequalities
         from ipax.result import WarmStart
 
-        x = np.asarray(_to_numpy(x0), dtype=np.float64)
-        host = self._host_twin()
-        low = lower_linear_inequalities(host, x, np)
-        grad = np.asarray(_to_numpy(low.gradient(x)), dtype=np.float64)
-        try:
-            g = np.asarray(_to_numpy(low.ineq_constraints(x)), dtype=np.float64)
-            jac = low.ineq_jacobian(x)
-        except NotImplementedError:  # no inequalities at all
-            g, jac = np.zeros((0,)), None
-        m, n_vars = int(g.shape[0]), int(x.shape[0])
-
-        if jac is None or m == 0:
-            y = np.zeros((0,))
-            jt_y = np.zeros((n_vars,))
+        lsq = self._breedveld_least_squares(
+            x0, lsqr, lsqr_iter=lsqr_iter, lsqr_tol=lsqr_tol
+        )
+        ns, y = lsq.ns, lsq.y
+        if lsq.jac is None:
+            jt_y = ns.zeros_like(lsq.x)
         else:
-            op = jac
-
-            def jt_matvec(v: Any) -> Any:
-                return np.asarray(_to_numpy(op.rmatvec(np.ravel(v))))
-
-            def j_matvec(v: Any) -> Any:
-                return np.asarray(_to_numpy(op.matvec(np.ravel(v))))
-
-            jt = spla.LinearOperator(
-                (n_vars, m), matvec=jt_matvec, rmatvec=j_matvec, dtype=np.float64
-            )
-            # Breedveld et al. 2017, eq. (26): least-squares multipliers.
-            y, istop, itn = spla.lsqr(
-                jt,
-                -grad,
-                atol=_BREEDVELD_LSQR_TOL,
-                btol=_BREEDVELD_LSQR_TOL,
-                iter_lim=_BREEDVELD_LSQR_ITER,
-            )[:3]
-            if istop == 7:  # SciPy's code for "iteration limit reached"
-                _LOG.warning(
-                    "Breedveld start: LSQR stopped at its iteration limit (%d) "
-                    "before reaching atol = btol = %g; using its last iterate",
-                    itn,
-                    _BREEDVELD_LSQR_TOL,
-                )
-            y = np.maximum(y, _BREEDVELD_START_FLOOR)
-            jt_y = jt_matvec(y)
+            y = ns.maximum(y, dual_floor)
+            jt_y = lsq.vec(lsq.jac.rmatvec(y))
         # eq. (27): bound multipliers from stationarity, on bounded entries.
-        lower = np.asarray(_to_numpy(host.bounds()[0]), dtype=np.float64)
-        bounded = np.isfinite(lower)
-        z = np.where(bounded, np.maximum(grad + jt_y, _BREEDVELD_START_FLOOR), 0.0)
+        bounded = ns.isfinite(lsq.lower)
+        z = ns.where(bounded, ns.maximum(lsq.grad + jt_y, dual_floor), 0.0)
         # eq. (28): slacks, g(x0) + w0 = 0 pushed inside by the floor.
-        w = np.maximum(-g, _BREEDVELD_START_FLOOR)
+        w = ns.maximum(-lsq.g, _BREEDVELD_START_FLOOR)
         # eq. (10): the average complementarity.
-        gap = np.where(bounded, x - np.where(bounded, lower, 0.0), 0.0)
-        n_bounded = int(np.count_nonzero(bounded))
+        gap = ns.where(bounded, lsq.x - ns.where(bounded, lsq.lower, 0.0), 0.0)
+        n_bounded = int(ns.count_nonzero(bounded))
+        m = int(lsq.g.shape[0])
         denom = m + n_bounded
         if denom == 0:
             raise ValueError(
@@ -2438,17 +3744,135 @@ class TROTSProblem(Problem):
         mu0 = (float(w @ y) + float(z @ gap)) / denom
         # Solver-space μ0: ipax.solve scales every complementarity pair by the
         # objective factor s_f (see the docstring).
-        mu0 *= _objective_scale_factor(grad, scaling)
+        mu0 *= _objective_scale_factor(_to_numpy(lsq.grad), scaling)
         # Back to x0's namespace and device (the compat namespace accepts
-        # ``device=`` also where the problem was built on a raw module).
+        # ``device=`` also where the problem was built on a raw module); a
+        # no-op for the device path, whose arrays already live there.
         xp = array_namespace(x0)
         dev = device(x0)
 
         def put(arr: Any) -> Array:
+            if lsq.on_device:
+                return xp.asarray(arr, dtype=xp.float64, device=dev)
             return xp.asarray(np.asarray(arr, dtype=np.float64), device=dev)
 
         warm = WarmStart(s=put(w), y_ineq=put(y), z_lower=put(z))
         return warm, mu0
+
+    def _breedveld_least_squares(
+        self,
+        x0: Array,
+        lsqr: Literal["auto", "host", "device"] = "auto",
+        *,
+        lsqr_iter: int | None = None,
+        lsqr_tol: float | None = None,
+    ) -> _BreedveldLSQ:
+        """The pieces of :meth:`breedveld_warm_start` before its floors.
+
+        ``x0``, ``∇f(x0)``, ``g(x0)``, the lowered inequality Jacobian, the
+        lower bounds and the *unfloored* LSQR multipliers of eq. (26), all in
+        one namespace: NumPy on the host twin (``lsqr="host"``) or the
+        problem's CuPy namespace (``lsqr="device"``; see
+        :meth:`breedveld_warm_start` for ``"auto"``). ``lsqr_iter``/
+        ``lsqr_tol`` override the LSQR iteration cap / ``atol = btol`` of
+        eq. (26) (``None``: the module constants).
+        """
+        import numpy as np
+
+        from ipax.backend.namespace import array_namespace
+        from ipax.problem.linear_ineq import lower_linear_inequalities
+
+        if lsqr not in ("auto", "host", "device"):
+            raise ValueError(
+                f"unknown lsqr {lsqr!r}; expected 'auto', 'host' or 'device'"
+            )
+        if lsqr_iter is not None and lsqr_iter < 1:
+            raise ValueError(f"lsqr_iter must be >= 1, got {lsqr_iter}")
+        if lsqr_tol is not None and not (math.isfinite(lsqr_tol) and lsqr_tol > 0):
+            raise ValueError(f"lsqr_tol must be > 0 and finite, got {lsqr_tol}")
+        iter_lim = _BREEDVELD_LSQR_ITER if lsqr_iter is None else lsqr_iter
+        tol = _BREEDVELD_LSQR_TOL if lsqr_tol is None else lsqr_tol
+        if lsqr == "device" and not self._eval_device:
+            raise ValueError(
+                "Breedveld start: lsqr='device' needs a CuPy namespace "
+                "(with cupyx) on the problem"
+            )
+        on_device = self._eval_device and lsqr != "host"
+        if on_device:
+            ns: Any = array_namespace(x0)
+            x = ns.asarray(x0, dtype=ns.float64)
+            problem: TROTSProblem = self
+        else:
+            ns = np
+            x = np.asarray(_to_numpy(x0), dtype=np.float64)
+            problem = self._host_twin()
+
+        def as_vec(v: Any) -> Any:
+            return _as_float_vec(v, ns, on_device)
+
+        low = lower_linear_inequalities(problem, x, ns)
+        grad = as_vec(low.gradient(x))
+        try:
+            g = as_vec(low.ineq_constraints(x))
+            jac = low.ineq_jacobian(x)
+        except NotImplementedError:  # no inequalities at all
+            g, jac = ns.zeros((0,), dtype=ns.float64), None
+        if jac is not None and int(g.shape[0]) == 0:
+            jac = None
+        lower = as_vec(problem.bounds()[0])
+
+        if jac is None:
+            y = ns.zeros((0,), dtype=ns.float64)
+        else:
+            op = jac
+            m, n_vars = int(g.shape[0]), int(x.shape[0])
+            if on_device:
+                # Breedveld et al. 2017, eq. (26): least-squares multipliers,
+                # A = ∇g(x0)ᵀ applied as op.rmatvec, Aᵀ as op.matvec.
+                y, istop, itn = _lsqr(
+                    lambda v: as_vec(op.rmatvec(v)),
+                    lambda u: as_vec(op.matvec(u)),
+                    -grad,
+                    m,
+                    ns,
+                    atol=tol,
+                    btol=tol,
+                    iter_lim=iter_lim,
+                )
+            else:
+                import scipy.sparse.linalg as spla
+
+                jt = spla.LinearOperator(
+                    (n_vars, m),
+                    matvec=lambda v: as_vec(op.rmatvec(np.ravel(v))),
+                    rmatvec=lambda u: as_vec(op.matvec(np.ravel(u))),
+                    dtype=np.float64,
+                )
+                # Breedveld et al. 2017, eq. (26): least-squares multipliers.
+                y, istop, itn = spla.lsqr(
+                    jt,
+                    -grad,
+                    atol=tol,
+                    btol=tol,
+                    iter_lim=iter_lim,
+                )[:3]
+            if istop == 7:  # SciPy's code for "iteration limit reached"
+                _LOG.warning(
+                    "Breedveld start: LSQR stopped at its iteration limit (%d) "
+                    "before reaching atol = btol = %g; using its last iterate",
+                    itn,
+                    tol,
+                )
+        return _BreedveldLSQ(
+            ns=ns,
+            on_device=on_device,
+            x=x,
+            grad=grad,
+            g=g,
+            jac=jac,
+            lower=lower,
+            y=y,
+        )
 
     # -- evaluation-space accessors -----------------------------------------
     # Host (default): NumPy vectors + the SciPy matrices as loaded. Device
@@ -2531,10 +3955,12 @@ class TROTSProblem(Problem):
         :class:`~ipax.backend.operators.VStack` of the float32-sourced and the
         float64 row groups when the plan mixes them, so each keeps its own
         precision hint — with the original two-sided bounds (every row has
-        exactly one finite side). ipax lowers it at the triplet level into
-        one-sided rows, never densified, and appends them after the nonlinear
-        rows of :meth:`ineq_constraints`; the lowered row order is the core's
-        (per group: finite-lower rows, then finite-upper rows), not the loader's.
+        exactly one finite side). ipax lowers it into one-sided rows, never
+        densified — plain groups at the triplet level, the loader's operator
+        subclasses as a signed row selection around them — and appends them
+        after the nonlinear rows of :meth:`ineq_constraints`; the lowered row
+        order is the core's (per group: finite-lower rows, then finite-upper
+        rows), not the loader's.
 
         Built fresh on every call and deliberately not cached: the lowering
         emits an operator of its own, so holding this one would keep a second
@@ -2565,9 +3991,12 @@ class TROTSProblem(Problem):
 
         The :class:`TiledGramCSROperator` is used on NumPy (host BLAS) and on
         CuPy / Torch namespaces (the device kernel on the operator's device)
-        when its plan passes the flop-ratio gate; otherwise (gated off, or any
-        other namespace: JAX, ``array_api_strict``) the plain ``CSROperator`` —
-        which the core lowers at the triplet level exactly as before.
+        when its plan passes the flop-ratio gate. A group the gate keeps off
+        is an :class:`ActiveRowGramCSROperator` on NumPy (the plain product,
+        restoration's active sets from the active rows alone) and the plain
+        ``CSROperator`` elsewhere, as is every group on any other namespace
+        (JAX, ``array_api_strict``) — which the core lowers at the triplet
+        level exactly as before.
         """
 
         if self._tiled_cfg is not None:
@@ -2588,6 +4017,7 @@ class TROTSProblem(Problem):
                             values_dtype_hint=hint,
                             plan=plan,
                             device_cache=self._device_tiles,
+                            merge=self._gram_merge,
                         )
                     except ValueError as exc:
                         # The segments disagree with the assembled rows (a
@@ -2596,6 +4026,13 @@ class TROTSProblem(Problem):
                         _LOG.warning(
                             "tiled Gram disabled for a linear-block group: %s", exc
                         )
+                elif _is_host_numpy(self.xp) and not self._eval_device:
+                    # Gated off on the host: the plain product in the
+                    # interior-point iterations, the active rows only in
+                    # restoration (see ActiveRowGramCSROperator).
+                    return ActiveRowGramCSROperator(
+                        csr, self.xp, values_dtype_hint=hint, config=self._tiled_cfg
+                    )
         return self._csr_operator(csr, symmetric=False, values_dtype_hint=hint)
 
     # -- nonlinear inequality constraints (smooth cost-function rows) --------
@@ -2710,6 +4147,200 @@ def _objective_scale_factor(
     return opts.max_gradient / norm
 
 
+def _as_float_vec(v: Any, ns: Any, on_device: bool) -> Any:
+    """``v`` as a 1-D float64 vector: in ``ns`` on the device, else NumPy."""
+    import numpy as np
+
+    if on_device:
+        return ns.reshape(ns.asarray(v, dtype=ns.float64), (-1,))
+    return np.asarray(_to_numpy(v), dtype=np.float64)
+
+
+@dataclass
+class _BreedveldLSQ:
+    """:meth:`TROTSProblem._breedveld_least_squares`' result, in one namespace.
+
+    ``y`` is the unfloored LSQR solution of eq. (26) (empty without
+    inequalities, when ``jac`` is ``None``)."""
+
+    ns: Any
+    on_device: bool
+    x: Any
+    grad: Any
+    g: Any
+    jac: Any
+    lower: Any
+    y: Any
+
+    def vec(self, v: Any) -> Any:
+        return _as_float_vec(v, self.ns, self.on_device)
+
+
+def _ieee_div(a: float, b: float) -> float:
+    """``a / b`` with IEEE-754 semantics on a zero divisor.
+
+    SciPy's ``lsqr`` runs its recurrence on NumPy scalars, where ``x / 0``
+    gives ``±inf`` (``nan`` for ``0 / 0``) and the stopping tests then act on
+    it; a Python-float division raises ``ZeroDivisionError`` instead. Used for
+    the recurrence divisions of :func:`_lsqr` so the transcription degrades
+    the way SciPy does rather than crashing.
+    """
+    import math
+
+    if b != 0.0:
+        return a / b
+    if a == 0.0 or math.isnan(a):
+        return math.nan
+    return math.copysign(math.inf, a) * math.copysign(1.0, b)
+
+
+def _sym_ortho(a: float, b: float) -> tuple[float, float, float]:
+    """Stable Givens rotation ``(c, s, r)`` with ``[c s; -s c]ᵀ[a; b] = [r; 0]``.
+
+    Choi's SymOrtho (S.-C. Choi 2006, PhD thesis, Stanford), as in SciPy's
+    ``scipy.sparse.linalg.lsqr``; host scalars."""
+    import math
+
+    if b == 0.0:
+        return math.copysign(1.0, a) if a != 0.0 else 0.0, 0.0, abs(a)
+    if a == 0.0:
+        return 0.0, math.copysign(1.0, b), abs(b)
+    if abs(b) > abs(a):
+        tau = a / b
+        s = math.copysign(1.0, b) / math.sqrt(1.0 + tau * tau)
+        c = s * tau
+        return c, s, b / s
+    tau = b / a
+    c = math.copysign(1.0, a) / math.sqrt(1.0 + tau * tau)
+    s = c * tau
+    return c, s, a / c
+
+
+def _lsqr(
+    matvec: Any,
+    rmatvec: Any,
+    b: Any,
+    n: int,
+    xp: Any,
+    *,
+    atol: float,
+    btol: float,
+    iter_lim: int,
+    conlim: float = 1e8,
+) -> tuple[Any, int, int]:
+    """LSQR for ``min ‖A x − b‖₂`` in the namespace of ``b`` (e.g. on a GPU).
+
+    Paige & Saunders (1982), "LSQR: An algorithm for sparse linear equations
+    and sparse least squares", ACM TOMS 8(1), 43–71 — transcribed from SciPy's
+    ``scipy.sparse.linalg.lsqr`` (no damping, ``x0 = 0``) with the same
+    stopping rules and ``istop`` codes: a device run follows the host SciPy
+    run to round-off, up to the round-off amplification that is LSQR's own
+    (Golub–Kahan loses orthogonality; on TROTS Protons_01 a 1e-16 relative
+    perturbation of SciPy's matvec moves its final iterate by ~1e-4).
+    ``matvec(v) = A v`` (length ``len(b)``), ``rmatvec(u) = Aᵀ u`` (length
+    ``n``). The vectors stay in ``xp``; the recurrence scalars are host floats
+    (three norms per iteration sync).
+
+    cupyx's ``lsqr`` is not this algorithm — it is a direct sparse-QR solve
+    of a *square* CSR system (cuSOLVER ``csrlsvqr``) — so it cannot solve the
+    rectangular eq. (26) through an operator.
+
+    Returns ``(x, istop, itn)`` (``istop = 7``: iteration limit reached).
+    """
+    import math
+
+    eps = float(xp.finfo(xp.float64).eps)
+    ctol = 1.0 / conlim if conlim > 0 else 0.0
+    anorm = acond = ddnorm = res2 = xnorm = xxnorm = z = 0.0
+    cs2, sn2 = -1.0, 0.0
+    itn = istop = 0
+
+    def norm(v: Any) -> float:
+        return float(xp.linalg.vector_norm(v))
+
+    u = b
+    bnorm = norm(b)
+    x = xp.zeros((n,), dtype=b.dtype)
+    beta = bnorm
+    if beta > 0:
+        u = (1.0 / beta) * u
+        v = rmatvec(u)
+        alfa = norm(v)
+    else:
+        v = xp.zeros_like(x)
+        alfa = 0.0
+    if alfa > 0:
+        v = (1.0 / alfa) * v
+    w = v
+    rhobar, phibar = alfa, beta
+    if alfa * beta == 0:
+        return x, istop, itn
+
+    while itn < iter_lim:
+        itn += 1
+        # Bidiagonalization: beta·u = A v − alfa·u, alfa·v = Aᵀ u − beta·v.
+        u = matvec(v) - alfa * u
+        beta = norm(u)
+        if beta > 0:
+            u = (1.0 / beta) * u
+            anorm = math.sqrt(anorm**2 + alfa**2 + beta**2)
+            v = rmatvec(u) - beta * v
+            alfa = norm(v)
+            if alfa > 0:
+                v = (1.0 / alfa) * v
+        # Plane rotation eliminating the subdiagonal beta.
+        cs, sn, rho = _sym_ortho(rhobar, beta)
+        theta = sn * alfa
+        rhobar = -cs * alfa
+        phi = cs * phibar
+        phibar = sn * phibar
+        tau = sn * phi
+        # Update x and w; ‖dk‖ = ‖w‖/|rho| with dk = w/rho.
+        # IEEE division (SciPy's NumPy scalars give inf/nan at rho = 0).
+        t1 = _ieee_div(phi, rho)
+        t2 = _ieee_div(-theta, rho)
+        ddnorm += _ieee_div(norm(w), abs(rho)) ** 2
+        x = x + t1 * w
+        w = v + t2 * w
+        # Plane rotation on the right; estimate ‖x‖.
+        delta = sn2 * rho
+        gambar = -cs2 * rho
+        rhs = phi - delta * z
+        zbar = _ieee_div(rhs, gambar)
+        xnorm = math.sqrt(xxnorm + zbar**2)
+        gamma = math.sqrt(gambar**2 + theta**2)
+        cs2 = _ieee_div(gambar, gamma)
+        sn2 = _ieee_div(theta, gamma)
+        z = _ieee_div(rhs, gamma)
+        xxnorm += z**2
+        # Convergence tests (SciPy's order: the last satisfied test wins).
+        acond = anorm * math.sqrt(ddnorm)
+        rnorm = math.sqrt(phibar**2 + res2)
+        arnorm = alfa * abs(tau)
+        test1 = rnorm / bnorm
+        test2 = arnorm / (anorm * rnorm + eps)
+        test3 = 1.0 / (acond + eps)
+        t1 = test1 / (1.0 + anorm * xnorm / bnorm)
+        rtol = btol + atol * anorm * xnorm / bnorm
+        if itn >= iter_lim:
+            istop = 7
+        if 1.0 + test3 <= 1.0:
+            istop = 6
+        if 1.0 + test2 <= 1.0:
+            istop = 5
+        if 1.0 + t1 <= 1.0:
+            istop = 4
+        if test3 <= ctol:
+            istop = 3
+        if test2 <= atol:
+            istop = 2
+        if test1 <= rtol:
+            istop = 1
+        if istop != 0:
+            break
+    return x, istop, itn
+
+
 def _is_host_numpy(xp: Namespace) -> bool:
     """Whether ``xp`` produces NumPy ndarrays (the host-BLAS kernels' domain).
 
@@ -2742,8 +4373,11 @@ class _CurvedStructure:
     """One structure matrix carrying nonlinear (curved) cost terms.
 
     ``perm``/``tiles`` hold its tiled-Gram plan when the per-structure gate
-    passes; otherwise ``csr`` (a CSR view of the matrix, shared with the
-    caller when it already is CSR) serves full-width dense row chunks.
+    passes, or (host) when the gate rejected a plan whose flop ratio is at
+    most ``TiledGramConfig.host_hessian_flop_ratio``; otherwise ``csr`` (a CSR view of the matrix, shared with the
+    caller when it already is CSR) serves full-width dense row chunks on the
+    host. On a device namespace a gated-off structure is planned anyway
+    (``device_perm``/``device_tiles``): see :class:`TROTSDeviceExactHessian`.
     """
 
     mat: TROTSMatrix
@@ -2751,8 +4385,58 @@ class _CurvedStructure:
     tiles: list[_Tile] | None = None
     csr: Any = None
     flop_ratio: float = 1.0
+    #: Device namespaces only: the plan of a structure the gate keeps off
+    #: (the device kernel runs it like any tiled structure).
+    device_perm: Any = None
+    device_tiles: list[_Tile] | None = None
     #: ``(A∘A)ᵀ`` (host CSR), built on the first :meth:`TROTSExactHessian.diagonal`.
     sq_t: Any = None
+    #: Host gated-off structures: the full-width row chunks of ``csr``,
+    #: built on the first dense Hessian (see :func:`_host_chunks`).
+    host_chunks: list[_Tile] | None = None
+
+
+def _host_chunks(cs: _CurvedStructure, nx: int, cfg: TiledGramConfig) -> list[_Tile]:
+    """The full-width ``block_rows`` row chunks of a gated-off structure.
+
+    Constant for the problem's lifetime, so they are cut once and kept on
+    ``cs``: zero-copy CSR windows onto ``cs.csr`` (views of its data and
+    indices; only the ``block_rows + 1`` row pointers are new), where slicing
+    ``csr[start:stop]`` on every dense Hessian copied each chunk — ~0.09 s of
+    the 0.33 s host Hessian on Prostate_VMAT_101 (two gated-off structures,
+    18M entries). The densified values are those of the slices, so the
+    product is unchanged bit for bit.
+    """
+    import numpy as np
+    import scipy.sparse as sp
+
+    if cs.host_chunks is None:
+        a = cs.csr
+        cols = np.arange(nx, dtype=np.int64)
+        chunks: list[_Tile] = []
+        for start in range(0, a.shape[0], cfg.block_rows):
+            stop = min(a.shape[0], start + cfg.block_rows)
+            lo, hi = int(a.indptr[start]), int(a.indptr[stop])
+            if hi == lo:
+                continue
+            # Assigned, not passed to the constructor (which copies the
+            # arrays): the window views the structure's own data/indices.
+            window = sp.csr_matrix((stop - start, a.shape[1]), dtype=a.dtype)
+            window.data = a.data[lo:hi]
+            window.indices = a.indices[lo:hi]
+            window.indptr = a.indptr[start : stop + 1] - lo
+            chunks.append(
+                _Tile(
+                    start,
+                    stop,
+                    cols,
+                    window,
+                    False,
+                    flops=float(stop - start) * nx * nx,
+                )
+            )
+        cs.host_chunks = chunks
+    return cs.host_chunks
 
 
 class TROTSExactHessian(LinearOperator):
@@ -2777,7 +4461,8 @@ class TROTSExactHessian(LinearOperator):
     mixed-precision refinement apply); :meth:`dense_matrix` forms the tiled
     products (:class:`TiledGramCSROperator`'s kernels, signed-weight gemm
     where needed; full-width dense row chunks for structures the gate keeps
-    off), is exactly symmetric, and is memoized on the operator (one
+    off whose plan was never made or exceeds
+    ``TiledGramConfig.host_hessian_flop_ratio``), is exactly symmetric, and is memoized on the operator (one
     operator per IPM iteration). :meth:`to_coo` serves the sparse-direct
     route through the plain SciPy product. Host-evaluated (NumPy/SciPy);
     results cross to the solve namespace — which is why
@@ -2787,6 +4472,11 @@ class TROTSExactHessian(LinearOperator):
     ``low_rank_factors`` is ``(U, V)`` (host NumPy, ``nx×r``) or None; the
     operator wraps them in a :class:`~ipax.backend.operators.LowRank`
     (:attr:`low_rank`) and keeps the factors (:attr:`low_rank_factors`).
+
+    :meth:`dense_matrix_with_gram` (the core's optional fused-curvature
+    capability, given a ``merge`` rendezvous) forms ``H + ∇gᵀ Σ_s ∇g`` with
+    every structure that is also in the linear block multiplied once, with
+    ``h_s + σ_s`` (Breedveld 2017, eq. (48) and §4.2); see :class:`_GramMerge`.
     """
 
     def __init__(
@@ -2799,6 +4489,8 @@ class TROTSExactHessian(LinearOperator):
         low_rank_factors: tuple[Any, Any] | None,
         config: TiledGramConfig,
         stats: dict[str, float] | None = None,
+        quad_builder: Callable[[], Any] | None = None,
+        merge: _GramMerge | None = None,
     ) -> None:
         from ipax.backend.operators import LowRank
 
@@ -2807,8 +4499,10 @@ class TROTSExactHessian(LinearOperator):
         self._nx = int(nx)
         #: ``(structure, w_k)`` per curved structure (dose-space weights).
         self.terms = terms
-        #: Beamlet-space quadratic part ``Q`` (host SciPy, ``nx×nx``) or None.
-        self.quad = quad
+        self._quad = quad
+        # Forms ``quad`` on first use instead (the device operator, whose
+        # dense and CuPy matvec paths never read the host Q).
+        self._quad_builder = quad_builder
         #: gEUD rank-1 factors ``(U, V)`` (host NumPy) or None.
         self.low_rank_factors = low_rank_factors
         #: gEUD rank-1 part ``U Vᵀ`` (:class:`LowRank` over host NumPy) or None.
@@ -2820,6 +4514,19 @@ class TROTSExactHessian(LinearOperator):
         self.config = config
         self._stats = stats
         self._dense: Any = None
+        self._merge = merge
+        #: The fused block of the last :meth:`dense_matrix_with_gram`, keyed
+        #: by its request, Jacobian and weights: ``(key, jac, weights, block)``.
+        self._fused: tuple[Any, Any, Any, Any] | None = None
+        #: The curved structures the last fused block multiplied merged.
+        self.fused_structures: list[_CurvedStructure] = []
+
+    @property
+    def quad(self) -> Any:
+        """Beamlet-space quadratic part ``Q`` (host SciPy, ``nx×nx``) or None."""
+        if self._quad_builder is not None:
+            self._quad, self._quad_builder = self._quad_builder(), None
+        return self._quad
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -2873,7 +4580,14 @@ class TROTSExactHessian(LinearOperator):
                 self._stats["dense_calls"] += 1
         return self._xp_ns.asarray(self._dense)
 
-    def _dense_host(self) -> Any:
+    def _dense_host(
+        self,
+        terms: list[tuple[_CurvedStructure, Any]] | None = None,
+        addend: Any = None,
+    ) -> Any:
+        """The dense Hessian over ``terms`` (default: all) plus ``Q`` and the
+        rank-1 part, exactly symmetric; ``addend`` (a symmetric host array)
+        is added after the mirror, in row panels on the pool."""
         import numpy as np
         import scipy.sparse as sp
 
@@ -2881,38 +4595,136 @@ class TROTSExactHessian(LinearOperator):
         cfg = self.config
         out = np.zeros((self._n_vars, self._n_vars), dtype=np.float64)
         work: list[tuple[_Tile, Any, Any, Any]] = []
-        for cs, w in self.terms:
+        for cs, w in self.terms if terms is None else terms:
             if cs.tiles is not None:
                 work.extend(_tile_work(w, cs.perm, cs.tiles, np.float64))
                 continue
             # Gated-off (dense-ish) structure: full-width dense row chunks —
             # the plain adapter's product, on the same lanes and kernels.
-            a = cs.csr
-            chunks: list[_Tile] = []
-            cols = np.arange(nx, dtype=np.int64)
-            for start in range(0, a.shape[0], cfg.block_rows):
-                stop = min(a.shape[0], start + cfg.block_rows)
-                if a.indptr[stop] == a.indptr[start]:
-                    continue
-                chunks.append(
-                    _Tile(
-                        start,
-                        stop,
-                        cols,
-                        a[start:stop],
-                        False,
-                        flops=float(stop - start) * nx * nx,
-                    )
-                )
-            work.extend(_tile_work(w, None, chunks, np.float64))
+            work.extend(_tile_work(w, None, _host_chunks(cs, nx, cfg), np.float64))
         acc = out[:nx, :nx]
-        _accumulate_tiles(acc, work, cfg, np.float64)
-        if self.quad is not None:
-            q = sp.coo_matrix(self.quad)
-            np.add.at(acc, (q.row, q.col), q.data)
-        if self.low_rank is not None:
-            acc += np.asarray(self.low_rank.dense_matrix())
-        return _mirror_lower(out)  # lower triangle mirrored: exactly symmetric
+        with _host_pool(cfg) as pool:
+            _accumulate_tiles(acc, work, cfg, np.float64, pool)
+            if self.quad is not None:
+                q = sp.coo_matrix(self.quad)
+                np.add.at(acc, (q.row, q.col), q.data)
+            if self.low_rank is not None:
+                acc += np.asarray(self.low_rank.dense_matrix())
+            # Lower triangle mirrored: exactly symmetric.
+            out = _mirror_lower(out, pool)
+            if addend is not None:
+                _add_rows(out, addend, pool)
+            return out
+
+    # -- the fused block (the core's dense_matrix_with_gram) ---------------
+    def _shared_tiles(self, cs: _CurvedStructure) -> Any:
+        """The tile set the Hessian multiplies ``cs`` with (None: chunks)."""
+        return cs.tiles
+
+    def _merge_offer(
+        self, accumulate_dtype: str | None, hinted_only: bool
+    ) -> dict[int, tuple[Any, Any]]:
+        """``{id(tiles): (tiles, h_s)}`` of the curved structures a linear
+        block operator would take under this request (see _GramMerge)."""
+        merge = self._merge
+        if merge is None:
+            return {}
+        offer: dict[int, tuple[Any, Any]] = {}
+        for cs, w in self.terms:
+            tiles = self._shared_tiles(cs)
+            if tiles and merge.mergeable(tiles, accumulate_dtype, hinted_only):
+                offer[id(tiles)] = (tiles, self._offer_weights(cs, w))
+        return offer
+
+    def _offer_weights(self, cs: _CurvedStructure, w: Any) -> Any:
+        del cs
+        return w
+
+    def _memo_weights(self, weights: Array) -> Any:
+        import numpy as np
+
+        return np.array(_to_numpy_nd(weights), dtype=np.float64, copy=True)
+
+    def _same_weights(self, a: Any, b: Any) -> bool:
+        import numpy as np
+
+        return a.shape == b.shape and bool(np.array_equal(a, b))
+
+    def _fused_block(
+        self, rest: list[tuple[_CurvedStructure, Any]], gram: Array
+    ) -> Array:
+        import numpy as np
+
+        g = np.asarray(_to_numpy_nd(gram), dtype=np.float64)
+        return self._xp_ns.asarray(self._dense_host(rest, addend=g))
+
+    def dense_matrix_with_gram(
+        self,
+        jac: LinearOperator,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        """``H + jacᵀ diag(weights) jac`` with shared structures multiplied once.
+
+        The core's optional fused-curvature capability
+        (``LinearOperator.dense_matrix_with_gram``). ``jac`` is the solver's
+        inequality Jacobian, whose wrappers translate ``weights`` to the
+        loader's rows; its Gram is requested with this Hessian's weights
+        ``h_s`` on offer (:class:`_GramMerge`), so each structure the linear
+        block also holds is multiplied once with ``h_s + σ_s`` (Breedveld
+        2017, eq. (48) and §4.2). The Hessian then forms the structures not
+        taken, ``Q`` and the rank-1 part, and adds the Gram. Declines
+        (``NotImplementedError``: the core's two-pass assembly) when no
+        structure is shared, when the merge is off
+        (``TiledGramConfig.merge_hessian_gram``), or when every shared
+        structure's block would accumulate in float32 — the Hessian part
+        stays float64. Memoized per request and weights (δ_w retries).
+        """
+        import time
+
+        from ipax.backend.operators import forward_gram
+
+        offer = self._merge_offer(accumulate_dtype, hinted_only)
+        if not offer:
+            raise NotImplementedError("no curved structure to merge with the Gram")
+        assert self._merge is not None
+        key = (accumulate_dtype, bool(hinted_only))
+        w_key = self._memo_weights(weights)
+        memo = self._fused
+        if (
+            memo is not None
+            and memo[0] == key
+            and memo[1] is jac
+            and self._same_weights(memo[2], w_key)
+        ):
+            return memo[3]
+        # Superseded: release it before the new block is formed beside it.
+        self._fused = memo = None
+        t0 = time.perf_counter()
+        with self._merge.open(offer) as taken:
+            gram = forward_gram(
+                jac, weights, accumulate_dtype=accumulate_dtype, hinted_only=hinted_only
+            )
+        if not taken:
+            # Offered, but no linear-block operator in ``jac`` took it (an
+            # operator from another linear_ineq() call): the two-pass block.
+            raise NotImplementedError("the linear block took no merged structure")
+        merged = [
+            (cs, w) for cs, w in self.terms if id(self._shared_tiles(cs)) in taken
+        ]
+        rest = [
+            (cs, w) for cs, w in self.terms if id(self._shared_tiles(cs)) not in taken
+        ]
+        out = self._fused_block(rest, gram)
+        del gram
+        self.fused_structures = [cs for cs, _w in merged]
+        self._fused = (key, jac, w_key, out)
+        if self._stats is not None:
+            self._stats["fused_seconds"] += time.perf_counter() - t0
+            self._stats["fused_calls"] += 1
+        return out
 
     def diagonal(self, like: Array | None = None) -> Array:
         """``Σ_k (A_k∘A_k)ᵀ w_k + diag(Q) + rowsum(U∘V)`` — no matrix formed."""
@@ -2971,19 +4783,128 @@ class TROTSExactHessian(LinearOperator):
         )
 
 
+class _DeviceQuadratic:
+    """The beamlet-space quadratic part ``Q = Σ_t mult_t·Q_t`` of the exact
+    Hessian on a device namespace, with no per-call host product or crossing.
+
+    Only the multipliers of the (symmetrised, constant) quadratic terms change
+    between calls, so the pattern of the sum is planned once on the host: the
+    union of the terms' patterns in CSR order and, per union entry, its
+    contributions stacked in ``K`` zero-padded layers (``K`` = the largest
+    number of terms sharing one entry). A call then uploads the multipliers
+    (one small transfer) and forms ``Σ_j val[j]·mult[term[j]]`` on the device;
+    the dense route scatters the lower triangle at unique positions, so no
+    index collides and the result is deterministic. The device copies are
+    made once per device-context signature.
+
+    The layers store ``K·U`` values for ``T`` contributions (``U`` union
+    entries); :attr:`fill_ratio` is ``K·U / T`` (1 when no entry is shared
+    by more terms than the others). The TROTS smoothing terms share little:
+    ``Prostate_CK_01`` (25 terms) builds a small plan, and the stat is logged
+    at debug level. A ``U × n_terms`` CSR matrix applied to the multipliers
+    (one SpMV) would store exactly ``T`` values, at the price of a
+    library-defined summation order; the layered sum keeps a fixed order.
+    """
+
+    def __init__(self, terms: Sequence[Any], n: int) -> None:
+        import numpy as np
+        import scipy.sparse as sp
+
+        rows, cols, vals, owner = [], [], [], []
+        for t, q in enumerate(terms):
+            c = sp.coo_matrix(q)
+            c.sum_duplicates()
+            rows.append(np.asarray(c.row, dtype=np.int64))
+            cols.append(np.asarray(c.col, dtype=np.int64))
+            vals.append(np.asarray(c.data, dtype=np.float64))
+            owner.append(np.full(c.nnz, t, dtype=np.int64))
+        # (At least one term: the problem builds a plan only when it has one.)
+        key = np.concatenate(rows) * n + np.concatenate(cols)
+        val, term = np.concatenate(vals), np.concatenate(owner)
+        order = np.lexsort((term, key))  # by entry, then by term (sum order)
+        key, val, term = key[order], val[order], term[order]
+        uniq, first, inv = np.unique(key, return_index=True, return_inverse=True)
+        rank = np.arange(key.shape[0]) - first[inv]
+        self.n = int(n)
+        self.layers = int(rank.max()) + 1 if rank.size else 0
+        self.val = np.zeros((self.layers, uniq.shape[0]))
+        self.term = np.zeros((self.layers, uniq.shape[0]), dtype=np.int64)
+        self.val[rank, inv] = val
+        self.term[rank, inv] = term
+        #: The union pattern (CSR order: sorted by row, then column).
+        self.row = uniq // n
+        self.col = uniq % n
+        self.indptr = np.concatenate(
+            ([0], np.cumsum(np.bincount(self.row, minlength=n)))
+        ).astype(np.int64)
+        #: Union positions of the lower triangle (the mirror source).
+        self.lower = np.flatnonzero(self.row >= self.col)
+        #: Stored layer values per contribution (``K·U / T``, see above).
+        self.fill_ratio = self.val.size / max(1, int(key.shape[0]))
+        _LOG.debug(
+            "device Q plan: %d terms, %d contributions, %d union entries, "
+            "%d layers (fill ratio %.2f)",
+            len(terms),
+            int(key.shape[0]),
+            int(uniq.shape[0]),
+            self.layers,
+            self.fill_ratio,
+        )
+        self._device: dict[Any, dict[str, Any]] = {}
+
+    def on_device(self, ctx: _DeviceGramContext) -> dict[str, Any]:
+        """The device copies for ``ctx``'s namespace/device (made once)."""
+        import numpy as np
+
+        hit = self._device.get(ctx.signature)
+        if hit is None:
+            hit = {
+                "val": ctx.put(self.val, np.float64),
+                "term": ctx.put(self.term.reshape(-1), np.int64),
+                "indices": ctx.put(self.col, np.int32),
+                "indptr": ctx.put(self.indptr, np.int32),
+                "lower": ctx.put(self.lower, np.int64),
+                "low_rows": ctx.put(self.row[self.lower], np.int64),
+                "low_cols": ctx.put(self.col[self.lower], np.int64),
+            }
+            self._device[ctx.signature] = hit
+        return hit
+
+    def values(self, ctx: _DeviceGramContext, mults: Any) -> Any:
+        """``Q``'s values on the union pattern for the host multipliers
+        ``mults`` (one upload of ``n_terms`` floats)."""
+        import numpy as np
+
+        xp = ctx.xp
+        dev = self.on_device(ctx)
+        nnz = int(self.row.shape[0])
+        m = ctx.put(np.asarray(mults, dtype=np.float64))
+        w = xp.reshape(xp.take(m, dev["term"]), (self.layers, nnz))
+        return xp.sum(dev["val"] * w, axis=0)
+
+
 class TROTSDeviceExactHessian(TROTSExactHessian):
     """:class:`TROTSExactHessian` with its products on a CuPy / Torch device.
 
-    What :class:`TROTSExactProblem` returns on those namespaces when at least
-    one curved structure is tiled (otherwise the host Hessian is crossed as a
-    ``CSCOperator``, as before):
+    What :class:`TROTSExactProblem` returns on those namespaces when tiling
+    is on (``tiled_gram`` not ``False``) and the Hessian has a curved
+    structure or a quadratic term (otherwise the host Hessian is crossed as
+    a ``CSCOperator``, as before):
 
-    * :meth:`dense_matrix` runs the tiled structures through the device tiled
-      kernel (:func:`_device_accumulate`, sharing the linear block's device
-      tiles through the problem's cache), crosses the gated-off structures'
-      host SciPy products plus ``Q`` once as a lower-triangle COO, adds
-      ``U Vᵀ`` by a device matmul, and mirrors one triangle (exactly
-      symmetric), memoized like the host operator.
+    * :meth:`dense_matrix` runs every curved structure through the device
+      tiled kernel (:func:`_device_accumulate`, sharing the linear block's
+      device tiles through the problem's cache). A structure the flop-ratio
+      gate keeps off runs through its own (ungated) plan, made on the first
+      dense Hessian by ``device_planner`` (so matvec-only and sparse-direct
+      routes never plan it): on the host the alternative is BLAS on
+      full-width dense row chunks, but here it was a host SciPy SpGEMM plus
+      a crossing of its product (``Prostate_CK_01``: 36 s per iteration),
+      and the tiled plan never costs more flops than full-width chunks.
+      ``Q`` is formed on the device from its constant union pattern
+      (:class:`_DeviceQuadratic`); ``U Vᵀ`` is a device matmul; one triangle
+      is mirrored (exactly symmetric). Memoized like the host operator. No
+      per-call transfer is larger than a weight vector or the ``n×r`` gEUD
+      factors.
     * :meth:`matvec` is the exact float64 product. With device-resident
       structure matrices (CuPy evaluation, ``sparse_module`` = ``cupyx``) it
       runs on the device; otherwise (Torch) it is a host round trip per
@@ -3000,33 +4921,69 @@ class TROTSDeviceExactHessian(TROTSExactHessian):
         context: _DeviceGramContext,
         device_matrix: Any = None,
         sparse_module: Any = None,
+        quad_plan: _DeviceQuadratic | None = None,
+        quad_mults: Any = None,
+        device_planner: Callable[[_CurvedStructure], tuple[Any, list[_Tile]]]
+        | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._ctx = context
+        self._device_planner = device_planner
         self._device_matrix = device_matrix
         self._sparse_module = sparse_module
+        self._quad_plan = quad_plan
+        self._quad_mults = quad_mults
+        self._quad_values: Any = None  # Q on the union pattern (device)
+        self._dev_weights: list[Any] | None = None  # w_k per term (device)
+        self._dev_low_rank: Any = None  # (U, V) on the device
         self._dev_products: Any = None  # (terms, Q, U, V) on the device
+
+    # Device copies of the per-call data, uploaded once per operator and
+    # shared by dense_matrix and matvec.
+    def _device_quad_values(self) -> Any:
+        if self._quad_values is None and self._quad_plan is not None:
+            self._quad_values = self._quad_plan.values(self._ctx, self._quad_mults)
+        return self._quad_values
+
+    def _device_weights(self) -> list[Any]:
+        if self._dev_weights is None:
+            import numpy as np
+
+            self._dev_weights = [
+                self._ctx.put(np.asarray(w, np.float64)) for _cs, w in self.terms
+            ]
+        return self._dev_weights
+
+    def _device_low_rank(self) -> Any:
+        if self._dev_low_rank is None and self.low_rank_factors is not None:
+            import numpy as np
+
+            u, v = self.low_rank_factors
+            self._dev_low_rank = (
+                self._ctx.put(np.asarray(u, np.float64)),
+                self._ctx.put(np.asarray(v, np.float64)),
+            )
+        return self._dev_low_rank
 
     # -- products ------------------------------------------------------------
     def _device_factors(self) -> Any:
         if self._dev_products is None:
-            import numpy as np
-
             ctx = self._ctx
             terms = [
-                (self._device_matrix(cs.mat), ctx.put(np.asarray(w, np.float64)))
-                for cs, w in self.terms
+                (self._device_matrix(cs.mat), w)
+                for (cs, _w), w in zip(self.terms, self._device_weights(), strict=True)
             ]
-            quad = (
-                self._sparse_module.csr_matrix(self.quad.tocsr())
-                if self.quad is not None
-                else None
-            )
-            u = v = None
-            if self.low_rank_factors is not None:
-                u = ctx.put(np.asarray(self.low_rank_factors[0], np.float64))
-                v = ctx.put(np.asarray(self.low_rank_factors[1], np.float64))
+            quad = None
+            plan = self._quad_plan
+            if plan is not None:
+                dev = plan.on_device(ctx)
+                quad = self._sparse_module.csr_matrix(
+                    (self._device_quad_values(), dev["indices"], dev["indptr"]),
+                    shape=(plan.n, plan.n),
+                )
+                quad.has_canonical_format = True  # CSR order, duplicate-free
+            u, v = self._device_low_rank() or (None, None)
             self._dev_products = (terms, quad, u, v)
         return self._dev_products
 
@@ -3068,47 +5025,74 @@ class TROTSDeviceExactHessian(TROTSExactHessian):
                 self._stats["dense_calls"] += 1
         return self._dense
 
-    def _dense_device(self) -> Any:
-        import numpy as np
-        import scipy.sparse as sp
-
+    def _dense_device(
+        self, terms: list[tuple[_CurvedStructure, Any]] | None = None
+    ) -> Any:
+        """The dense Hessian on the device over ``terms`` (default: all)."""
         ctx = self._ctx
         xp = ctx.xp
         nx = self._nx
         out = xp.zeros(
             (self._n_vars, self._n_vars), dtype=xp.float64, device=ctx.device
         )
+        keep = None if terms is None else {id(cs) for cs, _w in terms}
         items: list[tuple[_DeviceStructure, Any]] = []
-        rest = None
-        for cs, w in self.terms:
-            if cs.tiles is not None:
-                ds = ctx.structure(
-                    cs.perm, cs.tiles, cs.mat.matrix.shape[0], self.config.block_rows
-                )
-                items.append((ds, ctx.put(np.asarray(w, np.float64))))
+        for (cs, _w), w in zip(self.terms, self._device_weights(), strict=True):
+            if keep is not None and id(cs) not in keep:
                 continue
-            # Gated-off (dense-ish) structure: the host SciPy product, crossed
-            # below together with Q (the pre-device path's crossing).
-            a = sp.csr_matrix(cs.mat.matrix)
-            prod = (a.T @ sp.diags(w) @ a).tocsr()
-            rest = prod if rest is None else rest + prod
-        _device_accumulate(ctx, out, items, "float64")
-        if self.quad is not None:
-            rest = self.quad if rest is None else rest + self.quad
-        if rest is not None:
-            low = sp.tril(sp.csr_matrix(rest), format="coo")  # the mirror source
-            low.sum_duplicates()
-            ctx.scatter_coo(
-                out,
-                ctx.put(low.row, np.int64),
-                ctx.put(low.col, np.int64),
-                ctx.put(low.data, np.float64),
+            if cs.tiles is not None:
+                perm, tiles = cs.perm, cs.tiles
+            else:  # gated off: its device plan, made on first use
+                assert self._device_planner is not None, cs.mat.name
+                perm, tiles = self._device_planner(cs)
+            if not tiles:
+                continue  # an all-zero structure contributes nothing
+            ds = ctx.structure(
+                perm, tiles, cs.mat.matrix.shape[0], self.config.block_rows
             )
-        if self.low_rank_factors is not None:
-            u = ctx.put(np.asarray(self.low_rank_factors[0], np.float64))
-            v = ctx.put(np.asarray(self.low_rank_factors[1], np.float64))
+            items.append((ds, w))
+        _device_accumulate(ctx, out, items, "float64")
+        if self._quad_plan is not None:
+            dev = self._quad_plan.on_device(ctx)
+            ctx.scatter_coo(  # unique lower-triangle positions: no collisions
+                out,
+                dev["low_rows"],
+                dev["low_cols"],
+                xp.take(self._device_quad_values(), dev["lower"]),
+            )
+        low_rank = self._device_low_rank()
+        if low_rank is not None:
+            u, v = low_rank
             out[:nx, :nx] += xp.matmul(u, xp.permute_dims(v, (1, 0)))
         return ctx.mirror_lower(out)
+
+    # -- the fused block on the device ------------------------------------
+    def _shared_tiles(self, cs: _CurvedStructure) -> Any:
+        if cs.tiles is not None:
+            return cs.tiles
+        if self._device_planner is None:
+            return None
+        return self._device_planner(cs)[1]  # gated off: its device plan
+
+    def _offer_weights(self, cs: _CurvedStructure, w: Any) -> Any:
+        del w
+        index = next(i for i, (c, _w) in enumerate(self.terms) if c is cs)
+        return self._device_weights()[index]
+
+    def _memo_weights(self, weights: Array) -> Any:
+        xp = self._ctx.xp
+        return xp.asarray(xp.asarray(weights, device=self._ctx.device), copy=True)
+
+    def _same_weights(self, a: Any, b: Any) -> bool:
+        xp = self._ctx.xp
+        return a.shape == b.shape and bool(xp.all(a == b))
+
+    def _fused_block(
+        self, rest: list[tuple[_CurvedStructure, Any]], gram: Array
+    ) -> Array:
+        out = self._dense_device(rest)
+        out += self._ctx.xp.asarray(gram, device=self._ctx.device)
+        return out
 
     def diagonal(self, like: Array | None = None) -> Array:
         del like
@@ -3145,11 +5129,13 @@ class TROTSExactProblem(TROTSProblem):
 
     The grouped operator is host-resident (its products run in NumPy/SciPy),
     so it is returned as-is only on NumPy namespaces. On CuPy and Torch the
-    curved structures are planned too and, when at least one is tiled, a
-    :class:`TROTSDeviceExactHessian` runs their products through the device
-    tiled kernel (sharing the linear block's device tiles). On any other
-    namespace with an ipax sparse adapter (JAX) — or with no tiled structure
-    (``tiled_gram=False``) — the grouped Hessian is formed once per call on
+    curved structures are planned too (a structure the gate keeps off gets a
+    device plan anyway) and a :class:`TROTSDeviceExactHessian` runs their
+    products through the device tiled kernel (sharing the linear block's
+    device tiles), with the quadratic terms summed on the device over their
+    constant pattern. On any other namespace with an ipax sparse adapter
+    (JAX), with ``tiled_gram=False``, or when the Hessian has no curved or
+    quadratic term at all, the grouped Hessian is formed once per call on
     the host (:meth:`TROTSExactHessian.host_sparse`: one SciPy SpGEMM per
     structure) and crossed to the namespace as a
     :class:`~ipax.backend.operators.CSCOperator`, like the per-term path —
@@ -3200,6 +5186,8 @@ class TROTSExactProblem(TROTSProblem):
             "build_calls": 0,
             "dense_seconds": 0.0,
             "dense_calls": 0,
+            "fused_seconds": 0.0,
+            "fused_calls": 0,
         }
         if not self._grouped_hessian:
             return
@@ -3218,6 +5206,14 @@ class TROTSExactProblem(TROTSProblem):
         self._hess_cfg = (
             self._tiled_cfg if self._tiled_cfg is not None else TiledGramConfig()
         )
+        # One product per structure for the Hessian and the linear block's
+        # Gram (see _GramMerge): host and device tiled Hessians only.
+        if (
+            self._tiled_cfg is not None
+            and self._tiled_cfg.merge_hessian_gram
+            and (self._hess_host or self._hess_device)
+        ):
+            self._gram_merge = _GramMerge()
         # One entry per unique curved structure (insertion order = first use).
         self._curved: dict[int, _CurvedStructure] = {}
         curved_mats = [mat for mat, _c, _t, _p in self._nl_obj] + [
@@ -3233,20 +5229,7 @@ class TROTSExactProblem(TROTSProblem):
                 and a.shape[0] > 0
                 and (self._hess_host or self._hess_device)
             ):
-                # The hint requests float32 tile storage; _plan_structure
-                # falls back to float64 unless the values are float32-exact.
-                hint = "float32" if mat.source_dtype == "float32" else None
-                if (
-                    hint is not None
-                    and self.float32_group_folded
-                    and id(mat) in self._lin_structure_keys
-                ):
-                    # The share gate folded this structure's linear rows into
-                    # the unhinted float64 group, which plans it without a
-                    # hint: plan it the same way, so the registry key matches
-                    # and one tile set serves the block and the Hessian (the
-                    # exact products are identical either way).
-                    hint = None
+                hint = self._hessian_hint(mat)
                 plan = TiledGramPlan.build(
                     (int(a.shape[0]), self._n),
                     [GramSegment(0, int(a.shape[0]), a, key=id(mat))],
@@ -3258,11 +5241,38 @@ class TROTSExactProblem(TROTSProblem):
                 if plan.tiled:
                     cs.perm = plan.structures[0].perm
                     cs.tiles = plan.structures[0].tiles
+                elif self._hess_device and plan.gated_structures:
+                    # Gated off on a device after being planned: keep that
+                    # plan for the device kernel (see _device_structure_plan)
+                    # rather than planning the structure a second time.
+                    gp = plan.gated_structures[0]
+                    self._register_device_plan(cs, gp.perm, gp.tiles)
+                elif (
+                    self._hess_host
+                    and plan.gated_structures
+                    and plan.flop_ratio <= self._tiled_cfg.host_hessian_flop_ratio
+                ):
+                    # Gated off after planning, but still cheaper than the
+                    # full-width chunks (see TiledGramConfig): keep the plan
+                    # and register it, so the linear block reuses this tile
+                    # set if it plans the same structure.
+                    gp = plan.gated_structures[0]
+                    cs.perm, cs.tiles = gp.perm, gp.tiles
+                    assert self._plan_registry is not None
+                    self._plan_registry[self._registry_key(mat)] = (
+                        a,
+                        gp.perm,
+                        gp.tiles,
+                    )
             if cs.tiles is None and self._hess_host:
                 # Row slicing needs CSR, not sorted indices: never sort in
                 # place (a CSR source is shared with the instance cache).
                 cs.csr = sp.csr_matrix(a)
             self._curved[id(mat)] = cs
+        if self._hess_host and self._curved:
+            # The host dense Hessian's compiled scatter, warmed up now (see
+            # TiledGramCSROperator.__init__).
+            _scatter_kernel(self._hess_cfg)
         # Beamlet-space quadratic terms: constant symmetric matrices (only
         # their multipliers change per call).
         self._quad_obj_sym = [
@@ -3272,6 +5282,82 @@ class TROTSExactProblem(TROTSProblem):
             (0.5 * (mat.matrix + mat.matrix.T)).tocsr()
             for mat, _s, _b in self._quad_con
         ]
+        # Device namespaces: their sum's constant pattern, planned once, so a
+        # call forms Q on the device from the multipliers alone.
+        self._quad_device: _DeviceQuadratic | None = None
+        if (
+            self._hess_device
+            and self._tiled_cfg is not None
+            and (self._quad_obj_sym or self._quad_con_sym)
+        ):
+            self._quad_device = _DeviceQuadratic(
+                self._quad_obj_sym + self._quad_con_sym, self._n
+            )
+
+    def _hessian_hint(self, mat: TROTSMatrix) -> str | None:
+        """The tile-storage request of a curved structure's plan.
+
+        float32 is a request: _plan_structure falls back to float64 unless
+        the values are float32-exact."""
+        hint = "float32" if mat.source_dtype == "float32" else None
+        if (
+            hint is not None
+            and self.float32_group_folded
+            and id(mat) in self._lin_structure_keys
+        ):
+            # The share gate folded this structure's linear rows into the
+            # unhinted float64 group, which plans it without a hint: plan it
+            # the same way, so the registry key matches and one tile set
+            # serves the block and the Hessian (the exact products are
+            # identical either way).
+            hint = None
+        return hint
+
+    def _registry_key(self, mat: TROTSMatrix) -> tuple[Any, ...]:
+        """The plan-registry key the linear block would use for ``mat``."""
+        import numpy as np
+
+        store = np.float32 if self._hessian_hint(mat) == "float32" else np.float64
+        return (id(mat), np.dtype(store).str, self._tiled_cfg)
+
+    def _register_device_plan(
+        self, cs: _CurvedStructure, perm: Any, tiles: list[_Tile]
+    ) -> None:
+        assert self._plan_registry is not None
+        self._plan_registry[self._registry_key(cs.mat)] = (cs.mat.matrix, perm, tiles)
+        cs.device_perm, cs.device_tiles = perm, tiles
+
+    def _device_structure_plan(self, cs: _CurvedStructure) -> tuple[Any, list[_Tile]]:
+        """The device plan of a curved structure the gate keeps off, made on
+        the first dense Hessian and cached on ``cs`` (see
+        :class:`TiledGramConfig`: on a device the Hessian ignores the gate).
+
+        The registry is consulted first, so a structure the linear block
+        already planned (or planned later, from this entry) holds one tile
+        set; a fresh plan is registered under the linear block's key.
+        """
+        import numpy as np
+
+        if cs.device_tiles is None:
+            a = cs.mat.matrix
+            if a.shape[0] == 0:  # no rows, no tiles (nothing to register)
+                cs.device_perm, cs.device_tiles = np.zeros((0,), np.int64), []
+            else:
+                assert self._plan_registry is not None
+                assert self._tiled_cfg is not None
+                hit = self._plan_registry.get(self._registry_key(cs.mat))
+                if hit is not None and hit[0] is a:
+                    cs.device_perm, cs.device_tiles = hit[1], hit[2]
+                else:
+                    store = (
+                        np.float32
+                        if self._hessian_hint(cs.mat) == "float32"
+                        else np.float64
+                    )
+                    perm, tiles = _plan_structure(a, self._tiled_cfg, store)
+                    self._register_device_plan(cs, perm, tiles)
+        assert cs.device_tiles is not None
+        return cs.device_perm, cs.device_tiles
 
     def lagrangian_hessian(
         self,
@@ -3285,9 +5371,10 @@ class TROTSExactProblem(TROTSProblem):
         t0 = time.perf_counter()
         if self._grouped_hessian:
             grouped = self._grouped_lagrangian_hessian(x, y_ineq, sigma)
-            # Non-NumPy namespace: the device operator when a structure is
-            # tiled, else cross the grouped Hessian once per call instead of
-            # round-tripping every product (class docstring).
+            # Non-NumPy namespace: the device operator (CuPy / Torch with
+            # tiling on and a curved or quadratic term), else cross the
+            # grouped Hessian once per call instead of round-tripping every
+            # product (class docstring).
             op: LinearOperator = (
                 grouped
                 if self._hess_host or isinstance(grouped, TROTSDeviceExactHessian)
@@ -3340,30 +5427,37 @@ class TROTSExactProblem(TROTSProblem):
         for mat, sign, ctype, par, _bound in self._nl_con:
             add(mat, float(yv[row]) * sign, ctype, par)
             row += 1
-        quad = None
-        for sym, (_mat, coef) in zip(self._quad_obj_sym, self._quad_obj, strict=True):
-            quad = (s * coef) * sym if quad is None else quad + (s * coef) * sym
-        for sym, (_mat, sign, _b) in zip(
-            self._quad_con_sym, self._quad_con, strict=True
-        ):
-            mult = float(yv[row]) * sign
+        # One multiplier per quadratic term: objective terms first, then the
+        # constraint rows (the order of _quad_obj_sym + _quad_con_sym).
+        obj_mults = [s * coef for _mat, coef in self._quad_obj]
+        con_mults = []
+        for _mat, sign, _b in self._quad_con:
+            con_mults.append(float(yv[row]) * sign)
             row += 1
-            if mult != 0.0:
+        quad_syms = (self._quad_obj_sym, self._quad_con_sym)
+
+        def quad_sum() -> Any:
+            """``Q = Σ mult·sym`` (host SciPy); zero-multiplier constraint
+            terms are skipped; None when no term contributes."""
+            quad = None
+            for sym, mult in zip(quad_syms[0], obj_mults, strict=True):
                 quad = mult * sym if quad is None else quad + mult * sym
+            for sym, mult in zip(quad_syms[1], con_mults, strict=True):
+                if mult != 0.0:
+                    quad = mult * sym if quad is None else quad + mult * sym
+            return quad
+
         low_rank = (
             (np.stack(u_cols, axis=1), np.stack(v_cols, axis=1)) if u_cols else None
         )
         terms = [(self._curved[key], w) for key, w in weights.items()]
-        args = (
-            self.xp,
-            self._n_vars,
-            self._n,
-            terms,
-            quad,
-            low_rank,
-            self._hess_cfg,
-        )
-        if self._hess_device and any(cs.tiles is not None for cs, _w in terms):
+        if (
+            self._hess_device
+            and self._tiled_cfg is not None
+            and (terms or self._quad_device is not None)
+        ):
+            # Every curved structure has a device plan (tiled, or planned
+            # past the gate at construction) and Q a device pattern.
             from ipax.backend.namespace import device as device_of
 
             assert self._device_kind is not None
@@ -3374,15 +5468,37 @@ class TROTSExactProblem(TROTSProblem):
                 self._device_tiles,
                 sparse_tiles=self._hess_cfg.device_sparse_tiles,
                 densify_budget_bytes=self._hess_cfg.device_densify_budget_bytes,
+                sparse_ratio=self._hess_cfg.device_sparse_tile_flop_ratio,
             )
             return TROTSDeviceExactHessian(
-                *args,
+                self.xp,
+                self._n_vars,
+                self._n,
+                terms,
+                None,
+                low_rank,
+                self._hess_cfg,
                 stats=self.hessian_stats,
+                quad_builder=quad_sum,  # host fallbacks only (diagonal, COO)
+                device_planner=self._device_structure_plan,
                 context=context,
                 device_matrix=self._eval_mat if self._eval_device else None,
                 sparse_module=self._cxs if self._eval_device else None,
+                quad_plan=self._quad_device,
+                quad_mults=np.asarray(obj_mults + con_mults, dtype=np.float64),
+                merge=self._gram_merge,
             )
-        return TROTSExactHessian(*args, stats=self.hessian_stats)
+        return TROTSExactHessian(
+            self.xp,
+            self._n_vars,
+            self._n,
+            terms,
+            quad_sum(),
+            low_rank,
+            self._hess_cfg,
+            stats=self.hessian_stats,
+            merge=self._gram_merge,
+        )
 
     def _per_term_lagrangian_hessian(
         self, x: Array, y_ineq: Array, sigma: Scalar
@@ -3599,6 +5715,7 @@ def trots_problems(
 
 
 __all__ = [
+    "ActiveRowGramCSROperator",
     "GramSegment",
     "TROTSEntry",
     "TROTSExactProblem",

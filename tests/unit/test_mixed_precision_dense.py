@@ -35,6 +35,7 @@ from ipax.ipm.kkt import _CondensedOperator
 from ipax.linalg.dense import DenseSolver
 from ipax.linalg.solver import LinearSolveError
 from ipax.options import DenseOptions
+from tests._helpers import to_numpy
 
 
 def _condensed(namespace, *, n=24, m=96, seed=0, scale=10.0):
@@ -79,8 +80,8 @@ def test_mixed_materialization_is_actually_reduced(namespace):
     # scale — proof the accumulation really ran in reduced precision — while
     # still being float64-typed and close.
     op, rhs = _condensed(namespace)
-    exact = np.asarray(op.dense_matrix(rhs))
-    mixed = np.asarray(op.dense_matrix_mixed(rhs, "float32"))
+    exact = to_numpy(op.dense_matrix(rhs))
+    mixed = to_numpy(op.dense_matrix_mixed(rhs, "float32"))
     assert mixed.dtype == np.float64
     rel = np.max(np.abs(mixed - exact)) / np.max(np.abs(exact))
     assert 1e-12 < rel < 1e-3
@@ -90,11 +91,11 @@ def test_mixed_solve_matches_native_after_refinement(namespace):
     op, rhs = _condensed(namespace)
     native = DenseSolver(DenseOptions())
     native.factor(op)
-    x_native = np.asarray(native.solve(rhs))
+    x_native = to_numpy(native.solve(rhs))
 
     mixed = DenseSolver(DenseOptions(gram_dtype="float32"))
     mixed.factor(op)
-    x_mixed = np.asarray(mixed.solve(rhs))
+    x_mixed = to_numpy(mixed.solve(rhs))
 
     np.testing.assert_allclose(x_mixed, x_native, rtol=1e-6, atol=1e-9)
     # The fp32-factor first solve is not fp64-accurate on its own: refinement
@@ -112,8 +113,8 @@ def test_refinement_meets_residual_tolerance(namespace):
     solver.factor(op)
     x = solver.solve(rhs)
 
-    residual = np.asarray(rhs - op.matvec(x))
-    bnorm = float(np.max(np.abs(np.asarray(rhs))))
+    residual = to_numpy(rhs - op.matvec(x))
+    bnorm = float(np.max(np.abs(to_numpy(rhs))))
     # Modest slack over refine_tol: the loop exits at the first residual at or
     # below tol·‖b‖, so the achieved residual is bounded by it exactly; slack
     # covers the matvec evaluation rounding.
@@ -204,14 +205,14 @@ def test_refinement_stall_rebuilds_exact_and_counts_failures(namespace):
     solver = DenseSolver(DenseOptions(gram_dtype="float32", refine_failure_limit=3))
     for expected_mixed_calls in (1, 2, 3):
         solver.factor(op)
-        x = np.asarray(solver.solve(rhs))
-        np.testing.assert_allclose(x, np.linalg.solve(a, np.asarray(rhs)), rtol=1e-8)
+        x = to_numpy(solver.solve(rhs))
+        np.testing.assert_allclose(x, np.linalg.solve(a, to_numpy(rhs)), rtol=1e-8)
         assert op.mixed_calls == expected_mixed_calls
         assert op.exact_calls >= expected_mixed_calls
 
     # Third consecutive failure hit the limit: permanently native from here.
     solver.factor(op)
-    np.asarray(solver.solve(rhs))
+    to_numpy(solver.solve(rhs))
     assert op.mixed_calls == 3
     # Sticky honesty marker: the run used the reduced Gram before disabling.
     assert solver.describe() == "dense (gram=float32->native)"
@@ -238,8 +239,8 @@ def test_budget_exhaustion_accepts_certified_residual(namespace):
     solver.factor(op)
     x = solver.solve(rhs)
 
-    residual = np.asarray(rhs - op.matvec(x))
-    bnorm = float(np.max(np.abs(np.asarray(rhs))))
+    residual = to_numpy(rhs - op.matvec(x))
+    bnorm = float(np.max(np.abs(to_numpy(rhs))))
     assert float(np.max(np.abs(residual))) <= 0.05 * bnorm
     assert op.exact_calls == 0  # accepted: no exact rebuild
     assert solver._mixed_failures == 0
@@ -293,12 +294,12 @@ def test_precision_caused_pd_failure_falls_back_to_exact(namespace):
 
     solver = DenseSolver(DenseOptions(gram_dtype="float32", refine_failure_limit=1))
     solver.factor(op)
-    x = np.asarray(solver.solve(rhs))  # must NOT raise LinearSolveError
+    x = to_numpy(solver.solve(rhs))  # must NOT raise LinearSolveError
 
-    np.testing.assert_allclose(x, np.linalg.solve(a, np.asarray(rhs)), rtol=1e-8)
+    np.testing.assert_allclose(x, np.linalg.solve(a, to_numpy(rhs)), rtol=1e-8)
     assert op.mixed_calls == 1
     solver.factor(op)
-    np.asarray(solver.solve(rhs))
+    to_numpy(solver.solve(rhs))
     assert op.mixed_calls == 1  # limit 1: disabled by the single PD mismatch
 
 
@@ -331,7 +332,7 @@ def test_genuine_non_pd_still_raises(namespace):
     # try reduced precision again.
     op2 = _FakeMixedOperator(xp, a, err=0.0)
     solver.factor(op2)
-    np.asarray(solver.solve(rhs))
+    to_numpy(solver.solve(rhs))
     assert op2.mixed_calls == 1
 
 
@@ -344,7 +345,7 @@ def test_native_default_never_calls_mixed(namespace):
 
     solver = DenseSolver(DenseOptions())
     solver.factor(op)
-    np.asarray(solver.solve(rhs))
+    to_numpy(solver.solve(rhs))
     assert op.mixed_calls == 0
     assert solver.refine_iterations == 0
 
@@ -367,22 +368,22 @@ def test_operator_without_a_mixed_materialization_falls_back(namespace):
 
     solver = DenseSolver(DenseOptions(gram_dtype="float32"))
     solver.factor(op)
-    x = np.asarray(solver.solve(rhs))
+    x = to_numpy(solver.solve(rhs))
 
-    np.testing.assert_allclose(a @ x, np.asarray(rhs), rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(a @ x, to_numpy(rhs), rtol=1e-8, atol=1e-10)
     assert op.mixed_calls == 1 and op.exact_calls >= 1
     assert "gram=" not in solver.describe()  # never claims a route it did not take
 
 
 def test_mixed_materialization_failure_is_a_linear_solve_error(namespace):
-    # A mixed hook that fails for a non-capability reason is a real fault and
-    # must surface as LinearSolveError (so δ_w escalation sees it), not escape
-    # as an arbitrary backend exception.
+    # A mixed hook that fails numerically (an overflow in the reduced-precision
+    # accumulation) must surface as LinearSolveError (so δ_w escalation sees
+    # it), not escape as an arbitrary backend exception.
     xp = namespace
 
     class _BrokenMixed(_FakeMixedOperator):
         def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
-            raise RuntimeError("backend blew up")
+            raise FloatingPointError("overflow encountered in matmul")
 
     op = _BrokenMixed(xp, _spd(), err=0.0)
     rhs = xp.asarray(np.random.default_rng(22).standard_normal(12), dtype=xp.float64)
@@ -391,6 +392,48 @@ def test_mixed_materialization_failure_is_a_linear_solve_error(namespace):
     solver.factor(op)
     with pytest.raises(LinearSolveError):
         solver.solve(rhs)
+
+
+def test_mixed_materialization_bug_propagates_unchanged(namespace):
+    # ...while a programming error in the hook (the Gram behind it is user
+    # code) is not a singular system: it leaves the solver as itself.
+    xp = namespace
+    bug = TypeError("asarray() got an unexpected keyword argument 'device'")
+
+    class _BuggyMixed(_FakeMixedOperator):
+        def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
+            raise bug
+
+    op = _BuggyMixed(xp, _spd(), err=0.0)
+    rhs = xp.asarray(np.random.default_rng(22).standard_normal(12), dtype=xp.float64)
+
+    solver = DenseSolver(DenseOptions(gram_dtype="float32"))
+    solver.factor(op)
+    with pytest.raises(TypeError) as info:
+        solver.solve(rhs)
+    assert info.value is bug
+
+
+def test_refinement_matvec_bug_propagates_unchanged(namespace):
+    # The refinement residual applies the operator's exact matvec (user
+    # Jacobian products). A missing matvec (NotImplementedError) makes the
+    # mixed factor uncertifiable and falls back to native precision; a bug in
+    # it must propagate instead of being mistaken for that fallback.
+    xp = namespace
+    bug = TypeError("asarray() got an unexpected keyword argument 'device'")
+
+    class _BuggyMatvec(_FakeMixedOperator):
+        def matvec(self, v):
+            raise bug
+
+    op = _BuggyMatvec(xp, _spd(), err=1e-6)
+    rhs = xp.asarray(np.random.default_rng(23).standard_normal(12), dtype=xp.float64)
+
+    solver = DenseSolver(DenseOptions(gram_dtype="float32"))
+    solver.factor(op)
+    with pytest.raises(TypeError) as info:
+        solver.solve(rhs)
+    assert info.value is bug
 
 
 def test_refinement_accepts_a_degenerate_right_hand_side(namespace):
@@ -403,22 +446,31 @@ def test_refinement_accepts_a_degenerate_right_hand_side(namespace):
 
     solver = DenseSolver(DenseOptions(gram_dtype="float32"))
     solver.factor(op)
-    x = np.asarray(solver.solve(rhs))
+    x = to_numpy(solver.solve(rhs))
 
     np.testing.assert_allclose(x, np.zeros(a.shape[0]), atol=0.0)
     assert solver.refine_iterations == 0  # returned before the first residual
 
 
-def test_operator_without_an_exact_matvec_cannot_certify(namespace):
+@pytest.mark.parametrize(
+    "failure",
+    [
+        NotImplementedError("matrix-free apply unavailable"),
+        FloatingPointError("overflow encountered in matmul"),
+    ],
+    ids=["missing", "numerical"],
+)
+def test_operator_without_an_exact_matvec_cannot_certify(namespace, failure):
     # Refinement's certificate *is* the exact operator matvec. An operator that
-    # cannot supply one leaves the mixed factor uncertifiable, so the solve must
-    # be answered from the exact rebuild rather than returned on trust.
+    # cannot supply one (or whose exact residual itself breaks down
+    # numerically) leaves the mixed factor uncertifiable, so the solve must be
+    # answered from the exact rebuild rather than returned on trust.
     xp = namespace
     a = _spd()
 
     class _NoMatvec(_FakeMixedOperator):
         def matvec(self, v):
-            raise NotImplementedError("matrix-free apply unavailable")
+            raise failure
 
     op = _NoMatvec(xp, a, err=1e-3)
     rng = np.random.default_rng(23)
@@ -426,10 +478,10 @@ def test_operator_without_an_exact_matvec_cannot_certify(namespace):
 
     solver = DenseSolver(DenseOptions(gram_dtype="float32"))
     solver.factor(op)
-    x = np.asarray(solver.solve(rhs))
+    x = to_numpy(solver.solve(rhs))
 
     # Exact-quality answer despite the mixed materialization being perturbed.
-    np.testing.assert_allclose(a @ x, np.asarray(rhs), rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(a @ x, to_numpy(rhs), rtol=1e-8, atol=1e-10)
     assert op.exact_calls >= 1
 
 
@@ -463,9 +515,9 @@ def test_auto_falls_back_when_the_hint_is_unusable(namespace, mode):
 
     solver = DenseSolver(DenseOptions())  # gram_dtype="auto"
     solver.factor(op)
-    x = np.asarray(solver.solve(rhs))
+    x = to_numpy(solver.solve(rhs))
 
-    np.testing.assert_allclose(a @ x, np.asarray(rhs), rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(a @ x, to_numpy(rhs), rtol=1e-8, atol=1e-10)
     assert "gram=" not in solver.describe()
 
 
@@ -525,8 +577,8 @@ def test_pre_keyword_gram_operator_degrades_to_exact(namespace):
             return xp.permute_dims(j, (1, 0)) @ v
 
         def gram(self, weights):  # pre-keyword signature, on purpose
-            j = np.asarray(jac)
-            w = np.asarray(weights)
+            j = to_numpy(jac)
+            w = to_numpy(weights)
             return xp.asarray(j.T @ (w[:, None] * j), dtype=xp.float64)
 
     n, m = 8, 30
@@ -538,8 +590,8 @@ def test_pre_keyword_gram_operator_degrades_to_exact(namespace):
         0.0,
     )
     like = xp.ones(n, dtype=xp.float64)
-    mixed = np.asarray(op.dense_matrix_mixed(like, "float32"))
-    exact = np.asarray(op.dense_matrix(like))
+    mixed = to_numpy(op.dense_matrix_mixed(like, "float32"))
+    exact = to_numpy(op.dense_matrix(like))
     np.testing.assert_array_equal(mixed, exact)  # degraded to the exact Gram
 
 
@@ -572,17 +624,17 @@ def test_sparse_fast_path_end_to_end_reduced():
         0.0,
     )
     rhs = xp.asarray(rng.standard_normal(n))
-    exact = np.asarray(op.dense_matrix(rhs))
-    mixed = np.asarray(op.dense_matrix_mixed(rhs, "float32"))
+    exact = to_numpy(op.dense_matrix(rhs))
+    mixed = to_numpy(op.dense_matrix_mixed(rhs, "float32"))
     rel = np.max(np.abs(mixed - exact)) / np.max(np.abs(exact))
     assert 1e-12 < rel < 1e-3  # the adapter really accumulated in float32
 
     native = DenseSolver(DenseOptions())
     native.factor(op)
-    x_native = np.asarray(native.solve(rhs))
+    x_native = to_numpy(native.solve(rhs))
     solver = DenseSolver(DenseOptions(gram_dtype="float32"))
     solver.factor(op)
-    x_mixed = np.asarray(solver.solve(rhs))
+    x_mixed = to_numpy(solver.solve(rhs))
     np.testing.assert_allclose(x_mixed, x_native, rtol=1e-6, atol=1e-9)
     assert solver.refine_iterations >= 1
 
@@ -786,19 +838,19 @@ def test_real_sparse_operator_declines_a_per_block_reduction_it_cannot_support()
     weights = xp.asarray(rng.uniform(0.5, 1.5, size=m))
 
     unhinted = _hinted_csr(xp, m, n, values, hint=None)
-    exact = np.asarray(unhinted.gram(weights))
+    exact = to_numpy(unhinted.gram(weights))
 
-    per_block = np.asarray(
+    per_block = to_numpy(
         unhinted.gram(weights, accumulate_dtype="float32", hinted_only=True)
     )
     np.testing.assert_array_equal(per_block, exact)  # declined: bit-identical
 
-    forced = np.asarray(unhinted.gram(weights, accumulate_dtype="float32"))
+    forced = to_numpy(unhinted.gram(weights, accumulate_dtype="float32"))
     assert np.max(np.abs(forced - exact)) > 0.0  # forced: really reduced
 
     # And an operator whose data *does* support it reduces under the same request.
     hinted = _hinted_csr(xp, m, n, values, hint="float32")
-    accepted = np.asarray(
+    accepted = to_numpy(
         hinted.gram(weights, accumulate_dtype="float32", hinted_only=True)
     )
     np.testing.assert_array_equal(accepted, forced)
@@ -822,17 +874,17 @@ def test_mixed_stack_of_real_sparse_operators_reduces_only_its_hinted_block():
     w = xp.asarray(rng.uniform(0.5, 1.5, size=35))
 
     assert stack.gram_accumulate_dtype_hint() == "float32"
-    per_block = np.asarray(stack.gram(w, accumulate_dtype="float32", hinted_only=True))
+    per_block = to_numpy(stack.gram(w, accumulate_dtype="float32", hinted_only=True))
 
     # Exactly: reduced first block + exact second block.
-    expected = np.asarray(f32.gram(w[:20], accumulate_dtype="float32")) + np.asarray(
+    expected = to_numpy(f32.gram(w[:20], accumulate_dtype="float32")) + to_numpy(
         f64.gram(w[20:])
     )
     np.testing.assert_array_equal(per_block, expected)
 
     # Not the same as reducing everything, nor as reducing nothing.
-    blanket = np.asarray(stack.gram(w, accumulate_dtype="float32"))
-    exact = np.asarray(stack.gram(w))
+    blanket = to_numpy(stack.gram(w, accumulate_dtype="float32"))
+    exact = to_numpy(stack.gram(w))
     assert np.max(np.abs(per_block - blanket)) > 0.0
     assert np.max(np.abs(per_block - exact)) > 0.0
 
@@ -875,9 +927,9 @@ def test_a_stack_tolerates_a_block_predating_the_accumulation_keywords():
     stack = VStack((_PreKeywordGram(xp.asarray(a)), _PreKeywordGram(xp.asarray(b))))
     w = xp.asarray(rng.uniform(0.5, 1.5, size=12))
 
-    got = np.asarray(stack.gram(w, accumulate_dtype="float32", hinted_only=True))
+    got = to_numpy(stack.gram(w, accumulate_dtype="float32", hinted_only=True))
 
-    expected = a.T @ (np.asarray(w)[:7, None] * a) + b.T @ (np.asarray(w)[7:, None] * b)
+    expected = a.T @ (to_numpy(w)[:7, None] * a) + b.T @ (to_numpy(w)[7:, None] * b)
     np.testing.assert_allclose(got, expected, rtol=1e-13, atol=0)
 
 
@@ -895,9 +947,9 @@ def test_row_scaling_tolerates_a_jacobian_predating_the_accumulation_keywords():
     scaled = _RowScaled(_PreKeywordGram(xp.asarray(jac)), xp.asarray(d))
     w = xp.asarray(rng.uniform(0.5, 1.5, size=6))
 
-    got = np.asarray(scaled.gram(w, accumulate_dtype="float32", hinted_only=True))
+    got = to_numpy(scaled.gram(w, accumulate_dtype="float32", hinted_only=True))
 
-    expected = jac.T @ ((d * d * np.asarray(w))[:, None] * jac)
+    expected = jac.T @ ((d * d * to_numpy(w))[:, None] * jac)
     np.testing.assert_allclose(got, expected, rtol=1e-13, atol=0)
 
 
@@ -939,8 +991,8 @@ def test_reduced_densify_handles_a_non_diagonal_sigma(namespace):
     )
     like = xp.asarray(rng.standard_normal(n), dtype=xp.float64)
 
-    exact = np.asarray(op.dense_matrix(like))
-    mixed = np.asarray(op.dense_matrix_mixed(like, "float32"))
+    exact = to_numpy(op.dense_matrix(like))
+    mixed = to_numpy(op.dense_matrix_mixed(like, "float32"))
 
     rel = np.max(np.abs(mixed - exact)) / np.max(np.abs(exact))
     assert 1e-12 < rel < 1e-3  # really accumulated in float32, and still close
@@ -1009,15 +1061,15 @@ def test_auto_engages_only_on_reduced_hint(namespace):
     hinted = _HintedExact(xp, a, err=0.0)
     solver = DenseSolver(DenseOptions())  # auto
     solver.factor(hinted)
-    x = np.asarray(solver.solve(rhs))
-    np.testing.assert_allclose(x, np.linalg.solve(a, np.asarray(rhs)), rtol=1e-8)
+    x = to_numpy(solver.solve(rhs))
+    np.testing.assert_allclose(x, np.linalg.solve(a, to_numpy(rhs)), rtol=1e-8)
     assert hinted.mixed_calls == 1
     assert "float32" in solver.describe()
 
     plain = _FakeMixedOperator(xp, a, err=0.05)  # no hint ⇒ native
     solver2 = DenseSolver(DenseOptions())
     solver2.factor(plain)
-    np.asarray(solver2.solve(rhs))
+    to_numpy(solver2.solve(rhs))
     assert plain.mixed_calls == 0
     assert solver2.refine_iterations == 0
     assert solver2.describe() == "dense"
@@ -1049,7 +1101,7 @@ def test_reduction_is_skipped_when_working_precision_is_not_wider(namespace):
         solver = DenseSolver(options)
         solver.factor(op)
         x = solver.solve(rhs)
-        assert np.all(np.isfinite(np.asarray(x)))
+        assert np.all(np.isfinite(to_numpy(x)))
         assert solver.describe() == "dense"  # native: no reduction, no refine
         assert solver.refine_iterations == 0
 
@@ -1073,11 +1125,11 @@ def test_auto_is_native_on_fp64_condensed_system(namespace):
     op, rhs = _condensed(namespace)
     solver = DenseSolver(DenseOptions())
     solver.factor(op)
-    x = np.asarray(solver.solve(rhs))
+    x = to_numpy(solver.solve(rhs))
 
     native = DenseSolver(DenseOptions(gram_dtype="native"))
     native.factor(op)
-    np.testing.assert_array_equal(x, np.asarray(native.solve(rhs)))
+    np.testing.assert_array_equal(x, to_numpy(native.solve(rhs)))
     assert solver.refine_iterations == 0
     assert solver.describe() == "dense"
 
@@ -1115,17 +1167,17 @@ def test_auto_end_to_end_with_hinted_sparse_jacobian():
 
     native = DenseSolver(DenseOptions(gram_dtype="native"))
     native.factor(op)
-    x_native = np.asarray(native.solve(rhs))
+    x_native = to_numpy(native.solve(rhs))
 
     solver = DenseSolver(DenseOptions())  # auto
     solver.factor(op)
-    x_auto = np.asarray(solver.solve(rhs))
+    x_auto = to_numpy(solver.solve(rhs))
 
     np.testing.assert_allclose(x_auto, x_native, rtol=1e-6, atol=1e-9)
     assert "float32" in solver.describe()
     # The materialized matrix really came from the reduced accumulate.
-    exact = np.asarray(op.dense_matrix(rhs))
-    mixed = np.asarray(op.dense_matrix_mixed(rhs, "float32"))
+    exact = to_numpy(op.dense_matrix(rhs))
+    mixed = to_numpy(op.dense_matrix_mixed(rhs, "float32"))
     rel = np.max(np.abs(mixed - exact)) / np.max(np.abs(exact))
     assert 1e-12 < rel < 1e-3
 
@@ -1181,7 +1233,7 @@ def test_solve_hs35_with_mixed_gram_matches_reference(namespace):
     )
     assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
     np.testing.assert_allclose(
-        np.asarray(result.x), np.asarray(problem.known_solution()), atol=1e-6
+        to_numpy(result.x), to_numpy(problem.known_solution()), atol=1e-6
     )
     # The mixed route really engaged (sticky "->native" also counts: it means
     # it ran reduced first and self-disabled later) — guards against the

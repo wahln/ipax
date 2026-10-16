@@ -224,3 +224,33 @@ def test_exact_hessian_scales_only_the_objective_term_by_sigma(sparse):
         [[sigma * _QuadInstance.a + 2.0, 0.0], [0.0, sigma * _QuadInstance.b]]
     )
     assert_allclose(xp, hess, expected, rtol=1e-12, atol=1e-12)
+
+
+class _DeviceArray:
+    """Stand-in for a CuPy array: no host DLPack capsule, no implicit
+    ``np.asarray`` conversion, an explicit device-to-host ``get()``."""
+
+    def __init__(self, values):
+        self._values = np.asarray(values, dtype=float)
+
+    def __dlpack__(self, *args, **kwargs):
+        raise BufferError("device memory")
+
+    def __dlpack_device__(self):
+        return (2, 0)
+
+    def __array__(self, *args, **kwargs):
+        raise TypeError("Implicit conversion to a NumPy array is not allowed")
+
+    def get(self):
+        return self._values.copy()
+
+
+def test_to_numpy_copies_a_device_array_through_get():
+    # Regression: the bridge fell through to ``np.asarray`` on a CuPy array,
+    # which raises, so ``--backends cupy`` could not run a single problem.
+    from benchmarks.corpus.s2mpj import _to_numpy
+
+    out = _to_numpy(_DeviceArray([[1.0], [2.0], [3.0]]))
+    assert isinstance(out, np.ndarray)
+    np.testing.assert_array_equal(out, [1.0, 2.0, 3.0])

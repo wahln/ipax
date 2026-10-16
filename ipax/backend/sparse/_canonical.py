@@ -87,6 +87,18 @@ class CompiledCompressed:
         # cuDSS symmetric lower-triangle path); ``None`` keeps every triplet.
         self._keep = keep
 
+    @property
+    def inverse(self) -> Array:
+        """Canonical slot of each emitted triplet (after the ``keep`` filter).
+
+        Exposed for an adapter that sums duplicates by another kernel than
+        ``scatter_add`` (the CuPy adapter's ordered segment sum). It indexes
+        the triplets that survive ``keep``, so it pairs with a value vector
+        directly only for a map compiled without ``keep`` (the CuPy
+        adapter's use).
+        """
+        return self._inverse
+
     def data(self, values: Array) -> Array:
         """Canonical ``data`` for ``values`` via one scatter-add (no sort)."""
         if self._keep is not None:
@@ -135,9 +147,10 @@ def compile_lower_triangle(
     nnz = int(lower_indices.shape[0])
 
     idx_dtype = index_dtype(xp, n, nnz)
-    lower_counts = xp.bincount(lower_rows, minlength=n)
     lower_indptr = xp.zeros((n + 1,), dtype=idx_dtype)
     if nnz:
+        # Guarded for CuPy's empty-input ``bincount`` (see compile_compressed).
+        lower_counts = xp.bincount(lower_rows, minlength=n)
         lower_indptr[1:] = xp.cumsum(lower_counts).astype(idx_dtype, copy=False)
     return CompiledLowerTriangle(
         indptr=lower_indptr,
@@ -186,9 +199,12 @@ def compile_compressed(
     out_major = (uniq // n_minor).astype(idx_dtype, copy=False)
     indices = (uniq % n_minor).astype(idx_dtype, copy=False)
 
-    counts = xp.bincount(out_major, minlength=n_major)
     indptr = xp.zeros((n_major + 1,), dtype=idx_dtype)
     if nnz:
+        # Inside the guard: an empty pattern's all-zero indptr needs no counts,
+        # and CuPy's ``bincount`` (unlike NumPy's) cannot take an empty input —
+        # it sizes the output by ``max(x)``, a reduction with no identity.
+        counts = xp.bincount(out_major, minlength=n_major)
         indptr[1:] = xp.cumsum(counts).astype(idx_dtype, copy=False)
 
     return CompiledCompressed(

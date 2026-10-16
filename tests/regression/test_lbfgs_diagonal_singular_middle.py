@@ -120,3 +120,30 @@ def test_a_healthy_operator_still_applies_its_correction(namespace):
 
     # B = I - U (2I)^-1 U^T = I - 0.5 I = 0.5 I
     assert_allclose(namespace, out, 0.5 * v, rtol=1e-10)
+
+
+@pytest.mark.parametrize("method", ["matvec", "diagonal"])
+def test_a_non_numerical_solve_error_is_not_mistaken_for_a_singular_middle(
+    namespace, monkeypatch, method
+):
+    # Only a numerical failure (``numerical_failure_types()``) of the compact
+    # solve takes the seed / "unavailable" fallbacks above; a bug there (a
+    # dtype/device mismatch) must propagate instead of silently dropping the
+    # curvature information for the rest of the run.
+    op = _operator_with_middle(
+        namespace, [[2.0, 0.0], [0.0, 2.0]], [[1.0, 0.0], [0.0, 1.0]]
+    )
+    bug = TypeError("expected both operands on the same device")
+
+    def raising_solve(*args, **kwargs):
+        del args, kwargs
+        raise bug
+
+    monkeypatch.setattr(namespace.linalg, "solve", raising_solve)
+
+    with pytest.raises(TypeError) as info:
+        if method == "matvec":
+            op.matvec(array(namespace, [2.0, -3.0]))
+        else:
+            op.diagonal()
+    assert info.value is bug

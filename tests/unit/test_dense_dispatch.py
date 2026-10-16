@@ -9,7 +9,9 @@ from importlib.util import find_spec
 import pytest
 
 from ipax.backend.dense import (
+    get_dense_cholesky,
     get_dense_cholesky_solve,
+    get_dense_diagonal_adder,
     get_dense_symmetric_indefinite_adapter,
 )
 from ipax.testing.backends import import_namespace
@@ -129,3 +131,79 @@ def test_cholesky_solve_dispatch_cupy_branch_returns_the_adapter(monkeypatch):
     finally:
         if stubbed:
             sys.modules.pop("ipax.backend.dense.cupy", None)
+
+
+# --- the O(n) diagonal-add gap-filler shares the dispatch shape --------------
+# (numpy, torch only: CuPy's ndarray.diagonal() is documented as a writable
+# view like Torch's, but unverified on real CUDA hardware, so the adapter is
+# deliberately not added there yet -- get_dense_diagonal_adder falls back to
+# the eye-based formula on cupy/JAX/array-api-strict.)
+
+
+def test_diagonal_adder_dispatch_numpy_returns_add_diagonal():
+    numpy = import_namespace("numpy")
+    add_diagonal = get_dense_diagonal_adder(numpy)
+    assert add_diagonal is not None
+    assert add_diagonal.__name__ == "add_diagonal"
+
+
+def test_diagonal_adder_dispatch_torch_returns_add_diagonal():
+    pytest.importorskip("torch")
+    torch = import_namespace("torch")
+    add_diagonal = get_dense_diagonal_adder(torch)
+    assert add_diagonal is not None
+    assert add_diagonal.__name__ == "add_diagonal"
+
+
+def test_diagonal_adder_dispatch_returns_none_for_unregistered_namespace():
+    strict = import_namespace("array_api_strict")
+    assert get_dense_diagonal_adder(strict) is None
+
+
+def test_diagonal_adder_dispatch_returns_none_for_cupy():
+    fake_namespace = types.SimpleNamespace(__name__="cupy")
+    assert get_dense_diagonal_adder(fake_namespace) is None
+
+
+def test_diagonal_adder_dispatch_degrades_when_scipy_unimportable(monkeypatch):
+    numpy = import_namespace("numpy")
+    monkeypatch.setitem(sys.modules, "ipax.backend.dense.numpy_scipy", None)
+    assert get_dense_diagonal_adder(numpy) is None
+
+
+def test_diagonal_adder_dispatch_degrades_when_torch_unimportable(monkeypatch):
+    pytest.importorskip("torch")
+    torch = import_namespace("torch")
+    monkeypatch.setitem(sys.modules, "ipax.backend.dense.torch", None)
+    assert get_dense_diagonal_adder(torch) is None
+
+
+# --- the Cholesky factorization gap-filler (LAPACK ``potrf``, NumPy only) ----
+# Torch (``torch.linalg.cholesky``: LAPACK/MAGMA ``potrf``) and CuPy
+# (``cupy.linalg.cholesky``: cuSOLVER ``potrf``) already call ``potrf`` without
+# NumPy's two transposing copies, so they keep ``xp.linalg.cholesky``.
+
+
+def test_cholesky_dispatch_numpy_returns_the_potrf_adapter():
+    pytest.importorskip("scipy")
+    numpy = import_namespace("numpy")
+    factorize = get_dense_cholesky(numpy)
+    assert factorize is not None
+    assert factorize.__module__ == "ipax.backend.dense.numpy_scipy"
+    assert factorize.__name__ == "cholesky"
+
+
+def test_cholesky_dispatch_returns_none_for_torch():
+    pytest.importorskip("torch")
+    assert get_dense_cholesky(import_namespace("torch")) is None
+
+
+def test_cholesky_dispatch_returns_none_for_cupy_and_unregistered_namespaces():
+    assert get_dense_cholesky(types.SimpleNamespace(__name__="cupy")) is None
+    assert get_dense_cholesky(import_namespace("array_api_strict")) is None
+
+
+def test_cholesky_dispatch_degrades_when_scipy_unimportable(monkeypatch):
+    numpy = import_namespace("numpy")
+    monkeypatch.setitem(sys.modules, "ipax.backend.dense.numpy_scipy", None)
+    assert get_dense_cholesky(numpy) is None

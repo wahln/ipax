@@ -72,6 +72,11 @@ def _to_numpy(x: Array) -> Any:
     try:
         return np.reshape(np.from_dlpack(x), (-1,))
     except (TypeError, RuntimeError, BufferError, ValueError):
+        # A device array (CuPy) exports no host DLPack capsule and refuses the
+        # implicit ``np.asarray``; its explicit device-to-host copy is ``get()``.
+        get = getattr(x, "get", None)
+        if callable(get):
+            return np.reshape(np.asarray(get()), (-1,))
         return np.reshape(np.asarray(x), (-1,))
 
 
@@ -341,7 +346,22 @@ class _S2MPJProblem(Problem):
 
     # -- shared Hessian helpers (used by the exact subclass) ---------------
     def _sparse_op(self, matrix: Any) -> LinearOperator:
-        """Wrap a host ``scipy.sparse`` matrix as a COO-exposing operator."""
+        """Wrap a host ``scipy.sparse`` matrix as a COO-exposing operator.
+
+        On CuPy the matrix is uploaded once into the CuPy adapter's operator
+        (``cupyx.scipy.sparse`` CSR), so the sparse-direct route factors it
+        with cuDSS on the device; every other backend keeps the host SciPy
+        operator.
+        """
+        from array_api_compat import is_cupy_namespace
+
+        if is_cupy_namespace(self.xp):
+            import cupyx.scipy.sparse as cusp
+
+            from ipax.backend.sparse.cupy import SparseOperator as CuPySparseOperator
+
+            return CuPySparseOperator(cusp.csr_matrix(matrix.tocsr()), self.xp)
+
         from ipax.backend.sparse.numpy_scipy import SparseOperator
 
         return SparseOperator(matrix, self.xp)

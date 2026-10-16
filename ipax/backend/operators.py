@@ -180,7 +180,8 @@ class LinearOperator(ABC):
         operator's native result dtype regardless. Best-effort: implementations
         may ignore the request (returning the exact Gram is always valid), and
         wrappers forwarding :meth:`gram` must forward it. Callers tolerate
-        pre-keyword implementations (``TypeError``) by retrying without it —
+        pre-keyword implementations (the ``TypeError`` naming the keyword —
+        any other ``TypeError`` propagates) by retrying without it —
         a wrapper is also a caller, so it owes the same retry:
         :func:`forward_gram` is that call, ready-made.
 
@@ -225,6 +226,45 @@ class LinearOperator(ABC):
         the reduction where its data justifies it.
         """
         return None
+
+    def dense_matrix_with_gram(
+        self,
+        jac: LinearOperator,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        """Dense ``A + jacᵀ diag(weights) jac`` formed by ``A`` itself, fused.
+
+        Optional capability of a square curvature operator — the Hessian
+        ``W`` of the condensed normal equations, whose dense route otherwise
+        forms ``W.dense_matrix()`` and the inequality Gram
+        ``jac.gram(weights)`` (``∇gᵀ Σ_s ∇g``, Breedveld 2017, eq. 18) in two
+        separate passes. A curvature that is itself a weighted Gram
+        ``Bᵀ diag(h) B`` over rows it shares with ``jac`` can multiply those
+        rows once with the summed weights ``h + w`` (Breedveld 2017, eq. 48,
+        across the two terms), up to halving the dominant product. ``jac`` and
+        ``weights`` are the solver's view of the inequality block — after
+        ``linear_ineq`` lowering, problem scaling and stacking — so an
+        operator that cannot read that layout directly may route through
+        ``jac.gram`` (whose wrappers translate the weights to the source
+        rows) and cooperate with its own source operators there.
+
+        Contract: the result equals ``self.dense_matrix() + jacᵀ diag(weights)
+        jac`` up to round-off, is symmetric, lives in the namespace and on the
+        device of ``weights`` in their (working) dtype, and is treated as
+        **read-only**
+        (it may alias a memo, as :meth:`dense_matrix` may). ``accumulate_dtype``
+        and ``hinted_only`` are :meth:`gram`'s mixed-precision request and
+        apply to the Gram part only; ``self``'s own part must stay in native
+        precision. Declining is always valid: raise ``NotImplementedError``
+        (the default) and the caller forms the two terms separately, bit for
+        bit as without this hook — but decide *before* forming anything, as
+        the caller pays for the two-pass assembly in full after a decline.
+        """
+        del jac, weights, accumulate_dtype, hinted_only
+        raise NotImplementedError("operator does not fuse an inequality Gram")
 
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         """``Aᵀ diag(weights) A`` as *sparse* COO triplets (invariant #4).
@@ -729,6 +769,36 @@ class Composite(LinearOperator):
         return result
 
 
+# The accumulation keywords a pre-0.10 ``gram(weights)`` signature rejects.
+_GRAM_KEYWORDS = ("accumulate_dtype", "hinted_only")
+
+
+def _gram_rejects_keywords(exc: TypeError) -> bool:
+    """Whether ``exc`` is a pre-keyword ``gram(weights)`` refusing the keywords.
+
+    The compatibility retry (:meth:`LinearOperator.gram`) exists for exactly
+    one ``TypeError``: Python's "got an unexpected keyword argument
+    'accumulate_dtype'" (or ``'hinted_only'``) from an operator written against
+    the old signature. Any other ``TypeError`` raised *inside* a Gram that
+    accepted the keywords is a bug in that operator; retrying without the
+    keywords would silently degrade to the exact Gram and hide it (or run the
+    same failing Gram twice), so it must propagate.
+
+    Two recognizers, either suffices: (1) the error was raised at the call
+    boundary — argument binding fails before the callee's frame exists, so the
+    traceback (caught in the caller) has no deeper frame; this also covers a
+    compiled ``gram`` (a builtin's "takes no keyword arguments", pybind11's
+    "incompatible function arguments"), whose wording names no keyword. (2)
+    the message names a keyword — for a ``*args, **kwargs`` wrapper that
+    forwards to an old signature one frame down.
+    """
+    traceback = exc.__traceback__
+    if traceback is not None and traceback.tb_next is None:
+        return True
+    message = str(exc)
+    return any(f"'{name}'" in message for name in _GRAM_KEYWORDS)
+
+
 def forward_gram(
     op: LinearOperator,
     weights: Array,
@@ -752,7 +822,9 @@ def forward_gram(
         return op.gram(
             weights, accumulate_dtype=accumulate_dtype, hinted_only=hinted_only
         )
-    except TypeError:
+    except TypeError as exc:
+        if not _gram_rejects_keywords(exc):
+            raise
         return op.gram(weights)
 
 
@@ -1184,11 +1256,33 @@ class COOOperator(_SparseStructured):
 def _expand_indptr(xp: object, indptr: Array, nnz: int) -> Array:
     """Compressed ``indptr`` → the major-axis index of each stored entry.
 
-    Entry ``e`` belongs to major index ``i`` where ``indptr[i] ≤ e < indptr[i+1]``;
-    ``searchsorted(..., 'right') − 1`` recovers it in one pure Array-API pass (no
-    scatter primitive, which the standard lacks).
+    Entry ``e`` belongs to major index ``i`` where ``indptr[i] ≤ e < indptr[i+1]``,
+    so the map is ``repeat(arange(len(indptr) − 1), diff(indptr))``: one O(nnz)
+    pass with no ``arange(nnz)`` temporary. ``repeat`` with array-valued counts is
+    standard since the 2023.12 revision, but it is a data-dependent-shape
+    primitive not every namespace provides (CuPy < 14 rejects array counts;
+    ``array-api-strict`` rejects them with ``data_dependent_shapes`` disabled; a
+    pre-2023.12 namespace lacks ``repeat``). Those fall back to the equivalent
+    ``searchsorted(indptr, arange(nnz), 'right') − 1`` (O(nnz log m)). Both forms
+    agree exactly — values and dtype — on a valid ``indptr``.
     """
-    arange = xp.arange(nnz, device=device(indptr))  # type: ignore[attr-defined]
+    dev = device(indptr)
+    repeat = getattr(xp, "repeat", None)
+    if repeat is not None:
+        counts = indptr[1:] - indptr[:-1]
+        major = xp.arange(int(indptr.shape[0]) - 1, device=dev)  # type: ignore[attr-defined]
+        try:
+            expanded = repeat(major, counts)
+        except (TypeError, ValueError, RuntimeError, NotImplementedError):
+            expanded = None  # array-valued ``repeat`` unsupported → searchsorted
+        if expanded is not None:
+            if int(expanded.shape[0]) != nnz:
+                raise ValueError(
+                    "compressed indptr does not span the stored entries: "
+                    f"indptr[-1] - indptr[0] = {int(expanded.shape[0])}, nnz = {nnz}"
+                )
+            return expanded
+    arange = xp.arange(nnz, device=dev)  # type: ignore[attr-defined]
     return xp.searchsorted(indptr, arange, side="right") - 1  # type: ignore[attr-defined]
 
 

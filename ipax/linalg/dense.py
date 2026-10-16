@@ -25,9 +25,13 @@ escalation — the dense analog of the sparse route's inertia check. Both
 stays pure Array API. Target ≤ ~1e4 variables; the reference implementation every
 other solver is checked against.
 
-When the probed block spans the whole system (the condensed route), the probe's
-Cholesky factor is kept and every solve back-substitutes it through the
-``get_dense_cholesky_solve`` backend gap-filler (the Array-API ``linalg``
+The probe factors through the ``get_dense_cholesky`` backend gap-filler where
+one is registered (NumPy: LAPACK ``potrf`` on a single cache-blocked copy,
+instead of ``numpy.linalg.cholesky``'s two transposing copies around it) and
+through ``xp.linalg.cholesky`` everywhere else. When the probed block spans the
+whole system (the condensed route), the probe's Cholesky factor is kept and
+every solve back-substitutes it through the ``get_dense_cholesky_solve`` backend
+gap-filler (the Array-API ``linalg``
 extension has no triangular solve), replacing the redundant O(n³) LU refactor
 with an O(n²) solve — this also makes corrector/SOC back-solves against the
 same factorization cheap. Backends without the gap-filler (array-api-strict,
@@ -48,15 +52,35 @@ always available) otherwise. Either way it exposes real inertia via
 wired generically in ``ipm/driver.py``) engages for the dense route too.
 Falls back to the condensed route automatically when the operator can't
 expose the bordered matrix (e.g. an L-BFGS Hessian, already PD by damping).
+
+Failure classification: only a numerical failure
+(:func:`~ipax.linalg.solver.numerical_failure_types` — the backend's
+``LinAlgError``, an ``ArithmeticError``, an already-classified
+``LinearSolveError``) raised while materializing, probing or solving becomes
+:class:`LinearSolveError` and so feeds the IPM's δ_w ladder. Materializing
+runs the operator's own callbacks (a user Jacobian's ``gram``, a Hessian
+operator's ``dense_matrix``), so anything else raised there is a bug and
+propagates unchanged instead of being retried as a singular system. A backend
+that reports a breakdown *silently* (CuPy under its default ``errstate``, JAX)
+is classified by inspecting the result instead: a Cholesky factor with a NaN
+or zero pivot fails the PD probe exactly as a raised ``LinAlgError`` does
+(:func:`~ipax.linalg.solver.checked_cholesky`), and a singular LU yields the
+non-finite solution the ``LinearSolver`` contract accepts as the same signal.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import TYPE_CHECKING, Any
 
 from ipax.backend.namespace import array_namespace
-from ipax.linalg.solver import LinearSolveError
+from ipax.linalg.solver import (
+    LinearSolveError,
+    checked_cholesky,
+    cholesky_breakdown_is_silent,
+    numerical_failure_types,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -132,6 +156,16 @@ class DenseSolver:
         self._cholesky_factor: Array | None = None
         self._cholesky_solve: Callable[[Array, Array], Array] | None = None
         self._cholesky_solve_checked = False
+        # The backend's own Cholesky factorization (``get_dense_cholesky``:
+        # LAPACK ``potrf`` without NumPy's layout round trip), looked up once
+        # per instance like the back-substitution above; ``None`` ⇒
+        # ``xp.linalg.cholesky``.
+        self._cholesky: Callable[[Array], Array] | None = None
+        self._cholesky_checked = False
+        # Whether the backend's ``cholesky`` reports a breakdown silently (a
+        # broken factor instead of an exception), probed once per instance
+        # like the lookup above; ``None`` until the first PD probe.
+        self._silent_cholesky: bool | None = None
         # Mixed-precision Gram state (DenseOptions.gram_dtype): whether the
         # *current* factorization was materialized with a reduced-precision
         # Gram (so solves must be refined), and the instance-wide kill switch
@@ -248,7 +282,7 @@ class DenseSolver:
                     pass
                 except LinearSolveError:
                     raise
-                except Exception as exc:
+                except numerical_failure_types() as exc:
                     raise LinearSolveError("dense structured solve failed") from exc
 
             self._materialize_and_guard(rhs, xp, n)
@@ -317,7 +351,7 @@ class DenseSolver:
                 )
             except NotImplementedError:
                 matrix = None
-            except Exception as exc:
+            except numerical_failure_types() as exc:
                 raise LinearSolveError("dense matrix materialization failed") from exc
             if matrix is not None:
                 self._mixed_ever_engaged = True
@@ -387,9 +421,9 @@ class DenseSolver:
             if solve_cholesky is not None:
                 try:
                     return solve_cholesky(self._cholesky_factor, rhs)
-                except Exception:
+                except numerical_failure_types():
                     # The reuse is purely an optimization: the materialized
-                    # matrix is still in hand, so an unexpected trsm/potrs
+                    # matrix is still in hand, so a numerical trsm/potrs
                     # failure falls back to LU instead of escalating delta_w
                     # (the factor is dropped so later solves skip the retry).
                     self._cholesky_factor = None
@@ -437,8 +471,10 @@ class DenseSolver:
             self.refine_iterations = iteration
             try:
                 residual = rhs - apply(x)
-            except Exception:
+            except NotImplementedError:
                 return None  # no exact matvec ⇒ a mixed factor is uncertifiable
+            except numerical_failure_types():
+                return None  # the exact residual itself broke down: same verdict
             rnorm = float(xp.max(xp.abs(residual)))
             if rnorm < best_rnorm:
                 best = x
@@ -458,10 +494,24 @@ class DenseSolver:
         return None  # pragma: no cover
 
     def _solve_lu(self, matrix: Array, rhs: Array, xp: Any) -> Array:
+        # A backend that does not raise on an exactly singular LU (CuPy, JAX;
+        # ``ipax.backend.errors``) returns inf/NaN instead — the zero pivot
+        # reaches the solution through the back-substitution's division —
+        # which the ``LinearSolver`` contract accepts as the same failure
+        # signal: every caller checks the solution's finiteness already, so
+        # re-checking here would only add a host sync per solve.
         try:
             return xp.linalg.solve(matrix, rhs)
-        except Exception as exc:
+        except numerical_failure_types() as exc:
             raise LinearSolveError("dense linear solve failed") from exc
+
+    def _lookup_cholesky(self, xp: Any) -> Callable[[Array], Array] | None:
+        if not self._cholesky_checked:
+            from ipax.backend.dense import get_dense_cholesky
+
+            self._cholesky = get_dense_cholesky(xp)
+            self._cholesky_checked = True
+        return self._cholesky
 
     def _lookup_cholesky_solve(self, xp: Any) -> Callable[[Array, Array], Array] | None:
         if not self._cholesky_solve_checked:
@@ -492,7 +542,7 @@ class DenseSolver:
             matrix = augmented_dense_matrix()
         except NotImplementedError:
             return
-        except Exception as exc:
+        except numerical_failure_types() as exc:
             raise LinearSolveError(
                 "augmented dense matrix materialization failed"
             ) from exc
@@ -523,7 +573,7 @@ class DenseSolver:
 
         try:
             result = eigh(matrix)
-        except Exception as exc:
+        except numerical_failure_types() as exc:
             raise LinearSolveError("augmented dense eigendecomposition failed") from exc
 
         eigenvalues = result.eigenvalues
@@ -548,7 +598,7 @@ class DenseSolver:
                 solution = self._augmented_adapter.solve(padded_rhs)
             except LinearSolveError:
                 raise
-            except Exception as exc:
+            except numerical_failure_types() as exc:
                 raise LinearSolveError("augmented dense LDL^T solve failed") from exc
             return self._truncate_solution(solution, n)
 
@@ -598,13 +648,13 @@ class DenseSolver:
                 return dense_matrix(rhs)
             except NotImplementedError:
                 pass
-            except Exception as exc:
+            except numerical_failure_types() as exc:
                 raise LinearSolveError("dense matrix materialization failed") from exc
 
         identity = xp.eye(n, dtype=rhs.dtype)
         try:
             return self._operator.matmat(identity)
-        except Exception as exc:
+        except numerical_failure_types() as exc:
             raise LinearSolveError("dense matrix materialization failed") from exc
 
     def _guard_positive_definite(
@@ -630,6 +680,23 @@ class DenseSolver:
         cholesky = getattr(xp.linalg, "cholesky", None)
         if cholesky is None:
             return
+        injected = self._lookup_cholesky(xp)
+        if injected is not None:
+            # The backend gap-filler (LAPACK ``potrf`` on one blocked copy on
+            # NumPy) raises the backend's numerical failure on a breakdown by
+            # contract, so it needs no pivot check.
+            cholesky = injected
+        else:
+            # A backend that returns a broken factor instead of raising (CuPy,
+            # JAX) must fail this probe too, or an indefinite N would pass the
+            # guard: there the factor's pivots are checked
+            # (``checked_cholesky``, one host sync). Where the backend raises,
+            # the check could never trip, so the plain call stays — no sync
+            # added, results unchanged.
+            if self._silent_cholesky is None:
+                self._silent_cholesky = cholesky_breakdown_is_silent(xp, matrix)
+            if self._silent_cholesky:
+                cholesky = functools.partial(checked_cholesky, xp)
         primal_block = getattr(self._operator, "primal_block", None)
         block = primal_block() if primal_block is not None else None
         if block is None:
@@ -641,7 +708,7 @@ class DenseSolver:
         primal = matrix if n == matrix.shape[0] else matrix[:n, :n]
         try:
             factor = cholesky(primal)
-        except Exception as exc:
+        except numerical_failure_types() as exc:
             raise LinearSolveError("condensed block is not positive definite") from exc
         # Keep the factor only where a backend back-substitution exists;
         # otherwise it would be dead n×n memory next to the LU path.
@@ -666,10 +733,13 @@ class DenseSolver:
         so a numerical breakdown simply leaves the LU path as it was.
 
         The silent fallback relies on ``cholesky`` *raising* on a non-PD input,
-        which the Array API does not mandate (JAX returns NaN). The three
-        backends with a back-substitution gap-filler (NumPy/SciPy, Torch,
-        CuPy) all raise; JAX is excluded by that same lookup — a JAX adapter
-        would need an ``isfinite`` acceptance check here (one host sync).
+        which the Array API does not mandate: CuPy (default ``errstate``) and
+        JAX return a broken factor instead. On such a backend the
+        ``cholesky`` handed in is the pivot-checked one from
+        :meth:`_guard_positive_definite`
+        (:func:`~ipax.linalg.solver.checked_cholesky`), and a registered
+        backend gap-filler (``get_dense_cholesky``) raises by contract, so a
+        breakdown raises on every backend.
 
         A breakdown is not free — the attempted factorization is wasted work
         — so ``DenseOptions.pd_hint_failure_limit`` *consecutive* breakdowns
@@ -698,7 +768,7 @@ class DenseSolver:
             return  # no back-substitution ⇒ a factor would be dead n×n memory
         try:
             factor = cholesky(matrix)
-        except Exception:
+        except numerical_failure_types():
             # Numerically not PD after all: the LU path, as before.
             self._pd_hint_ever_failed = True
             if reduced:

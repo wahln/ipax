@@ -49,6 +49,16 @@ from ipax.backend.sparse._canonical import CompiledCompressed, compile_compresse
 from ipax.backend.sparse._routing import to_xp_array
 from ipax.linalg.solver import LinearSolveError
 
+try:
+    # SciPy's own CSR→dense kernel (what ``csr_matrix.toarray`` runs after
+    # zeroing its target): ``out[i, indices[k]] += data[k]`` for the rows of
+    # ``indptr``. Private but stable; used to densify Gram row windows into a
+    # reused buffer without building a ``csr_matrix`` per chunk. Absent ⇒ the
+    # public ``toarray(out=...)`` route (same kernel behind a wrapper).
+    from scipy.sparse._sparsetools import csr_todense as _csr_todense
+except ImportError:  # pragma: no cover - depends on the SciPy build
+    _csr_todense = None
+
 if TYPE_CHECKING:
     from ipax.typing import Array, Namespace
 
@@ -142,6 +152,39 @@ def _to_index(arr: Array) -> np.ndarray:
 def _scatter_add(out: np.ndarray, idx: np.ndarray, vals: np.ndarray) -> None:
     """Unbuffered scatter-add (sums duplicate targets) for the canonical map."""
     np.add.at(out, idx, vals)
+
+
+def _densify_rows(
+    a: scipy.sparse.csr_matrix,
+    start: int,
+    end: int,
+    out: np.ndarray,
+    *,
+    zeroed: bool = False,
+) -> None:
+    """Write rows ``start:end`` of CSR ``a`` densely into ``out`` (overwritten).
+
+    Bit-identical to ``a[start:end].toarray()`` — the same zero-then-accumulate
+    kernel, so duplicate entries are summed in storage order and ``-0.0`` data
+    lands as ``0.0 + -0.0`` — but with no per-window ``csr_matrix`` (whose
+    constructor re-canonicalizes int64 index windows to int32 copies) and no
+    fresh output allocation: ``out`` must be C-contiguous with ``a``'s dtype.
+    ``zeroed=True`` asserts ``out`` is already all zeros (a fresh ``np.zeros``
+    buffer, whose lazily-mapped pages a redundant fill would fault in early).
+    """
+    lo, hi = int(a.indptr[start]), int(a.indptr[end])
+    indptr = a.indptr[start : end + 1] - lo  # only the row pointers are new
+    if not zeroed:
+        out.fill(0)  # the kernel accumulates (+=), as into toarray's zeroed target
+    if _csr_todense is not None:
+        _csr_todense(
+            end - start, out.shape[1], indptr, a.indices[lo:hi], a.data[lo:hi], out
+        )
+    else:  # exercised by monkeypatching ``_csr_todense`` in the unit tests
+        window = scipy.sparse.csr_matrix(
+            (a.data[lo:hi], a.indices[lo:hi], indptr), shape=out.shape, copy=False
+        )
+        window.toarray(out=out)
 
 
 def _import_feral() -> Any:
@@ -479,11 +522,14 @@ class SparseOperator(LinearOperator):
 
     @staticmethod
     def _gram_dense_accumulate(a: scipy.sparse.csr_matrix, w: np.ndarray) -> np.ndarray:
-        """``Aᵀ diag(w) A`` by BLAS over zero-copy row windows of ``a``.
+        """``Aᵀ diag(w) A`` by BLAS over row windows of ``a``.
 
         Each chunk densifies ``m_chunk × n`` rows (bounded by
-        ``_GRAM_DENSE_CHUNK_ELEMENTS``) — O(m·n²) FLOPs total at dense-BLAS
-        speed, peak extra memory two chunk buffers regardless of ``m``.
+        ``_GRAM_DENSE_CHUNK_ELEMENTS``) straight from views of ``a``'s CSR
+        arrays into one chunk buffer reused across chunks (see
+        :func:`_densify_rows`) — O(m·n²) FLOPs total at dense-BLAS speed, peak
+        extra memory two chunk buffers regardless of ``m`` (one when no dtype
+        promotion is needed).
 
         For finite nonnegative real weights (the IPM's Σ weights are positive
         by construction) the chunk is scaled in place by ``√w`` and
@@ -515,16 +561,29 @@ class SparseOperator(LinearOperator):
             out = np.zeros((n, n), dtype=dtype, order="F")
         else:
             out = np.zeros((n, n), dtype=dtype)
+        rows_max = min(int(m), chunk)
+        # Chunk buffers, allocated once per call instead of once per chunk (a
+        # fresh ``toarray`` + dtype-promoting ``asarray`` per chunk). ``dense``
+        # holds the data dtype — duplicates are summed in it, as ``toarray``
+        # does — and ``cast`` the promoted dtype when it differs. ``np.zeros``
+        # (lazily zero-mapped pages) lets the first chunk skip the re-zeroing.
+        dense_buf = np.zeros((rows_max, int(n)), dtype=a.dtype)
+        cast_buf = (
+            None if dtype == a.dtype else np.empty((rows_max, int(n)), dtype=dtype)
+        )
         for start in range(0, m, chunk):
             end = min(m, start + chunk)
-            lo, hi = int(a.indptr[start]), int(a.indptr[end])
-            window = scipy.sparse.csr_matrix(
-                (a.data[lo:hi], a.indices[lo:hi], a.indptr[start : end + 1] - lo),
-                shape=(end - start, n),
-            )
-            block = np.asarray(window.toarray(), dtype=dtype)
+            dense = dense_buf[: end - start]  # leading rows: C-contiguous view
+            _densify_rows(a, start, end, dense, zeroed=start == 0)
+            if cast_buf is None:
+                block = dense
+            else:
+                block = cast_buf[: end - start]
+                np.copyto(block, dense)  # the cast ``np.asarray(·, dtype)`` did
             if use_syrk:
-                block *= sqrt_w[start:end, None]  # in place — block is fresh
+                # In place: the buffer is fully re-filled (zeros included) by
+                # the next chunk's _densify_rows / copyto before any reuse.
+                block *= sqrt_w[start:end, None]
                 # ``block.T`` is an F-contiguous (n, m_chunk) view (no copy);
                 # syrk adds block.T @ block into ``out``'s lower triangle.
                 out = syrk(

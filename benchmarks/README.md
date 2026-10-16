@@ -17,6 +17,9 @@ benchmarks/
 
 ```bash
 pip install -e ".[bench,numpy,torch,sparse-cpu]"
+# The bench extra includes Numba, which the TROTS loader uses for its
+# compiled tile scatter; without it the loader falls back to NumPy and gets
+# bitwise-identical results, only slower (docs/benchmarks/trots.md).
 
 # Quality-control sweep (correctness / robustness / accuracy regression gate).
 # Runs the curated corpus across a config matrix (hessian x linsolve x

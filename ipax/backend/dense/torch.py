@@ -39,6 +39,48 @@ def cholesky_solve(factor: Any, rhs: Any) -> torch.Tensor:
     return x.squeeze(-1) if vector_rhs else x
 
 
+def add_diagonal(matrix: Any, diagonal: Any) -> torch.Tensor:
+    """Return ``matrix + diag(diagonal)`` in O(n) beyond the unavoidable copy.
+
+    Gap-filler for a missing Array-API primitive (see the NumPy adapter's
+    ``add_diagonal`` for the full rationale): ``torch.Tensor.diagonal()``
+    returns a genuine writable view sharing storage with its source (unlike
+    NumPy's array method, which is read-only), so ``.add_()`` on it updates
+    ``result`` in place in O(n) instead of materializing an ``eye(n)`` term.
+    ``diagonal`` may be a vector or a scalar (broadcasts, e.g. a
+    ``delta_w * I`` term).
+
+    Bitwise identical (for finite inputs) to ``matrix + delta * torch.eye(n)``
+    *at the dtype that expression would have promoted to* — which is not
+    always ``matrix.dtype``: Torch's own type-promotion rules keep
+    ``matrix.dtype`` for a Python-scalar ``diagonal`` (a "weak" type) but
+    promote to ``diagonal``'s dtype when it is a wider-precision tensor (e.g.
+    a float64 vector against a float32 ``matrix``). Casting unconditionally
+    to ``result.dtype`` silently narrows that case, and double-rounds a
+    float32 scalar computed via a float64 intermediate; ``torch.result_type``
+    reproduces the reference expression's exact promotion decision instead.
+    """
+    base = torch.as_tensor(matrix)
+    if isinstance(diagonal, (int, float)):
+        # A Python scalar is "weak": it never widens a floating-point tensor
+        # (``torch.result_type`` would just return ``base.dtype`` here), so
+        # ``Tensor.add_`` takes it directly — no 0-d tensor allocation, and
+        # no CPU/device mismatch to reason about (Torch treats a genuine
+        # Python number as a device-less scalar in-place, exactly like the
+        # reference ``eye`` formula's own scalar multiply).
+        result = base.clone()
+        result.diagonal().add_(diagonal)
+        return result
+    dtype = torch.result_type(base, diagonal)
+    result = base.to(dtype)
+    if result is base:
+        # ``Tensor.to`` returns ``self`` (no copy) when the dtype already
+        # matches; still owe the caller a fresh tensor to mutate.
+        result = result.clone()
+    result.diagonal().add_(torch.as_tensor(diagonal, dtype=dtype))
+    return result
+
+
 def _ldl_blocks_from_pivots(pivots: torch.Tensor) -> list[tuple[int, int]]:
     """Identify the ``(start, size)`` of each 1x1/2x2 block from LAPACK ``ipiv``.
 
@@ -145,4 +187,4 @@ class TorchLDLFactorization:
         return self._inertia
 
 
-__all__ = ["TorchLDLFactorization", "cholesky_solve"]
+__all__ = ["TorchLDLFactorization", "add_diagonal", "cholesky_solve"]

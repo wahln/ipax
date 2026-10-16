@@ -271,6 +271,129 @@ def test_breedveld_oracle_with_corrector_solves(namespace):
     assert_allclose(namespace, result.x, problem.known_solution(), rtol=1e-6, atol=1e-6)
 
 
+# -- probing σ rule (BarrierOptions.probing_sigma) ----------------------------
+
+
+def _solve_hs35_probing(namespace, **barrier_kwargs):
+    problem = HS35(namespace)
+    return problem, solve(
+        problem,
+        array(namespace, [0.5, 0.5, 0.5]),
+        options=Options(
+            hessian="exact",
+            linsolve="dense",
+            mu_schedule="probing",
+            corrections="mehrotra",
+            globalization="breedveld",
+            barrier=BarrierOptions(**barrier_kwargs),
+        ),
+    )
+
+
+def test_probing_sigma_default_never_consults_the_mehrotra_rule(namespace, monkeypatch):
+    # The unclipped Mehrotra σ rule is opt-in: under the default options the
+    # probing oracle must go through the NWW rule (``probing_mu``) and never
+    # reach ``mehrotra_probing_mu``.
+    import ipax.ipm.driver as driver_module
+
+    assert BarrierOptions().probing_sigma == "nww"
+    calls = {"nww": 0, "mehrotra": 0}
+    original_nww = driver_module.probing_mu
+    original_mehrotra = driver_module.mehrotra_probing_mu
+
+    def nww_spy(context):
+        calls["nww"] += 1
+        return original_nww(context)
+
+    def mehrotra_spy(context, tau):
+        calls["mehrotra"] += 1
+        return original_mehrotra(context, tau=tau)
+
+    monkeypatch.setattr(driver_module, "probing_mu", nww_spy)
+    monkeypatch.setattr(driver_module, "mehrotra_probing_mu", mehrotra_spy)
+    _, default = _solve_hs35_probing(namespace)
+
+    assert default.status is Status.OPTIMAL
+    assert calls["mehrotra"] == 0
+    assert calls["nww"] > 0
+
+    # Smoke check only: the explicit "nww" setting takes the same path.
+    _, explicit = _solve_hs35_probing(namespace, probing_sigma="nww")
+    assert _mu_trace(default) == _mu_trace(explicit)
+
+
+def test_probing_sigma_rejects_unknown_rule():
+    with pytest.raises(ValueError, match="probing_sigma"):
+        BarrierOptions(probing_sigma="breedveld")  # type: ignore[arg-type]
+
+
+def test_mehrotra_probing_sigma_solves_and_uses_the_breedveld_tau(
+    namespace, monkeypatch
+):
+    # probing_sigma="mehrotra" routes the probing oracle to the unclipped rule
+    # (Mehrotra 1992; Breedveld 2017 supplement eqs. (4)–(7)) with the probe
+    # step cut back by BreedveldOptions.tau.
+    import ipax.ipm.driver as driver_module
+
+    seen: list[float] = []
+    original = driver_module.mehrotra_probing_mu
+
+    def spy(context, tau):
+        seen.append(tau)
+        return original(context, tau=tau)
+
+    monkeypatch.setattr(driver_module, "mehrotra_probing_mu", spy)
+    problem, result = _solve_hs35_probing(namespace, probing_sigma="mehrotra")
+    _, nww = _solve_hs35_probing(namespace)
+
+    assert result.status is Status.OPTIMAL
+    assert_allclose(namespace, result.x, problem.known_solution(), rtol=1e-6, atol=1e-6)
+    assert seen, "the unclipped Mehrotra σ oracle was never consulted"
+    assert set(seen) == {Options().breedveld.tau}
+    assert _mu_trace(result) != _mu_trace(nww)
+
+
+def test_breedveld_mehrotra_and_gondzio_variant_solve_hs35(namespace, monkeypatch):
+    # Breedveld 2017 supplement A.1 + A.2 together (σ rule + Gondzio variant).
+    import dataclasses
+
+    import ipax.ipm.corrections as corrections_module
+    from ipax.options import CorrectionsOptions
+
+    # Spy: at least one candidate corrector solve of the Breedveld Gondzio
+    # loop must run (not only the Mehrotra step preceding it).
+    candidate_solves = []
+    original = corrections_module._breedveld_gondzio
+
+    def spy(ctx, xp, step, mu_target, targets, max_corrections):
+        def counting_solve(*args):
+            candidate_solves.append(mu_target)
+            return ctx.solve(*args)
+
+        counted = dataclasses.replace(ctx, solve=counting_solve)
+        return original(counted, xp, step, mu_target, targets, max_corrections)
+
+    monkeypatch.setattr(corrections_module, "_breedveld_gondzio", spy)
+    problem = HS35(namespace)
+    result = solve(
+        problem,
+        array(namespace, [0.5, 0.5, 0.5]),
+        options=Options(
+            hessian="exact",
+            linsolve="dense",
+            mu_schedule="probing",
+            corrections=CorrectionsOptions(
+                method="gondzio", gondzio_variant="breedveld"
+            ),
+            globalization="breedveld",
+            barrier=BarrierOptions(probing_sigma="mehrotra"),
+        ),
+    )
+    assert result.status is Status.OPTIMAL
+    assert_allclose(namespace, result.x, problem.known_solution(), rtol=1e-6, atol=1e-6)
+    assert candidate_solves, "no Breedveld Gondzio candidate solve ran"
+
+
 # -- free-mode KKT-error fallback (NWW 2009, §5.1, Algorithm A) ---------------
 
 

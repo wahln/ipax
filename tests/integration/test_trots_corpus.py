@@ -564,6 +564,131 @@ def test_device_exact_hessian_solves_like_numpy_on_liver01_cupy(monkeypatch):
     assert abs(r_cp.objective - r_np.objective) <= 1e-8 * max(1.0, abs(r_np.objective))
 
 
+def test_device_exact_hessian_keeps_gated_off_structures_on_the_gpu_ck01(
+    monkeypatch,
+):
+    # Regression (2026-09-27): Prostate_CK_01's curved structures (PTV 3 mm,
+    # PZ: 87-90% dense) fail the tile gate, so on CuPy no curved structure
+    # was tiled and the grouped Hessian crossed through the host on every
+    # call -- TROTSExactHessian.host_sparse, one SciPy SpGEMM per structure
+    # (36 s), then a CSCOperator upload: 33 s/iter vs 2.2 s on NumPy. The
+    # device operator now plans them past the gate and forms the 25
+    # smoothing quadratics on the device; a steady-state call uploads only
+    # weight vectors and the quadratic multipliers.
+    xp = _cupy_namespace()
+    if "Prostate_CK_01" not in trots.list_trots_cases():
+        pytest.skip("Prostate_CK_01 not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/Prostate_CK_01.mat")
+    host = trots.TROTSExactProblem(instance, np)
+    dev = trots.TROTSExactProblem(instance, xp)
+    assert all(cs.tiles is None for cs in dev._curved.values())  # gated off
+    assert len(dev._quad_con) == 25
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("the device Hessian crossed through the host")
+
+    monkeypatch.setattr(trots.TROTSExactHessian, "host_sparse", boom)
+    uploads = []
+    real_put = trots._DeviceGramContext.put
+
+    def put(self, arr, dtype=None):
+        host = np.asarray(arr)
+        uploads.append((int(host.nbytes), np.dtype(dtype or host.dtype)))
+        return real_put(self, arr, dtype)
+
+    monkeypatch.setattr(trots._DeviceGramContext, "put", put)
+    z = np.asarray(host.initial_point())
+    rng = np.random.default_rng(2027)
+    zero = xp.asarray(np.zeros(0))
+    rows = max(cs.mat.matrix.shape[0] for cs in dev._curved.values())
+    for sigma, y in (
+        (1.0, np.zeros(host._n_nl_ineq)),  # the LTCP structures alone
+        (0.9, rng.uniform(0.0, 2.0, host._n_nl_ineq)),  # plus the quadratics
+    ):
+        uploads.clear()
+        h = dev.lagrangian_hessian(xp.asarray(z), zero, xp.asarray(y), sigma)
+        assert isinstance(h, trots.TROTSDeviceExactHessian)
+        d = trots._to_numpy_nd(h.dense_matrix())
+        ref = np.asarray(
+            host.lagrangian_hessian(z, np.zeros(0), y, sigma).dense_matrix()
+        )
+        np.testing.assert_array_equal(d, d.T)
+        assert np.max(np.abs(d - ref)) <= 1e-12 * np.max(np.abs(ref))
+        v = rng.standard_normal(host.n_vars)
+        hv = trots._to_numpy_nd(h.matvec(xp.asarray(v)))
+        assert np.max(np.abs(hv - ref @ v)) <= 1e-12 * np.max(np.abs(ref @ v))
+    # Second call (tiles cached): per structure its weights, plus the
+    # multipliers -- nothing of the size of a tile, a product or n x n, and
+    # no index array (the fingerprint of a COO / CSC crossing).
+    assert max(nbytes for nbytes, _dt in uploads) <= 8 * rows
+    assert len(uploads) <= len(dev._curved) + 1
+    assert all(dt.kind == "f" for _nb, dt in uploads), uploads
+
+
+def test_device_breedveld_start_matches_the_host_start_on_protons01_cupy():
+    # On CuPy the Breedveld et al. 2017 §3.1 start runs LSQR (eq. (26)) on the
+    # GPU against the problem's own lowered operator; it must give the host
+    # SciPy start to round-off and return device arrays.
+    import scipy.sparse.linalg as spla
+
+    xp = _cupy_namespace()
+    import cupy
+
+    if "Protons_01" not in trots.list_trots_cases():
+        pytest.skip("Protons_01 not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/Protons_01.mat")
+    problem = trots.TROTSProblem(instance, xp)
+    x0 = problem.initial_point(strategy="breedveld")
+
+    dev = problem._breedveld_least_squares(x0, "auto")
+    host = problem._breedveld_least_squares(x0, "host")
+    assert dev.on_device and not host.on_device
+    assert isinstance(dev.y, cupy.ndarray)
+    np.testing.assert_allclose(cupy.asnumpy(dev.grad), host.grad, rtol=1e-12)
+    np.testing.assert_allclose(
+        cupy.asnumpy(dev.g), host.g, rtol=0, atol=1e-12 * np.max(np.abs(host.g))
+    )
+
+    # Unfloored LSQR solution. Over a short horizon the device iteration
+    # tracks SciPy's to round-off; afterwards Golub–Kahan's loss of
+    # orthogonality amplifies it (a 1e-16 relative perturbation of SciPy's own
+    # matvec moves its final iterate by ~1e-4), so the full runs are compared
+    # as least-squares solutions: both stop on the atol/btol test at a
+    # residual of the same size, and the multipliers agree far below the
+    # floor of 5 that every one of them is raised to.
+    m, n = int(host.g.shape[0]), int(host.x.shape[0])
+    jt = spla.LinearOperator(
+        (n, m),
+        matvec=lambda v: np.asarray(host.jac.rmatvec(np.ravel(v))),
+        rmatvec=lambda u: np.asarray(host.jac.matvec(np.ravel(u))),
+        dtype=np.float64,
+    )
+    y_short = spla.lsqr(jt, -host.grad, atol=0.0, btol=0.0, conlim=0.0, iter_lim=10)[0]
+    y_short_dev = trots._lsqr(
+        dev.jac.rmatvec, dev.jac.matvec, -dev.grad, m, xp,
+        atol=0.0, btol=0.0, conlim=0.0, iter_lim=10,
+    )[0]  # fmt: skip
+    np.testing.assert_allclose(
+        cupy.asnumpy(y_short_dev), y_short, rtol=0, atol=1e-10 * np.max(np.abs(y_short))
+    )
+    y_dev = cupy.asnumpy(dev.y)
+    assert np.linalg.norm(y_dev - host.y) <= 1e-2 * np.linalg.norm(host.y)
+    assert np.max(np.abs(y_dev - host.y)) <= 1e-4
+    r_host = np.linalg.norm(jt.matvec(host.y) + host.grad)
+    r_dev = float(xp.linalg.vector_norm(dev.jac.rmatvec(dev.y) + dev.grad))
+    assert r_dev == pytest.approx(r_host, rel=0.05)
+    assert r_host <= 1e-3 * np.linalg.norm(host.grad)
+
+    # The start itself (after the floors) and μ0: round-off, on the device.
+    wd, mu_dev = problem.breedveld_warm_start(x0)
+    wh, mu_host = problem.breedveld_warm_start(x0, lsqr="host")
+    for a, b in ((wd.s, wh.s), (wd.y_ineq, wh.y_ineq), (wd.z_lower, wh.z_lower)):
+        assert isinstance(a, cupy.ndarray) and a.device == x0.device
+        np.testing.assert_allclose(cupy.asnumpy(a), cupy.asnumpy(b), rtol=1e-8)
+    assert mu_dev == pytest.approx(mu_host, rel=1e-8)
+    assert bool(cupy.all(wd.y_ineq == 5.0))  # every multiplier on the floor
+
+
 # --------------------------------------------------------------------------- #
 # Restoration's dense route on a tall linear block: Gram, not densification
 # --------------------------------------------------------------------------- #

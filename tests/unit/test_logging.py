@@ -158,6 +158,33 @@ def test_format_record_combines_restored_and_acceptable_tags():
     assert row.rstrip().endswith("R *")
 
 
+def test_format_record_marks_second_order_corrected_iterates():
+    record = IterationRecord(
+        3, 1.0, 1e-9, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.0, 0.0, used_soc=True
+    )
+    row = format_record(record)
+    assert row.rstrip().endswith("C")
+
+
+def test_format_record_combines_all_tags():
+    record = IterationRecord(
+        3,
+        1.0,
+        1e-9,
+        1e-9,
+        1e-9,
+        1.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        restored=True,
+        used_soc=True,
+    )
+    row = format_record(record, acceptable=True)
+    assert row.rstrip().endswith("R C *")
+
+
 def test_format_setup_reports_condensed_headline():
     line = format_setup(
         n_vars=120,

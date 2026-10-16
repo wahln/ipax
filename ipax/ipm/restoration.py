@@ -33,11 +33,17 @@ from collections.abc import Callable
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from ipax._logging import logger
 from ipax.backend.operators import LinearOperator, VStack
-from ipax.linalg.solver import LinearSolveError
+from ipax.linalg.solver import (
+    LinearSolveError,
+    cholesky_factor_ok,
+    numerical_failure_types,
+)
 
 if TYPE_CHECKING:
     from ipax.linalg.solver import LinearSolver
+    from ipax.options import RestorationDenseFactorization
     from ipax.typing import Array, Namespace
 
 _MAX_ITER = 200  # outer (Jacobian-rebuild) iterations; stalls exit via the window
@@ -207,6 +213,61 @@ class _RestorationNormalOperator(LinearOperator):
         return self._reduced_diagonal + self.damping
 
 
+def _dense_cholesky_solver(xp: Namespace) -> Callable[[Array, Array], Array] | None:
+    """The backend's ``(L, b) -> (L Lᵀ)⁻¹ b``, or ``None`` where it has none.
+
+    The Array-API ``linalg`` extension provides ``cholesky`` but no triangular
+    solve, so the back-substitution comes from the per-backend gap-filler
+    :func:`ipax.backend.dense.get_dense_cholesky_solve` (invariant #2) — the
+    same one ``DenseSolver`` back-substitutes its kept KKT factor through.
+    """
+    from ipax.backend.dense import get_dense_cholesky_solve
+
+    return get_dense_cholesky_solve(xp)
+
+
+def _cholesky_lm_direction(
+    xp: Namespace,
+    damped: Array,
+    rhs: Array,
+    cholesky_solve: Callable[[Array, Array], Array],
+) -> Array | None:
+    """Solve the damped Gauss–Newton system by Cholesky; ``None`` on breakdown.
+
+    ``damped = Jᵀ Σ J + λ I`` is symmetric positive definite for ``λ > 0``
+    (a Gram plus a positive shift; Nocedal & Wright 2006, §10.3), so the
+    Cholesky factorization ``L Lᵀ`` replaces the LU at about half its flops
+    (``n³/3`` vs ``2n³/3``; Golub & Van Loan 2013, §§3.2, 4.2). In floating
+    point an extreme-scale Gram (the HS7-class
+    ``~1e200`` Jacobians) can still be numerically indefinite. A breakdown is
+    reported as ``None`` so the caller solves that trial by LU instead:
+
+    * the backend raising a numerical failure (``numerical_failure_types()``:
+      NumPy/array-api-strict/Torch ``LinAlgError``, overflow);
+    * a broken factor returned silently — NumPy returns NaN for a NaN
+      input, CuPy (default ``errstate``) returns a NaN pivot for a negative
+      one and a *finite* factor with an exact zero pivot for a singular
+      matrix, JAX never raises (:mod:`ipax.backend.errors`). Classified by
+      :func:`~ipax.linalg.solver.cholesky_factor_ok` (every pivot finite and
+      positive, the ``potrf`` success criterion) and checked explicitly
+      because a BLAS ``trsm`` skips zero right-hand-side entries, so neither
+      a NaN nor a zero pivot in ``L`` need reach the solution (the rows of
+      bound-blocked variables have a zero right-hand side);
+    * a non-finite back-substitution (overflow of a finite factor).
+
+    Both tests share one host sync. Anything else (a bug, an out-of-memory
+    error) propagates unchanged.
+    """
+    try:
+        factor = xp.linalg.cholesky(damped)
+        dx = cholesky_solve(factor, rhs)
+    except numerical_failure_types():
+        return None
+    if not bool(cholesky_factor_ok(xp, factor) & xp.all(xp.isfinite(dx))):
+        return None
+    return dx
+
+
 def _escape_direction(xp: Namespace, x: Array) -> Array:
     """A fixed, component-wise aperiodic probe direction for the escape kick.
 
@@ -273,14 +334,18 @@ def restore(
     tol: float,
     linear_solver: LinearSolver | None = None,
     dense_materialize_max_elements: int | None = None,
+    dense_factorization: RestorationDenseFactorization = "lu",
 ) -> tuple[Array, Array, RestorationExit]:
     """Minimize the constraint infeasibility; return ``(x, s, exit_reason)``.
 
     ``dense_materialize_max_elements`` is
     :attr:`~ipax.options.RestorationOptions.dense_materialize_max_elements`
-    (``None``: that option's default); it only affects the dense route
-    (``linear_solver is None``).
+    (``None``: that option's default) and ``dense_factorization`` is
+    :attr:`~ipax.options.RestorationOptions.dense_factorization`; both only
+    affect the dense route (``linear_solver is None``).
     """
+    if dense_factorization not in ("lu", "cholesky"):
+        raise ValueError("dense_factorization must be 'lu' or 'cholesky'")
     if dense_materialize_max_elements is None:
         from ipax.options import RestorationOptions
 
@@ -290,6 +355,16 @@ def restore(
     dtype = x.dtype
     n = int(x.shape[0])
     identity = xp.eye(n, dtype=dtype) if linear_solver is None else None
+    # Opt-in Cholesky solve of the dense LM trials (``_cholesky_lm_direction``);
+    # without a triangular-solve adapter it is the LU path unchanged.
+    cholesky_solve: Callable[[Array, Array], Array] | None = None
+    if linear_solver is None and dense_factorization == "cholesky":
+        cholesky_solve = _dense_cholesky_solver(xp)
+        if cholesky_solve is None:
+            logger.debug(
+                "restoration: no Cholesky back-substitution for this backend; "
+                "dense_factorization='cholesky' solves by LU"
+            )
     feasible_tol = feasible_theta_tol(tol)
 
     margin = feasible_tol
@@ -450,32 +525,45 @@ def restore(
         # backend's solve raise or return a non-finite step; both count as a
         # rejected trial. The dense exception type is backend-specific (numpy
         # ``LinAlgError``, torch ``_LinAlgError``, …) and cannot be named
-        # without importing a concrete library (invariant #1), so it is caught
-        # broadly. The iterative route raises ``LinearSolveError`` only for
-        # numerical trouble — any other exception is an operator-callback or
-        # configuration bug and propagates — and a work-capped solve hands
-        # back its truncated iterate, which is a descent direction for the SPD
-        # Gauss-Newton model (Steihaug 1983): it is tried like any direction
-        # rather than discarded, so the ladder is not climbed on Krylov work
-        # limits alone.
+        # without importing a concrete library (invariant #1), so it is
+        # recognized through ``numerical_failure_types()``; anything else (a
+        # resource failure, a bug) propagates. The iterative route raises
+        # ``LinearSolveError`` only for numerical trouble — any other exception
+        # is an operator-callback or configuration bug and propagates — and a
+        # work-capped solve hands back its truncated iterate, which is a
+        # descent direction for the SPD Gauss-Newton model (Steihaug 1983): it
+        # is tried like any direction rather than discarded, so the ladder is
+        # not climbed on Krylov work limits alone. The opt-in Cholesky solve
+        # (``RestorationOptions.dense_factorization``) runs first and hands a
+        # breakdown to this same LU solve for the trial.
         accepted = False
         direction_tried = False
+        rhs = -grad  # fixed across the damping trials of this iterate
         while lam <= _LM_MAX:
             dx: Array | None
             try:
                 if normal is None:
                     assert hessian is not None and identity is not None
-                    dx = xp.linalg.solve(hessian + lam * identity, -grad)
+                    damped = hessian + lam * identity
+                    dx = None
+                    if cholesky_solve is not None:
+                        dx = _cholesky_lm_direction(xp, damped, rhs, cholesky_solve)
+                        if dx is None:
+                            logger.debug(
+                                "restoration: Cholesky breakdown at damping "
+                                "%.3g; solving this trial by LU",
+                                lam,
+                            )
+                    if dx is None:
+                        dx = xp.linalg.solve(damped, rhs)
                 else:
                     assert linear_solver is not None
                     normal.damping = lam
                     linear_solver.factor(normal)
                     dx = linear_solver.solve(-grad)
-            except MemoryError:  # a genuine resource failure must propagate
-                raise
             except LinearSolveError as exc:
                 dx = exc.iterate
-            except Exception:
+            except numerical_failure_types():
                 if normal is not None:
                     raise
                 dx = None  # backend-specific dense singular-solve error
@@ -495,8 +583,8 @@ def restore(
             # the iterative route, never obtaining a direction at all is not a
             # certificate (a Krylov breakdown says nothing about local
             # feasibility). The dense route keeps its established
-            # exception-to-NO_DESCENT semantics: its λ = 1e16 rung is always
-            # solvable, so that case is a non-finite Jacobian.
+            # numerical-failure-to-NO_DESCENT semantics: its λ = 1e16 rung is
+            # always solvable, so that case is a non-finite Jacobian.
             certified = normal is None or direction_tried
             if certified and not escape_used:
                 # Same saddle probe as the gradient test: a symmetric trap

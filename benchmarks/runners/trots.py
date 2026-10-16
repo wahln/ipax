@@ -29,17 +29,42 @@ Two jobs, both gated on a local TROTS dataset (``IPAX_TROTS_DIR`` or ``--dir``):
    the paper's §3.1 initialisation (``--init breedveld``): the least-squares
    fluence rescaled towards its mean and floored at 5 (eqs. (23)–(24)), LSQR
    multipliers with floored bound multipliers and slacks (eqs. (26)–(28)), and
-   ``μ0`` their average complementarity (eq. (10)). The initialisation's time
+   ``μ0`` their average complementarity (eq. (10)); ``--lsqr-iter``/
+   ``--lsqr-tol`` override the eq. (26) LSQR's iteration cap/tolerance
+   (``--init breedveld`` only), opt-in because a lower cap is only known to
+   reproduce the default bit-for-bit on the measured corpus, not in general
+   (docs/benchmarks/trots.md's "LSQR dual start"). The initialisation's time
    — the starting point included, under either ``--init`` — counts toward the
-   reported solve time. μ follows the monotone
-   Fiacco–McCormick reduction (``--mu-schedule monotone``); ``--mu-schedule
-   probing`` is the closest transcription of Breedveld's Mehrotra μ and the
-   proton lever (about 2× fewer iterations on the proton cases, but about 6×
-   more on Liver, where it drives barrier-dominated objective excursions).
-   The previous default stays one flag set away: ``--config
-   lbfgs/dense,exact/dense --init ipax --globalization filter --corrections
-   none`` (the RT recipes of ``docs/benchmarks/trots.md`` add levers on top of
-   it, e.g. the proton recipe's ``--mu-schedule quality``).
+   reported solve time. μ comes from the Mehrotra probing oracle
+   (``--mu-schedule probing``, the closest transcription of Breedveld's
+   Mehrotra μ) with the El-Bakry centrality floor off
+   (``--kappa-centrality 0``): the 2026-09-27 sweep over all seven TROTS sites
+   (docs/benchmarks/trots.md) found the floor, not the oracle, behind the
+   barrier-dominated excursions on the nonconvex cases, and probing without
+   it beats the monotone reduction on every measured case (Protons_01 93 vs
+   214 iterations, Liver_01 57 vs 74, Prostate_CK_01 39 vs 87, VMAT_101 404
+   vs 635, the BT pair certifying the −0.78/−0.75 optima where monotone stops
+   at 0). ``--mu-schedule monotone`` is the previous runner default. The
+   pre-2026-09-26 default stays one flag set away: ``--config
+   lbfgs/dense,exact/dense --init ipax --mu-schedule monotone --globalization
+   filter --corrections none --kappa-centrality 1e-2`` (the RT recipes of
+   ``docs/benchmarks/trots.md`` add levers on top of it).
+
+   ``--breedveld-soc N`` (off by default; only with ``--globalization
+   breedveld``) adds a second-order correction of ``N`` accumulated rounds
+   to the Breedveld controller's rejected full step
+   (``BreedveldOptions.max_soc``, Wächter & Biegler 2006 §2.4 — an ipax
+   addition, not part of the paper's solver). Every solve row carries
+   ``soc_attempted`` / ``soc_accepted`` (summed from the public
+   ``IterationRecord.soc_attempted`` / ``.used_soc`` on ``Result.history``),
+   whichever globalization produced them — the filter line search has its
+   own ``LineSearchOptions.max_soc`` correction, on by default.
+
+   Each solve row also carries the paper's own result for the case, the
+   Mehrotra-method iterations and seconds of Breedveld et al. 2017's timing
+   supplement (``ref_iters`` / ``ref_time_s`` in the JSON report, "paper" on
+   the console; :mod:`benchmarks.corpus.trots_reference`, CC BY 4.0). Those
+   seconds were measured on the paper's 2017 16-core machine.
 
 Run from the repository root::
 
@@ -58,12 +83,14 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import ipax
 from benchmarks.corpus.trots import (
+    _BREEDVELD_START_FLOOR,
     TROTSExactProblem,
     TROTSProblem,
     list_trots_cases,
@@ -72,11 +99,18 @@ from benchmarks.corpus.trots import (
     reference_for,
     trots_dir,
 )
+from benchmarks.corpus.trots_reference import breedveld2017_reference
 from benchmarks.harness import capture_environment, run_case
-from ipax.options import BarrierOptions, OptimalityConditionOptions
+from ipax.options import (
+    BarrierOptions,
+    BreedveldOptions,
+    DenseOptions,
+    OptimalityConditionOptions,
+)
 from ipax.testing.backends import import_namespace
 
 if TYPE_CHECKING:
+    from benchmarks.harness import CaseResult
     from ipax.problem.base import Problem
     from ipax.result import WarmStart
     from ipax.typing import Array
@@ -155,17 +189,26 @@ def _solve_case(
     opts: ipax.Options,
     xp: object,
     *,
+    backend: str = "numpy",
     plain_gram: bool = False,
     per_term_hessian: bool = False,
     init: str = "breedveld",
+    lsqr_iter: int | None = None,
+    lsqr_tol: float | None = None,
+    dual_floor: float = _BREEDVELD_START_FLOOR,
 ):
     """Score one solve via the shared harness (wrapping the case as a corpus problem).
+
+    ``dual_floor`` is the Breedveld start's multiplier floor
+    (:meth:`TROTSProblem.breedveld_warm_start`; default the paper's 5).
 
     ``plain_gram`` builds the problem with ``tiled_gram=False`` (the core's
     plain Gram for the linear block, dense row chunks for the exact Hessian);
     ``per_term_hessian`` keeps the exact Hessian's original per-term SpGEMM
     path (``grouped_hessian=False``). Both are A/B levers; unset, the loader
-    defaults apply.
+    defaults apply. ``lsqr_iter``/``lsqr_tol`` override the Breedveld dual
+    start's LSQR iteration cap / tolerance (``init="breedveld"`` only; see
+    :meth:`TROTSProblem.breedveld_warm_start`).
 
     The starting point is produced by the case's ``prepare_solve`` hook, which
     the harness times as initialisation and counts in the solve time (the
@@ -217,7 +260,13 @@ def _solve_case(
         # (eqs. (26)–(28)) and μ0 (eq. (10)).
         start = problem.initial_point(strategy="breedveld")
         # μ0 in solver space: the solve's scaling multiplies it by s_f.
-        warm, mu0 = problem.breedveld_warm_start(start, scaling=options.scaling)
+        warm, mu0 = problem.breedveld_warm_start(
+            start,
+            scaling=options.scaling,
+            lsqr_iter=lsqr_iter,
+            lsqr_tol=lsqr_tol,
+            dual_floor=dual_floor,
+        )
         barrier = dataclasses.replace(options.barrier, mu_init=mu0)
         return start, warm, dataclasses.replace(options, barrier=barrier)
 
@@ -228,7 +277,7 @@ def _solve_case(
         build=build,
         prepare_solve=prepare_solve,
     )
-    return run_case(bench, config=label, options=opts, xp=xp, backend="numpy")
+    return run_case(bench, config=label, options=opts, xp=xp, backend=backend)
 
 
 def _solve_options(args: argparse.Namespace, label: str) -> ipax.Options:
@@ -253,6 +302,10 @@ def _solve_options(args: argparse.Namespace, label: str) -> ipax.Options:
         globalization=args.globalization,
         corrections=args.corrections,
         barrier=BarrierOptions(**barrier_kwargs),
+        breedveld=BreedveldOptions(
+            common_step=args.common_step, max_soc=args.breedveld_soc
+        ),
+        dense=DenseOptions(gram_dtype=args.gram_dtype),
         optimality=OptimalityConditionOptions(
             dual_inf_tol=args.tol,
             constr_viol_tol=args.tol,
@@ -286,6 +339,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="comma-separated solve configs (default: exact/dense, Breedveld "
         "et al. 2017's exact Hessian): " + ", ".join(_CONFIGS),
     )
+    parser.add_argument(
+        "--backend",
+        default="numpy",
+        help="array namespace for the solves (numpy, cupy, torch); the loader"
+        " mirrors the case to the device and the report row records it",
+    )
     parser.add_argument("--max-iter", type=int, default=300)
     parser.add_argument("--max-time", type=float, default=120.0)
     # Solver levers (docs/benchmarks/trots.md). The defaults reproduce Breedveld
@@ -293,11 +352,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # ipax default is a no-op.
     parser.add_argument(
         "--mu-schedule",
-        default="monotone",
-        help='Options.mu_schedule (default "monotone": the Fiacco-McCormick '
-        'reduction; "probing" is the proton lever — Mehrotra\'s predictor-based '
-        "mu as in Breedveld et al. 2017, ~2x fewer iterations on the proton "
-        'cases, ~6x more on Liver; the proton recipe used "quality")',
+        default="probing",
+        help='Options.mu_schedule (default "probing": Mehrotra\'s predictor-based '
+        "mu as in Breedveld et al. 2017, paired with --kappa-centrality 0; "
+        '"monotone" is the Fiacco-McCormick reduction and the previous runner '
+        'default; the old proton recipe used "quality")',
     )
     parser.add_argument(
         "--globalization",
@@ -339,8 +398,26 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--kappa-centrality",
         type=float,
+        default=0.0,
+        help="BarrierOptions.kappa_centrality (default 0: the El-Bakry floor off, "
+        "which is what makes probing mu converge the nonconvex TROTS cases; "
+        "ipax's own default is 1e-2; the old proton stack used 1e-4)",
+    )
+    parser.add_argument(
+        "--lsqr-iter",
+        type=int,
         default=None,
-        help="BarrierOptions.kappa_centrality (proton stack: 1e-4)",
+        help="LSQR iteration cap for the Breedveld dual start's eq. (26) solve "
+        "(default 200 via TROTSProblem.breedveld_warm_start); only with "
+        "--init breedveld -- an error with --init ipax, which does not run it",
+    )
+    parser.add_argument(
+        "--lsqr-tol",
+        type=float,
+        default=None,
+        help="LSQR atol = btol for the Breedveld dual start's eq. (26) solve "
+        "(default 1e-6 via TROTSProblem.breedveld_warm_start); only with "
+        "--init breedveld -- an error with --init ipax, which does not run it",
     )
     parser.add_argument(
         "--plain-gram",
@@ -351,6 +428,43 @@ def _build_parser() -> argparse.ArgumentParser:
         "--per-term-hessian",
         action="store_true",
         help="exact configs: the per-term SpGEMM Hessian (grouped_hessian=False)",
+    )
+    # Head-and-Neck_01 diagnosis levers (2026-09-28, docs/benchmarks/trots.md).
+    parser.add_argument(
+        "--common-step",
+        action="store_true",
+        help="BreedveldOptions(common_step=True): one step length "
+        "min(alpha_primal, alpha_dual) for the primal and dual updates, as "
+        "Breedveld et al. 2017 §2.1 (only with --globalization breedveld)",
+    )
+    parser.add_argument(
+        "--breedveld-soc",
+        type=int,
+        default=0,
+        help="BreedveldOptions(max_soc=N): a second-order correction of N "
+        "accumulated rounds on a rejected full step (Waechter & Biegler 2006 "
+        "§2.4; an ipax addition, not in Breedveld et al. 2017); default 0 = "
+        "off; N > 0 only with --globalization breedveld. Every solve row "
+        "counts soc_attempted / soc_accepted",
+    )
+    parser.add_argument(
+        "--gram-dtype",
+        choices=("auto", "native", "float32"),
+        default="auto",
+        help='DenseOptions.gram_dtype (default "auto", the ipax default: '
+        'float32 only where the data is float32). "float32" forces the '
+        "mixed-precision condensed Gram with float64 iterative refinement "
+        "(Carson & Higham 2018) on float64 data too, e.g. Head-and-Neck_01; "
+        '*/dense configs only (docs/benchmarks/trots.md, "Head-and-Neck_01 '
+        'speed profile (2026-10-02)")',
+    )
+    parser.add_argument(
+        "--dual-floor",
+        type=float,
+        default=_BREEDVELD_START_FLOOR,
+        help="floor of the Breedveld start's multipliers y0, z0 (eqs. (26)-(27); "
+        "default 5 as in the paper; the slacks keep 5); only with --init "
+        "breedveld",
     )
     return parser
 
@@ -364,6 +478,36 @@ def _parse_args(
         parser.error(
             "--slack-init-scale applies only with --init ipax; the Breedveld "
             "start (--init breedveld) sets the slacks itself (eq. (28))"
+        )
+    if args.lsqr_iter is not None and args.init != "breedveld":
+        parser.error(
+            "--lsqr-iter applies only with --init breedveld; --init ipax does "
+            "not run the Breedveld dual start's eq. (26) LSQR solve"
+        )
+    if args.lsqr_tol is not None and args.init != "breedveld":
+        parser.error(
+            "--lsqr-tol applies only with --init breedveld; --init ipax does "
+            "not run the Breedveld dual start's eq. (26) LSQR solve"
+        )
+    if args.lsqr_tol is not None and not (
+        math.isfinite(args.lsqr_tol) and args.lsqr_tol > 0.0
+    ):
+        parser.error("--lsqr-tol must be positive and finite")
+    if args.dual_floor != _BREEDVELD_START_FLOOR and args.init != "breedveld":
+        parser.error("--dual-floor applies only with --init breedveld")
+    if not (math.isfinite(args.dual_floor) and args.dual_floor > 0.0):
+        parser.error("--dual-floor must be positive and finite")
+    if args.common_step and args.globalization != "breedveld":
+        parser.error(
+            "--common-step applies only with --globalization breedveld (the "
+            "filter line search keeps separate primal and dual step lengths)"
+        )
+    if args.breedveld_soc < 0:
+        parser.error("--breedveld-soc must be a non-negative integer")
+    if args.breedveld_soc > 0 and args.globalization != "breedveld":
+        parser.error(
+            "--breedveld-soc applies only with --globalization breedveld (the "
+            "filter line search's corrections are LineSearchOptions.max_soc)"
         )
     return args
 
@@ -407,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
     # 2) Solves (opt-in).
     solve_rows = []
     if args.solve:
-        xp = import_namespace("numpy")
+        xp = import_namespace(args.backend)
         labels = [c.strip() for c in args.config.split(",") if c.strip()]
         unknown = [label for label in labels if label not in _CONFIGS]
         if unknown:
@@ -421,21 +565,22 @@ def main(argv: list[str] | None = None) -> int:
                     label,
                     opts,
                     xp,
+                    backend=args.backend,
                     plain_gram=args.plain_gram,
                     per_term_hessian=args.per_term_hessian,
                     init=args.init,
+                    lsqr_iter=args.lsqr_iter,
+                    lsqr_tol=args.lsqr_tol,
+                    dual_floor=args.dual_floor,
                 )
-                solve_rows.append(result)
-                print(
-                    f"  {case:20s} [{label:12s}] {result.status:12s} "
-                    f"iters={result.n_iter:4d} kkt={result.kkt_error:.2e} "
-                    f"cviol={result.constraint_violation:.2e} t={result.solve_time:.1f}s"
-                )
+                row = _solve_row(result)
+                solve_rows.append(row)
+                print(_solve_line(case, label, row))
 
     payload = {
         "environment": environment,
         "verification": [asdict(r) for r in verification],
-        "solves": [asdict(r) for r in solve_rows],
+        "solves": solve_rows,
     }
     json_path = out.with_suffix(".json")
     json_path.write_text(json.dumps(payload, indent=2))
@@ -448,6 +593,45 @@ def main(argv: list[str] | None = None) -> int:
         f"({n_checked} with references) -> {json_path}"
     )
     return 0 if all(r.verified for r in verification) else 1
+
+
+def _solve_row(result: CaseResult) -> dict[str, object]:
+    """One solve's JSON row: the harness result plus the paper's reference.
+
+    ``ref_iters`` / ``ref_time_s`` are Breedveld et al. 2017's Mehrotra-method
+    iterations and wall-clock seconds for the case (the run behind the
+    dataset's ``Results/*.txt``; supplement ESM 2, see
+    :mod:`benchmarks.corpus.trots_reference`), ``None`` for cases the paper
+    does not solve (``Prostate_BT_*``). The paper's times are on its 2017
+    16-core machine: context, not a like-for-like comparison.
+    """
+    ref = breedveld2017_reference(result.problem)
+    return {
+        **asdict(result),
+        "ref_iters": None if ref is None else ref.mehrotra.iterations,
+        "ref_time_s": None if ref is None else ref.mehrotra.seconds,
+    }
+
+
+def _solve_line(case: str, label: str, row: dict[str, object]) -> str:
+    """The console line for one solve row (see :func:`_solve_row`)."""
+    ref_iters, ref_time = row["ref_iters"], row["ref_time_s"]
+    paper = (
+        "paper n/a"
+        if ref_iters is None or ref_time is None
+        else f"paper iters={ref_iters} t={ref_time:.1f}s"
+    )
+    soc = (
+        f"soc={row['soc_accepted']}/{row['soc_attempted']}  "
+        if row.get("soc_attempted")
+        else ""
+    )
+    return (
+        f"  {case:20s} [{label:12s}] {row['status']!s:12s} "
+        f"iters={row['n_iter']:4d} kkt={row['kkt_error']:.2e} "
+        f"cviol={row['constraint_violation']:.2e} t={row['solve_time']:.1f}s  "
+        f"{soc}({paper})"
+    )
 
 
 def _write_markdown(path: Path, verification, solves, environment) -> None:
@@ -466,13 +650,25 @@ def _write_markdown(path: Path, verification, solves, environment) -> None:
         )
     if solves:
         lines += ["", "## Solves", ""]
-        lines.append("| case | config | status | iters | kkt | cviol | time (s) |")
-        lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: |")
+        lines.append(
+            "| case | config | status | iters | kkt | cviol | time (s) "
+            "| paper iters | paper time (s) |"
+        )
+        lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
         for s in solves:
+            ref_iters = "" if s["ref_iters"] is None else str(s["ref_iters"])
+            ref_time = "" if s["ref_time_s"] is None else f"{s['ref_time_s']:.1f}"
             lines.append(
-                f"| {s.problem} | {s.config} | {s.status} | {s.n_iter} | "
-                f"{s.kkt_error:.2e} | {s.constraint_violation:.2e} | {s.solve_time:.1f} |"
+                f"| {s['problem']} | {s['config']} | {s['status']} | {s['n_iter']} | "
+                f"{s['kkt_error']:.2e} | {s['constraint_violation']:.2e} | "
+                f"{s['solve_time']:.1f} | {ref_iters} | {ref_time} |"
             )
+        lines += [
+            "",
+            "Paper columns: Breedveld et al. 2017 (doi:10.1007/s10589-017-9919-4), "
+            "supplement ESM 2, Mehrotra method, on the paper's 2017 hardware; "
+            "CC BY 4.0.",
+        ]
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
 

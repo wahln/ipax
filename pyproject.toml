@@ -86,6 +86,13 @@ bench = [
     "matplotlib>=3.8",       # report plots (§9.4); optional, imported lazily
     "osqp>=1.0",             # QP reference baseline (§9.3); optional
 ]
+trots = [
+    # Accelerates the TROTS benchmark loader's compacted tile scatter only
+    # (benchmarks/corpus/_trots_kernels.py; lazy import, NumPy fallback with
+    # the same bits). Numba lags new Python/NumPy releases, so it stays out
+    # of `dev` and `bench`.
+    "numba>=0.60",
+]
 docs = [
     "mkdocs>=1.6",
     "mkdocs-material>=9.5",
@@ -182,7 +189,15 @@ disallow_any_generics = true
 # CI `lint` job installs only `[lint]`, so the numpy/scipy sparse adapter is
 # type-checked without numpy present).
 [[tool.mypy.overrides]]
-module = ["numpy.*", "torch.*", "jax.*", "cupy.*", "scipy.*", "array_api_strict.*"]
+module = [
+    "numpy.*",
+    "torch.*",
+    "jax.*",
+    "cupy.*",
+    "cupy_backends.*",
+    "scipy.*",
+    "array_api_strict.*",
+]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

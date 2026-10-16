@@ -16,11 +16,12 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from ipax.backend.namespace import array_namespace
-from ipax.backend.operators import Diagonal, Identity, LinearOperator
+from ipax.backend.operators import Diagonal, Identity, LinearOperator, forward_gram
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -318,11 +319,85 @@ def _diagonal_solve(d: Array, rhs: Array, xp: Namespace) -> Array:
     raise ValueError("diagonal solve requires a vector or matrix RHS")
 
 
-def _add_dense_diagonal(matrix: Array, diagonal: Array) -> Array:
-    """Return ``matrix + diag(diagonal)`` without an identity matmat probe."""
-    xp = array_namespace(matrix, diagonal)
-    n = int(diagonal.shape[0])
+def _add_dense_diagonal(matrix: Array, diagonal: Array | float) -> Array:
+    """Return ``matrix + diag(diagonal)`` without an identity matmat probe.
+
+    ``diagonal`` may be a vector (one addend per diagonal entry) or a Python
+    scalar (a ``delta * I`` term, broadcasting to every diagonal entry).
+    Routes through the ``get_dense_diagonal_adder`` backend gap-filler when
+    available: the ``linalg`` extension has no strided diagonal setter, so a
+    pure-standard fallback must build the diagonal via ``xp.eye(n) *
+    diagonal`` — an extra O(n²) identity allocation and elementwise multiply
+    on top of the O(n²) copy already needed to return a new matrix. Both
+    formulas are bitwise identical for finite inputs, including the dtype
+    they promote to (see the adapters' docstrings for the NEP 50 / Torch
+    promotion subtlety this must reproduce). Non-finite addends are marked
+    as NaN: an infinite pivot can otherwise yield a finite zero direction,
+    hiding overflow from the driver's numerical-failure check.
+    """
+    from ipax.backend.dense import get_dense_diagonal_adder
+
+    xp = array_namespace(matrix)
+    # Sigma_x = z / (x - l) can overflow even for finite bound data. Inf
+    # pivots can back-substitute to finite zeros, then bound-dual recovery
+    # computes inf * 0 (Breedveld 2017, eqs. 14-17). Mark invalid addends
+    # before either assembly route: NaN forces a numerical failure or a
+    # non-finite solution, both covered by the LinearSolver contract.
+    # The vector check stays on device, in O(n), with no host synchronization.
+    if isinstance(diagonal, (int, float)):
+        if not math.isfinite(diagonal):
+            diagonal = float("nan")
+    else:
+        diagonal = xp.where(
+            xp.isfinite(diagonal), diagonal, xp.full_like(diagonal, float("nan"))
+        )
+    add_diagonal = get_dense_diagonal_adder(xp)
+    if add_diagonal is not None:
+        return add_diagonal(matrix, diagonal)
+    n = int(matrix.shape[0])
     return matrix + xp.eye(n, dtype=matrix.dtype) * diagonal
+
+
+def _sanitize_diagonal_operator(sigma_x: LinearOperator) -> LinearOperator:
+    """Mark non-finite ``Sigma_x`` entries as NaN once, where it is received.
+
+    ``Sigma_x = z / (x - l)`` [``+ z_u / (u - x)``] can overflow to ``+inf``
+    for finite bound data. An infinite pivot can back-substitute to a finite
+    zero step component, which then makes bound-dual recovery compute
+    ``inf * 0`` (Breedveld 2017, eqs. 14-17). ``_add_dense_diagonal`` already
+    turns an addend like this into a NaN pivot before the dense *add*, because
+    the O(n) backend adapter no longer poisons the row through
+    ``0 * inf = NaN`` the way the portable ``eye``-multiply fallback does.
+    The structured L-BFGS solve (``_CondensedOperator.dense_structured_solve``
+    and its Woodbury-preconditioner twin ``lbfgs_inverse_apply``) has the same
+    hole through the opposite operation: both *divide* a finite right-hand
+    side by a ``Sigma_x``-derived diagonal ``D`` (``_seed_diagonal_solve``,
+    ``_woodbury_diagonal``), and ``finite / inf = 0`` silently drops that
+    component instead of raising or poisoning — the add there keeps the inf
+    itself, only the later division masks it, so the dense-add fix does not
+    cover it. Sanitizing ``Sigma_x`` once here, at construction — the one
+    place ``_CondensedOperator`` receives it — means every consumer (the
+    dense add, the structured/Woodbury division, and the Krylov exact-inverse
+    dispatch, which reads the same ``self._sigma_x`` through
+    ``lbfgs_inverse_apply``) sees the same NaN in place of inf, without
+    duplicating the check at each division/addition site. It also reaches
+    the sparse/normal-equations COO assembly and the Jacobi ``diagonal()`` for
+    free, both of which would otherwise carry the same bare inf into their
+    own consumers.
+
+    Only a :class:`Diagonal` block carries this risk (the driver and every
+    caller in this module always pass one for ``Sigma_x``; an ``Identity``
+    seed is always finite ones, and any other operator can't be rewrapped
+    safely here). Finite entries are returned unchanged, so this is
+    bit-identical for every problem that never overflows. O(n) device
+    comparison + select, no host synchronization — the same primitive
+    ``_add_dense_diagonal`` already uses.
+    """
+    if not isinstance(sigma_x, Diagonal):
+        return sigma_x
+    d = sigma_x.diagonal()
+    xp = array_namespace(d)
+    return Diagonal(xp.where(xp.isfinite(d), d, xp.full_like(d, float("nan"))))
 
 
 def _dense_or_matmat_probe(op: LinearOperator, n_cols: int, like: Array) -> Array:
@@ -366,7 +441,7 @@ class _CondensedOperator(LinearOperator):
         if sigma_s.shape != (ineq_jac.shape[0], ineq_jac.shape[0]):
             raise ValueError("sigma_s must match the inequality dimension")
         self._W = W
-        self._sigma_x = sigma_x
+        self._sigma_x = _sanitize_diagonal_operator(sigma_x)
         self._sigma_s = sigma_s
         self._ineq_jac = ineq_jac
         self._delta_w = delta_w
@@ -411,6 +486,11 @@ class _CondensedOperator(LinearOperator):
         Shared by :meth:`dense_matrix` (condensed route: folds the inequality
         Gram term ``∇gᵀ Σ_s ∇g`` into this via a matmul) and
         :meth:`augmented_dense_matrix` (augmented route: borders it instead).
+
+        Always a fresh array, never ``W``'s own dense form (which an operator
+        may return by reference or from a memo): the ``Sigma_x`` term is added
+        out of place. :meth:`_dense_matrix_impl` relies on this to accumulate
+        the Gram term into it in place.
         """
         template = like
         if template is None:
@@ -419,16 +499,23 @@ class _CondensedOperator(LinearOperator):
             except NotImplementedError:
                 template = None
 
-        dense = self._W.dense_matrix(template)
+        return self._add_logical_diagonals(self._W.dense_matrix(template))
 
+    def _add_logical_diagonals(self, curvature: Array) -> Array:
+        """``curvature + Sigma_x + delta_w I``, always out of place.
+
+        ``curvature`` is ``W``'s dense form, or the fused ``W + ∇gᵀ Σ_s ∇g``
+        block (:meth:`_fused_curvature_gram`); either may alias a memo of the
+        operator that produced it, so neither is ever written: the ``Sigma_x``
+        term is added out of place, which also makes the result a fresh array.
+        """
         if isinstance(self._sigma_x, (Diagonal, Identity)):
-            dense = _add_dense_diagonal(dense, self._sigma_x.diagonal(dense))
+            dense = _add_dense_diagonal(curvature, self._sigma_x.diagonal(curvature))
         else:
-            dense = dense + self._sigma_x.dense_matrix(dense)
+            dense = curvature + self._sigma_x.dense_matrix(curvature)
 
         if self._delta_w != 0.0:
-            xp = array_namespace(dense)
-            dense = dense + self._delta_w * xp.eye(self.shape[0], dtype=dense.dtype)
+            dense = _add_dense_diagonal(dense, self._delta_w)
         return dense
 
     def dense_matrix(self, like: Array | None = None) -> Array:
@@ -463,6 +550,10 @@ class _CondensedOperator(LinearOperator):
     def _dense_matrix_impl(
         self, like: Array | None, gram_dtype: str | None, hinted_only: bool
     ) -> Array:
+        fused = self._fused_curvature_gram(gram_dtype, hinted_only)
+        if fused is not None:
+            return self._add_logical_diagonals(fused)
+
         dense = self.logical_dense_block(like)
 
         if self._ineq_jac.shape[0] > 0:
@@ -474,7 +565,13 @@ class _CondensedOperator(LinearOperator):
             # ``gram`` (e.g. a dense/matrix-free Jacobian) or Σ_s is non-diagonal.
             gram = self._sparse_gram(dense, gram_dtype, hinted_only)
             if gram is not None:
-                dense = dense + xp.astype(gram, dense.dtype, copy=False)
+                # In place: ``dense`` is this assembly's own fresh block (see
+                # logical_dense_block), so accumulating into it is invisible
+                # to every caller and saves the n×n sum at the route's memory
+                # peak (block, Gram and sum alive together — 0.76 GB each on
+                # TROTS Head-and-Neck_01). A namespace with immutable arrays
+                # (JAX) rebinds instead, exactly as before.
+                dense += xp.astype(gram, dense.dtype, copy=False)
             else:
                 jac = self._ineq_jac.dense_matrix(dense)
                 reduce_densified = gram_dtype is not None and (
@@ -509,6 +606,43 @@ class _CondensedOperator(LinearOperator):
 
         return dense
 
+    def _fused_curvature_gram(
+        self, gram_dtype: str | None, hinted_only: bool
+    ) -> Array | None:
+        """``W + ∇gᵀ Σ_s ∇g`` formed by ``W`` in one pass, or ``None``.
+
+        The optional :meth:`~ipax.backend.operators.LinearOperator.
+        dense_matrix_with_gram` capability of the curvature operator: a ``W``
+        that is itself a weighted Gram over rows it shares with the inequality
+        Jacobian can multiply those rows once with the summed weights
+        (Breedveld 2017, eq. 48, across ``W`` and the Gram term) instead of in
+        two passes. Consulted only when there are inequality rows and Σ_s is
+        a :class:`Diagonal` (the weight vector the hook takes; the
+        :meth:`_sparse_gram` fast path also accepts an ``Identity``, which
+        the driver never passes); ``W`` without the capability, or
+        declining this call, raises ``NotImplementedError`` and the two-pass
+        assembly below runs unchanged. The mixed-precision request is
+        forwarded for the Gram part; ``W``'s own part stays native (the
+        capability's contract), so DenseSolver's refinement against the exact
+        :meth:`matvec` covers the result exactly as it covers the two-pass
+        block (Carson & Higham 2018).
+        """
+        if self._ineq_jac.shape[0] == 0 or not isinstance(self._sigma_s, Diagonal):
+            return None
+        weights = self._sigma_s.diagonal()
+        try:
+            fused = self._W.dense_matrix_with_gram(
+                self._ineq_jac,
+                weights,
+                accumulate_dtype=gram_dtype,
+                hinted_only=hinted_only,
+            )
+        except NotImplementedError:
+            return None
+        # The contract's working dtype (that of the weights); a no-op for a
+        # conforming operator, as the two-pass path's cast of the Gram is.
+        return array_namespace(fused).astype(fused, weights.dtype, copy=False)
+
     def _sparse_gram(
         self,
         like: Array,
@@ -521,8 +655,9 @@ class _CondensedOperator(LinearOperator):
         inequality Jacobian exposes :meth:`~ipax.backend.operators.LinearOperator.
         gram`; either absent returns ``None`` so the caller densifies instead.
         ``gram_dtype`` forwards the mixed-precision accumulate request; operators
-        predating the keyword (``TypeError``) are retried without it, so the
-        request degrades to an exact Gram rather than failing.
+        predating the keyword (the ``TypeError`` naming it) are retried without
+        it, so the request degrades to an exact Gram rather than failing; any
+        other ``TypeError`` from inside the Gram is a bug and propagates.
         """
         if not isinstance(self._sigma_s, (Diagonal, Identity)):
             return None
@@ -530,12 +665,13 @@ class _CondensedOperator(LinearOperator):
         try:
             if gram_dtype is None:
                 return self._ineq_jac.gram(weights)
-            try:
-                return self._ineq_jac.gram(
-                    weights, accumulate_dtype=gram_dtype, hinted_only=hinted_only
-                )
-            except TypeError:
-                return self._ineq_jac.gram(weights)
+            # The one shared keyword-compat retry (pre-keyword signatures only).
+            return forward_gram(
+                self._ineq_jac,
+                weights,
+                accumulate_dtype=gram_dtype,
+                hinted_only=hinted_only,
+            )
         except NotImplementedError:
             return None
 

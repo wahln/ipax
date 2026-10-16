@@ -263,6 +263,43 @@ the built-in `Dense`, `Diagonal`, and `Identity` operators already do, and the
 `SparseOperator` adapter wraps a backend sparse matrix. See
 [The linear-algebra layer](../concepts/linalg.md).
 
+### Fusing the Hessian with the inequality Gram (optional)
+
+On the dense route the solver forms the condensed block
+`N = W + ∇gᵀ Σ_s ∇g + Σ_x` in two passes: `W.dense_matrix()` and the
+Jacobian's `gram(σ_s)`. When your Hessian is itself a weighted Gram over rows
+it shares with the inequality Jacobian (`W = Bᵀ diag(h) B + …`, with `B`'s rows
+also among the inequality rows), the shared rows can be multiplied once with
+the summed weights `h + σ_s` instead of twice (Breedveld et al. 2017, eq. (48)).
+The Hessian operator opts in by overriding
+`LinearOperator.dense_matrix_with_gram(jac, weights, *, accumulate_dtype=None,
+hinted_only=False)`:
+
+```python
+class MyHessian(LinearOperator):
+    def dense_matrix_with_gram(
+        self, jac, weights, *, accumulate_dtype=None, hinted_only=False
+    ):
+        # Return dense  W + jacᵀ diag(weights) jac,  or decline:
+        raise NotImplementedError
+```
+
+- `jac` and `weights` are the solver's view of the inequality block: nonlinear
+  rows first, then the lowered `linear_ineq` rows, after problem scaling. An
+  operator that cannot read that layout can call `jac.gram(weights)` itself —
+  the wrappers translate the weights back to your rows — and cooperate with its
+  own Jacobian operator there (this is how the TROTS loader does it, see
+  [the TROTS page](../benchmarks/trots.md)).
+- The result must equal `W.dense_matrix() + jacᵀ diag(weights) jac` up to
+  round-off, be symmetric, live in the namespace, device and dtype of
+  `weights`, and is treated as read-only (it may be a memo).
+- `accumulate_dtype`/`hinted_only` are the mixed-precision request of
+  `DenseOptions.gram_dtype` and apply to the Gram part only; `W`'s own part
+  must stay in the working precision.
+- Raising `NotImplementedError` (the default) is always valid: the solver then
+  forms the two terms separately, exactly as without the method. Problems that
+  do not override it are unaffected; the Krylov and sparse routes never ask.
+
 ## Quadratic and linear programs
 
 For a QP or LP, skip the subclass entirely:

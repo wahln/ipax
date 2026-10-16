@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 
 from ipax.backend.namespace import array_namespace
 from ipax.backend.operators import LinearOperator
+from ipax.linalg.solver import numerical_failure_types
 
 if TYPE_CHECKING:
     from ipax.options import LBFGSOptions
@@ -180,7 +181,7 @@ class LBFGSOperator(LinearOperator):
         # GPU in ``barrier.py``.
         try:
             z = xp.linalg.solve(self._m, u_t_x)
-        except Exception:
+        except numerical_failure_types():
             return self._xi * x
         # Keep the solve-output guard on device: replacing a poisoned compact
         # solution by zeros makes the correction exactly zero without a host
@@ -230,7 +231,7 @@ class LBFGSOperator(LinearOperator):
         )
         try:
             z = xp.linalg.solve(self._m, u_t)
-        except Exception as exc:
+        except numerical_failure_types() as exc:
             raise NotImplementedError(
                 "L-BFGS diagonal is unavailable: the compact middle matrix is singular"
             ) from exc

@@ -739,6 +739,51 @@ class InfeasibleEqualities(Problem):
         return _mat(xp, ((2.0 * sigma + xp.zeros_like(x[0]),),))
 
 
+class Maratos(Problem):
+    """The Maratos-effect test problem (Nocedal & Wright 2006, Example 15.4).
+
+    ``min 2(x1² + x2² − 1) − x1`` s.t. ``x1² + x2² = 1``. Optimum ``(1, 0)``,
+    ``f* = -1``. The textbook example of the Maratos effect: a full Newton
+    step taken from a feasible point near the optimum increases *both* the
+    objective and the constraint violation, so a merit function or filter
+    that insists on improving one of them rejects an otherwise-good step
+    outright — the motivating case for a second-order correction (Wächter &
+    Biegler 2006, §2.4).
+    """
+
+    def __init__(self, xp: Namespace) -> None:
+        self.xp = xp
+
+    @property
+    def n_vars(self) -> int:
+        return 2
+
+    def objective(self, x: Array) -> Scalar:
+        return 2.0 * (x[0] * x[0] + x[1] * x[1] - 1.0) - x[0]
+
+    def gradient(self, x: Array) -> Array:
+        return self.xp.stack((4.0 * x[0] - 1.0, 4.0 * x[1]))
+
+    def eq_constraints(self, x: Array) -> Array:
+        return self.xp.stack((x[0] * x[0] + x[1] * x[1] - 1.0,))
+
+    def eq_jacobian(self, x: Array) -> Array:
+        xp = self.xp
+        return _mat(xp, ((2.0 * x[0], 2.0 * x[1]),))
+
+    def lagrangian_hessian(
+        self, x: Array, y_eq: Array, y_ineq: Array, sigma: Scalar = 1.0
+    ) -> Array:
+        del y_ineq
+        xp = self.xp
+        diagonal = 4.0 * sigma + 2.0 * y_eq[0]
+        zero = xp.zeros_like(x[0])
+        return _mat(xp, ((diagonal, zero), (zero, diagonal)))
+
+    def known_solution(self) -> Array:
+        return _array(self.xp, [1.0, 0.0])
+
+
 class _DiagPlusLowRank(LinearOperator):
     """Matrix-free SPD Hessian ``W = σ·(diag(h) + C Cᵀ)`` (RT-like coupling).
 
@@ -922,6 +967,7 @@ __all__ = [
     "BoundConstrainedQP",
     "EqualityConstrainedQP",
     "InfeasibleEqualities",
+    "Maratos",
     "SyntheticRTProblem",
     "UnconstrainedQuadratic",
     "make_rt_like_problem",

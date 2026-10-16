@@ -1,0 +1,57 @@
+Creative Commons Attribution 4.0 International (CC BY 4.0)
+
+The file trots_reference.json in this directory is an adaptation (a format
+conversion, values unmodified) of "Electronic supplementary material 2" of
+
+  Breedveld, S., van den Berg, B. & Heijmen, B. (2017). "An interior-point
+  implementation developed and tuned for radiation therapy treatment
+  planning." Computational Optimization and Applications 68(2), 209-242.
+  https://doi.org/10.1007/s10589-017-9919-4
+
+Copyright (c) 2017 The Author(s). The article and its electronic
+supplementary material are published open access under the Creative Commons
+Attribution 4.0 International License.
+
+This is a human-readable summary of (and not a substitute for) the license.
+The full legal code is at
+
+  https://creativecommons.org/licenses/by/4.0/legalcode
+
+You are free to:
+
+  Share - copy and redistribute the material in any medium or format for any
+          purpose, even commercially.
+  Adapt - remix, transform, and build upon the material for any purpose, even
+          commercially.
+
+The licensor cannot revoke these freedoms as long as you follow the license
+terms.
+
+Under the following terms:
+
+  Attribution - You must give appropriate credit, provide a link to the
+                license, and indicate if changes were made. You may do so in
+                any reasonable manner, but not in any way that suggests the
+                licensor endorses you or your use.
+
+  No additional restrictions - You may not apply legal terms or technological
+                measures that legally restrict others from doing anything the
+                license permits.
+
+Notices:
+
+  You do not have to comply with the license for elements of the material in
+  the public domain or where your use is permitted by an applicable exception
+  or limitation.
+
+  No warranties are given. The license may not give you all of the
+  permissions necessary for your intended use. For example, other rights such
+  as publicity, privacy, or moral rights may limit how you use the material.
+
+Changes made: the spreadsheet (10589_2017_9919_MOESM2_ESM.xlsx) was converted
+to JSON by benchmarks/tools/convert_breedveld2017_esm.py. Cell values are
+unmodified; formula-derived columns (speed-up factors, time per iteration,
+column sums) were not converted, and each problem label was annotated with the
+matching TROTS case name and tumour site.
+
+License: https://creativecommons.org/licenses/by/4.0/

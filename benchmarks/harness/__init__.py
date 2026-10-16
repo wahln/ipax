@@ -73,6 +73,11 @@ class CaseResult:
     # Seconds spent in the case's ``prepare_solve`` hook; already included in
     # ``solve_time`` (paper accounting), reported separately for attribution.
     prepare_time: float = 0.0
+    # Second-order-correction counts summed from ``result.history`` (either
+    # globalization's correction — see ``IterationRecord.used_soc`` /
+    # ``.soc_attempted``); 0 for both when the case never attempts one.
+    soc_attempted: int = 0
+    soc_accepted: int = 0
 
 
 def capture_environment() -> dict[str, object]:
@@ -237,6 +242,8 @@ def run_case(
         gradient_source=sources.gradient,
         hessian_source=sources.hessian,
         error=None,
+        soc_attempted=sum(1 for r in result.history if r.soc_attempted),
+        soc_accepted=sum(1 for r in result.history if r.used_soc),
     )
 
 
