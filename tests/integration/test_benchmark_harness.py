@@ -233,7 +233,7 @@ def test_run_case_applies_prepare_solve(namespace, monkeypatch):
     assert result.error is None and result.correct
     # prepare_time attributes the hook's share; solve_time is the combined
     # (paper-accounting) figure.
-    assert result.prepare_time >= 0.05
+    assert result.prepare_time >= 0.04  # sleep(0.05), Windows timer jitter
     assert result.solve_time >= result.prepare_time
     row = json.loads(json.dumps(to_payload([result], capture_environment())))
     assert row["results"][0]["prepare_time"] == result.prepare_time
@@ -301,7 +301,7 @@ def test_run_case_keeps_prepare_time_when_the_solve_raises(namespace, monkeypatc
         backend="test",
     )
     assert result.status == "solve_error"
-    assert result.prepare_time >= 0.05
+    assert result.prepare_time >= 0.04  # sleep(0.05), Windows timer jitter
     assert result.solve_time == result.prepare_time
 
 
@@ -321,4 +321,4 @@ def test_run_case_keeps_elapsed_time_when_prepare_solve_raises(namespace):
         backend="test",
     )
     assert result.status == "prepare_error"
-    assert result.prepare_time >= 0.05
+    assert result.prepare_time >= 0.04  # sleep(0.05), Windows timer jitter
