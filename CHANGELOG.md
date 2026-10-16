@@ -308,6 +308,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     reports.
 
 ### Changed
+- **Highlights of this release.** The Breedveld 2017 parity campaign on
+  the TROTS radiotherapy corpus: Head-and-Neck_01, the one site that did not
+  converge, reaches the paper's optimum in 46 iterations (paper: 45) with the
+  opt-in common step, and runs in 749 s on NumPy (was 1786 s) and 283 s on
+  CuPy with the opt-in float32 Gram (paper: 279 s on 16 cores) after a
+  profiling-driven set of loader and dense-route levers (threaded and
+  compiled tile scatter, LAPACK `dpotrf` on one blocked copy, one product per
+  structure through the new optional `LinearOperator.dense_matrix_with_gram`
+  hook). The CuPy sparse route refines cuDSS perturbed-pivot solves before
+  certifying them (sparse-config gap to NumPy −39 → −17 rows), is bitwise
+  reproducible run to run, and exposes its policy through `SparseOptions`.
+  Overflowing bound diagonals can no longer pass as finite steps. Every
+  options dataclass is importable from `ipax`. All behaviour-changing
+  defaults were gated by full-corpus sweeps (S2MPJ v36 NumPy +1/−0 vs v31,
+  v37 CuPy); every other lever is opt-in.
 - **Dense route on NumPy: Cholesky through LAPACK `dpotrf` on one blocked
   copy** (`ipax.backend.dense.get_dense_cholesky`, NumPy only).
   `numpy.linalg.cholesky` runs `dpotrf` between two unblocked transposing
