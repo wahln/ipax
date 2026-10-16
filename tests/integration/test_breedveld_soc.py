@@ -25,41 +25,8 @@ import pytest
 from ipax import Options, Status, solve
 from ipax.ipm.driver import IPMDriver
 from ipax.options import BreedveldOptions, LineSearchOptions
-from ipax.problem.base import Problem
-from ipax.testing.problems import HS43, HS71
+from ipax.testing.problems import HS43, HS71, Maratos
 from tests._helpers import array, assert_allclose, assert_scalar_close
-
-
-class Maratos(Problem):
-    """``min 2(x1² + x2² − 1) − x1`` s.t. ``x1² + x2² = 1``; optimum ``(1, 0)``, f = −1."""
-
-    def __init__(self, xp) -> None:
-        self.xp = xp
-
-    @property
-    def n_vars(self) -> int:
-        return 2
-
-    def objective(self, x):
-        return 2.0 * (x[0] * x[0] + x[1] * x[1] - 1.0) - x[0]
-
-    def gradient(self, x):
-        return self.xp.stack((4.0 * x[0] - 1.0, 4.0 * x[1]))
-
-    def eq_constraints(self, x):
-        return self.xp.stack((x[0] * x[0] + x[1] * x[1] - 1.0,))
-
-    def eq_jacobian(self, x):
-        xp = self.xp
-        return xp.stack((xp.stack((2.0 * x[0], 2.0 * x[1])),))
-
-    def lagrangian_hessian(self, x, y_eq, y_ineq, sigma=1.0):
-        del y_ineq
-        xp = self.xp
-        diagonal = 4.0 * sigma + 2.0 * y_eq[0]
-        zero = xp.zeros_like(x[0])
-        return xp.stack((xp.stack((diagonal, zero)), xp.stack((zero, diagonal))))
-
 
 # A far start (radius 0.5, angle 2.5 rad) whose later full steps are rejected
 # by the Markov test while worsening θ — measured to trigger accepted

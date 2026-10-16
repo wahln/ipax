@@ -99,39 +99,15 @@ def test_run_case_reports_soc_attempted_and_accepted(namespace):
 
     from benchmarks.corpus import BenchmarkProblem
     from ipax.options import BreedveldOptions
+    from ipax.testing.problems import Maratos
     from tests._helpers import array
-
-    class _Maratos(ipax.Problem):
-        @property
-        def n_vars(self) -> int:
-            return 2
-
-        def objective(self, x):
-            return 2.0 * (x[0] * x[0] + x[1] * x[1] - 1.0) - x[0]
-
-        def gradient(self, x):
-            return namespace.stack((4.0 * x[0] - 1.0, 4.0 * x[1]))
-
-        def eq_constraints(self, x):
-            return namespace.stack((x[0] * x[0] + x[1] * x[1] - 1.0,))
-
-        def eq_jacobian(self, x):
-            return namespace.stack((namespace.stack((2.0 * x[0], 2.0 * x[1])),))
-
-        def lagrangian_hessian(self, x, y_eq, y_ineq, sigma=1.0):
-            del y_ineq
-            diagonal = 4.0 * sigma + 2.0 * y_eq[0]
-            zero = namespace.zeros_like(x[0])
-            return namespace.stack(
-                (namespace.stack((diagonal, zero)), namespace.stack((zero, diagonal)))
-            )
 
     start = [0.5 * math.cos(2.5), 0.5 * math.sin(2.5)]
     case = BenchmarkProblem(
         name="maratos",
         kind="NLP",
         tags=(),
-        build=lambda xp: (_Maratos(), array(namespace, start)),
+        build=lambda xp: (Maratos(namespace), array(namespace, start)),
     )
 
     def _run(max_soc: int):

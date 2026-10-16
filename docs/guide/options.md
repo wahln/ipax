@@ -186,6 +186,34 @@ arrays) is the only one that perturbs pivots; see
 ignores both fields. The defaults are the ones the CUDA adapter has always
 used, so leaving them alone changes nothing.
 
+### Reproducible sparse factorizations
+
+A parallel sparse factorization may sum in a different order on every run, so
+two factorizations of the same matrix can differ in the last bits, and an
+interior-point trajectory amplifies such differences into different
+iteration counts. Another field of `SparseOptions` asks for the reproducible
+mode where the backend has one:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `deterministic` | `False` | Ask the sparse-direct adapter for run-to-run reproducible factorizations where the backend offers them, at a factorization-time cost. Adapters without such a mode ignore it. Must be a `bool`. |
+
+```python
+opts = ipax.Options(linsolve="sparse", sparse=SparseOptions(deterministic=True))
+```
+
+Today the CUDA sparse route reads it: it switches cuDSS to
+`DETERMINISTIC_MODE`, which makes repeated factorizations bitwise identical.
+The CuPy adapter's own sparse products and COO→CSR builds are
+reproducible whatever this option says, except the transposed products of
+an operator whose transpose would exceed a 512 MiB cache cap. So the
+factorization was the last run-dependent step: with `deterministic=True` a
+CuPy sparse solve repeats bit for bit on the same machine and software
+stack, within the limits listed under
+[Reproducibility on CUDA](backends.md#reproducibility-on-cuda). The CPU route (Feral `LDLᵀ`, SuperLU)
+is reproducible already and ignores the option. The same section gives the
+measured cost.
+
 ## Problem scaling
 
 Badly scaled problems converge faster with gradient-based auto-scaling (IPOPT's

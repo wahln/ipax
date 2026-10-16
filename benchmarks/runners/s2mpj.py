@@ -48,6 +48,14 @@ and ``--cudss-max-residual`` override the perturbed-pivot solve policy the
 CuPy rows run with (``SparseOptions.perturbed_pivot_refinement_steps`` /
 ``perturbed_pivot_max_residual``: maximum iterative-refinement steps,
 post-refinement certificate threshold), for A/B sweeps of those defaults.
+``--cudss-deterministic`` runs the CuPy rows with
+``SparseOptions(deterministic=True)`` (cuDSS ``DETERMINISTIC_MODE``), which
+removes the factorization's run-to-run noise from an A/B. The CuPy
+adapter's own products and COO builds are reproducible in every mode, so
+with it a CuPy row repeats bit for bit, except a row that stops on
+``max_time`` (see the backends guide).
+The report records all three under
+``environment.cudss_policy``; ``--resume`` refuses to mix policies.
 """
 
 from __future__ import annotations
@@ -327,7 +335,8 @@ def _run_problem_cases(
     max_build_seconds: float,
     inflight_prefix: str | None = None,
     certificate_prefix: str | None = None,
-    cudss_policy: tuple[int | None, float | None] = (None, None),
+    cudss_policy: tuple[int | None, float | None]
+    | tuple[int | None, float | None, bool] = (None, None),
 ) -> tuple[list[CaseResult], str | None]:
     """Run one problem across the config matrix; ``(rows, skip_reason)``.
 
@@ -376,11 +385,15 @@ def _run_problem_cases_inner(
     global_max_vars: int,
     max_build_seconds: float,
     certificate_prefix: str | None = None,
-    cudss_policy: tuple[int | None, float | None] = (None, None),
+    cudss_policy: tuple[int | None, float | None]
+    | tuple[int | None, float | None, bool] = (None, None),
 ) -> tuple[list[CaseResult], str | None]:
     """The sweep proper; see :func:`_run_problem_cases`."""
     xp = import_namespace(backend)
-    if backend == "cupy" and cudss_policy != (None, None):
+    # ``(steps, max_residual[, deterministic])``; None/False = the default.
+    if backend == "cupy" and any(
+        v is not None and v is not False for v in cudss_policy
+    ):
         configs = _with_cudss_policy(configs, *cudss_policy)
 
     # Optional build guard: abandon a problem whose sized build is too slow
@@ -466,21 +479,27 @@ def _run_problem_cases_inner(
 
 
 def _with_cudss_policy(
-    configs: list[ConfigSpec], steps: int | None, max_residual: float | None
+    configs: list[ConfigSpec],
+    steps: int | None,
+    max_residual: float | None,
+    deterministic: bool = False,
 ) -> list[ConfigSpec]:
-    """``configs`` with the perturbed-pivot policy overridden in ``Options.sparse``.
+    """``configs`` with the cuDSS policy overridden in ``Options.sparse``.
 
-    ``None`` keeps a config's own value (the ``SparseOptions`` default). The
-    policy reaches the cuDSS adapter through the public options path
-    (``SparseDirectSolver`` → the adapter's ``configure_perturbed_pivots``),
-    and is validated by ``SparseOptions`` itself. Only the sparse-route
-    configs read it; the others carry it inertly.
+    ``None`` keeps a config's own value (the ``SparseOptions`` default), and so
+    does ``deterministic=False``. The policy reaches the cuDSS adapter through
+    the public options path (``SparseDirectSolver`` → the adapter's
+    ``configure_perturbed_pivots`` / ``configure_deterministic``), and is
+    validated by ``SparseOptions`` itself. Only the sparse-route configs read
+    it; the others carry it inertly.
     """
     overrides: dict[str, object] = {}
     if steps is not None:
         overrides["perturbed_pivot_refinement_steps"] = steps
     if max_residual is not None:
         overrides["perturbed_pivot_max_residual"] = max_residual
+    if deterministic:
+        overrides["deterministic"] = True
     if not overrides:
         return configs
     return [
@@ -738,6 +757,13 @@ def main(argv: list[str] | None = None) -> int:
         "threshold (SparseOptions.perturbed_pivot_max_residual; default 1e-2)",
     )
     parser.add_argument(
+        "--cudss-deterministic",
+        action="store_true",
+        help="on the cupy backend, factor with cuDSS's run-to-run reproducible "
+        "mode (SparseOptions.deterministic=True; costs factorization time), "
+        "removing the factorization's run-to-run noise from an A/B",
+    )
+    parser.add_argument(
         "--jobs",
         type=int,
         default=1,
@@ -812,13 +838,14 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("--cudss-max-residual must be finite and > 0")
     environment = capture_environment()
-    # The cuDSS perturbed-pivot policy the CuPy rows ran with (None = the
-    # SparseOptions default at this commit), so an A/B arm is identifiable from
-    # its report and a resume cannot silently mix two policies. The keys keep
-    # the adapter's parameter names so earlier reports still resume.
+    # The cuDSS policy the CuPy rows ran with (None = the SparseOptions
+    # default at this commit), so an A/B arm is identifiable from its report
+    # and a resume cannot silently mix two policies. The keys keep the
+    # adapter's parameter names so earlier reports still resume.
     cudss_policy = {
         "max_refinement_steps": args.cudss_refinement_steps,
         "perturbed_max_residual": args.cudss_max_residual,
+        "deterministic": args.cudss_deterministic,
     }
     if "cupy" in backends:
         environment["cudss_policy"] = cudss_policy
@@ -837,7 +864,10 @@ def main(argv: list[str] | None = None) -> int:
         prior = json.loads(json_path.read_text())
         environment = prior.get("environment", environment)
         if "cupy" in backends:
-            ran = environment.get("cudss_policy", dict.fromkeys(cudss_policy))
+            ran = dict(environment.get("cudss_policy", dict.fromkeys(cudss_policy)))
+            # Reports from before --cudss-deterministic ran in the default mode.
+            if ran.get("deterministic") is None:
+                ran["deterministic"] = False
             if ran != cudss_policy:
                 parser.error(
                     f"--resume of {json_path} would mix cuDSS policies: the "
@@ -885,7 +915,11 @@ def main(argv: list[str] | None = None) -> int:
             args.max_build_seconds,
             str(inflight_path),
             certificate_prefix,
-            (args.cudss_refinement_steps, args.cudss_max_residual),
+            (
+                args.cudss_refinement_steps,
+                args.cudss_max_residual,
+                args.cudss_deterministic,
+            ),
         )
 
     def _record(

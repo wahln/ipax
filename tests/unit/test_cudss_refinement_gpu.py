@@ -15,6 +15,8 @@ import sys
 import numpy as np
 import pytest
 
+from tests._cudss import require_deterministic_cudss
+
 cupy = pytest.importorskip("cupy")
 
 from ipax.linalg.solver import LinearSolveError  # noqa: E402
@@ -35,11 +37,13 @@ if not _cuda_available():
 import ipax.backend.sparse.cupy as cupy_adapter  # noqa: E402
 
 
-def _cudss_or_skip() -> None:
+def _cudss_or_skip(*, deterministic: bool = False) -> None:
     try:
-        cupy_adapter._load_cudss()
+        cudss = cupy_adapter._load_cudss()
     except ImportError as exc:
         pytest.skip(f"cuDSS runtime unavailable: {exc}")
+    if deterministic:
+        require_deterministic_cudss(cudss)
 
 
 # One KKT system of MAKELA1 (S2MPJ, exact Hessian, sparse route) captured
@@ -209,3 +213,163 @@ def test_sparse_options_policy_reaches_cudss_end_to_end():
     assert cudss._max_refinement_steps == adapter_module._PERTURBED_MAX_REFINEMENT_STEPS
     assert 1 <= cudss.last_refinement_steps <= 10
     assert _relative_residual(_MAKELA1_KKT, _MAKELA1_RHS, x_on) <= 1e-9
+
+
+# --- SparseOptions.deterministic: cuDSS DETERMINISTIC_MODE -------------------
+
+
+def _synthetic_kkt(n: int = 1500, m: int = 500, seed: int = 0):
+    """A seeded sparse saddle point whose default cuDSS solve is not reproducible.
+
+    Random symmetric Hessian (a third of its diagonal zeroed, so static
+    pivoting perturbs pivots, as on ROTDISC/CATENARY) bordered by a random
+    sparse Jacobian. On cuDSS 0.7.1 five fresh default-mode solvers returned
+    five different solutions (max difference 0.24), the run-to-run
+    non-determinism the 2026-09-30 study measured on captured KKT systems.
+    """
+    sp = pytest.importorskip("scipy.sparse")
+    rng = np.random.default_rng(seed)
+    H = sp.random(n, n, density=4.0 / n, random_state=rng)
+    H = H + H.T
+    d = rng.uniform(1.0, 10.0, n)
+    d[rng.random(n) < 0.3] = 0.0
+    J = sp.random(m, n, density=3.0 / n, random_state=rng)
+    K = sp.bmat([[H + sp.diags(d), J.T], [J, -1e-8 * sp.eye(m)]]).tocoo()
+    rhs = np.random.default_rng(9).standard_normal(n + m)
+    return K, rhs
+
+
+def _factor_coo(K: object, **policy: object):
+    adapter = cupy_adapter.CuPySparseAdapter(**policy)
+    operator = adapter.from_coo(
+        cupy.asarray(K.row),  # type: ignore[attr-defined]
+        cupy.asarray(K.col),  # type: ignore[attr-defined]
+        cupy.asarray(K.data),  # type: ignore[attr-defined]
+        shape=K.shape,  # type: ignore[attr-defined]
+        symmetric=True,
+    )
+    solver = adapter.solver()
+    solver.factor(operator)
+    return solver
+
+
+def test_deterministic_mode_makes_fresh_factorizations_bitwise_identical():
+    _cudss_or_skip(deterministic=True)
+    K, rhs = _synthetic_kkt()
+    solutions = []
+    for _ in range(3):
+        solver = _factor_coo(K, deterministic=True)
+        solutions.append(cupy.asnumpy(solver.solve(cupy.asarray(rhs))))
+        solver._inner.close()
+    # Bitwise, not allclose: reproducibility is the whole point of the mode.
+    assert all(x.tobytes() == solutions[0].tobytes() for x in solutions[1:])
+    np.testing.assert_allclose(
+        K.dot(solutions[0]),  # type: ignore[attr-defined]
+        rhs,
+        atol=1e-2 * float(np.max(np.abs(rhs))),
+    )
+
+
+def _config_int(solver: object, name: str) -> int:
+    import ctypes
+
+    from nvmath.bindings import cudss
+
+    value = ctypes.c_int32()
+    written = ctypes.c_size_t()
+    cudss.config_get(
+        solver._config,  # type: ignore[attr-defined]
+        int(getattr(cudss.ConfigParam, name)),
+        ctypes.addressof(value),
+        ctypes.sizeof(value),
+        ctypes.addressof(written),
+    )
+    return int(value.value)
+
+
+def test_sparse_options_deterministic_reaches_the_cudss_config():
+    # SparseOptions(deterministic=True) → select_solver → facade →
+    # configure_deterministic → the cuDSS config, read back from the runtime;
+    # the default options leave the runtime's default (0).
+    _cudss_or_skip(deterministic=True)
+    from ipax.options import SparseOptions
+
+    on, _ = _options_solve(SparseOptions(deterministic=True))
+    assert _config_int(on._inner._inner, "DETERMINISTIC_MODE") == 1
+    off, _ = _options_solve(SparseOptions())
+    assert _config_int(off._inner._inner, "DETERMINISTIC_MODE") == 0
+
+
+# --- the inertia of a perturbed-pivot factorization ------------------------
+
+# One KKT system of CATENARY (S2MPJ, exact Hessian, sparse route) captured
+# from the 2026-09 CuPy sweep, as COO of the full symmetric 19×19 matrix. Five
+# of its rows/columns (4, 7, 10, 13, 14) are identically zero, so it is
+# singular; a dense Bunch–Kaufman LDLᵀ finds 7 zero pivots, inertia (8, 4, 7).
+# cuDSS perturbs 9 pivots to ±1e-13 and counts them by that sign: (15, 4, 0),
+# a nonsingular inertia that equals the IPM's target. That reading is kept
+# (withholding it was measured and rejected on the corpus, 2026-10-01); this
+# test pins it, so a runtime that starts reporting the zeros is noticed.
+_CATENARY_ROWS = [0, 0, 1, 2, 2, 3, 3, 3, 4, 5, 5, 6, 6, 6, 7, 8, 8, 9, 9, 9, 10]
+_CATENARY_ROWS += [11, 11, 12, 12, 13, 14, 15, 15, 15, 15, 16, 16, 16, 16, 17, 17]
+_CATENARY_ROWS += [17, 17, 18, 18, 18, 18]
+_CATENARY_COLS = [0, 15, 1, 2, 15, 3, 15, 16, 4, 5, 16, 6, 16, 17, 7, 8, 17, 9, 17]
+_CATENARY_COLS += [18, 10, 11, 18, 12, 18, 13, 14, 0, 2, 3, 15, 3, 5, 6, 16, 6, 8, 9]
+_CATENARY_COLS += [17, 9, 11, 12, 18]
+_CATENARY_VALS = [
+    2e15, -1.4142135623730951, 2e15, 2e15, -1.4142135623730951, 0.0,
+    2.8284271247461903, -0.37736970136067605, 0.0, 0.0, -1.9640753825897215, 0.0,
+    2.3414450839503975, -1.1747801618140798, 0.0, 0.0, -1.6186079115734306, 0.0,
+    2.7933880733875105, -1.8336365464521482, 0.0, 0.0, -0.798609426137161,
+    2.0888710079901012e16, 2.6322459725893093, 0.0, 0.0, -1.4142135623730951,
+    -1.4142135623730951, 2.8284271247461903, -1e-08, -0.37736970136067605,
+    -1.9640753825897215, 2.3414450839503975, -1e-08, -1.1747801618140798,
+    -1.6186079115734306, 2.7933880733875105, -1e-08, -1.8336365464521482,
+    -0.798609426137161, 2.6322459725893093, -1e-08,
+]  # fmt: skip
+_CATENARY_RHS = [
+    0.0, -50.0, 0.0, 0.0, -100.0, 0.0, 0.0, -100.0, 0.0, 0.0, -100.0, 0.0,
+    7368421.146619504, -50.0, 0.0, -2.220446049250313e-16, -1.6653345369377348e-15,
+    -4.551914400963142e-15, -2.170486013142181e-14,
+]  # fmt: skip
+
+
+def _factor_triplets(rows, cols, vals, n):
+    adapter = cupy_adapter.CuPySparseAdapter()
+    operator = adapter.from_coo(
+        cupy.asarray(rows),
+        cupy.asarray(cols),
+        cupy.asarray(vals, dtype=cupy.float64),
+        shape=(n, n),
+        symmetric=True,
+    )
+    solver = adapter.solver()
+    solver.factor(operator)
+    return solver
+
+
+def test_perturbed_factor_of_a_singular_kkt_reports_the_perturbed_count():
+    _cudss_or_skip()
+    dense = np.zeros((19, 19))
+    dense[_CATENARY_ROWS, _CATENARY_COLS] = _CATENARY_VALS
+    zero_rows = np.flatnonzero(~dense.any(axis=1))
+    assert zero_rows.tolist() == [4, 7, 10, 13, 14]  # singular by construction
+    solver = _factor_triplets(_CATENARY_ROWS, _CATENARY_COLS, _CATENARY_VALS, 19)
+    # The certificate accepts the solve: relative to ‖b‖∞ ≈ 7e6 the
+    # inconsistent rows' residual (≤ 1e2) stays under 1e-2.
+    solver.solve(cupy.asarray(_CATENARY_RHS))
+    premise = "premise: cuDSS 0.7.1 perturbs this system's zero pivots"
+    assert solver._inner._npivots > 0, premise
+    # The count of A + E: every perturbed zero pivot counted by its ±ε sign,
+    # no zero eigenvalue reported although the matrix is singular.
+    assert solver.inertia_or_none() == (15, 4, 0)
+
+
+def test_unperturbed_factor_reports_its_inertia():
+    _cudss_or_skip()
+    saddle = np.asarray([[4.0, 1.0, 1.0], [1.0, 3.0, 0.0], [1.0, 0.0, -2.0]])
+    rows, cols = np.nonzero(saddle)
+    solver = _factor_triplets(rows, cols, saddle[rows, cols], 3)
+    solver.solve(cupy.asarray([1.0, 2.0, 3.0]))
+    assert solver._inner._npivots == 0
+    assert solver.inertia_or_none() == (2, 1, 0)

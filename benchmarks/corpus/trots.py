@@ -1291,9 +1291,12 @@ class TiledGramCSROperator(CSROperator):
 
         ``csr`` is canonical (sorted, duplicate-free), so its arrays already
         are that adapter CSR: the same indices, values and index dtypes, so
-        every product is the same computation (bit-identical, except the
-        transpose products, which cuSPARSE accumulates with atomics and
-        which vary in the last bits between any two calls). They are
+        every product is the same computation, bit for bit (the adapter's
+        products are reproducible; its transposed ones run on an ``Aᵀ``
+        copy it builds on the first transposed product, a second device
+        copy of the block — except for a block whose transpose exceeds the
+        adapter's 512 MiB cap, such as Head-and-Neck_01's, which keeps
+        cuSPARSE's non-reproducible transposed product). They are
         uploaded once and wrapped
         in the adapter's operator directly (``canonical=True``); the values
         array doubles as :meth:`coo_values`, and :meth:`to_coo` rebuilds the

@@ -87,6 +87,18 @@ class CompiledCompressed:
         # cuDSS symmetric lower-triangle path); ``None`` keeps every triplet.
         self._keep = keep
 
+    @property
+    def inverse(self) -> Array:
+        """Canonical slot of each emitted triplet (after the ``keep`` filter).
+
+        Exposed for an adapter that sums duplicates by another kernel than
+        ``scatter_add`` (the CuPy adapter's ordered segment sum). It indexes
+        the triplets that survive ``keep``, so it pairs with a value vector
+        directly only for a map compiled without ``keep`` (the CuPy
+        adapter's use).
+        """
+        return self._inverse
+
     def data(self, values: Array) -> Array:
         """Canonical ``data`` for ``values`` via one scatter-add (no sort)."""
         if self._keep is not None:

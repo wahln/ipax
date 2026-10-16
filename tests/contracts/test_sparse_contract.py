@@ -68,6 +68,26 @@ class SparseDirectSolverContract:
 
         assert_allclose(namespace, actual, array(namespace, [1.0, 2.0, 2.0]), **tol)
 
+    def test_optional_determinism_hook_keeps_solves_exact(self, namespace, tol):
+        # ``configure_deterministic`` is optional (adapters without a
+        # reproducible mode omit it and the facade skips them). Where present,
+        # switching it on must leave a well-posed factor/solve exact.
+        with implemented(self.implementation_reason):
+            adapter = self.make_adapter(namespace)
+            configure = getattr(adapter, "configure_deterministic", None)
+            if configure is None:
+                pytest.skip("adapter has no determinism hook")
+            configure(enabled=True)
+            rows = namespace.asarray([0, 1, 1, 2])
+            cols = namespace.asarray([0, 0, 1, 2])
+            values = array(namespace, [2.0, 1.0, 3.0, 4.0])
+            K = adapter.from_coo(rows, cols, values, shape=(3, 3))
+            solver = adapter.solver()
+            solver.factor(K)
+            actual = solver.solve(array(namespace, [2.0, 7.0, 8.0]))
+
+        assert_allclose(namespace, actual, array(namespace, [1.0, 2.0, 2.0]), **tol)
+
     def test_reports_inertia_when_available(self, namespace):
         with implemented("inertia reporting"):
             adapter = self.make_adapter(namespace)

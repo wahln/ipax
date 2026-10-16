@@ -7,6 +7,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **All options dataclasses are exported from `ipax`**: `BarrierOptions`,
+  `BreedveldOptions`, `DenseOptions`, `KrylovOptions`, `LBFGSOptions`,
+  `LineSearchOptions`, `RegularizationOptions`, `RestorationOptions` and
+  `SparseOptions` join the top-level namespace next to `Options`; importing
+  them from `ipax.options` keeps working.
+- **`ipax.testing.problems.Maratos`**: the Maratos-effect problem (Nocedal &
+  Wright 2006, Example 15.4) joins the analytic test problems; the sparse-direct
+  contract battery now also runs against the CuPy/cuDSS adapter when a CUDA
+  device is present.
+- **`SparseOptions.deterministic`** (default `False`): asks the sparse-direct
+  adapter for run-to-run reproducible factorizations where the backend offers
+  them, at a factorization-time cost; adapters without such a mode ignore it.
+  The CUDA route (cuDSS) reads it and sets `DETERMINISTIC_MODE`, which makes
+  repeated factorizations bitwise identical. Six default-mode solvers on one
+  captured `ROTDISC` KKT system had given six different solutions. The mode
+  costs 1.2–3× per cuDSS factorization phase in isolation and 2–3 % per
+  factorization call on whole S2MPJ solves.
+  - The flag reaches the adapter through a second optional, duck-typed hook,
+    `configure_deterministic(enabled=)`, which the `SparseDirectSolver`
+    facade calls once, and only when the option is on. The CuPy adapter
+    implements it and the device-routing adapter (Torch/JAX) forwards it.
+    The SciPy adapter has no hook. The default calls nothing, so default
+    behaviour is unchanged.
+  - With it, the CuPy sparse route as a whole is bitwise reproducible
+    run to run on one machine: the adapter's own products and COO builds
+    are reproducible in every mode (see Fixed below). Three processes per
+    problem on `AGG`, `ROTDISC`, `ACOPR14`, `YORKNET` and `COSHFUN`
+    (`exact/sparse`) traced identical trajectories.
+  - The S2MPJ runner gains `--cudss-deterministic`. It is recorded in
+    `environment.cudss_policy`, and `--resume` refuses to mix it with the
+    default mode; older reports resume as non-deterministic.
 - **`SparseOptions.perturbed_pivot_refinement_steps`** (default `10`) and
   **`SparseOptions.perturbed_pivot_max_residual`** (default `1e-2`): the
   perturbed-pivot solve policy of static-pivoting sparse factorizations (today
@@ -519,6 +550,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     exactly. `--slack-init-scale` applies only with `--init ipax`.
 
 ### Fixed
+- **The CuPy sparse adapter's products and COO builds are bitwise
+  reproducible run to run** (`ipax/backend/sparse/cupy.py`). CuPy's
+  `csr @ x` uses cuSPARSE's default algorithms, which accumulate with
+  atomics in the transposed product `A.T @ y` (every `rmatvec`), in forward
+  products of matrices with long rows, and, through `cupy.add.at`, in the
+  COO → CSR duplicate sum. Each returned 28–30 distinct results in 30
+  repeats, and with `SparseOptions(deterministic=True)` three processes on
+  `AGG` still diverged at the first `rmatvec`.
+  - Vector products now use `CUSPARSE_SPMV_CSR_ALG2` (documented
+    deterministic). Transposed products run forward on an explicit `Aᵀ`
+    that the operator caches for its values (a gather through a shared
+    per-pattern plan for the operators one adapter builds on one pattern).
+    Multi-column products use an ordered kernel (one
+    thread or one warp per output entry). The COO build sums duplicates in
+    emission order, which matches the SciPy adapter's build bit for bit.
+  - On by default: the Jacobian operators never see `SparseOptions`, and
+    the kernels cost little or nothing. A forward SpMV is unchanged, a
+    transposed one is up to 38 % faster once `Aᵀ` exists, and the COO value
+    pass is twice as fast. Eight-column products are 18–50 % faster on short
+    rows and 11–20 % slower on 52 000-entry rows. Per-operator costs:
+    building `Aᵀ` (as much as 3–11 transposed products, so once per
+    iteration for a problem's Jacobian) and compiling the COO map (+27–53 %,
+    once per pattern and adapter).
+  - Memory: a transposed operator keeps a second copy of its values and
+    indices. Above 512 MiB per transpose it builds none for its transposed
+    products and uses cuSPARSE's, which is not reproducible (the sparse Gram
+    still keeps its `Aᵀ`, as before). On `Head-and-Neck_01`'s
+    1.1e8-nonzero dose block, the cached transpose had pushed the CuPy
+    dense route past the 8 GB card.
+  - New GPU tests: `tests/unit/test_cupy_sparse_determinism_gpu.py` (30-repeat
+    bitwise products and COO builds, stale-cache checks, a repeated
+    deterministic solve in one process and across two processes).
 - **cuDSS solves on perturbed-pivot factorizations are now iteratively
   refined** (`ipax/backend/sparse/cupy.py`). cuDSS's static pivoting replaces a
   pivot that is too small by `±ε`, so it factors `A + E` instead of `A`. The

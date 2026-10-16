@@ -115,6 +115,9 @@ class DeviceRoutingSparseAdapter:
         # Perturbed-pivot policy to hand to a delegate that reads it (the
         # CuPy/cuDSS adapter); ``None`` = never configured, delegate defaults.
         self._perturbed_pivots: tuple[int | None, float | None] | None = None
+        # Reproducible-factorization request for a delegate that reads it;
+        # ``None`` = never configured, delegate default.
+        self._deterministic: bool | None = None
 
     def configure_perturbed_pivots(
         self, *, refinement_steps: int | None, max_residual: float | None
@@ -130,11 +133,25 @@ class DeviceRoutingSparseAdapter:
         if self._delegate is not None:
             self._configure(self._delegate)
 
+    def configure_deterministic(self, *, enabled: bool) -> None:
+        """Forward the reproducible-factorization request to the device's adapter.
+
+        Remembered and applied like :meth:`configure_perturbed_pivots`, through
+        the delegate's own optional ``configure_deterministic`` hook: the CUDA
+        (cuDSS) delegate reads it, the CPU (SciPy) delegate has no hook.
+        """
+        self._deterministic = enabled
+        if self._delegate is not None:
+            self._configure(self._delegate)
+
     def _configure(self, delegate: Any) -> None:
         configure = getattr(delegate, "configure_perturbed_pivots", None)
         if self._perturbed_pivots is not None and configure is not None:
             steps, max_residual = self._perturbed_pivots
             configure(refinement_steps=steps, max_residual=max_residual)
+        make_deterministic = getattr(delegate, "configure_deterministic", None)
+        if self._deterministic is not None and make_deterministic is not None:
+            make_deterministic(enabled=self._deterministic)
 
     def _resolve(self, like: Array) -> Any:
         kind = _dlpack_device_kind(like)

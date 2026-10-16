@@ -847,6 +847,21 @@ class SparseOptions:
     (threshold-pivoting LDLᵀ, LU) ignore both fields; the backends guide says
     which adapters read them. The defaults are those adapters' own defaults,
     so leaving the fields alone changes nothing.
+
+    **Reproducibility.** ``deterministic=True`` asks the sparse-direct adapter
+    for run-to-run reproducible factorizations where the backend offers them,
+    at a factorization-time cost; adapters without such a mode ignore it. A
+    parallel factorization may reduce in a different order on every run, so
+    two solves of the same problem can then differ in the last bits, and an
+    interior-point trajectory amplifies such differences. On the CUDA route
+    the factorization is the last such source: the adapter's own sparse
+    products and COO builds are reproducible in every mode (bar the
+    transposed products of an operator too large to cache its transpose),
+    so with ``deterministic=True`` a CuPy sparse solve repeats bit for bit on
+    the same machine and software stack, within the limits the backends
+    guide lists (a ``max_time`` stop, cuBLAS and cuDSS versions). The default (``False``) keeps the
+    backend's own, fastest mode; the backends guide says which adapters read
+    the field and what it costs.
     """
 
     kkt_route: SparseKKTRoute = "auto"
@@ -854,6 +869,9 @@ class SparseOptions:
     # factorization uses static pivoting.
     perturbed_pivot_refinement_steps: int = 10
     perturbed_pivot_max_residual: float = 1e-2
+    # Reproducible factorizations (see docstring); read only by adapters whose
+    # backend offers such a mode.
+    deterministic: bool = False
 
     def __post_init__(self) -> None:
         if self.kkt_route not in ("auto", "augmented", "normal_equations"):
@@ -877,6 +895,10 @@ class SparseOptions:
             or not 0.0 < float(threshold) < math.inf
         ):
             raise ValueError("perturbed_pivot_max_residual must be finite and positive")
+        # Typed ``object``: a truthy non-bool (1, "yes") is a likely typo.
+        deterministic: object = self.deterministic
+        if not isinstance(deterministic, bool):
+            raise ValueError("deterministic must be a bool")
 
 
 @dataclass(frozen=True, slots=True)

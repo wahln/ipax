@@ -235,7 +235,11 @@ class SolverKind(Protocol):
 
 
 def _sparse_direct_solver(form: str, options: Options) -> LinearSolver:
-    """A ``SparseDirectSolver`` carrying ``Options.sparse``' perturbed-pivot policy."""
+    """A ``SparseDirectSolver`` carrying ``Options.sparse``' adapter policies.
+
+    The perturbed-pivot solve policy and the reproducible-factorization
+    request, both forwarded to the adapter through optional hooks.
+    """
     from ipax.linalg.sparse import SparseDirectSolver
 
     sparse = options.sparse
@@ -243,6 +247,7 @@ def _sparse_direct_solver(form: str, options: Options) -> LinearSolver:
         form=form,
         perturbed_pivot_refinement_steps=sparse.perturbed_pivot_refinement_steps,
         perturbed_pivot_max_residual=sparse.perturbed_pivot_max_residual,
+        deterministic=sparse.deterministic,
     )
 
 

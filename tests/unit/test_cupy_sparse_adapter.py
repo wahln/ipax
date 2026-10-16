@@ -28,6 +28,7 @@ def cupy_sparse_module(monkeypatch: pytest.MonkeyPatch):
     cupy.float64 = np.float64
     cupy.int32 = np.int32
     cupy.int64 = np.int64
+    cupy.int8 = np.int8
     cupy.asarray = np.asarray
     cupy.ascontiguousarray = np.ascontiguousarray
     cupy.asnumpy = np.asarray
@@ -56,6 +57,68 @@ def cupy_sparse_module(monkeypatch: pytest.MonkeyPatch):
 
     cupy.repeat = _repeat
     cupy.searchsorted = np.searchsorted
+    cupy.empty = np.empty
+    # CuPy's argsort is documented stable; NumPy's default is not.
+    cupy.argsort = lambda a: np.argsort(a, kind="stable")
+
+    class _ElementwiseKernel:
+        """The adapter's two custom kernels in NumPy, run serially as each
+        CUDA thread runs its own output entry: the ordered segment sum of the
+        COO build and the ordered multi-column CSR product."""
+
+        def __init__(self, in_params: str, out_params: str, op: str, name: str):
+            assert name in ("ipax_ordered_segment_sum", "ipax_ordered_csr_spmm"), name
+            del in_params, out_params, op
+            self.name = name
+
+        def __call__(self, *args):
+            if self.name == "ipax_ordered_segment_sum":
+                vals, order, starts, out = args
+                for i in range(out.shape[0]):
+                    acc = out.dtype.type(0)
+                    for k in range(int(starts[i]), int(starts[i + 1])):
+                        acc += vals[order[k]]
+                    out[i] = acc
+                return out
+            data, indptr, indices, x, m, n, out = args
+            for i in range(out.shape[0]):
+                row, base = i % m, (i // m) * n
+                acc = out.dtype.type(0)
+                for p in range(int(indptr[row]), int(indptr[row + 1])):
+                    acc += data[p] * x[base + indices[p]]
+                out[i] = acc
+            return out
+
+    cupy.ElementwiseKernel = _ElementwiseKernel
+
+    class _RawModule:
+        """The long-row ordered product's warp kernel, as a serial NumPy loop
+        (the order inside a row differs from the CUDA kernel's; the fakes
+        check the plumbing, the GPU tests check the bits)."""
+
+        def __init__(self, code: str, name_expressions: list[str]):
+            assert all(
+                n.startswith("ipax_ordered_csr_spmm_warp<") for n in name_expressions
+            )
+            del code
+            self.compiled: list[str] = []
+
+        def get_function(self, name: str):
+            self.compiled.append(name)
+
+            def launch(grid, block, args):
+                del grid, block
+                data, indptr, indices, x, out, m, n, total = args
+                for i in range(int(total)):
+                    row, base = i % int(m), (i // int(m)) * int(n)
+                    acc = out.dtype.type(0)
+                    for p in range(int(indptr[row]), int(indptr[row + 1])):
+                        acc += data[p] * x[base + indices[p]]
+                    out[i] = acc
+
+            return launch
+
+    cupy.RawModule = _RawModule
     cupy.result_type = np.result_type
     # Unbuffered scatter-add used by the canonical COO map (cupy.add.at is
     # the documented replacement for the deprecated cupyx.scatter_add).
@@ -1488,3 +1551,447 @@ def test_cupy_adapter_hook_validates_the_policy(cupy_sparse_module):
         cupy_sparse_module._PERTURBED_MAX_REFINEMENT_STEPS,
         cupy_sparse_module._PERTURBED_SOLVE_MAX_RESIDUAL,
     )
+
+
+# --- SparseOptions.deterministic: cuDSS DETERMINISTIC_MODE -------------------
+
+
+class _ConfigParam(enum.IntEnum):
+    # ``cudssConfigParam_t`` value of DETERMINISTIC_MODE on cuDSS 0.7.
+    DETERMINISTIC_MODE = 25
+
+
+class _ConfigurableFakeCudss(_FakeCudss):
+    """Fake cuDSS that records ``config_set`` calls (and their order).
+
+    ``config_set`` takes the value by address and size, like the nvmath
+    binding; the fake reads it back as the ``int32`` cuDSS documents for
+    ``DETERMINISTIC_MODE``.
+    """
+
+    ConfigParam = _ConfigParam
+
+    def __init__(self, *, fail_config_set: bool | str = False) -> None:
+        super().__init__()
+        self.config_sets: list[tuple[int, int, int]] = []
+        self.events: list[str] = []
+        self.fail_config_set = fail_config_set
+
+    def config_set(self, config: int, param: int, value: int, size: int) -> None:
+        if self.fail_config_set == "signature":
+            raise TypeError("config_set() takes 3 positional arguments")
+        if self.fail_config_set:
+            raise _CuDSSError("NOT_SUPPORTED (4)", status=4)
+        assert int(size) == 4  # int32
+        self.config_sets.append(
+            (int(config), int(param), ctypes.c_int32.from_address(value).value)
+        )
+        self.events.append("config_set")
+
+    def execute(self, *args: Any) -> None:
+        self.events.append("execute")
+        super().execute(*args)
+
+
+def _diag_solver(module, monkeypatch, fake, **adapter_kwargs):
+    monkeypatch.setattr(module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(module, "_ptr", lambda arr: int(arr.ctypes.data))
+    adapter = module.CuPySparseAdapter(**adapter_kwargs)
+    operator = adapter.from_coo(
+        np.asarray([0, 1]), np.asarray([0, 1]), np.asarray([1.0, -1.0]), shape=(2, 2)
+    )
+    return adapter, operator
+
+
+def test_cudss_deterministic_mode_is_set_before_the_first_execute(
+    cupy_sparse_module, monkeypatch
+):
+    fake = _ConfigurableFakeCudss()
+    adapter, operator = _diag_solver(cupy_sparse_module, monkeypatch, fake)
+    adapter.configure_deterministic(enabled=True)
+    solver = adapter.solver()
+    solver.factor(operator)
+    np.testing.assert_array_equal(
+        solver.solve(np.asarray([1.0, 2.0])), np.asarray([1.0, 2.0])
+    )
+    (config_set,) = fake.config_sets
+    assert config_set[1:] == (int(_ConfigParam.DETERMINISTIC_MODE), 1)
+    assert config_set[0] == solver._inner._config
+    # Set on the config the analysis/factorization phases run with.
+    assert fake.events.index("config_set") < fake.events.index("execute")
+
+
+def test_cudss_default_mode_never_touches_the_config(cupy_sparse_module, monkeypatch):
+    fake = _ConfigurableFakeCudss()
+    adapter, operator = _diag_solver(cupy_sparse_module, monkeypatch, fake)
+    solver = adapter.solver()
+    solver.factor(operator)
+    solver.solve(np.asarray([1.0, 2.0]))
+    assert fake.config_sets == []
+
+
+def test_cudss_deterministic_constructor_keyword(cupy_sparse_module, monkeypatch):
+    fake = _ConfigurableFakeCudss()
+    adapter, operator = _diag_solver(
+        cupy_sparse_module, monkeypatch, fake, deterministic=True
+    )
+    solver = adapter.solver()
+    solver.factor(operator)
+    assert [entry[1:] for entry in fake.config_sets] == [
+        (int(_ConfigParam.DETERMINISTIC_MODE), 1)
+    ]
+    # The hook switches it back off for the solvers made afterwards.
+    adapter.configure_deterministic(enabled=False)
+    later = adapter.solver()
+    later.factor(operator)
+    assert len(fake.config_sets) == 1
+
+
+def test_cudss_deterministic_mode_is_reapplied_to_a_new_context(
+    cupy_sparse_module, monkeypatch
+):
+    # ``close`` destroys the config; the next factor creates a fresh one,
+    # which must carry the mode too.
+    fake = _ConfigurableFakeCudss()
+    adapter, operator = _diag_solver(
+        cupy_sparse_module, monkeypatch, fake, deterministic=True
+    )
+    solver = adapter.solver()
+    solver.factor(operator)
+    solver._inner.close()
+    solver.factor(operator)
+    assert len(fake.config_sets) == 2
+    assert fake.config_sets[0][0] != fake.config_sets[1][0]
+
+
+@pytest.mark.parametrize("fail_config_set", [False, True, "signature"])
+def test_cudss_without_a_deterministic_mode_warns_and_still_solves(
+    cupy_sparse_module, monkeypatch, fail_config_set
+):
+    # A runtime whose bindings lack the parameter (or reject it, or take a
+    # different config_set signature) cannot honour the request: say so once,
+    # then factor in the default mode.
+    fake = (
+        _ConfigurableFakeCudss(fail_config_set=fail_config_set)
+        if fail_config_set
+        else _FakeCudss()
+    )
+    adapter, operator = _diag_solver(
+        cupy_sparse_module, monkeypatch, fake, deterministic=True
+    )
+    solver = adapter.solver()
+    with pytest.warns(RuntimeWarning, match="deterministic"):
+        solver.factor(operator)
+    np.testing.assert_array_equal(
+        solver.solve(np.asarray([1.0, 2.0])), np.asarray([1.0, 2.0])
+    )
+
+
+@pytest.mark.parametrize("value", [1, None, "on"])
+def test_cupy_adapter_determinism_hook_rejects_non_bool(cupy_sparse_module, value):
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    with pytest.raises(ValueError, match="deterministic"):
+        adapter.configure_deterministic(enabled=value)
+    assert adapter._deterministic is False
+    with pytest.raises(ValueError, match="deterministic"):
+        cupy_sparse_module.CuPySparseAdapter(deterministic=value)
+
+
+# --- the inertia of a perturbed-pivot factorization is still reported -------
+# cuDSS's count of a factor with NPIVOTS > 0 is the inertia of A + E (each
+# perturbed pivot counted by the sign of its ±ε). Withholding it was measured
+# on the S2MPJ corpus and rejected (2026-10-01, lone re-runs: exact/sparse lost 9
+# rows with no fixes, lbfgs/sparse 5 fixed / 6 broken), so the rule is pinned here.
+
+
+@pytest.mark.parametrize("npivots", [0, 2])
+@pytest.mark.parametrize("require_inertia", [False, True])
+def test_cudss_reports_its_inertia_whatever_npivots(
+    cupy_sparse_module, monkeypatch, npivots, require_inertia
+):
+    fake = _PivotingFakeCudss(npivots)
+    solver = _cudss_solver(
+        cupy_sparse_module,
+        monkeypatch,
+        fake,
+        [1.0, 0.0, 0.0, 1.0],
+        require_inertia=require_inertia,
+    )
+    solver.solve(np.asarray([1.0, 2.0]))
+    assert solver.inertia_or_none() == (1, 1, 0)
+    if require_inertia:
+        assert solver.inertia == (1, 1, 0)
+    assert fake.npivot_reads == 1  # the certificate's read, once per factor
+
+
+def test_cudss_perturbed_inertia_is_read_before_any_solve(
+    cupy_sparse_module, monkeypatch
+):
+    # Asked before the first solve (the IPM never does, but a direct user
+    # may), the reading does not depend on the deferred NPIVOTS settlement.
+    fake = _PivotingFakeCudss(3)
+    solver = _cudss_solver(cupy_sparse_module, monkeypatch, fake, [1.0, 0.0, 0.0, 1.0])
+    assert solver.inertia_or_none() == (1, 1, 0)
+    assert fake.npivot_reads == 0
+
+
+# --- run-to-run reproducible products and COO builds ------------------------
+# The GPU behaviour (bitwise repeats, agreement with SciPy) is pinned in
+# test_cupy_sparse_determinism_gpu.py; these pin the plumbing on the fakes.
+
+
+def test_coo_build_sums_duplicates_in_emission_order(cupy_sparse_module):
+    # Slot (0, 0) gets three entries whose sum depends on the order; the
+    # ordered segment sum adds them as NumPy's sequential np.add.at does.
+    rows = np.asarray([0, 1, 0, 1, 0, 0])
+    cols = np.asarray([0, 1, 0, 0, 0, 1])
+    values = np.asarray([1e16, 2.0, 1.0, 3.0, -1e16, 4.0])
+    expected = np.zeros(4)
+    np.add.at(expected, np.asarray([0, 3, 0, 2, 0, 1]), values)
+    assert expected[0] == 0.0  # (1e16 + 1) − 1e16 in emission order
+    for signature in (None, ("dups", 2)):
+        op = cupy_sparse_module.CuPySparseAdapter().from_coo(
+            rows, cols, values, shape=(2, 2), pattern_signature=signature
+        )
+        matrix = op.cupy_matrix
+        assert matrix.has_canonical_format
+        np.testing.assert_array_equal(matrix.indptr, [0, 2, 4])
+        np.testing.assert_array_equal(matrix.indices, [0, 1, 0, 1])
+        assert matrix.data.tobytes() == expected.tobytes()
+
+
+def test_coo_build_of_an_empty_pattern(cupy_sparse_module):
+    empty = np.zeros((0,), dtype=np.int64)
+    op = cupy_sparse_module.CuPySparseAdapter().from_coo(
+        empty, empty, np.zeros((0,)), shape=(3, 2), pattern_signature=("e",)
+    )
+    assert op.cupy_matrix.nnz == 0
+    np.testing.assert_array_equal(op.matvec(np.ones(2)), np.zeros(3))
+
+
+def test_canonical_csr_passes_a_canonical_matrix_through(cupy_sparse_module):
+    canonical = scipy_sparse.csr_matrix(np.asarray([[1.0, 0.0], [2.0, 3.0]]))
+    assert cupy_sparse_module._canonical_csr(canonical) is canonical
+    # A CSR with an unsorted, duplicated row goes through the ordered map.
+    raw = scipy_sparse.csr_matrix(
+        (np.asarray([1.0, 5.0, 2.0]), np.asarray([1, 0, 1]), np.asarray([0, 3, 3])),
+        shape=(2, 2),
+    )
+    raw.has_canonical_format = False
+    out = cupy_sparse_module._canonical_csr(raw)
+    np.testing.assert_array_equal(out.indptr, [0, 2, 2])
+    np.testing.assert_array_equal(out.indices, [0, 1])
+    np.testing.assert_array_equal(out.data, [5.0, 3.0])
+
+
+def _tall_operator(cupy_sparse_module):
+    dense = np.asarray(
+        [[2.0, 0.0, 1.0], [0.0, 3.0, 0.0], [1.0, -1.0, 0.5], [0.0, 0.0, 4.0]]
+    )
+    coo = scipy_sparse.coo_matrix(dense)
+    op = cupy_sparse_module.CuPySparseAdapter().from_coo(
+        coo.row, coo.col, coo.data, shape=dense.shape
+    )
+    return op, dense
+
+
+def test_transposed_products_share_one_cached_transpose(
+    cupy_sparse_module, monkeypatch
+):
+    op, dense = _tall_operator(cupy_sparse_module)
+    y = np.asarray([1.0, -2.0, 0.5, 3.0])
+    np.testing.assert_allclose(op.rmatvec(y), dense.T @ y)
+    transpose = op._transpose
+    assert transpose is not None
+    Y = np.stack([y, 2.0 * y], axis=1)
+    np.testing.assert_allclose(op.rmatmat(Y), dense.T @ Y)
+    np.testing.assert_allclose(op.gram_diagonal(y * y), (dense**2).T @ (y * y))
+    # The sparse (SpGEMM) Gram strategies reuse the same transpose.
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_MIN_DENSITY", 1.1)
+    w = np.asarray([0.5, 2.0, 1.0, 0.25])
+    reference = dense.T @ (w[:, None] * dense)
+    np.testing.assert_allclose(op.gram(w), reference)
+    rows, cols, vals, _ = op.gram_coo(w)
+    gram = np.zeros((3, 3))
+    np.add.at(gram, (np.asarray(rows), np.asarray(cols)), np.asarray(vals))
+    np.testing.assert_allclose(gram, reference)
+    assert op._transpose is transpose
+
+
+def test_cached_transpose_and_squares_follow_replaced_values(cupy_sparse_module):
+    op, dense = _tall_operator(cupy_sparse_module)
+    y = np.asarray([1.0, -2.0, 0.5, 3.0])
+    x = np.asarray([1.0, 2.0, -1.0])
+    op.rmatvec(y)
+    op.gram_diagonal(y)
+    op.row_gram_diagonal(x)
+    matrix = op.cupy_matrix
+    matrix.data = 3.0 * matrix.data  # a new value array, same pattern
+    new = 3.0 * dense
+    np.testing.assert_allclose(op.rmatvec(y), new.T @ y)
+    np.testing.assert_allclose(op.gram_diagonal(y), (new**2).T @ y)
+    np.testing.assert_allclose(op.row_gram_diagonal(x), (new**2) @ x)
+
+
+class _FakeCusparseLib:
+    """cuSPARSE's generic SpMV in NumPy, over the fake descriptors."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int]] = []
+
+    def spMV_bufferSize(self, handle, op, alpha, a, x, beta, y, cuda_type, alg):
+        del handle, op, alpha, a, x, beta, y, cuda_type, alg
+        return 16
+
+    def spMV(self, handle, op, alpha, a, x, beta, y, cuda_type, alg, buffer):
+        del handle, alpha, beta, cuda_type, buffer
+        self.calls.append((op, alg))
+        y[...] = a @ x
+
+
+def _descriptor(value: object) -> types.SimpleNamespace:
+    return types.SimpleNamespace(desc=value)
+
+
+@pytest.fixture
+def generic_products(cupy_sparse_module, monkeypatch):
+    lib = _FakeCusparseLib()
+    descriptors = types.SimpleNamespace(
+        SpMatDescriptor=types.SimpleNamespace(create=_descriptor),
+        DnVecDescriptor=types.SimpleNamespace(create=_descriptor),
+    )
+    monkeypatch.setattr(cupy_sparse_module, "_GENERIC_PRODUCTS", True)
+    monkeypatch.setattr(cupy_sparse_module, "_cusparse_lib", lib)
+    monkeypatch.setattr(cupy_sparse_module, "_cupyx_cusparse", descriptors)
+    monkeypatch.setattr(
+        cupy_sparse_module,
+        "_cuda_device",
+        types.SimpleNamespace(get_cusparse_handle=lambda: 7),
+    )
+    monkeypatch.setattr(
+        cupy_sparse_module.cupy, "asfortranarray", np.asfortranarray, raising=False
+    )
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+    return lib
+
+
+def test_products_run_as_non_transposed_alg2_spmv(
+    cupy_sparse_module, generic_products, monkeypatch
+):
+    op, dense = _tall_operator(cupy_sparse_module)
+    x = np.asarray([1.0, 2.0, -1.0])
+    y = np.asarray([1.0, -2.0, 0.5, 3.0])
+    np.testing.assert_allclose(op.matvec(x), dense @ x)
+    np.testing.assert_allclose(op.rmatvec(y), dense.T @ y)
+    assert generic_products.calls == [(0, 3)] * 2  # non-transposed, CSR_ALG2
+    Y = np.stack([y, -y, 2.0 * y], axis=1)
+    # Several columns: an ordered kernel, no SpMV — the thread kernel on
+    # short rows, the warp kernel on rows longer than its limit.
+    out = op.rmatmat(Y)
+    np.testing.assert_allclose(out, dense.T @ Y)
+    monkeypatch.setattr(cupy_sparse_module, "_ORDERED_SPMM_MAX_ROW", 0)
+    out = op.matmat(Y[:3, :])
+    np.testing.assert_allclose(out, dense @ Y[:3, :])
+    assert out.flags.f_contiguous  # CuPy's csr @ X layout
+    assert cupy_sparse_module._ORDERED_SPMM_WARP_MODULE.compiled == [
+        "ipax_ordered_csr_spmm_warp<double, int>"
+    ]
+    assert generic_products.calls == [(0, 3)] * 2
+    # A one-column matrix is one SpMV whatever the row length.
+    np.testing.assert_allclose(op.matmat(x[:, None]), (dense @ x)[:, None])
+    assert generic_products.calls == [(0, 3)] * 3
+    # A float32 matrix and a float64 vector promote, as CuPy's product does.
+    op32 = cupy_sparse_module.SparseOperator(
+        scipy_sparse.csr_matrix(dense.astype(np.float32)), np, canonical=True
+    )
+    promoted = op32.matvec(x)
+    assert promoted.dtype == np.float64
+    np.testing.assert_allclose(promoted, dense @ x)
+
+
+def test_generic_products_degrade_to_cupy_for_other_inputs(
+    cupy_sparse_module, generic_products
+):
+    op, dense = _tall_operator(cupy_sparse_module)
+    matmul = cupy_sparse_module._csr_matmul
+    a = op.cupy_matrix
+    # Integer data is CuPy's own product (no SpMV call).
+    ints = dense.astype(np.int64)
+    np.testing.assert_array_equal(
+        matmul(scipy_sparse.csr_matrix(ints), np.ones(3, np.int64)),
+        ints @ np.ones(3, np.int64),
+    )
+    assert generic_products.calls == []
+    with pytest.raises(ValueError, match="dimension mismatch"):
+        matmul(a, np.ones(4))
+    # Empty operands skip the library: zero matrix, zero columns.
+    empty = scipy_sparse.csr_matrix((4, 3))
+    np.testing.assert_array_equal(matmul(empty, np.ones(3)), np.zeros(4))
+    assert matmul(a, np.ones((3, 0))).shape == (4, 0)
+    assert generic_products.calls == []
+
+
+def test_generic_products_capability_probe(cupy_sparse_module, monkeypatch):
+    # The fakes lack cuSPARSE: the adapter falls back to CuPy's products.
+    assert cupy_sparse_module._GENERIC_PRODUCTS is False
+    assert cupy_sparse_module._generic_products_available() is False
+    available = types.SimpleNamespace(check_availability=lambda name: True)
+    monkeypatch.setattr(cupy_sparse_module, "_cusparse_lib", object())
+    monkeypatch.setattr(cupy_sparse_module, "_cupyx_cusparse", available)
+    monkeypatch.setattr(cupy_sparse_module, "_cuda_device", object())
+    runtime = cupy_sparse_module.cupy.cuda.runtime
+    monkeypatch.setattr(runtime, "is_hip", False, raising=False)
+    assert cupy_sparse_module._generic_products_available() is True
+    monkeypatch.setattr(runtime, "is_hip", True)
+    assert cupy_sparse_module._generic_products_available() is False
+
+
+def test_signature_operators_share_the_pattern_transpose_plan(cupy_sparse_module):
+    # Operators of one adapter and one pattern signature share the pattern's
+    # structure: Aᵀ is a gather through one permutation, each operator with
+    # its own values.
+    dense = np.asarray([[2.0, 0.0, 1.0], [0.0, 3.0, 0.0], [1.0, -1.0, 0.5]])
+    rows, cols = np.nonzero(dense)
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    y = np.asarray([1.0, -2.0, 0.5])
+    ops = []
+    for scale in (1.0, -3.0):
+        op = adapter.from_coo(
+            rows, cols, scale * dense[rows, cols], shape=(3, 3), pattern_signature="p"
+        )
+        np.testing.assert_allclose(op.rmatvec(y), scale * dense.T @ y)
+        transpose = op._transpose
+        reference = scipy_sparse.csr_matrix(scale * dense).T.tocsr()
+        np.testing.assert_array_equal(transpose.indptr, reference.indptr)
+        np.testing.assert_array_equal(transpose.indices, reference.indices)
+        np.testing.assert_array_equal(transpose.data, reference.data)
+        ops.append(op)
+    assert ops[0]._structure is ops[1]._structure
+    assert ops[0]._transpose_structure is ops[1]._transpose_structure
+    assert ops[0]._structure.max_row == 3
+    assert ops[0]._transpose_structure.max_row == 2
+    assert cupy_sparse_module._max_row(np.zeros((1,), np.int32)) == 0
+
+
+def test_operators_over_the_cache_budget_keep_no_transpose(
+    cupy_sparse_module, monkeypatch
+):
+    # Above the cache budget no Aᵀ is kept: the transposed products are
+    # cuSPARSE's own (memory-neutral, not reproducible on a GPU).
+    monkeypatch.setattr(cupy_sparse_module, "_TRANSPOSE_CACHE_MAX_BYTES", 0)
+    op, dense = _tall_operator(cupy_sparse_module)
+    y = np.asarray([1.0, -2.0, 0.5, 3.0])
+    np.testing.assert_allclose(op.rmatvec(y), dense.T @ y)
+    Y = np.stack([y, 2.0 * y], axis=1)
+    np.testing.assert_allclose(op.rmatmat(Y), dense.T @ Y)
+    np.testing.assert_allclose(op.gram_diagonal(y * y), (dense**2).T @ (y * y))
+    assert op._transpose is None
+    # The sparse Gram builds and keeps Aᵀ whatever the cap; the transposed
+    # products then use that copy instead of cuSPARSE's.
+    monkeypatch.setattr(cupy_sparse_module, "_GRAM_DENSE_MIN_DENSITY", 1.1)
+    w = np.asarray([0.5, 2.0, 1.0, 0.25])
+    np.testing.assert_allclose(op.gram(w), dense.T @ (w[:, None] * dense))
+    transpose = op._transpose
+    assert transpose is not None
+    np.testing.assert_allclose(op.rmatvec(y), dense.T @ y)
+    assert op._transpose is transpose

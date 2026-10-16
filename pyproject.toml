@@ -182,7 +182,15 @@ disallow_any_generics = true
 # CI `lint` job installs only `[lint]`, so the numpy/scipy sparse adapter is
 # type-checked without numpy present).
 [[tool.mypy.overrides]]
-module = ["numpy.*", "torch.*", "jax.*", "cupy.*", "scipy.*", "array_api_strict.*"]
+module = [
+    "numpy.*",
+    "torch.*",
+    "jax.*",
+    "cupy.*",
+    "cupy_backends.*",
+    "scipy.*",
+    "array_api_strict.*",
+]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

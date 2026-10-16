@@ -80,6 +80,13 @@ class SparseDirectSolver:
     Both ``None`` (the default) leaves the hook uncalled, so the adapter keeps
     its own defaults; ``select_solver`` always passes ``Options.sparse``'s
     values. Validation is the adapter's (and ``SparseOptions``') concern.
+
+    ``deterministic=True`` (``SparseOptions.deterministic``) reaches the
+    adapter the same way, through its optional
+    ``configure_deterministic(enabled=True)`` hook, called once right after
+    the adapter is created: an adapter whose backend offers run-to-run
+    reproducible factorizations switches that mode on, any other adapter has
+    no hook and ignores it. ``False`` (the default) never calls the hook.
     """
 
     def __init__(
@@ -89,6 +96,7 @@ class SparseDirectSolver:
         form: str = "augmented",
         perturbed_pivot_refinement_steps: int | None = None,
         perturbed_pivot_max_residual: float | None = None,
+        deterministic: bool = False,
     ) -> None:
         if form not in ("augmented", "normal_equations"):
             raise ValueError(
@@ -102,6 +110,11 @@ class SparseDirectSolver:
             and perturbed_pivot_max_residual is None
             else (perturbed_pivot_refinement_steps, perturbed_pivot_max_residual)
         )
+        # Typed ``object``: a truthy non-bool ("no") must not switch it on.
+        flag: object = deterministic
+        if not isinstance(flag, bool):
+            raise ValueError("SparseDirectSolver deterministic must be a bool")
+        self._deterministic = flag
         self._adapter: Any = None
         self._adapter_key: tuple[str, int | None] | None = None
         self._inner: Any = None
@@ -227,6 +240,10 @@ class SparseDirectSolver:
             if self._perturbed_pivot_policy is not None and configure is not None:
                 steps, max_residual = self._perturbed_pivot_policy
                 configure(refinement_steps=steps, max_residual=max_residual)
+            # Optional hook too: only adapters with a reproducible mode have it.
+            make_deterministic = getattr(self._adapter, "configure_deterministic", None)
+            if self._deterministic and make_deterministic is not None:
+                make_deterministic(enabled=True)
         elif adapter_key != self._adapter_key:
             raise RuntimeError(
                 "SparseDirectSolver cannot reuse a cached sparse adapter across "

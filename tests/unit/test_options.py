@@ -321,3 +321,16 @@ def test_sparse_rejects_invalid_perturbed_pivot_refinement_steps(steps):
 def test_sparse_rejects_invalid_perturbed_pivot_max_residual(threshold):
     with pytest.raises(ValueError, match="perturbed_pivot_max_residual"):
         SparseOptions(perturbed_pivot_max_residual=threshold)
+
+
+def test_sparse_deterministic_is_off_by_default():
+    # Opt-in: reproducible factorizations cost factorization time where an
+    # adapter offers them, so the default leaves the backend's fastest mode.
+    assert SparseOptions().deterministic is False
+    assert SparseOptions(deterministic=True).deterministic is True
+
+
+@pytest.mark.parametrize("value", [1, 0, 1.0, "yes", None])
+def test_sparse_rejects_a_non_bool_deterministic(value):
+    with pytest.raises(ValueError, match="deterministic"):
+        SparseOptions(deterministic=value)
