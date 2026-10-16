@@ -763,9 +763,12 @@ def test_grouped_and_per_term_hessians_solve_alike(linsolve):
 # --------------------------------------------------------------------------- #
 def _unguarded_geud_hess(d, a):
     m = d.size
-    s = float(np.mean(np.abs(d) ** a))
-    diag = s ** (1 / a - 1) * (a - 1) * np.abs(d) ** (a - 2) / m
-    u = np.abs(d) ** (a - 1) * np.sign(d) / m
+    s = float(np.mean(np.power(np.abs(d), a)))
+    # np.power, not ``**``: ndarray.__pow__ takes scalar-exponent fast paths
+    # (sqrt for 0.5, reciprocal for -1) whose last bit can differ from the
+    # np.power ufunc the production code calls on some CPUs (AVX512 pow).
+    diag = s ** (1 / a - 1) * (a - 1) * np.power(np.abs(d), a - 2) / m
+    u = np.power(np.abs(d), a - 1) * np.sign(d) / m
     return diag, u, (1 / a - 1) * a * s ** (1 / a - 2)
 
 
@@ -778,9 +781,9 @@ def test_geud_guards_leave_normal_doses_bitwise_unchanged(a):
     np.testing.assert_array_equal(diag, ref[0])
     np.testing.assert_array_equal(u, ref[1])
     assert coef == ref[2]
-    s = np.mean(d**a)
+    s = np.mean(np.power(d, a))
     np.testing.assert_array_equal(
-        trots._cost_grad_d(3, d, par), s ** (1 / a - 1) * d ** (a - 1) / d.size
+        trots._cost_grad_d(3, d, par), s ** (1 / a - 1) * np.power(d, a - 1) / d.size
     )
 
 
