@@ -972,7 +972,7 @@ def test_runner_times_the_least_squares_start_as_initialisation(monkeypatch, ini
 
     assert result.error is None, result.error
     assert calls == ["prepare"]  # one least-squares solve, inside the timed hook
-    assert result.prepare_time >= 0.2
+    assert result.prepare_time >= 0.15  # slept 0.2 s; timer jitter
     assert result.solve_time >= result.prepare_time
 
 

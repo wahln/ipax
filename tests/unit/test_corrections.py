@@ -649,3 +649,47 @@ def test_gondzio_accumulates_partial_trial_residual_and_uses_gamma(namespace):
     assert_allclose(xp, targets[1][0], array(xp, [expected]))
     assert_allclose(xp, targets[2][0], array(xp, [expected_2]))
     assert result.step is candidate_2
+
+
+# -- degenerate complementarity (no pairs / zero gap) -----------------------
+
+
+def test_probing_rules_without_complementarity_pairs_return_zero(namespace):
+    import dataclasses
+
+    xp = namespace
+    context = dataclasses.replace(
+        _context(
+            xp,
+            _step(xp, ds=-1.0, dy=-1.0),
+            solve=lambda *args: None,
+            alpha_primal=lambda step, *, tau: 0.5,
+            alpha_dual=lambda step, *, tau: 0.5,
+            mu_min=0.5,
+        ),
+        s=array(xp, []),
+        y_ineq=array(xp, []),
+    )
+    assert probing_mu(context) == 0.0
+    assert mehrotra_probing_mu(context, tau=0.995) == 0.0
+
+
+def test_probing_rules_at_zero_gap_fall_to_the_floor(namespace):
+    # s = 0 ⇒ μ_gap = 0: σ = (μ_aff/μ)³ is undefined, so both rules return the
+    # floor (the NWW rule via σ = 0, the unclipped rule via its μ_gap ≤ 0 guard).
+    import dataclasses
+
+    xp = namespace
+    context = dataclasses.replace(
+        _context(
+            xp,
+            _step(xp, ds=1.0, dy=1.0),
+            solve=lambda *args: None,
+            alpha_primal=lambda step, *, tau: 1.0,
+            alpha_dual=lambda step, *, tau: 1.0,
+            mu_min=0.5,
+        ),
+        s=array(xp, [0.0]),
+    )
+    assert probing_mu(context) == 0.5
+    assert mehrotra_probing_mu(context, tau=0.995) == 0.5

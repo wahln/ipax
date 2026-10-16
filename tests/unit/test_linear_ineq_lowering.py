@@ -828,3 +828,124 @@ def test_compressed_lowering_does_not_read_the_array_device_attribute():
         op, offset = _lower_two_sided(matrix, hide(lo), hide(hi), xp)
         assert_allclose(xp, op.matvec(x), xp.matmul(xp.asarray(jac_ref), x), **_TOL)
         assert_allclose(xp, offset, xp.asarray(off_ref), **_TOL)
+
+
+# --------------------------------------------------------------------------- #
+# Edge cases of the lowering and its signed-row-selection wrapper.
+# --------------------------------------------------------------------------- #
+def test_all_unbounded_array_block_lowers_to_an_empty_dense(namespace):
+    xp = namespace
+    rows, _, _ = _random_block()
+    op, offset = _lower(xp, array(xp, rows), [-_INF] * _M, [_INF] * _M)
+    assert isinstance(op, Dense) and op.shape == (0, _N)
+    assert int(offset.shape[0]) == 0
+
+
+def test_vstack_with_one_bounded_block_is_not_restacked(namespace):
+    # Only the first block has finite bounds: the lowered result is that
+    # block's own operator, not a one-element VStack.
+    xp = namespace
+    rows, lo, hi = _random_block()
+    top = _Opaque(array(xp, rows[:_SPLIT]))
+    bottom = _Opaque(array(xp, rows[_SPLIT:]))
+    lo = lo[:_SPLIT] + [-_INF] * (_M - _SPLIT)
+    hi = hi[:_SPLIT] + [_INF] * (_M - _SPLIT)
+
+    op, offset = _lower(xp, VStack((top, bottom)), lo, hi)
+
+    jac_ref, off_ref = _reference(rows[:_SPLIT], lo[:_SPLIT], hi[:_SPLIT], [_SPLIT])
+    assert not isinstance(op, VStack)
+    x = array(xp, [0.3, -1.2, 2.0, 0.7, -0.4])
+    assert_allclose(xp, op.matvec(x), xp.matmul(array(xp, jac_ref), x), **_TOL)
+    assert_allclose(xp, offset, array(xp, off_ref), **_TOL)
+
+
+def test_row_selection_rejects_masks_of_the_wrong_length(namespace):
+    from ipax.backend.operators import _SignedRowSelection
+
+    xp = namespace
+    a = Dense(array(xp, [[1.0, 2.0], [3.0, 4.0]]))
+    ok = array(xp, [1.0, 0.0]) > 0.5
+    short = array(xp, [1.0]) > 0.5
+    with pytest.raises(ValueError, match="row-selection masks"):
+        _SignedRowSelection(a, short, ok)
+    with pytest.raises(ValueError, match="row-selection masks"):
+        _SignedRowSelection(a, ok, short)
+
+
+def test_row_selection_without_rows_adjoint_is_zero(namespace):
+    # k = 0: Sᵀ v is an empty-source expansion, so the adjoint products are
+    # zero for rank-1 and rank-2 inputs alike.
+    from ipax.backend.operators import _SignedRowSelection
+
+    xp = namespace
+    a = Dense(array(xp, [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]))
+    none = array(xp, [0.0, 0.0, 0.0]) > 0.5
+    op = _SignedRowSelection(a, none, none)
+    assert op.shape == (0, 2)
+    empty = array(xp, [])
+    assert_allclose(xp, op.rmatvec(empty), array(xp, [0.0, 0.0]), **_TOL)
+    empty2 = xp.reshape(array(xp, []), (0, 3))
+    assert_allclose(xp, op.rmatmat(empty2), array(xp, [[0.0] * 3, [0.0] * 3]), **_TOL)
+
+
+def test_wrapper_forwards_gram_coo_with_folded_weights(namespace):
+    xp = namespace
+    rows, lo, hi = _random_block()
+
+    class _OpaqueCoo(_Opaque):
+        def gram_coo(self, weights):
+            g = self.gram(weights)
+            r, c = [], []
+            for i in range(_N):
+                for j in range(_N):
+                    r.append(i)
+                    c.append(j)
+            flat = xp.reshape(g, (-1,))
+            return (
+                xp.asarray(r, dtype=xp.int64),
+                xp.asarray(c, dtype=xp.int64),
+                flat,
+                (_N, _N),
+            )
+
+    op, _ = _lower(xp, _OpaqueCoo(array(xp, rows)), lo, hi)
+    jac_ref, _ = _reference(rows, lo, hi, [_M])
+    J = array(xp, jac_ref)
+    w = _weights(xp, len(jac_ref))
+    assert op.gram_coo_capable()
+    r, c, g, shape = op.gram_coo(w)
+    assert_allclose(
+        xp,
+        _coo_dense(xp, r, c, g, shape),
+        xp.matmul(transpose(xp, J), xp.expand_dims(w, 1) * J),
+        **_TOL,
+    )
+
+
+def test_lowered_problem_delegates_equality_constraints(namespace):
+    xp = namespace
+
+    class _WithEquality(_LinearIneqOnly):
+        def eq_constraints(self, x):
+            return xp.sum(x, keepdims=True) - 1.0
+
+        def eq_jacobian(self, x):
+            return xp.ones((1, int(x.shape[0])), dtype=x.dtype)
+
+    problem = _WithEquality(
+        xp,
+        array(xp, [[1.0, 0.0], [0.0, 1.0]]),
+        array(xp, [0.0, 0.0]),
+        array(xp, [1.0, 1.0]),
+    )
+    lowered = lower_linear_inequalities(problem, array(xp, [0.0, 0.0]), xp)
+    x = array(xp, [0.25, 0.5])
+    assert_allclose(xp, lowered.eq_constraints(x), array(xp, [-0.25]), **_TOL)
+    assert_allclose(xp, lowered.eq_jacobian(x), array(xp, [[1.0, 1.0]]), **_TOL)
+
+
+def test_array_block_must_be_rank_two(namespace):
+    xp = namespace
+    with pytest.raises(ValueError, match="rank-2"):
+        _lower(xp, array(xp, [1.0, 2.0]), [0.0, 0.0], [1.0, 1.0])

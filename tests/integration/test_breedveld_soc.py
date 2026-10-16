@@ -156,3 +156,21 @@ def test_soc_leaves_hock_schittkowski_optima_unchanged(namespace, cls, start):
     assert corrected.status is Status.OPTIMAL
     assert_scalar_close(corrected.objective, plain.objective, rtol=1e-8, atol=1e-8)
     assert_allclose(namespace, corrected.x, plain.x, rtol=1e-6, atol=1e-6)
+
+
+def test_soc_trials_are_logged_at_debug_level(namespace, caplog):
+    import logging
+
+    with caplog.at_level(logging.DEBUG):
+        _solve_maratos(namespace, _options(max_soc=1))
+    assert any(
+        "breedveld trial" in r.getMessage() and "soc-" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_maratos_known_solution_is_the_optimum(namespace):
+    problem = Maratos(namespace)
+    solution = problem.known_solution()
+    assert_allclose(namespace, solution, array(namespace, [1.0, 0.0]))
+    assert_scalar_close(problem.objective(solution), -1.0)

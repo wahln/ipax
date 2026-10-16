@@ -233,7 +233,7 @@ def test_run_case_applies_prepare_solve(namespace, monkeypatch):
     assert result.error is None and result.correct
     # prepare_time attributes the hook's share; solve_time is the combined
     # (paper-accounting) figure.
-    assert result.prepare_time >= 0.05
+    assert result.prepare_time >= 0.04  # sleep(0.05), Windows timer jitter
     assert result.solve_time >= result.prepare_time
     row = json.loads(json.dumps(to_payload([result], capture_environment())))
     assert row["results"][0]["prepare_time"] == result.prepare_time
@@ -275,3 +275,50 @@ def test_run_case_records_a_failing_prepare_solve(namespace):
     )
     assert result.status == "prepare_error"
     assert "init failed" in (result.error or "")
+
+
+def test_run_case_keeps_prepare_time_when_the_solve_raises(namespace, monkeypatch):
+    # Regression: a failed solve row dropped the (possibly expensive) prepare_solve
+    # time, so failures looked cheaper than they were under paper accounting.
+    import time
+    from dataclasses import replace
+
+    from ipax.result import WarmStart
+
+    def prepare(problem, x0, options):
+        time.sleep(0.05)
+        return x0, WarmStart(), options
+
+    def failing_solve(problem, x0, **kwargs):
+        raise RuntimeError("solve failed")
+
+    monkeypatch.setattr(ipax, "solve", failing_solve)
+    result = run_case(
+        replace(_bound_qp_case(), prepare_solve=prepare),
+        config="exact/dense",
+        options=ipax.Options(hessian="exact", linsolve="dense"),
+        xp=namespace,
+        backend="test",
+    )
+    assert result.status == "solve_error"
+    assert result.prepare_time >= 0.04  # sleep(0.05), Windows timer jitter
+    assert result.solve_time == result.prepare_time
+
+
+def test_run_case_keeps_elapsed_time_when_prepare_solve_raises(namespace):
+    import time
+    from dataclasses import replace
+
+    def boom(problem, x0, options):
+        time.sleep(0.05)
+        raise RuntimeError("init failed")
+
+    result = run_case(
+        replace(_bound_qp_case(), prepare_solve=boom),
+        config="exact/dense",
+        options=ipax.Options(hessian="exact", linsolve="dense"),
+        xp=namespace,
+        backend="test",
+    )
+    assert result.status == "prepare_error"
+    assert result.prepare_time >= 0.04  # sleep(0.05), Windows timer jitter

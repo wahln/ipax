@@ -798,3 +798,29 @@ def test_dense_solver_describe_composes_retired_mixed_and_pd_hint_markers():
     solver._mixed_label = "float32"
     solver._pd_hint_ever_failed = True
     assert solver.describe() == "dense (gram=float32->native, pd-hint->lu)"
+
+
+def test_dense_solver_checks_the_pivots_where_the_backend_breakdown_is_silent(
+    namespace, monkeypatch
+):
+    # No gap-filler and a backend whose ``cholesky`` does not raise on a
+    # breakdown (CuPy, JAX): the PD probe must go through ``checked_cholesky``.
+    import ipax.backend.dense as dense_backend
+    import ipax.linalg.dense as dense_module
+
+    calls: list = []
+    monkeypatch.setattr(dense_backend, "get_dense_cholesky", lambda xp: None)
+    monkeypatch.setattr(
+        dense_module, "cholesky_breakdown_is_silent", lambda xp, like: True
+    )
+    real = dense_module.checked_cholesky
+
+    def forward(xp, matrix):
+        calls.append(1)
+        return real(xp, matrix)
+
+    monkeypatch.setattr(dense_module, "checked_cholesky", forward)
+    solver = DenseSolver()
+    solver.factor(_condensed_with_inequalities(namespace))
+    solver.solve(array(namespace, [1.0, -2.0]))
+    assert calls

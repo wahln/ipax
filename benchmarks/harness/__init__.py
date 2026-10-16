@@ -129,7 +129,9 @@ def run_case(
     aborts the sweep.
     """
 
-    def _fail(status: str, error: str) -> CaseResult:
+    def _fail(status: str, error: str, prepare_seconds: float = 0.0) -> CaseResult:
+        # A failed row keeps the time the ``prepare_solve`` hook already spent
+        # (same paper accounting as a successful row: it is part of solve_time).
         return CaseResult(
             problem=case.name,
             kind=case.kind,
@@ -150,7 +152,8 @@ def run_case(
             expected_objective=None,
             expected_infeasible=False,
             pbclass=None,
-            solve_time=0.0,
+            solve_time=prepare_seconds,
+            prepare_time=prepare_seconds,
             linear_solver="",
             gradient_source="n/a",
             hessian_source="n/a",
@@ -168,7 +171,11 @@ def run_case(
         try:
             x0, warm_start, prepared = case.prepare_solve(problem, x0, options)
         except Exception:  # report initialisation failures as a row
-            return _fail("prepare_error", traceback.format_exc(limit=2).strip())
+            return _fail(
+                "prepare_error",
+                traceback.format_exc(limit=2).strip(),
+                perf_counter() - start,
+            )
         # Counted in the row's solve_time: the initialisation — the starting
         # point as well as any multiplier solve — is part of the method
         # (Breedveld et al. 2017 report runtimes including it), which is why
@@ -181,7 +188,9 @@ def run_case(
         else:
             result = ipax.solve(problem, x0, options=prepared, warm_start=warm_start)
     except Exception:  # report solve failures as a row
-        return _fail("solve_error", traceback.format_exc(limit=2).strip())
+        return _fail(
+            "solve_error", traceback.format_exc(limit=2).strip(), prepare_seconds
+        )
 
     optimum = case.optimum(problem)
     error_vs_optimum = None if optimum is None else _inf_norm(xp, result.x, optimum)

@@ -197,3 +197,20 @@ def test_gram_keyword_rejection_recognizer(call, expected):
     assert _gram_rejects_keywords(exc.with_traceback(exc.__traceback__.tb_next)) is (
         expected
     )
+
+
+def test_cholesky_breakdown_probe_reports_a_silent_backend():
+    # A backend whose ``cholesky`` returns a factor for the negative-definite
+    # probe (CuPy under its default errstate, JAX) is reported as silent, so
+    # callers keep the pivot check.
+    import types
+
+    import array_api_compat.numpy as xp
+
+    class _Silent:
+        linalg = types.SimpleNamespace(cholesky=lambda a: a)
+
+        def __getattr__(self, name):
+            return getattr(xp, name)
+
+    assert cholesky_breakdown_is_silent(_Silent(), np.ones(1)) is True
