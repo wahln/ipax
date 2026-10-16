@@ -31,21 +31,22 @@ opts = ipax.Options(
     hessian="exact",
     linsolve="dense",
     corrections="mehrotra",  # predictor–corrector …
-    mu_schedule="monotone",  # "probing" (μ from the predictor) on protons
+    mu_schedule="probing",  # Mehrotra's predictor-based μ …
     globalization="breedveld",  # ratio control, then the Markov filter
-    barrier=BarrierOptions(mu_init=mu0),
+    barrier=BarrierOptions(mu_init=mu0, kappa_centrality=0.0),  # … floor off
     max_iter=300,
 )
 result = ipax.solve(problem, x0, options=opts, warm_start=warm)
 ```
 
-`Liver_01`: 74 iterations / 80 s on NumPy to a certified `1e-8` point at the
-reference objective (the reference solve: 36 iterations / 22 s), his
-tolerance class at iteration 37. `Protons_01` with `mu_schedule="probing"`:
-104 iterations, 60 s on NumPy / 27 s on CuPy plus a 4 s initialization (1 s
-for the least-squares fluence, 3 s for the LSQR dual start; the reference:
-79 iterations / 55 s); with the monotone default 227. The μ
-schedule is the one lever that splits by site — see *Why these levers*.
+`Protons_01`: 93 iterations, 24 s on CuPy including the LSQR dual start (the
+reference solve: 79 iterations / 55 s); `Liver_01`: 57 iterations / 58 s on
+CuPy (reference 36 / 22 s). The 2026-09-27 sweep below measured this recipe
+against the monotone-μ variant on all seven TROTS sites; it wins every case.
+Its times predate the runner counting the least-squares fluence of eq. (23)
+as initialization (1 s on `Protons_01`, 3.5 s on `Liver_01`, 18 s on
+`Prostate_VMAT_101`, 30 s on `Prostate_CK_01`, 20 s on `Head-and-Neck_01`),
+so add that solve to each row.
 
 **Previous L-BFGS recipes** (still the right choice for an L-BFGS solve:
 `--config lbfgs/dense --init ipax --mu-schedule monotone --globalization filter
@@ -158,7 +159,9 @@ recipe (`--config exact/dense --init ipax --mu-schedule quality --globalization
 filter --corrections mehrotra --slack-init-scale 0.1`), not a default.
 
 **Breedveld-parity recipe (2026-09-26) — the TROTS runner's default since
-then, with monotone μ; the proton rows below use `--mu-schedule probing`.**
+then; the rows below use `--mu-schedule probing` with ipax's centrality floor
+still on (`kappa_centrality=1e-2`), the runner default until the sweep of
+2026-09-27 turned the floor off.**
 Breedveld's solver setup transcribed lever by lever: the exact
 Hessian, the Mehrotra predictor–corrector with μ taken from the affine
 predictor (`corrections="mehrotra"` + `mu_schedule="probing"` — the affine
@@ -176,7 +179,8 @@ in full: the least-squares fluence of eq. (23) — 1.0 s here, 3.5 s on
 SciPy SpGEMM of the dataset's initialization matrices — and LSQR on the
 host (3.4 s at the loader's `atol=btol=1e-6`, 24 s at `1e-8` for a
 bit-identical start, because every LSQR multiplier is < 0.04 and the floor
-sets all 369,445 of them to 5):
+sets all 369,445 of them to 5). On CuPy the LSQR has since moved to the
+GPU; see *Device LSQR* below:
 
 | backend | tol | status | objective | iters | solve wall | s/iter | KKT ≤ 1e-4 first | within 1 % first |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -220,12 +224,43 @@ Three things to know when reading this against the paper's 79 iterations /
   and saves 4 iterations over ipax's start. It costs nothing to keep (3 s),
   and it is the paper's setup.
 
+**Device LSQR (CuPy, 2026-09-27).** On a CuPy namespace,
+`breedveld_warm_start` now runs eq. (26) on the GPU. It uses `_lsqr` in
+`benchmarks/corpus/trots.py`, a transcription of SciPy's Paige–Saunders LSQR
+into the array namespace with the same recurrences, stopping tests and
+`istop` codes. It runs on the problem's own lowered operator, so no NumPy
+host twin is built. cupyx has no drop-in replacement: its `lsqr` is a direct
+sparse-QR solve of a *square* CSR system. `lsqr="host"` keeps the SciPy path,
+which Torch, JAX and `array_api_strict` always use.
+
+The two paths give the same start to round-off. On `Protons_01` the relative
+differences are 1e-14 in the slacks, 5e-16 in the bound multipliers and 2e-15
+in `μ₀`, and `y₀` is on the floor in both. The unfloored LSQR iterate follows
+SciPy's to 1e-12 over the first 10 iterations and then drifts, ending
+8e-5 to 5e-4 apart in relative norm. That drift is LSQR's own sensitivity:
+Golub–Kahan bidiagonalization loses orthogonality and amplifies round-off.
+Perturbing SciPy's own matvec by 1e-16 relative moves its final iterate by
+8e-5. Both runs stop on the same test at residual norms within 1 %.
+
+`Protons_01`, RTX 4070 Laptop, fresh problem per sample. The CPU was at 100 %
+load from other jobs, which inflates the host numbers (the idle figure is the
+3.4 s above):
+
+| arm | initialization | next 3 iterations | total |
+| --- | ---: | ---: | ---: |
+| host LSQR (SciPy on the host twin) | 14.4–16.7 s | 5.1–6.2 s | 19.2–23.1 s |
+| device LSQR (`lsqr="auto"` on CuPy) | 3.5–4.1 s | 2.1 s | 5.5–6.2 s |
+
+The device initialization includes about 3 s of tile-plan building for the
+linear block. The solve reuses those plans, which is why its first iterations
+get faster. Once the plans exist, the device initialization takes 0.8 s.
+
 **`Liver_01` under the same setup (NumPy, `1e-8`, idle machine) — the μ
 schedule splits by site.** The reference solve: 36 iterations / 22 s.
 
 | arm | status | objective | iters | wall | s/iter | KKT ≤ 1e-4 first | within 1 % first |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Breedveld setup, `mu_schedule="monotone"` (the runner default) | optimal | **−1.03707** | 74 | 80 s | 1.09 | 37 | 55 |
+| Breedveld setup, `mu_schedule="monotone"` (the runner default until 2026-09-27) | optimal | **−1.03707** | 74 | 80 s | 1.09 | 37 | 55 |
 | … `mu_schedule="probing"` | optimal | **−1.03707** | 430 | 481 s | 1.12 | 312 | 214 |
 | … `probing` with ipax's start instead of §3.1 | optimal | **−1.03707** | 644 | 647 s | 1.01 | 271 | — |
 | … Breedveld's eq. (12) μ rule (`mu_schedule="breedveld"`) | optimal | **−1.03707** | 600 | 663 s | 1.10 | 268 | 335 |
@@ -237,12 +272,107 @@ iterations) — the August finding about μ-raising oracles on Liver/CK/VMAT,
 now with Mehrotra's predictor-based μ in the same family (his own eq. (12)
 rule behaves the same way: 600 iterations). Monotone μ reaches
 his tolerance class at iteration 37 against his 36. The §3.1 start helps here
-as well (644 → 430 under probing). Hence the runner default is Breedveld's
-setup with **monotone μ**, and `--mu-schedule probing` is the proton lever
-(`Protons_01`: 104 vs 227 iterations). The two remaining differences to the
+as well (644 → 430 under probing). At this point the runner default became
+Breedveld's setup with **monotone μ**, with `--mu-schedule probing` as the
+proton lever (`Protons_01`: 104 vs 227 iterations) — superseded the next day
+by the centrality-floor finding and the sweep below. The two remaining differences to the
 paper's per-case iteration counts are the μ dynamics inside the Mehrotra
 variant (his Supplementary material; not transcribed) and the tolerance
 measure discussed above.
+
+**Where the Mehrotra corrector's time goes (2026-09-27).** Stage-timed on
+`Protons_01` (exact Hessian, dense route, Breedveld start, 40 iterations): the
+corrector never rebuilds or refactors N. One tiled Gram (~0.32 s, 52–60 % of
+the iteration) and one Cholesky are shared by the predictor and the corrector.
+The corrector then pays exactly one Jᵀ·v for its right-hand side, one J·v for
+the Δs/Δλ recovery (about 14 ms each over the 369,445 rows) and a back-solve
+of the kept factor (under 1 ms). The rest was O(m) vector work — fraction-to-
+boundary sweeps, target vectors, and a second evaluation of the barrier
+directional derivative for the same step — now shared or skipped,
+bit-identically, as is one Jᵀ pass per monotone-μ KKT test on every path. The
+corrector's measured overhead is about 76 ms per iteration under monotone μ
+(0.53 → 0.61 s); under `probing` the probe's own affine solve adds ~80 ms.
+Re-timed on an idle machine after the reuse commit, the probing recipe on
+`Protons_01` goes from 59.7 s to **56.0 s** on NumPy (0.54 s/iter) and from
+27.4 s to **25.4 s** on CuPy (0.245 s/iter), at identical iteration counts.
+
+**Breedveld's Mehrotra σ, his Gondzio variant, and the centrality floor
+(2026-09-27).** With the supplement in hand (A.1–A.2), both of his
+higher-order rules are available as opt-ins and neither moves the counts.
+`BarrierOptions(probing_sigma="mehrotra")` is his σ = (μ_aff/μ)³ with μ the
+measured gap of eq. (10) and no clip at σ ≤ 1: on `Protons_01`/`Liver_01` σ
+exceeds 1 on one oracle call in ~250, so it is the `probing` rule with a
+τ = 0.995 probe (103 / 441 iterations vs 104 / 430). Reading μ_prev as the
+previous barrier *target* instead makes the rule μₖ₊₁ = μ_aff³/μₖ², which
+multiplies any target/complementarity mismatch by −2 per iteration in log
+space and diverges (tested: Protons > 293, Liver 736). His Gondzio loop
+(`CorrectionsOptions(gondzio_variant="breedveld")`, A.2) is neutral on
+`Protons_01` (103). What the same runs did locate is the Liver pathology
+under probing: ipax's El-Bakry centrality floor `μ ≥ κ_cent·infeasibility`
+(`kappa_centrality=1e-2`) binds on 36 of 37 oracle calls, the KKT-error
+monitor suspends free mode from iteration 10, and the floor inside the
+monotone re-entry then *raises* μ again and again (55, 12, 14, 3.2, 2.6, …) —
+the 1e6 objective excursions above. With `kappa_centrality=0`:
+
+| arm (Breedveld start, exact/dense, mehrotra, breedveld globalization, 1e-8) | Protons_01 | Liver_01 |
+| --- | ---: | ---: |
+| probing, default `kappa_centrality=1e-2` | 104 | 430 |
+| probing, `kappa_centrality=0` | 95 (50.8 s NumPy, 23.2 s CuPy) | **57** (60.7 s NumPy) |
+| probing + `probing_sigma="mehrotra"`, `kappa_centrality=0` | 95 | **50** |
+| monotone (the runner default) | 227 | 74 |
+| Breedveld's reference | 79 | 36 |
+
+Both `kappa_centrality=0` rows certify the reference objectives.
+
+**Corpus sweep (2026-09-27) — `probing` + `kappa_centrality=0` is now the
+runner default.** Breedveld setup (exact Hessian, Mehrotra, ratio control,
+§3.1 start, `1e-8`, budgets 800 iterations / 30 min, one process per case),
+the previous default (monotone μ) against the candidate, two cases per site
+plus the BT pair. CuPy where the case ran on the GPU before the device
+exact-Hessian fix below; the VMAT and Head-and-Neck L-BFGS rows were run
+when the exact arm's 30-minute cap on VMAT looked like a per-iteration cost
+(it was not, see the exact rows and the note below). The "paper" column is
+the supplement's Mehrotra run on the 2017 16-core machine.
+
+| case | paper | monotone μ (previous default) | probing μ, κ_cent = 0 (default) |
+| --- | ---: | --- | --- |
+| Protons_01 | 79 it, 55 s | acceptable, 214 it, 53 s (CuPy) | acceptable, **93 it, 24 s** (CuPy) |
+| Protons_02 | 65 it, 67 s | optimal, 154 it, 104 s (CuPy) | optimal, **80 it, 55 s** (CuPy) |
+| Liver_01 | 36 it, 22 s | optimal, 74 it, 74 s (CuPy) | optimal, **57 it, 58 s** (CuPy) |
+| Liver_02 | 43 it, 23 s | optimal, 72 it, 76 s (CuPy) | optimal, **39 it, 33 s** (CuPy) |
+| Prostate_CK_01 | 46 it, 41 s | optimal, 87 it, 258 s (NumPy) | optimal, **39 it, 127 s** (NumPy) |
+| Prostate_CK_02 | 39 it, 46 s | optimal, 90 it, 386 s (NumPy) | optimal, **48 it, 236 s** (NumPy) |
+| Prostate_VMAT_101 (exact, NumPy) | 57 it, 52 s | max_time, 39 it (restoration from it. 28, KKT 2.25) | optimal, **60 it, 197 s** |
+| Prostate_VMAT_102 (exact, NumPy) | 44 it, 50 s | — | optimal, **74 it, 317 s** |
+| Prostate_VMAT_101 (L-BFGS) | 57 it, 52 s | acceptable, 635 it, 1844 s | acceptable, **404 it, 1080 s** |
+| Prostate_VMAT_102 (L-BFGS) | 44 it, 50 s | max_time, 507 it, KKT 3.7e-5, +1.7 % obj | acceptable, **376 it, 1354 s** |
+| Head-and-Neck_01 (L-BFGS) | 45 it, 279 s | max_time, 68 it, KKT 0.39 | max_time, 67 it, **KKT 0.09** |
+| Prostate_BT_01 | — | optimal, 12 it, obj 3e-10 | optimal, 111 it, 4 s, **obj −0.780** |
+| Prostate_BT_02 | — | optimal, 10 it, obj 2e-9 | optimal, 83 it, 3 s, **obj −0.753** |
+
+Every objective matches the published one to 0.13 % or better except where
+marked; on the BT pair the monotone arm certifies a poor stationary point at
+objective 0 in a dozen iterations, while the candidate reaches the −0.78 /
+−0.75 optima the August L-BFGS runs needed 400 iterations for — so the BT
+"iteration regression" is a solution-quality win. Head-and-Neck (n = 9984)
+does not converge in 30 minutes under either arm on this machine (27 s per
+L-BFGS iteration on NumPy; the paper's 16 cores: 6 s); the candidate is
+further along at the cap. The sweep also exposed two apparent per-iteration
+problems. One was real and is fixed below: the exact Hessian on CuPy crossed
+gated-off structures through the host (CK 33 s/iter, VMAT 51 s/iter → 0.96
+and ~2 s/iter). The other was not a cost at all: the VMAT_101 exact arm's
+50 s per iteration under monotone μ was restoration. The exact Hessian costs
+~2.0 s per iteration on NumPy (VMAT_101; 2.7 s on VMAT_102), the same as
+L-BFGS (2.0 / 2.5 s); the monotone arm climbs to θ ≈ 2e10 at iteration 2
+and the objective to 9e6 by iteration 19, enters restoration at iteration
+28 and never recovers (157–200 Levenberg–Marquardt steps per call, 150–430 s
+each; the sweep row's final KKT 2.25 is iteration 28's). The default arm
+does not restore at all. Restoration's own cost on these cases is now
+mostly core-side (the LU solve of the SPD Gauss–Newton matrix, ~60 %): the
+loader forms its active-set Grams from the ~100 active rows instead of all
+81,279 (`ActiveRowGramCSROperator`; 946 → 631 s for the monotone arm's
+first 31 iterations, identical trajectory). Reproduce: the runner defaults;
+`--mu-schedule monotone --kappa-centrality 1e-2` for the previous arm.
 
 
 
@@ -622,13 +752,28 @@ variables:
   SciPy product, grouped per structure.
 
 **Namespaces.** The `TROTSExactHessian` operator is host-resident, so it is
-returned as-is only on NumPy namespaces. On CuPy and Torch the curved
-structures are planned as on NumPy and, when at least one is tiled,
-`lagrangian_hessian` returns a `TROTSDeviceExactHessian`: `dense_matrix` runs
-the tiled structures through the device tiled kernel (sharing the linear
-block's device tiles), crosses the gated-off structures' SciPy products plus
-`Q` once as a lower-triangle COO, adds `U Vᵀ` by a device matmul and mirrors
-one triangle. Its `matvec` is exact float64 and device-side on CuPy (the
+returned as-is only on NumPy namespaces. On CuPy and Torch
+`lagrangian_hessian` returns a `TROTSDeviceExactHessian` whenever the Hessian
+has a curved or quadratic term. A curved structure the flop-ratio gate keeps
+off is planned anyway, lazily on the first dense call (on a device its
+alternative was a host SciPy SpGEMM per call: `Prostate_CK_01` spent 36 s per
+iteration there, 33 s of a 33 s iteration; `Prostate_VMAT_101` 51 s), and
+registered under the linear block's key so a shared structure keeps one tile
+set whichever side plans it first. `dense_matrix` runs every structure
+through the device tiled kernel, sums `Q` on the device from the constant
+union pattern of the symmetrised quadratic terms (one upload of the
+multipliers per call, deterministic scatter at unique lower-triangle
+positions), adds `U Vᵀ` by a device matmul and mirrors one triangle; a
+steady-state call uploads only the per-structure weights, the multipliers and
+the n×r gEUD factors. After the fix (CuPy, RTX 4070 Laptop, Breedveld setup):
+`Prostate_CK_01` 33 → 0.96 s/iter, `Prostate_VMAT_101` 51 → ~1.2–2.3 s/iter,
+`Liver_01` 0.83 → 0.33 s/iter (its `Liver minus CTV` structure was gated off
+too), `Protons_01` unchanged; results match the host operator to round-off.
+`Head-and-Neck_01` (n = 9984) stays slower on this laptop GPU than on NumPy:
+the fp64 linear-block Gram dominates (71 s per Gram with cuSPARSE sparse
+tiles, 16–18 s densified, on a 1/64-rate fp64 card) — a size-aware sparse-tile
+choice is the open follow-up. The device operator's `matvec` is exact float64
+and device-side on CuPy (the
 problem's device-mirrored structure matrices); on Torch every product is a
 host round trip (download, SciPy products, upload onto the operator's
 device). On JAX, or with `tiled_gram=False`, the
@@ -713,6 +858,68 @@ IPAX_TROTS_DIR=/path/to/TROTS python -m benchmarks.runners.trots --solve \
     --slack-init-scale 0.1 --max-iter 10 [--per-term-hessian] [--plain-gram]
 ```
 
+## Reference timings from the paper (supplement)
+
+Breedveld et al. 2017 publish their per-problem results for the 120 TROTS
+cases they solve (all but the 25 `Prostate_BT_*` brachytherapy cases) in the
+paper's Electronic supplementary material 2: problem sizes, iterations and
+seconds for their Default, Mehrotra and Gondzio methods, the tiling /
+permutation / multiple-precision ablations, thread scaling, and a per-module
+time breakdown. `benchmarks/corpus/data/breedveld2017/trots_reference.json`
+holds that workbook with the values unchanged. The loader
+`benchmarks/corpus/trots_reference.py` reads it
+(`breedveld2017_reference(case)`, `breedveld2017_site_timings()`), and the
+runner prints the paper's Mehrotra iterations and seconds next to each ipax
+solve (`ref_iters` and `ref_time_s` in the JSON report). The dataset's
+`Results/*_result.txt` files come from those Mehrotra runs. For all 120 cases,
+their "Number of Iterations" and "Solve Time" equal the supplement's Mehrotra
+columns.
+
+Iterations / wall-clock seconds for the cases this page discusses. "n, m"
+counts the variables and constraints as stored; the "reformulated" column is
+the paper's solver problem after adding minimax auxiliaries and splitting
+constraints into one-sided rows. That column equals the problem ipax solves
+after lowering (Protons_01: 1,101 × 369,445, Liver_01: 1,124 × 121,975):
+
+| case | n | m | reformulated n, m | Default | Mehrotra | Gondzio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Protons_01 | 1,080 | 87,637 | 1,101, 369,445 | 120 / 71.8 s | 79 / 55.1 s | 56 / 52.8 s |
+| Liver_01 | 1,118 | 93,195 | 1,124, 121,975 | 86 / 42.3 s | 36 / 22.5 s | 32 / 25.1 s |
+| Prostate_CK_01 | 2,260 | 45,728 | 2,266, 89,195 | 91 / 69.8 s | 46 / 40.9 s | 39 / 40.4 s |
+| Prostate_VMAT_101 | 1,972 | 57,925 | 1,976, 81,279 | 85 / 72.2 s | 57 / 51.9 s | 44 / 48.3 s |
+| Head-and-Neck_01 | 9,977 | 77,726 | 9,984, 100,246 | 76 / 461.2 s | 45 / 279.4 s | 44 / 287.8 s |
+
+Where the time goes, per tumour site: each module's share of the
+module-timed seconds (Mehrotra method, tiling + permutation + mixed
+precision, summed over the site's cases; the supplement's `Image` sheet).
+"Make N" forms the normal-equations matrix `N`, the paper's counterpart of
+ipax's condensed Gram:
+
+| site | Make N | Backsolves | Cholesky | Initialise | Permute/Tile | Functions & gradients | Make TQD | Steplength | total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Prostate CK | 67 % | 12 % | 2 % | 4 % | 5 % | 3 % | 4 % | 2 % | 1,668 s |
+| Prostate VMAT | 69 % | 11 % | 2 % | 4 % | 8 % | 3 % | 1 % | 2 % | 2,148 s |
+| Head-and-Neck | 70 % | 7 % | 14 % | 3 % | 1 % | 2 % | 2 % | 1 % | 3,038 s |
+| Head-and-Neck Alt | 81 % | 5 % | 7 % | 2 % | 3 % | 1 % | 1 % | 1 % | 6,657 s |
+| Protons | 68 % | 18 % | 1 % | 3 % | 1 % | 3 % | 1 % | 4 % | 1,226 s |
+| Liver | 55 % | 14 % | 1 % | 4 % | 5 % | 3 % | 3 % | 16 % | 360 s |
+
+Forming `N` dominates at every site, as the Gram does in ipax. The Cholesky
+factorization only matters at Head-and-Neck scale (`n ≈ 10⁴`). The paper's
+"Initialise" module takes 1.6 s on `Protons_01`.
+
+The paper's seconds were measured on its 2017 hardware, a 16-core Xeon with
+16 threads unless the thread-scaling columns say otherwise (see the paper's
+§6.3). Read them as context
+for iteration counts and time shares, not as a like-for-like wall-clock
+target. The data is © 2017 The Author(s), CC BY 4.0: Breedveld, van den Berg
+& Heijmen, *Comput. Optim. Appl.* 68(2), 209–242,
+[doi:10.1007/s10589-017-9919-4](https://doi.org/10.1007/s10589-017-9919-4).
+It was converted to JSON by `benchmarks/tools/convert_breedveld2017_esm.py`
+without changing any value. The attribution and license are in
+`benchmarks/corpus/data/breedveld2017/`. That directory is the one part of
+the repository that is not Apache-2.0.
+
 ## Why these levers
 
 - **`slack_init_scale=0.1`** (the universal lever): the flat slack floor
@@ -739,10 +946,11 @@ IPAX_TROTS_DIR=/path/to/TROTS python -m benchmarks.runners.trots --solve \
     The stack is a *proton-signature* branch (deeply infeasible, extremely
     tall, default recipe stalls near the optimum after a long `α ≈ 10⁻³`
     grind), not a general RT setting.
-    The same holds for `"probing"` under the Breedveld-parity setup
-    (`Liver_01`: 430 iterations vs 74 with monotone μ, see *Measured*
-    *results*), which is why the runner's default μ schedule is monotone
-    and `--mu-schedule probing` is a proton-only flag.
+    Under the Breedveld-parity setup the culprit turned out to be the
+    El-Bakry centrality floor rather than the oracle: `"probing"` with
+    `kappa_centrality=0` converges `Liver_01` in 57 iterations (430 with the
+    floor, 74 with monotone μ) and won the 2026-09-27 sweep on every site,
+    so it is the runner default — see *Measured results*.
 
 ## Bound-only fluence-map runs
 
@@ -848,13 +1056,15 @@ fluence-map shape in dimensionality, sparsity, and conditioning.
 
 ```bash
 # Breedveld-parity recipe = the runner defaults (exact/dense, mehrotra,
-# breedveld globalization, monotone μ, --init breedveld, --tol 1e-8):
+# breedveld globalization, probing μ with --kappa-centrality 0,
+# --init breedveld, --tol 1e-8); --backend cupy for the GPU:
 IPAX_TROTS_DIR=/path/to/TROTS python -m benchmarks.runners.trots --solve \
-    --cases Liver_01 --max-iter 300 --max-time 900
+    --cases Protons_01 --backend cupy --max-iter 300 --max-time 900
 
-# Proton cases: the same with Mehrotra's predictor-based μ:
+# The monotone-μ arm of the 2026-09-27 sweep (the previous runner default):
 IPAX_TROTS_DIR=/path/to/TROTS python -m benchmarks.runners.trots --solve \
-    --cases Protons_01 --mu-schedule probing --max-iter 300 --max-time 900
+    --cases Liver_01 --mu-schedule monotone --kappa-centrality 1e-2 \
+    --max-iter 300 --max-time 900
 
 # Previous universal L-BFGS recipe (the pre-2026-09-26 runner defaults +
 # slack_init_scale=0.1):

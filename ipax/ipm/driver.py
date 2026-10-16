@@ -71,6 +71,7 @@ from ipax.ipm.corrections import (
     CenteringOnly,
     CorrectionContext,
     HigherOrderCorrection,
+    mehrotra_probing_mu,
     probing_mu,
     quality_mu,
     select_corrector,
@@ -199,6 +200,10 @@ _RESTORATION_PROGRESS_FACTOR = 0.9
 # (never worse-centered than a cold start).
 _RECENTER_MU_RAISE_FACTOR = 10.0
 _RECENTER_MU_ERROR_FRACTION = 0.1  # μ_new target: fraction of the stall's KKT error
+# Entries kept by each of the corrector pass's fraction-to-boundary memos
+# (primal and dual, see ``_memoized_step_length``): the two most recent
+# directions at the corrector's single τ = 1.
+_STEP_LENGTH_MEMO_SIZE = 2
 
 
 def _norm_inf(xp: Namespace, v: Array) -> float:
@@ -220,6 +225,38 @@ def _clamped_min(xp: Namespace, ratios: list[Array]) -> float:
         return 1.0
     alpha = float(ratios[0]) if len(ratios) == 1 else float(xp.min(xp.stack(ratios)))
     return max(0.0, min(1.0, alpha))
+
+
+def _memoized_step_length(
+    length: Callable[..., float],
+) -> Callable[..., float]:
+    """Memoize a fraction-to-boundary rule per ``(direction object, τ)``.
+
+    The cache holds the direction itself next to its value, so an identity
+    hit can never be a recycled ``id`` of a collected step. It keeps only the
+    ``_STEP_LENGTH_MEMO_SIZE`` most recent insertions: the repeats worth catching
+    are adjacent (the affine direction between the ``"probing"`` μ oracle —
+    or the ``"quality"`` oracle's probing fallback — and the corrector, a
+    Gondzio direction between its acceptance test and the next round), and
+    a bounded cache never pins the quality oracle's σ-trial directions (two
+    ``m``-vectors each) in memory. Lives for one corrector pass (see
+    ``IPMDriver._corrected_step``).
+    """
+    cache: dict[tuple[int, float], tuple[NewtonStep, float]] = {}
+
+    def memoized(step: NewtonStep, *, tau: float) -> float:
+        key = (id(step), tau)
+        hit = cache.get(key)
+        if hit is not None and hit[0] is step:
+            return hit[1]
+        value = length(step, tau=tau)
+        cache.pop(key, None)
+        cache[key] = (step, value)
+        while len(cache) > _STEP_LENGTH_MEMO_SIZE:
+            del cache[next(iter(cache))]  # oldest insertion first
+        return value
+
+    return memoized
 
 
 def _max_of(xp: Namespace, parts: list[Array]) -> float:
@@ -1142,10 +1179,13 @@ class IPMDriver:
                 "eq_jac": eq_jac,
                 "m_eq": m_eq,
                 "y_eq": y_eq,
+                # Every KKT evaluation at this iterate — this one and the
+                # μ-reduction loop's ``E_μ`` tests (W&B 2006, eq. (7)) — shares
+                # the ``∇gᵀλ`` product above instead of re-forming it: one tall
+                # Jᵀ pass per μ test on an RT-scale ``m ≫ n`` block.
+                "lagrangian_grad": lagrangian_grad,
             }
-            residuals = self.kkt_error(
-                mu=0.0, lagrangian_grad=lagrangian_grad, **err_kwargs
-            )
+            residuals = self.kkt_error(mu=0.0, **err_kwargs)
             e0 = residuals.error
             # Feed the current outer KKT residual to the linear solver so an
             # iterative route can drive an inexact-Newton forcing sequence (loose
@@ -1383,6 +1423,10 @@ class IPMDriver:
             }
 
             step_solve_failed = False
+            # ``∇φ_μᵀ d`` of the current ``step`` when a check below already
+            # evaluated it (reused by the descent probe / line search; ``None``
+            # whenever ``step`` or ``μ`` changes after the evaluation).
+            dphi_known: float | None = None
             if self._corrector.active:
                 # Mehrotra/Gondzio/probing: the affine and correction directions
                 # share one KKT operator. Sparse-direct reuses its factorization;
@@ -1418,21 +1462,10 @@ class IPMDriver:
                     # search only rejectable ascent trials. The corrector is a
                     # step-quality mechanism, not part of the μ selection, so fall
                     # back to the plain centered step toward the same μ.
-                    if (
-                        self._dphi(
-                            x,
-                            s,
-                            step,
-                            grad,
-                            mu,
-                            m,
-                            mask_l,
-                            mask_u,
-                            x_minus_l,
-                            u_minus_x,
-                        )
-                        >= 0.0
-                    ):
+                    dphi_known = self._dphi(
+                        x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
+                    )
+                    if dphi_known >= 0.0:
                         rhs = self._condensed_rhs(mu, mu, mu, **rhs_kwargs)
                         dx, dy_eq, reg_fallback, ok = solve_step_timed(
                             w,
@@ -1450,6 +1483,7 @@ class IPMDriver:
                                 dx, mu=mu, dy_eq=dy_eq, **recover_kwargs
                             )
                             reg_applied = max(reg_applied, reg_fallback)
+                            dphi_known = None
                         # else: the failed fallback ladder left the solver
                         # factored past the matrix that produced the (kept)
                         # corrected direction; ``_solve_step`` recorded that
@@ -1564,15 +1598,26 @@ class IPMDriver:
             phi0 = self._phi(x, s, mu, m, mask_l, mask_u, lower_safe, upper_safe)
             # The probe's directional derivative is the line search's ``dphi``
             # whenever the loop leaves the step unchanged; keep it to avoid a
-            # second evaluation (and host sync).
-            dphi_probe: float | None = None
+            # second evaluation (and host sync). The corrector path's descent
+            # check may already hold it for this very step.
+            dphi_probe: float | None = dphi_known
             if theta0 == 0.0:
                 ascent_noise = _DESCENT_NOISE_FACTOR * max(1.0, abs(phi0))
                 descent_floor = reg_applied
                 for _ in range(_MAX_DESCENT_ATTEMPTS):
-                    dphi_probe = self._dphi(
-                        x, s, step, grad, mu, m, mask_l, mask_u, x_minus_l, u_minus_x
-                    )
+                    if dphi_probe is None:
+                        dphi_probe = self._dphi(
+                            x,
+                            s,
+                            step,
+                            grad,
+                            mu,
+                            m,
+                            mask_l,
+                            mask_u,
+                            x_minus_l,
+                            u_minus_x,
+                        )
                     if dphi_probe <= ascent_noise:
                         break
                     dphi_rejected = dphi_probe
@@ -2527,23 +2572,36 @@ class IPMDriver:
             rhs_kwargs=rhs_kwargs,
             recover_kwargs=recover_kwargs,
         )
-        alpha_primal = functools.partial(
-            self._alpha_primal,
-            s=recover_kwargs["s"],
-            m=recover_kwargs["m"],
-            x_minus_l=recover_kwargs["x_minus_l"],
-            u_minus_x=recover_kwargs["u_minus_x"],
-            mask_l=recover_kwargs["mask_l"],
-            mask_u=recover_kwargs["mask_u"],
+        # One corrector pass asks for the same fraction-to-boundary length
+        # more than once — the ``"probing"`` oracle (and the ``"quality"``
+        # oracle's fallback to it; quality's own σ trials are fresh
+        # directions) and the Mehrotra keep-fraction test both measure the
+        # affine direction, Gondzio's loop re-measures the direction it just
+        # accepted — and on an RT-scale
+        # ``m ≫ n`` problem each is a full sweep over the slacks. Memoize per
+        # direction object for this iteration (pure reuse: same inputs, same
+        # value).
+        alpha_primal = _memoized_step_length(
+            functools.partial(
+                self._alpha_primal,
+                s=recover_kwargs["s"],
+                m=recover_kwargs["m"],
+                x_minus_l=recover_kwargs["x_minus_l"],
+                u_minus_x=recover_kwargs["u_minus_x"],
+                mask_l=recover_kwargs["mask_l"],
+                mask_u=recover_kwargs["mask_u"],
+            )
         )
-        alpha_dual = functools.partial(
-            self._alpha_dual,
-            y_ineq=recover_kwargs["y_ineq"],
-            z_lower=recover_kwargs["z_lower"],
-            z_upper=recover_kwargs["z_upper"],
-            m=recover_kwargs["m"],
-            mask_l=recover_kwargs["mask_l"],
-            mask_u=recover_kwargs["mask_u"],
+        alpha_dual = _memoized_step_length(
+            functools.partial(
+                self._alpha_dual,
+                y_ineq=recover_kwargs["y_ineq"],
+                z_lower=recover_kwargs["z_lower"],
+                z_upper=recover_kwargs["z_upper"],
+                m=recover_kwargs["m"],
+                mask_l=recover_kwargs["mask_l"],
+                mask_u=recover_kwargs["mask_u"],
+            )
         )
         context = CorrectionContext(
             affine=affine_step,
@@ -2563,16 +2621,21 @@ class IPMDriver:
             ),
         )
         if free_mode and self._mu_schedule in ("probing", "quality"):
-            oracle_mu = (
-                quality_mu(context, dual_infeasibility, primal_infeasibility)
-                if self._mu_schedule == "quality"
-                else probing_mu(context)
-            )
+            barrier = self._options.barrier
+            if self._mu_schedule == "quality":
+                oracle_mu = quality_mu(
+                    context, dual_infeasibility, primal_infeasibility
+                )
+            elif barrier.probing_sigma == "mehrotra":
+                # Mehrotra 1992; Breedveld 2017 supplement, eqs. (4)–(7):
+                # unclipped σ against the measured gap, τ-scaled probe.
+                oracle_mu = mehrotra_probing_mu(
+                    context, tau=self._options.breedveld.tau
+                )
+            else:
+                oracle_mu = probing_mu(context)
             # Centrality floor (El-Bakry et al. 1996) — see BarrierOptions.
-            mu_target = max(
-                oracle_mu,
-                self._options.barrier.kappa_centrality * infeasibility,
-            )
+            mu_target = max(oracle_mu, barrier.kappa_centrality * infeasibility)
         else:
             mu_target = self._next_mu(
                 mu,

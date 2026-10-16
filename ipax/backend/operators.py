@@ -180,7 +180,8 @@ class LinearOperator(ABC):
         operator's native result dtype regardless. Best-effort: implementations
         may ignore the request (returning the exact Gram is always valid), and
         wrappers forwarding :meth:`gram` must forward it. Callers tolerate
-        pre-keyword implementations (``TypeError``) by retrying without it —
+        pre-keyword implementations (the ``TypeError`` naming the keyword —
+        any other ``TypeError`` propagates) by retrying without it —
         a wrapper is also a caller, so it owes the same retry:
         :func:`forward_gram` is that call, ready-made.
 
@@ -729,6 +730,36 @@ class Composite(LinearOperator):
         return result
 
 
+# The accumulation keywords a pre-0.10 ``gram(weights)`` signature rejects.
+_GRAM_KEYWORDS = ("accumulate_dtype", "hinted_only")
+
+
+def _gram_rejects_keywords(exc: TypeError) -> bool:
+    """Whether ``exc`` is a pre-keyword ``gram(weights)`` refusing the keywords.
+
+    The compatibility retry (:meth:`LinearOperator.gram`) exists for exactly
+    one ``TypeError``: Python's "got an unexpected keyword argument
+    'accumulate_dtype'" (or ``'hinted_only'``) from an operator written against
+    the old signature. Any other ``TypeError`` raised *inside* a Gram that
+    accepted the keywords is a bug in that operator; retrying without the
+    keywords would silently degrade to the exact Gram and hide it (or run the
+    same failing Gram twice), so it must propagate.
+
+    Two recognizers, either suffices: (1) the error was raised at the call
+    boundary — argument binding fails before the callee's frame exists, so the
+    traceback (caught in the caller) has no deeper frame; this also covers a
+    compiled ``gram`` (a builtin's "takes no keyword arguments", pybind11's
+    "incompatible function arguments"), whose wording names no keyword. (2)
+    the message names a keyword — for a ``*args, **kwargs`` wrapper that
+    forwards to an old signature one frame down.
+    """
+    traceback = exc.__traceback__
+    if traceback is not None and traceback.tb_next is None:
+        return True
+    message = str(exc)
+    return any(f"'{name}'" in message for name in _GRAM_KEYWORDS)
+
+
 def forward_gram(
     op: LinearOperator,
     weights: Array,
@@ -752,7 +783,9 @@ def forward_gram(
         return op.gram(
             weights, accumulate_dtype=accumulate_dtype, hinted_only=hinted_only
         )
-    except TypeError:
+    except TypeError as exc:
+        if not _gram_rejects_keywords(exc):
+            raise
         return op.gram(weights)
 
 

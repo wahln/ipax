@@ -18,6 +18,22 @@ def implemented(reason: str) -> Iterator[None]:
         pytest.xfail(f"{reason}: {exc}")
 
 
+def backend_linalg_error(xp: Any) -> BaseException:
+    """The exception ``xp`` itself raises on an exactly singular ``linalg.solve``.
+
+    A genuine backend numerical failure (``numpy.linalg.LinAlgError`` on
+    NumPy/array-api-strict, ``torch.linalg.LinAlgError`` on Torch) to inject
+    where a test needs one, without naming a concrete library. Skips on a
+    backend that returns non-finite values instead of raising (JAX).
+    """
+    singular = array(xp, [[1.0, 1.0], [1.0, 1.0]])
+    try:
+        xp.linalg.solve(singular, array(xp, [1.0, 2.0]))
+    except Exception as exc:  # whatever the backend raises
+        return exc
+    pytest.skip(f"{xp.__name__} returns non-finite values instead of raising")
+
+
 def float_dtype(xp: Any) -> Any:
     return getattr(xp, "float64", getattr(xp, "float32", None))
 

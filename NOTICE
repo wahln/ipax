@@ -26,3 +26,14 @@ the academic sources of the algorithms it implements:
     interior-point method for convex quadratic programs." Mathematical
     Programming Computation 4(1), 71-107.
     https://doi.org/10.1007/s12532-012-0035-2
+
+------------------------------------------------------------------------------
+Third-party data
+------------------------------------------------------------------------------
+
+benchmarks/corpus/data/breedveld2017/trots_reference.json (source distribution
+only; not part of the ipax wheel) is Electronic supplementary material 2 of
+Breedveld, van den Berg & Heijmen (2017), cited above, (c) 2017 The Author(s),
+licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/) and
+converted to JSON without modification of the values. See the LICENSE and
+README.md in that directory.

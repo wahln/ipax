@@ -520,6 +520,178 @@ def test_tiled_operator_solves_like_the_plain_csr_operator():
 
 
 # --------------------------------------------------------------------------- #
+# Restoration active-set Grams: only the rows with a nonzero weight
+# --------------------------------------------------------------------------- #
+def _active_weights(m, k, seed, signed=False):
+    """``k`` nonzero weights among ``m`` (restoration's 1[g > 0], or signed)."""
+    rng = np.random.default_rng(seed)
+    w = np.zeros(m)
+    idx = rng.choice(m, k, replace=False)
+    w[idx] = rng.uniform(-1.0, 2.0, k) if signed else 1.0
+    return w
+
+
+def _plain_csr(a):
+    return CSROperator(
+        np.asarray(a.indptr, dtype=np.int64),
+        np.asarray(a.indices, dtype=np.int64),
+        a.data,
+        a.shape,
+    )
+
+
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("block_rows", [16, 5000])
+def test_active_row_gram_matches_the_dense_reference(signed, block_rows):
+    a = _random_sparse(800, 30, 0.7, 60)  # dense-ish: what the gate keeps off
+    op = trots.ActiveRowGramCSROperator(
+        a, np, config=trots.TiledGramConfig(block_rows=block_rows)
+    )
+    w = _active_weights(a.shape[0], 40, 61, signed)
+
+    g = np.asarray(op.gram(w))
+
+    assert op.active_rows.count == 1
+    assert _rel(g, _dense_gram(a, w)) < 1e-13
+    np.testing.assert_array_equal(g, g.T)
+    # No active row at all: the zero matrix, no product.
+    z = np.asarray(op.gram(np.zeros(a.shape[0])))
+    np.testing.assert_array_equal(z, np.zeros((a.shape[1], a.shape[1])))
+
+
+def test_active_row_gram_keeps_the_plain_product_for_interior_point_weights(
+    monkeypatch,
+):
+    # Σ_s > 0 on every row (every IPM iteration): the adapter's product,
+    # bit for bit, and the compacted kernel is never reached.
+    a = _random_sparse(600, 25, 0.6, 62)
+    op = trots.ActiveRowGramCSROperator(a, np)
+    plain = _plain_csr(a)
+    w = np.random.default_rng(63).uniform(0.1, 5.0, a.shape[0])
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("compacted a positive weight vector")
+
+    monkeypatch.setattr(trots._ActiveRowGram, "_product", boom)
+    np.testing.assert_array_equal(np.asarray(op.gram(w)), np.asarray(plain.gram(w)))
+    for acc in ("float32", None):
+        np.testing.assert_array_equal(
+            np.asarray(op.gram(w, accumulate_dtype=acc)),
+            np.asarray(plain.gram(w, accumulate_dtype=acc)),
+        )
+    # One row above the threshold share: still the plain product.
+    m = a.shape[0]
+    k = int(op.active_rows.max_fraction * m)
+    over = np.zeros(m)
+    over[: k + 1] = 1.0
+    np.testing.assert_array_equal(
+        np.asarray(op.gram(over)), np.asarray(plain.gram(over))
+    )
+    # Exactly at the threshold share: compacted (same matrix, own round-off).
+    monkeypatch.undo()
+    at = np.zeros(m)
+    at[:k] = 1.0
+    assert _rel(np.asarray(op.gram(at)), np.asarray(plain.gram(at))) < 1e-13
+    assert op.active_rows.count == 1
+
+
+def test_active_row_gram_non_finite_weights_agree_with_the_plain_verdict():
+    # Non-finite weights stay in the active set and take the gemm branch;
+    # the finiteness pattern and the finite entries match the plain product.
+    a = _random_sparse(500, 20, 0.6, 73)
+    op = trots.ActiveRowGramCSROperator(a, np)
+    plain = _plain_csr(a)
+    for bad in (np.inf, np.nan):
+        w = _active_weights(a.shape[0], 25, 74, signed=True)
+        w[np.flatnonzero(w)[3]] = bad
+        g, g_plain = np.asarray(op.gram(w)), np.asarray(plain.gram(w))
+        np.testing.assert_array_equal(np.isfinite(g), np.isfinite(g_plain))
+        ok = np.isfinite(g_plain)
+        if ok.any():  # 0·inf spreads NaN over a dense-ish row's whole block
+            assert _rel(g[ok], g_plain[ok]) < 1e-13
+    assert op.active_rows.count == 2
+
+
+def test_active_row_gram_float32_request_and_memo():
+    a = _random_sparse(500, 20, 0.6, 64)
+    a.data = a.data.astype(np.float32).astype(np.float64)
+    op = trots.ActiveRowGramCSROperator(a, np, values_dtype_hint="float32")
+    w = _active_weights(a.shape[0], 30, 65)
+    exact = np.asarray(op.gram(w))
+    again = np.asarray(op.gram(w.copy()))
+    reduced = np.asarray(op.gram(w, accumulate_dtype="float32", hinted_only=True))
+
+    assert op.active_rows.count == 2  # one slot per effective precision
+    np.testing.assert_array_equal(exact, again)
+    assert reduced.dtype == np.float64
+    assert _rel(reduced, exact) < 1e-6
+    # An unhinted operator keeps a hinted-only float32 request exact.
+    plain64 = trots.ActiveRowGramCSROperator(a, np)
+    np.testing.assert_array_equal(
+        np.asarray(plain64.gram(w, accumulate_dtype="float32", hinted_only=True)),
+        exact,
+    )
+
+
+def test_active_row_rmatvec_matches_the_plain_product():
+    a = _random_sparse(700, 30, 0.6, 70)
+    op = trots.ActiveRowGramCSROperator(a, np)
+    plain = _plain_csr(a)
+    rng = np.random.default_rng(71)
+    sparse_v = _active_weights(a.shape[0], 20, 72, signed=True)  # compacted
+    dense_v = rng.standard_normal(a.shape[0])  # the plain product
+    for v in (sparse_v, dense_v, np.zeros(a.shape[0])):
+        np.testing.assert_array_equal(
+            np.asarray(op.rmatvec(v)), np.asarray(plain.rmatvec(v))
+        )
+    assert op.active_rows.rmatvec_count == 2  # the sparse and the zero vector
+    # A column (rank-2) keeps the plain product and its shape.
+    col = np.asarray(op.rmatvec(sparse_v[:, None]))
+    np.testing.assert_array_equal(col, np.asarray(plain.rmatvec(sparse_v[:, None])))
+    assert op.active_rows.rmatvec_count == 2
+    V = rng.standard_normal((a.shape[0], 2))
+    np.testing.assert_array_equal(
+        np.asarray(op.rmatmat(V)), np.asarray(plain.rmatmat(V))
+    )
+
+
+def test_tiled_operator_serves_active_sets_from_the_active_rows(monkeypatch):
+    a = _banded(900, 60, 4, 66)
+    op = _op(a, block_rows=64)
+    assert op.tiled
+    w = _active_weights(a.shape[0], 25, 67)
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("ran every tile for an active-set Gram")
+
+    monkeypatch.setattr(trots.TiledGramCSROperator, "_tiled_gram", boom)
+    g = np.asarray(op.gram(w))
+
+    assert op.active_rows.count == 1
+    assert op.gram_compute_count == 0
+    assert _rel(g, _dense_gram(a, w)) < 1e-13
+    # A hinted-only float32 request on unhinted data stays exact (memo hit);
+    # on float32-hinted data it accumulates reduced, in its own memo slot.
+    np.testing.assert_array_equal(
+        np.asarray(op.gram(w, accumulate_dtype="float32", hinted_only=True)), g
+    )
+    assert op.active_rows.count == 1
+    b = a.copy()
+    b.data = b.data.astype(np.float32).astype(np.float64)
+    op32 = trots.TiledGramCSROperator(
+        b,
+        np,
+        values_dtype_hint="float32",
+        config=trots.TiledGramConfig(block_rows=64, flop_ratio_threshold=1.0),
+    )
+    exact = np.asarray(op32.gram(w))
+    reduced = np.asarray(op32.gram(w, accumulate_dtype="float32", hinted_only=True))
+    assert op32.active_rows.count == 2
+    assert reduced.dtype == np.float64
+    assert 0.0 < _rel(reduced, exact) < 1e-6
+
+
+# --------------------------------------------------------------------------- #
 # Loader integration (synthetic instance, no HDF5)
 # --------------------------------------------------------------------------- #
 def _structured_instance():
@@ -615,11 +787,11 @@ def test_loader_tiled_block_matches_the_plain_block():
     assert len(f64._plans[0].uses) == 3
 
 
-def test_loader_gates_dense_blocks_back_to_plain_csr(monkeypatch):
-    # A group whose plan fails the gate goes to the core as a plain
-    # CSROperator (triplet lowering, exactly the untiled path) — and the
-    # loader consults the plan first, so no tiled operator (with its own
-    # Array-API copies of the block) is ever built for it.
+def test_loader_gates_dense_blocks_back_to_the_plain_product(monkeypatch):
+    # A group whose plan fails the gate goes to the core as the plain product
+    # (an ActiveRowGramCSROperator on NumPy: the adapter's Gram except for
+    # restoration's active sets) — and the loader consults the plan first,
+    # so no tiled operator is ever built for it.
     def boom(*_args, **_kwargs):
         raise AssertionError("built a tiled operator for a gated-off group")
 
@@ -628,7 +800,49 @@ def test_loader_gates_dense_blocks_back_to_plain_csr(monkeypatch):
         np, tiled_gram=trots.TiledGramConfig(flop_ratio_threshold=0.0)
     )
     op = problem.linear_ineq()[0]
-    assert all(type(b) is CSROperator for b in op.blocks)
+    assert all(type(b) is trots.ActiveRowGramCSROperator for b in op.blocks)
+
+
+def test_gated_off_groups_lower_to_the_plain_products():
+    # The subclass is lowered as a signed row selection (no triplet rewrite);
+    # the lowered block is the plain problem's, product for product. The
+    # upper-only float32 group keeps the triplet-lowered row order, so its
+    # interior-point Gram and products are bit-identical; the float64 group
+    # has min rows (lower bounds first after lowering): round-off only.
+    from ipax.backend.operators import _SignedRowSelection
+
+    inst = _structured_instance()
+    gated = _split_problem(
+        np, inst, tiled_gram=trots.TiledGramConfig(flop_ratio_threshold=0.0)
+    )
+    plain = _split_problem(np, inst, tiled_gram=False)
+    jg, jp = _lowered_jac(gated), _lowered_jac(plain)
+    assert jg.shape == jp.shape
+    assert [type(b) for b in jg.blocks] == [_SignedRowSelection] * 2
+    assert [type(b) for b in jp.blocks] == [CSROperator] * 2
+    rng = np.random.default_rng(68)
+    w = rng.uniform(0.1, 5.0, jg.shape[0])
+    v, u = rng.standard_normal(jg.shape[1]), rng.standard_normal(jg.shape[0])
+    k32 = jg.blocks[0].shape[0]  # the float32 group: upper rows only
+    b32g, b32p = jg.blocks[0], jp.blocks[0]
+    for acc in (None, "float32"):
+        np.testing.assert_array_equal(
+            np.asarray(b32g.gram(w[:k32], accumulate_dtype=acc, hinted_only=True)),
+            np.asarray(b32p.gram(w[:k32], accumulate_dtype=acc, hinted_only=True)),
+        )
+    np.testing.assert_array_equal(
+        np.asarray(b32g.matvec(v)), np.asarray(b32p.matvec(v))
+    )
+    np.testing.assert_array_equal(
+        np.asarray(b32g.rmatvec(u[:k32])), np.asarray(b32p.rmatvec(u[:k32]))
+    )
+    assert _rel(np.asarray(jg.gram(w)), np.asarray(jp.gram(w))) < 1e-13
+    assert _rel(np.asarray(jg.rmatvec(u)), np.asarray(jp.rmatvec(u))) < 1e-13
+    np.testing.assert_array_equal(np.asarray(jg.matvec(v)), np.asarray(jp.matvec(v)))
+    # A restoration active set: the compacted product, same matrix.
+    act = _active_weights(jg.shape[0], 12, 69)
+    assert _rel(np.asarray(jg.gram(act)), np.asarray(jp.gram(act))) < 1e-13
+    assert all(b._op.active_rows.count == 1 for b in jg.blocks)
 
 
 def test_loader_falls_back_to_plain_csr_on_a_segment_mismatch(caplog):
@@ -689,6 +903,19 @@ def test_non_numpy_namespaces_get_the_plain_block():
     # CSROperator (lowered at the triplet level by the core).
     xp = pytest.importorskip("array_api_strict")
     problem = _split_problem(xp, tiled_gram=trots.TiledGramConfig(block_rows=128))
+    op = problem.linear_ineq()[0]
+    assert all(type(b) is CSROperator for b in op.blocks)
+
+
+def test_non_numpy_namespaces_keep_gated_off_groups_plain(namespace):
+    # The active-row Gram is host BLAS: on any other namespace (CuPy / Torch
+    # device kernel, array_api_strict) a gated-off group stays the plain
+    # CSROperator, lowered at the triplet level by the core, as before.
+    if trots._is_host_numpy(namespace):
+        pytest.skip("the host-NumPy namespace takes ActiveRowGramCSROperator")
+    problem = _split_problem(
+        namespace, tiled_gram=trots.TiledGramConfig(flop_ratio_threshold=0.0)
+    )
     op = problem.linear_ineq()[0]
     assert all(type(b) is CSROperator for b in op.blocks)
 

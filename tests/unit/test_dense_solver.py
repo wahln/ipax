@@ -12,7 +12,7 @@ from ipax.linalg.dense import DenseSolver
 from ipax.linalg.regularize import RegularizationState
 from ipax.linalg.solver import LinearSolveError
 from ipax.options import DenseOptions, LBFGSOptions
-from tests._helpers import array, assert_allclose
+from tests._helpers import array, assert_allclose, backend_linalg_error
 
 
 def test_dense_solver_wraps_backend_singular_failure(namespace):
@@ -270,12 +270,15 @@ def test_dense_solver_rejects_bad_rhs_rank(namespace):
 
 
 def test_dense_solver_wraps_structured_solve_failure(namespace):
-    # A structured solve crashing on unexpected numerics must surface as the
+    # A structured solve hitting a numerical failure (the backend's own
+    # LinAlgError from the Woodbury/Schur solve) must surface as the
     # controlled LinearSolveError (so the IPM escalates delta_w), not the raw
     # backend exception.
+    failure = backend_linalg_error(namespace)
+
     class _StructuredBoom(Dense):
         def dense_structured_solve(self, rhs):
-            raise RuntimeError("backend blew up")
+            raise failure
 
     solver = DenseSolver()
     solver.factor(_StructuredBoom(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
@@ -296,20 +299,25 @@ def test_dense_solver_passes_structured_linear_solve_error_through(namespace):
 
 
 def test_dense_solver_wraps_dense_matrix_failure(namespace):
+    failure = FloatingPointError("overflow encountered in matmul")
+
     class _DenseMatrixBoom(Dense):
         def dense_matrix(self, like=None):
-            raise RuntimeError("assembly blew up")
+            raise failure
 
     solver = DenseSolver()
     solver.factor(_DenseMatrixBoom(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
-    with pytest.raises(LinearSolveError, match="materialization failed"):
+    with pytest.raises(LinearSolveError, match="materialization failed") as info:
         solver.solve(array(namespace, [1.0, 2.0]))
+    assert info.value.__cause__ is failure
 
 
 def test_dense_solver_wraps_matmat_probe_failure(namespace):
     # A duck-typed operator without the optional structured-solve/dense-matrix
-    # hooks: the solver skips both and probes matmat, whose failure must also
-    # be classified as a LinearSolveError.
+    # hooks: the solver skips both and probes matmat, whose numerical failure
+    # must also be classified as a LinearSolveError.
+    failure = backend_linalg_error(namespace)
+
     class _MatmatBoom:
         @property
         def shape(self):
@@ -319,12 +327,69 @@ def test_dense_solver_wraps_matmat_probe_failure(namespace):
             return v
 
         def matmat(self, V):
-            raise RuntimeError("probe blew up")
+            raise failure
 
     solver = DenseSolver()
     solver.factor(_MatmatBoom())
     with pytest.raises(LinearSolveError, match="materialization failed"):
         solver.solve(array(namespace, [1.0, 2.0]))
+
+
+class _BuggyHooks(Dense):
+    """Every materialization hook the dense solver calls raises ``exc``."""
+
+    def __init__(self, A, exc, hook):
+        super().__init__(A)
+        self._exc = exc
+        self._hook = hook
+
+    def _maybe_raise(self, name):
+        if name == self._hook:
+            raise self._exc
+
+    def dense_structured_solve(self, rhs):
+        self._maybe_raise("dense_structured_solve")
+        raise NotImplementedError
+
+    def dense_matrix(self, like=None):
+        self._maybe_raise("dense_matrix")
+        raise NotImplementedError
+
+    def matmat(self, V):
+        self._maybe_raise("matmat")
+        return super().matmat(V)
+
+    def augmented_dense_matrix(self, like=None):
+        self._maybe_raise("augmented_dense_matrix")
+        raise NotImplementedError
+
+
+_BUGS = [
+    TypeError("asarray() got an unexpected keyword argument 'device'"),
+    AttributeError("'NoneType' object has no attribute 'shape'"),
+    ValueError("operands could not be broadcast together"),
+    RuntimeError("mat1 and mat2 shapes cannot be multiplied"),
+    MemoryError(),
+]
+
+
+@pytest.mark.parametrize(
+    "hook",
+    ["dense_structured_solve", "dense_matrix", "matmat", "augmented_dense_matrix"],
+)
+@pytest.mark.parametrize("bug", _BUGS, ids=lambda e: type(e).__name__)
+def test_dense_solver_propagates_operator_callback_bugs_unchanged(namespace, hook, bug):
+    # Materialization runs the operator's own callbacks (a user Jacobian's
+    # gram, a Hessian operator's dense_matrix). A non-numerical exception
+    # there is a bug, not a singular system: it must leave the solver as
+    # itself — never as a LinearSolveError the IPM would answer with the δ_w
+    # ladder and restoration.
+    options = DenseOptions(kkt_route="augmented") if hook.startswith("aug") else None
+    solver = DenseSolver(options)
+    solver.factor(_BuggyHooks(array(namespace, [[2.0, 0.0], [0.0, 3.0]]), bug, hook))
+    with pytest.raises(type(bug)) as info:
+        solver.solve(array(namespace, [1.0, 2.0]))
+    assert info.value is bug
 
 
 # --- augmented dense route (DenseOptions(kkt_route="augmented")) -----------
@@ -575,7 +640,7 @@ def test_eigenvalue_inertia_of_empty_spectrum_is_all_zero(namespace):
 def test_dense_solver_augmented_route_wraps_materialization_failure(namespace):
     class _AugmentedBoom(Dense):
         def augmented_dense_matrix(self, like=None):
-            raise RuntimeError("assembly blew up")
+            raise ZeroDivisionError("float division by zero")
 
     solver = DenseSolver(DenseOptions(kkt_route="augmented"))
     solver.factor(_AugmentedBoom(array(namespace, [[1.0, 0.0], [0.0, 1.0]])))
@@ -623,6 +688,10 @@ def test_dense_solver_augmented_route_wraps_adapter_solve_failure(
 ):
     import ipax.backend.dense as dense_backend
 
+    # The shipped LDLᵀ adapters translate their own failures at the backend
+    # boundary; an untranslated *numerical* one must still be classified.
+    failure = backend_linalg_error(namespace)
+
     class _SolveBoomAdapter:
         def factor(self, matrix):
             self._n = int(matrix.shape[0])
@@ -631,7 +700,7 @@ def test_dense_solver_augmented_route_wraps_adapter_solve_failure(
             return (2, 2, 0)
 
         def solve(self, rhs):
-            raise RuntimeError("backend blew up")
+            raise failure
 
     monkeypatch.setattr(
         dense_backend,

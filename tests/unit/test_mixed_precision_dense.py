@@ -375,14 +375,14 @@ def test_operator_without_a_mixed_materialization_falls_back(namespace):
 
 
 def test_mixed_materialization_failure_is_a_linear_solve_error(namespace):
-    # A mixed hook that fails for a non-capability reason is a real fault and
-    # must surface as LinearSolveError (so δ_w escalation sees it), not escape
-    # as an arbitrary backend exception.
+    # A mixed hook that fails numerically (an overflow in the reduced-precision
+    # accumulation) must surface as LinearSolveError (so δ_w escalation sees
+    # it), not escape as an arbitrary backend exception.
     xp = namespace
 
     class _BrokenMixed(_FakeMixedOperator):
         def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
-            raise RuntimeError("backend blew up")
+            raise FloatingPointError("overflow encountered in matmul")
 
     op = _BrokenMixed(xp, _spd(), err=0.0)
     rhs = xp.asarray(np.random.default_rng(22).standard_normal(12), dtype=xp.float64)
@@ -391,6 +391,48 @@ def test_mixed_materialization_failure_is_a_linear_solve_error(namespace):
     solver.factor(op)
     with pytest.raises(LinearSolveError):
         solver.solve(rhs)
+
+
+def test_mixed_materialization_bug_propagates_unchanged(namespace):
+    # ...while a programming error in the hook (the Gram behind it is user
+    # code) is not a singular system: it leaves the solver as itself.
+    xp = namespace
+    bug = TypeError("asarray() got an unexpected keyword argument 'device'")
+
+    class _BuggyMixed(_FakeMixedOperator):
+        def dense_matrix_mixed(self, like, gram_dtype, *, hinted_only=False):
+            raise bug
+
+    op = _BuggyMixed(xp, _spd(), err=0.0)
+    rhs = xp.asarray(np.random.default_rng(22).standard_normal(12), dtype=xp.float64)
+
+    solver = DenseSolver(DenseOptions(gram_dtype="float32"))
+    solver.factor(op)
+    with pytest.raises(TypeError) as info:
+        solver.solve(rhs)
+    assert info.value is bug
+
+
+def test_refinement_matvec_bug_propagates_unchanged(namespace):
+    # The refinement residual applies the operator's exact matvec (user
+    # Jacobian products). A missing matvec (NotImplementedError) makes the
+    # mixed factor uncertifiable and falls back to native precision; a bug in
+    # it must propagate instead of being mistaken for that fallback.
+    xp = namespace
+    bug = TypeError("asarray() got an unexpected keyword argument 'device'")
+
+    class _BuggyMatvec(_FakeMixedOperator):
+        def matvec(self, v):
+            raise bug
+
+    op = _BuggyMatvec(xp, _spd(), err=1e-6)
+    rhs = xp.asarray(np.random.default_rng(23).standard_normal(12), dtype=xp.float64)
+
+    solver = DenseSolver(DenseOptions(gram_dtype="float32"))
+    solver.factor(op)
+    with pytest.raises(TypeError) as info:
+        solver.solve(rhs)
+    assert info.value is bug
 
 
 def test_refinement_accepts_a_degenerate_right_hand_side(namespace):
@@ -409,16 +451,25 @@ def test_refinement_accepts_a_degenerate_right_hand_side(namespace):
     assert solver.refine_iterations == 0  # returned before the first residual
 
 
-def test_operator_without_an_exact_matvec_cannot_certify(namespace):
+@pytest.mark.parametrize(
+    "failure",
+    [
+        NotImplementedError("matrix-free apply unavailable"),
+        FloatingPointError("overflow encountered in matmul"),
+    ],
+    ids=["missing", "numerical"],
+)
+def test_operator_without_an_exact_matvec_cannot_certify(namespace, failure):
     # Refinement's certificate *is* the exact operator matvec. An operator that
-    # cannot supply one leaves the mixed factor uncertifiable, so the solve must
-    # be answered from the exact rebuild rather than returned on trust.
+    # cannot supply one (or whose exact residual itself breaks down
+    # numerically) leaves the mixed factor uncertifiable, so the solve must be
+    # answered from the exact rebuild rather than returned on trust.
     xp = namespace
     a = _spd()
 
     class _NoMatvec(_FakeMixedOperator):
         def matvec(self, v):
-            raise NotImplementedError("matrix-free apply unavailable")
+            raise failure
 
     op = _NoMatvec(xp, a, err=1e-3)
     rng = np.random.default_rng(23)

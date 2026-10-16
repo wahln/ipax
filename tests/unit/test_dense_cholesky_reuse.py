@@ -20,7 +20,7 @@ from ipax.linalg.dense import DenseSolver
 from ipax.linalg.regularize import RegularizationState
 from ipax.linalg.solver import LinearSolveError
 from ipax.options import DenseOptions, LBFGSOptions
-from tests._helpers import array, assert_allclose, transpose
+from tests._helpers import array, assert_allclose, backend_linalg_error, transpose
 
 
 def _spd_matrix(namespace):
@@ -177,17 +177,18 @@ def test_dense_solver_saddle_route_keeps_lu(namespace, tol, monkeypatch):
 
 
 def test_dense_solver_falls_back_to_lu_when_backsub_fails(namespace, tol, monkeypatch):
-    # The reuse is purely an optimization: an unexpected back-substitution
+    # The reuse is purely an optimization: a numerical back-substitution
     # failure must not escalate delta_w — the materialized matrix is still in
     # hand, so the solver falls back to LU and drops the factor so later
     # solves skip the retry.
     import ipax.backend.dense as dense_backend
 
     calls = {"boom": 0}
+    failure = backend_linalg_error(namespace)
 
     def boom(factor, rhs):
         calls["boom"] += 1
-        raise RuntimeError("backend blew up")
+        raise failure
 
     monkeypatch.setattr(dense_backend, "get_dense_cholesky_solve", lambda xp: boom)
     op = _condensed_with_inequalities(namespace)
@@ -202,6 +203,26 @@ def test_dense_solver_falls_back_to_lu_when_backsub_fails(namespace, tol, monkey
     dense = op.matmat(namespace.eye(2, dtype=rhs.dtype))
     assert_allclose(namespace, namespace.matmul(dense, x1), rhs, **tol)
     assert_allclose(namespace, namespace.matmul(dense, x2), rhs, **tol)
+
+
+def test_dense_solver_backsub_bug_propagates_unchanged(namespace, monkeypatch):
+    # ...but a non-numerical failure of the gap-filler (a shape/dtype bug in
+    # the adapter) is not something LU "recovers" from: silently paying the
+    # O(n³) fallback would hide it, so it propagates.
+    import ipax.backend.dense as dense_backend
+
+    bug = RuntimeError("Expected b and A to have the same dtype")
+
+    def buggy(factor, rhs):
+        raise bug
+
+    monkeypatch.setattr(dense_backend, "get_dense_cholesky_solve", lambda xp: buggy)
+    solver = DenseSolver()
+    solver.factor(_condensed_with_inequalities(namespace))
+
+    with pytest.raises(RuntimeError) as info:
+        solver.solve(array(namespace, [1.0, -2.0]))
+    assert info.value is bug
 
 
 def test_dense_solver_still_rejects_indefinite_block_before_reuse(namespace):

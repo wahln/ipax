@@ -7,6 +7,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **`BarrierOptions.probing_sigma`** (`"nww"` default | `"mehrotra"`): opt-in
+  unclipped Mehrotra σ-rule for `mu_schedule="probing"`, as Breedveld et al.
+  2017 run it (Mehrotra 1992; Breedveld 2017 supplement eqs. (4)–(7)):
+  σ = (μ_aff/μ)³ against the current average complementarity, without the
+  NWW clip at σ ≤ 1, the affine probe cut back by `BreedveldOptions.tau`. The
+  μ floor, the centrality floor and the KKT-error fallback still apply. On
+  TROTS it is a no-op (σ > 1 on 1 of ~250 oracle calls); the previous-target
+  reading of the supplement's μ_prev was tested and diverges as μ_aff³/μ².
+- **`CorrectionsOptions.gondzio_variant`** (`"ipax"` default | `"breedveld"`):
+  opt-in Breedveld et al. 2017 Gondzio loop (supplement A.2) after the full
+  Mehrotra corrector: trial step min(1.1α, 1), the asymmetric target box
+  [0.2μ, 8μ] with the downward correction of large outliers capped at
+  5·8·μ (Gondzio 1996's cap; the supplement's eqs. (13)–(14) read literally
+  give a non-monotone correction, so the capped reading is used and both
+  are documented), kept only when the step grows to at least 1.07α.
+  Neutral on TROTS `Protons_01` (101–103 vs 104 iterations).
+- **Breedveld 2017 reference timings as benchmark data** (CC BY 4.0;
+  `benchmarks/corpus/data/breedveld2017/`). Electronic supplementary material 2
+  of Breedveld, van den Berg & Heijmen (2017), doi:10.1007/s10589-017-9919-4,
+  converted to `trots_reference.json` by
+  `benchmarks/tools/convert_breedveld2017_esm.py` with the values unchanged:
+  per-problem sizes, Default/Mehrotra/Gondzio iterations and seconds, the
+  tiling/permutation/multiple-precision and thread-scaling variants, module
+  breakdowns and per-site module timings. Read by
+  `benchmarks.corpus.trots_reference.breedveld2017_reference()` /
+  `breedveld2017_site_timings()`; the TROTS runner reports the paper's
+  Mehrotra iterations and seconds next to each solve (`ref_iters`,
+  `ref_time_s`). All 120 dataset `Results/*_result.txt` files match the
+  supplement's Mehrotra runs. The directory carries its own LICENSE and
+  attribution README; it ships in the sdist only (README/NOTICE updated).
+- **Device LSQR for the Breedveld dual start on CuPy**
+  (`TROTSProblem.breedveld_warm_start(lsqr="auto")`): SciPy's LSQR ported to
+  the array namespace runs the eq. (26) least-squares solve on the problem's
+  own lowered operator, with no host twin. Same start as the host path to
+  round-off; `Protons_01` initialization 14–17 s → 3.5–4 s under CPU load,
+  0.8 s once the tile plans exist. `lsqr="host"` keeps the SciPy path.
 - **TROTS runner `--corrections` lever** (`benchmarks/runners/trots.py`):
   overrides `Options.corrections` (`none`/`mehrotra`/`gondzio`) like the
   existing `--mu-schedule`/`--globalization` levers. The TROTS docs record
@@ -93,6 +129,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   - Torch-CUDA is untested; Torch is validated on CPU tensors.
 
 ### Changed
+- **TROTS loader: restoration Grams from the active rows; host Hessian
+  chunks cut once** (`benchmarks/corpus/trots.py`). On NumPy, a linear-block
+  group the tiled-Gram gate keeps off is now an `ActiveRowGramCSROperator`:
+  interior-point Grams are the adapter's, unchanged, while the restoration
+  phase's active-set Grams `Jᵀ diag(1[g>0]) J` (Wächter & Biegler 2006, §3.3)
+  and gradient `Jᵀ max(g, 0)` are formed from the ~100 active rows instead of
+  all 81,279 (`Prostate_VMAT_101`); `TiledGramCSROperator` does the same for
+  sparse weight vectors on the host. VMAT_101, monotone-μ arm: restoration
+  calls 148–277 s → 109–139 s, 31 iterations 946 → 631 s, same trajectory;
+  the gated-off group is lowered as a signed row selection (solve setup
+  10.3 → 5.1 s, Breedveld start 31.9 → 27.0 s). The exact Hessian's
+  gated-off structures cut zero-copy row windows once instead of slicing
+  per call (0.34 → 0.24 s per Hessian, bit-identical). VMAT_101/102 and CK_01
+  trajectories are bit-identical; Liver_01 differs by round-off only. The
+  50 s/iteration seen for VMAT_101 in the 2026-09-27 sweep was restoration in
+  the monotone arm, not Hessian cost (~2 s/iteration); the default probing
+  arm converges VMAT_101 in 60 iterations / 197 s and VMAT_102 in 74.
+- **The TROTS runner's default μ schedule is `probing` with the centrality
+  floor off** (`--mu-schedule probing --kappa-centrality 0`;
+  `benchmarks/runners/trots.py`). A sweep over all seven TROTS sites
+  (2026-09-27, docs/benchmarks/trots.md) located the barrier-dominated
+  excursions of the nonconvex cases in ipax's El-Bakry centrality floor,
+  not in the oracle: with the floor off, Mehrotra's predictor-based μ beats
+  the monotone reduction on every measured case (Protons_01 93 vs 214
+  iterations, Liver_01 57 vs 74, Prostate_CK_01 39 vs 87, VMAT_101 404 vs
+  635 under L-BFGS; the BT pair certifies its −0.78/−0.75 optima where the
+  monotone arm stops at objective 0). `--mu-schedule monotone
+  --kappa-centrality 1e-2` reproduces the previous default. The runner also
+  gained `--backend` (numpy/cupy/torch) for the solves.
+- **Fewer tall-Jacobian and O(m) passes per iteration** (`ipax/ipm/driver.py`,
+  `barrier.py`, `corrections.py`). The monotone μ-reduction's KKT tests reuse
+  the iteration's ∇L instead of re-forming ∇gᵀλ (one Jᵀ pass per test, on
+  every path), and the Mehrotra/probing corrector pass no longer re-measures
+  a direction's fraction-to-boundary length or re-evaluates the barrier
+  directional derivative for the same step; the fraction-to-boundary rule
+  stops allocating fill vectors. Results are bit-identical (854-run
+  fingerprint A/B over 7 corrector/μ configurations: 0 differences). Stage
+  timing on TROTS `Protons_01` showed the corrector itself already at its
+  minimum: one Jᵀ·v, one J·v (~14 ms each over 369k rows) and a back-solve
+  of the kept factor, ~76 ms per iteration under monotone μ. Regression test
+  pins the operator call counts.
 - **TROTS float32 precision grouping is gated on its nonzero share**
   (`benchmarks/corpus/trots.py`). The float32-sourced rows of the linear block
   form their own hinted group only when they hold at least 5% of its nonzeros
@@ -145,6 +222,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     exactly. `--slack-init-scale` applies only with `--init ipax`.
 
 ### Fixed
+- **TROTS exact Hessian on CuPy/Torch no longer crosses gated-off structures
+  through the host** (`benchmarks/corpus/trots.py`). Curved structures that
+  fail the per-structure flop-ratio gate (the dense-ish PTVs of the CK/VMAT
+  cases) made `TROTSExactProblem.lagrangian_hessian` form the grouped Hessian
+  by host SciPy SpGEMM on every call: the whole Hessian when no structure was
+  tiled, otherwise the gated-off part plus the quadratic terms as a COO
+  upload. On device namespaces such structures now get a device plan anyway
+  (lazily, on the first dense call; a plan the gate rejected after building
+  is reused, never rebuilt), registered so a structure shared with the linear
+  block keeps one tile set; the beamlet-space quadratic terms are summed on
+  the device over their constant union pattern, so a call uploads only
+  weights and multipliers. CuPy, RTX 4070 Laptop, Breedveld setup:
+  `Prostate_CK_01` 33 → 0.96 s/iter, `Prostate_VMAT_101` 51 → ~1.2–2.3
+  s/iter, `Liver_01` 0.83 → 0.33 s/iter, `Protons_01` unchanged; results
+  match the host operator to round-off. `tiled_gram=False` keeps the
+  `CSCOperator` crossing. Device-gated regression tests pin that no index
+  array is uploaded in steady state and that matvec-only routes never plan.
+- **A programming error inside a step solve now propagates out of `ipax.solve`
+  unchanged** — e.g. a `TypeError` from a user operator's `gram()`,
+  `dense_matrix()` or `matvec()`, or from a Hessian operator's
+  materialization. Previously the dense KKT solver reclassified *any*
+  exception as a numerical failure, so it was retried up the δ_w
+  regularization ladder, handed to feasibility restoration and could end as an
+  ordinary status (or `numerical_error`) instead of surfacing. Only numerical
+  failures — the backend's `LinAlgError`, Python `ArithmeticError`s and
+  `LinearSolveError` — now reach the ladder (new
+  `ipax.linalg.solver.numerical_failure_types()`, backend classes resolved
+  without importing them in `ipax/backend/errors.py`); the same narrowing
+  applies to the Krylov exact-inverse fallback, the dense restoration solve
+  and the L-BFGS compact solves. Resource failures (`MemoryError`, CUDA
+  out-of-memory) likewise propagate. Regression tests pin propagation on the
+  first Gram call and the ladder's behaviour on genuine `LinAlgError`s; a
+  479-row S2MPJ rerun of every step-failure row (NumPy + Torch) is
+  status-identical apart from wall-clock-capped rows.
+- **The `gram()` keyword-compatibility retry** (`accumulate_dtype`/`hinted_only`)
+  now fires only for an operator whose signature rejects the keywords; a
+  `TypeError` raised inside a Gram that accepted them is no longer retried
+  away (which silently degraded the mixed-precision Gram to the exact one).
 - **TROTS device tiled Gram on the raw `cupy` module** (`benchmarks/corpus/trots.py`).
   The device kernels use Array API `device=` keywords that plain `cupy` (as
   opposed to the compat wrapper the test fixtures hand out) does not accept,

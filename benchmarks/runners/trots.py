@@ -31,15 +31,26 @@ Two jobs, both gated on a local TROTS dataset (``IPAX_TROTS_DIR`` or ``--dir``):
    multipliers with floored bound multipliers and slacks (eqs. (26)–(28)), and
    ``μ0`` their average complementarity (eq. (10)). The initialisation's time
    — the starting point included, under either ``--init`` — counts toward the
-   reported solve time. μ follows the monotone
-   Fiacco–McCormick reduction (``--mu-schedule monotone``); ``--mu-schedule
-   probing`` is the closest transcription of Breedveld's Mehrotra μ and the
-   proton lever (about 2× fewer iterations on the proton cases, but about 6×
-   more on Liver, where it drives barrier-dominated objective excursions).
-   The previous default stays one flag set away: ``--config
-   lbfgs/dense,exact/dense --init ipax --globalization filter --corrections
-   none`` (the RT recipes of ``docs/benchmarks/trots.md`` add levers on top of
-   it, e.g. the proton recipe's ``--mu-schedule quality``).
+   reported solve time. μ comes from the Mehrotra probing oracle
+   (``--mu-schedule probing``, the closest transcription of Breedveld's
+   Mehrotra μ) with the El-Bakry centrality floor off
+   (``--kappa-centrality 0``): the 2026-09-27 sweep over all seven TROTS sites
+   (docs/benchmarks/trots.md) found the floor, not the oracle, behind the
+   barrier-dominated excursions on the nonconvex cases, and probing without
+   it beats the monotone reduction on every measured case (Protons_01 93 vs
+   214 iterations, Liver_01 57 vs 74, Prostate_CK_01 39 vs 87, VMAT_101 404
+   vs 635, the BT pair certifying the −0.78/−0.75 optima where monotone stops
+   at 0). ``--mu-schedule monotone`` is the previous runner default. The
+   pre-2026-09-26 default stays one flag set away: ``--config
+   lbfgs/dense,exact/dense --init ipax --mu-schedule monotone --globalization
+   filter --corrections none --kappa-centrality 1e-2`` (the RT recipes of
+   ``docs/benchmarks/trots.md`` add levers on top of it).
+
+   Each solve row also carries the paper's own result for the case, the
+   Mehrotra-method iterations and seconds of Breedveld et al. 2017's timing
+   supplement (``ref_iters`` / ``ref_time_s`` in the JSON report, "paper" on
+   the console; :mod:`benchmarks.corpus.trots_reference`, CC BY 4.0). Those
+   seconds were measured on the paper's 2017 16-core machine.
 
 Run from the repository root::
 
@@ -72,11 +83,13 @@ from benchmarks.corpus.trots import (
     reference_for,
     trots_dir,
 )
+from benchmarks.corpus.trots_reference import breedveld2017_reference
 from benchmarks.harness import capture_environment, run_case
 from ipax.options import BarrierOptions, OptimalityConditionOptions
 from ipax.testing.backends import import_namespace
 
 if TYPE_CHECKING:
+    from benchmarks.harness import CaseResult
     from ipax.problem.base import Problem
     from ipax.result import WarmStart
     from ipax.typing import Array
@@ -155,6 +168,7 @@ def _solve_case(
     opts: ipax.Options,
     xp: object,
     *,
+    backend: str = "numpy",
     plain_gram: bool = False,
     per_term_hessian: bool = False,
     init: str = "breedveld",
@@ -228,7 +242,7 @@ def _solve_case(
         build=build,
         prepare_solve=prepare_solve,
     )
-    return run_case(bench, config=label, options=opts, xp=xp, backend="numpy")
+    return run_case(bench, config=label, options=opts, xp=xp, backend=backend)
 
 
 def _solve_options(args: argparse.Namespace, label: str) -> ipax.Options:
@@ -286,6 +300,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="comma-separated solve configs (default: exact/dense, Breedveld "
         "et al. 2017's exact Hessian): " + ", ".join(_CONFIGS),
     )
+    parser.add_argument(
+        "--backend",
+        default="numpy",
+        help="array namespace for the solves (numpy, cupy, torch); the loader"
+        " mirrors the case to the device and the report row records it",
+    )
     parser.add_argument("--max-iter", type=int, default=300)
     parser.add_argument("--max-time", type=float, default=120.0)
     # Solver levers (docs/benchmarks/trots.md). The defaults reproduce Breedveld
@@ -293,11 +313,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # ipax default is a no-op.
     parser.add_argument(
         "--mu-schedule",
-        default="monotone",
-        help='Options.mu_schedule (default "monotone": the Fiacco-McCormick '
-        'reduction; "probing" is the proton lever — Mehrotra\'s predictor-based '
-        "mu as in Breedveld et al. 2017, ~2x fewer iterations on the proton "
-        'cases, ~6x more on Liver; the proton recipe used "quality")',
+        default="probing",
+        help='Options.mu_schedule (default "probing": Mehrotra\'s predictor-based '
+        "mu as in Breedveld et al. 2017, paired with --kappa-centrality 0; "
+        '"monotone" is the Fiacco-McCormick reduction and the previous runner '
+        'default; the old proton recipe used "quality")',
     )
     parser.add_argument(
         "--globalization",
@@ -339,8 +359,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--kappa-centrality",
         type=float,
-        default=None,
-        help="BarrierOptions.kappa_centrality (proton stack: 1e-4)",
+        default=0.0,
+        help="BarrierOptions.kappa_centrality (default 0: the El-Bakry floor off, "
+        "which is what makes probing mu converge the nonconvex TROTS cases; "
+        "ipax's own default is 1e-2; the old proton stack used 1e-4)",
     )
     parser.add_argument(
         "--plain-gram",
@@ -407,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
     # 2) Solves (opt-in).
     solve_rows = []
     if args.solve:
-        xp = import_namespace("numpy")
+        xp = import_namespace(args.backend)
         labels = [c.strip() for c in args.config.split(",") if c.strip()]
         unknown = [label for label in labels if label not in _CONFIGS]
         if unknown:
@@ -421,21 +443,19 @@ def main(argv: list[str] | None = None) -> int:
                     label,
                     opts,
                     xp,
+                    backend=args.backend,
                     plain_gram=args.plain_gram,
                     per_term_hessian=args.per_term_hessian,
                     init=args.init,
                 )
-                solve_rows.append(result)
-                print(
-                    f"  {case:20s} [{label:12s}] {result.status:12s} "
-                    f"iters={result.n_iter:4d} kkt={result.kkt_error:.2e} "
-                    f"cviol={result.constraint_violation:.2e} t={result.solve_time:.1f}s"
-                )
+                row = _solve_row(result)
+                solve_rows.append(row)
+                print(_solve_line(case, label, row))
 
     payload = {
         "environment": environment,
         "verification": [asdict(r) for r in verification],
-        "solves": [asdict(r) for r in solve_rows],
+        "solves": solve_rows,
     }
     json_path = out.with_suffix(".json")
     json_path.write_text(json.dumps(payload, indent=2))
@@ -448,6 +468,40 @@ def main(argv: list[str] | None = None) -> int:
         f"({n_checked} with references) -> {json_path}"
     )
     return 0 if all(r.verified for r in verification) else 1
+
+
+def _solve_row(result: CaseResult) -> dict[str, object]:
+    """One solve's JSON row: the harness result plus the paper's reference.
+
+    ``ref_iters`` / ``ref_time_s`` are Breedveld et al. 2017's Mehrotra-method
+    iterations and wall-clock seconds for the case (the run behind the
+    dataset's ``Results/*.txt``; supplement ESM 2, see
+    :mod:`benchmarks.corpus.trots_reference`), ``None`` for cases the paper
+    does not solve (``Prostate_BT_*``). The paper's times are on its 2017
+    16-core machine: context, not a like-for-like comparison.
+    """
+    ref = breedveld2017_reference(result.problem)
+    return {
+        **asdict(result),
+        "ref_iters": None if ref is None else ref.mehrotra.iterations,
+        "ref_time_s": None if ref is None else ref.mehrotra.seconds,
+    }
+
+
+def _solve_line(case: str, label: str, row: dict[str, object]) -> str:
+    """The console line for one solve row (see :func:`_solve_row`)."""
+    ref_iters, ref_time = row["ref_iters"], row["ref_time_s"]
+    paper = (
+        "paper n/a"
+        if ref_iters is None or ref_time is None
+        else f"paper iters={ref_iters} t={ref_time:.1f}s"
+    )
+    return (
+        f"  {case:20s} [{label:12s}] {row['status']!s:12s} "
+        f"iters={row['n_iter']:4d} kkt={row['kkt_error']:.2e} "
+        f"cviol={row['constraint_violation']:.2e} t={row['solve_time']:.1f}s  "
+        f"({paper})"
+    )
 
 
 def _write_markdown(path: Path, verification, solves, environment) -> None:
@@ -466,13 +520,25 @@ def _write_markdown(path: Path, verification, solves, environment) -> None:
         )
     if solves:
         lines += ["", "## Solves", ""]
-        lines.append("| case | config | status | iters | kkt | cviol | time (s) |")
-        lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: |")
+        lines.append(
+            "| case | config | status | iters | kkt | cviol | time (s) "
+            "| paper iters | paper time (s) |"
+        )
+        lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
         for s in solves:
+            ref_iters = "" if s["ref_iters"] is None else str(s["ref_iters"])
+            ref_time = "" if s["ref_time_s"] is None else f"{s['ref_time_s']:.1f}"
             lines.append(
-                f"| {s.problem} | {s.config} | {s.status} | {s.n_iter} | "
-                f"{s.kkt_error:.2e} | {s.constraint_violation:.2e} | {s.solve_time:.1f} |"
+                f"| {s['problem']} | {s['config']} | {s['status']} | {s['n_iter']} | "
+                f"{s['kkt_error']:.2e} | {s['constraint_violation']:.2e} | "
+                f"{s['solve_time']:.1f} | {ref_iters} | {ref_time} |"
             )
+        lines += [
+            "",
+            "Paper columns: Breedveld et al. 2017 (doi:10.1007/s10589-017-9919-4), "
+            "supplement ESM 2, Mehrotra method, on the paper's 2017 hardware; "
+            "CC BY 4.0.",
+        ]
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
 

@@ -48,6 +48,15 @@ always available) otherwise. Either way it exposes real inertia via
 wired generically in ``ipm/driver.py``) engages for the dense route too.
 Falls back to the condensed route automatically when the operator can't
 expose the bordered matrix (e.g. an L-BFGS Hessian, already PD by damping).
+
+Failure classification: only a numerical failure
+(:func:`~ipax.linalg.solver.numerical_failure_types` — the backend's
+``LinAlgError``, an ``ArithmeticError``, an already-classified
+``LinearSolveError``) raised while materializing, probing or solving becomes
+:class:`LinearSolveError` and so feeds the IPM's δ_w ladder. Materializing
+runs the operator's own callbacks (a user Jacobian's ``gram``, a Hessian
+operator's ``dense_matrix``), so anything else raised there is a bug and
+propagates unchanged instead of being retried as a singular system.
 """
 
 from __future__ import annotations
@@ -56,7 +65,7 @@ import math
 from typing import TYPE_CHECKING, Any
 
 from ipax.backend.namespace import array_namespace
-from ipax.linalg.solver import LinearSolveError
+from ipax.linalg.solver import LinearSolveError, numerical_failure_types
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -248,7 +257,7 @@ class DenseSolver:
                     pass
                 except LinearSolveError:
                     raise
-                except Exception as exc:
+                except numerical_failure_types() as exc:
                     raise LinearSolveError("dense structured solve failed") from exc
 
             self._materialize_and_guard(rhs, xp, n)
@@ -317,7 +326,7 @@ class DenseSolver:
                 )
             except NotImplementedError:
                 matrix = None
-            except Exception as exc:
+            except numerical_failure_types() as exc:
                 raise LinearSolveError("dense matrix materialization failed") from exc
             if matrix is not None:
                 self._mixed_ever_engaged = True
@@ -387,9 +396,9 @@ class DenseSolver:
             if solve_cholesky is not None:
                 try:
                     return solve_cholesky(self._cholesky_factor, rhs)
-                except Exception:
+                except numerical_failure_types():
                     # The reuse is purely an optimization: the materialized
-                    # matrix is still in hand, so an unexpected trsm/potrs
+                    # matrix is still in hand, so a numerical trsm/potrs
                     # failure falls back to LU instead of escalating delta_w
                     # (the factor is dropped so later solves skip the retry).
                     self._cholesky_factor = None
@@ -437,8 +446,10 @@ class DenseSolver:
             self.refine_iterations = iteration
             try:
                 residual = rhs - apply(x)
-            except Exception:
+            except NotImplementedError:
                 return None  # no exact matvec ⇒ a mixed factor is uncertifiable
+            except numerical_failure_types():
+                return None  # the exact residual itself broke down: same verdict
             rnorm = float(xp.max(xp.abs(residual)))
             if rnorm < best_rnorm:
                 best = x
@@ -460,7 +471,7 @@ class DenseSolver:
     def _solve_lu(self, matrix: Array, rhs: Array, xp: Any) -> Array:
         try:
             return xp.linalg.solve(matrix, rhs)
-        except Exception as exc:
+        except numerical_failure_types() as exc:
             raise LinearSolveError("dense linear solve failed") from exc
 
     def _lookup_cholesky_solve(self, xp: Any) -> Callable[[Array, Array], Array] | None:
@@ -492,7 +503,7 @@ class DenseSolver:
             matrix = augmented_dense_matrix()
         except NotImplementedError:
             return
-        except Exception as exc:
+        except numerical_failure_types() as exc:
             raise LinearSolveError(
                 "augmented dense matrix materialization failed"
             ) from exc
@@ -523,7 +534,7 @@ class DenseSolver:
 
         try:
             result = eigh(matrix)
-        except Exception as exc:
+        except numerical_failure_types() as exc:
             raise LinearSolveError("augmented dense eigendecomposition failed") from exc
 
         eigenvalues = result.eigenvalues
@@ -548,7 +559,7 @@ class DenseSolver:
                 solution = self._augmented_adapter.solve(padded_rhs)
             except LinearSolveError:
                 raise
-            except Exception as exc:
+            except numerical_failure_types() as exc:
                 raise LinearSolveError("augmented dense LDL^T solve failed") from exc
             return self._truncate_solution(solution, n)
 
@@ -598,13 +609,13 @@ class DenseSolver:
                 return dense_matrix(rhs)
             except NotImplementedError:
                 pass
-            except Exception as exc:
+            except numerical_failure_types() as exc:
                 raise LinearSolveError("dense matrix materialization failed") from exc
 
         identity = xp.eye(n, dtype=rhs.dtype)
         try:
             return self._operator.matmat(identity)
-        except Exception as exc:
+        except numerical_failure_types() as exc:
             raise LinearSolveError("dense matrix materialization failed") from exc
 
     def _guard_positive_definite(
@@ -641,7 +652,7 @@ class DenseSolver:
         primal = matrix if n == matrix.shape[0] else matrix[:n, :n]
         try:
             factor = cholesky(primal)
-        except Exception as exc:
+        except numerical_failure_types() as exc:
             raise LinearSolveError("condensed block is not positive definite") from exc
         # Keep the factor only where a backend back-substitution exists;
         # otherwise it would be dead n×n memory next to the LU path.
@@ -698,7 +709,7 @@ class DenseSolver:
             return  # no back-substitution ⇒ a factor would be dead n×n memory
         try:
             factor = cholesky(matrix)
-        except Exception:
+        except numerical_failure_types():
             # Numerically not PD after all: the LU path, as before.
             self._pd_hint_ever_failed = True
             if reduced:

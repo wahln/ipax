@@ -186,9 +186,10 @@ def test_breedveld_initial_point_on_the_namespace(namespace):
 # --------------------------------------------------------------------------- #
 # Dual start: eqs. (26)–(28) and μ0 by eq. (10)
 # --------------------------------------------------------------------------- #
-def _check_warm_start(inst, x0_host, warm, mu0, s_f=1.0):
+def _check_warm_start(inst, x0_host, warm, mu0, s_f=1.0, *, device_lsqr=False):
     """Check eqs. (26)–(28) and (10); ``s_f`` is the solver's objective factor
-    the returned μ0 carries (1 for ``scaling="none"``)."""
+    the returned μ0 carries (1 for ``scaling="none"``). ``device_lsqr`` marks
+    a start whose LSQR ran on the GPU (looser multiplier tolerance)."""
     low = _lowered_host(inst, x0_host)
     m = int(np.asarray(low.ineq_constraints(x0_host)).shape[0])
     s, y, zl = _host(warm.s), _host(warm.y_ineq), _host(warm.z_lower)
@@ -197,7 +198,11 @@ def _check_warm_start(inst, x0_host, warm, mu0, s_f=1.0):
 
     # eq. (26) + floor: y0 = max(LSQR(∇gᵀ y = −∇f), 5).
     y_ls = _lsqr_reference(low, x0_host)
-    np.testing.assert_allclose(y, np.maximum(y_ls, 5.0), rtol=1e-10, atol=1e-10)
+    # rtol 1e-8 only on the device path: the CuPy start runs LSQR on the GPU,
+    # whose reduction-order round-off LSQR amplifies (7e-10 here); the host
+    # path keeps the tight 1e-10.
+    rtol_y = 1e-8 if device_lsqr else 1e-10
+    np.testing.assert_allclose(y, np.maximum(y_ls, 5.0), rtol=rtol_y, atol=1e-10)
     # eq. (28): w0 = max(−g(x0), 5); ipax slacks satisfy g + s = 0.
     g = np.asarray(low.ineq_constraints(x0_host))
     np.testing.assert_allclose(s, np.maximum(-g, 5.0), rtol=1e-12, atol=0)
@@ -252,9 +257,9 @@ def test_breedveld_warm_start_on_the_exact_problem_matches_the_base():
 
 
 def test_breedveld_warm_start_on_the_namespace(namespace):
-    # Host-side computation regardless of the namespace (a NumPy twin of the
-    # problem supplies the lowered Jacobian); results cross back to it, on
-    # x0's device.
+    # Host-side computation off CuPy (a NumPy twin of the problem supplies the
+    # lowered Jacobian), on the GPU on CuPy; results come back in the
+    # namespace, on x0's device, and agree with the host reference.
     from ipax.backend.namespace import device
 
     inst = _instance()
@@ -267,7 +272,7 @@ def test_breedveld_warm_start_on_the_namespace(namespace):
     assert all(type(a) is kind for a in (warm.s, warm.y_ineq, warm.z_lower))
     assert all(device(a) == device(x0) for a in (warm.s, warm.y_ineq, warm.z_lower))
     assert isinstance(mu0, float)
-    _check_warm_start(inst, _host(x0), warm, mu0)
+    _check_warm_start(inst, _host(x0), warm, mu0, device_lsqr=problem._eval_device)
     if _sparse_capable(namespace):
         # The solver-order claim, directly: the slacks line up with the
         # namespace problem's own lowered rows (as ipax.solve lowers them).
@@ -320,12 +325,15 @@ def test_mu0_is_in_the_solver_scaled_space(namespace):
     assert grad_norm > 100.0  # the scaling is active on this instance
     s_f = min(1.0, 100.0 / grad_norm)
 
+    # CuPy runs LSQR on the device (see _check_warm_start's device_lsqr).
+    device = problem._eval_device
     warm_none, mu_none = problem.breedveld_warm_start(x0, scaling="none")
-    _check_warm_start(inst, _host(x0), warm_none, mu_none)  # unscaled eq. (10)
+    # unscaled eq. (10)
+    _check_warm_start(inst, _host(x0), warm_none, mu_none, device_lsqr=device)
     for scaling in (None, "gradient-based", ScalingOptions()):
         warm, mu0 = problem.breedveld_warm_start(x0, scaling=scaling)
         assert mu0 == pytest.approx(s_f * mu_none, rel=1e-12)
-        _check_warm_start(inst, _host(x0), warm, mu0, s_f=s_f)
+        _check_warm_start(inst, _host(x0), warm, mu0, s_f=s_f, device_lsqr=device)
         np.testing.assert_array_equal(_host(warm.y_ineq), _host(warm_none.y_ineq))
     _, mu_loose = problem.breedveld_warm_start(
         x0, scaling=ScalingOptions(max_gradient=1e6)
@@ -359,6 +367,85 @@ def test_lsqr_iteration_limit_is_logged(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger=trots.__name__):
         problem.breedveld_warm_start(x0)
     assert "iteration limit" in caplog.text
+
+
+def test_lsqr_port_matches_scipy():
+    # trots._lsqr (the device LSQR) transcribes SciPy's Paige–Saunders
+    # iteration: on the host it reproduces SciPy's iterate, stop code and
+    # iteration count on a well-conditioned rectangular system, through the
+    # matvec / rmatvec pair only.
+    rng = np.random.default_rng(7)
+    a = rng.standard_normal((40, 90))  # A: 40×90, b in R^40 (eq. (26)'s shape)
+    b = rng.standard_normal(40)
+    for tol, iters in ((1e-6, 200), (0.0, 7)):
+        ref_x, ref_stop, ref_itn = spla.lsqr(
+            a, b, atol=tol, btol=tol, conlim=1e8, iter_lim=iters
+        )[:3]
+        x, istop, itn = trots._lsqr(
+            lambda v: a @ v, lambda u: a.T @ u, b, 90, np,
+            atol=tol, btol=tol, iter_lim=iters,
+        )  # fmt: skip
+        assert (istop, itn) == (ref_stop, ref_itn)
+        np.testing.assert_allclose(x, ref_x, rtol=1e-10, atol=1e-13)
+    assert ref_stop == 7  # the second case exercises the iteration limit
+    # b = 0: the exact solution x = 0 (SciPy's istop 0, no iterations).
+    x, istop, itn = trots._lsqr(
+        lambda v: a @ v, lambda u: a.T @ u, np.zeros(40), 90, np,
+        atol=1e-6, btol=1e-6, iter_lim=10,
+    )  # fmt: skip
+    assert (istop, itn) == (0, 0)
+    assert not np.any(x)
+
+
+def test_lsqr_mode_is_validated():
+    problem = trots.TROTSProblem(_instance(), np)
+    x0 = problem.initial_point(strategy="breedveld")
+    with pytest.raises(ValueError, match="CuPy"):
+        problem.breedveld_warm_start(x0, lsqr="device")
+    with pytest.raises(ValueError, match="unknown lsqr"):
+        problem.breedveld_warm_start(x0, lsqr="gpu")
+    # "auto" is the host path off CuPy.
+    wa, ma = problem.breedveld_warm_start(x0)
+    wh, mh = problem.breedveld_warm_start(x0, lsqr="host")
+    np.testing.assert_array_equal(wa.y_ineq, wh.y_ineq)
+    assert ma == mh
+
+
+def test_device_lsqr_start_matches_the_host_start_on_cupy():
+    # On a CuPy namespace the start runs on the GPU (the device LSQR on the
+    # problem's own lowered operator, no host twin) and matches the host
+    # SciPy path to round-off, before and after the floors.
+    pytest.importorskip("cupy")
+    import cupy
+
+    try:
+        cupy.cuda.runtime.getDeviceCount()
+        cupy.asarray(0.0)
+    except Exception:
+        pytest.skip("no usable CUDA device")
+    from ipax.testing.backends import import_namespace
+
+    xp = import_namespace("cupy")
+    inst = _instance()
+    problem = trots.TROTSProblem(inst, xp)
+    x0 = problem.initial_point(strategy="breedveld")
+
+    dev = problem._breedveld_least_squares(x0, "auto")
+    host = problem._breedveld_least_squares(x0, "host")
+    assert dev.on_device and not host.on_device
+    assert isinstance(dev.y, cupy.ndarray)
+    np.testing.assert_allclose(cupy.asnumpy(dev.y), host.y, rtol=1e-8, atol=1e-12)
+    np.testing.assert_allclose(
+        host.y, _lsqr_reference(_lowered_host(inst, _host(x0)), _host(x0)), rtol=1e-12
+    )
+
+    wd, md = problem.breedveld_warm_start(x0, scaling="none")
+    wh, mh = problem.breedveld_warm_start(x0, scaling="none", lsqr="host")
+    for a, b in ((wd.s, wh.s), (wd.y_ineq, wh.y_ineq), (wd.z_lower, wh.z_lower)):
+        assert isinstance(a, cupy.ndarray) and a.device == x0.device
+        np.testing.assert_allclose(cupy.asnumpy(a), _host(b), rtol=1e-8, atol=1e-12)
+    assert md == pytest.approx(mh, rel=1e-8)
+    _check_warm_start(inst, _host(x0), wd, md, device_lsqr=True)
 
 
 def test_undefined_mu0_raises(monkeypatch):
@@ -424,15 +511,16 @@ def test_solve_accepts_the_breedveld_start(namespace):
 # Runner: Breedveld's setup is the default; the old recipe stays reachable
 # --------------------------------------------------------------------------- #
 def test_runner_defaults_are_breedveld_setup():
-    # Breedveld et al. 2017's setup, except μ: monotone by default (probing,
-    # the closest transcription of his Mehrotra μ, is the proton lever).
+    # Breedveld et al. 2017's setup with the Mehrotra probing μ and the
+    # centrality floor off (the 2026-09-27 TROTS sweep's winner on every case).
     from benchmarks.runners import trots as runner
 
     args = runner._build_parser().parse_args([])
     assert args.config == "exact/dense"
     assert args.corrections == "mehrotra"
     assert args.globalization == "breedveld"
-    assert args.mu_schedule == "monotone"
+    assert args.mu_schedule == "probing"
+    assert args.kappa_centrality == 0.0
     assert args.init == "breedveld"
     assert args.tol == 1e-8
 
@@ -440,7 +528,8 @@ def test_runner_defaults_are_breedveld_setup():
     assert opts.hessian == "exact" and opts.linsolve == "dense"
     assert opts.corrections.method == "mehrotra"
     assert opts.globalization == "breedveld"
-    assert opts.mu_schedule == "monotone"
+    assert opts.mu_schedule == "probing"
+    assert opts.barrier.kappa_centrality == 0.0
     assert opts.optimality.dual_inf_tol == 1e-8
     assert opts.optimality.constr_viol_tol == 1e-8
     assert opts.optimality.compl_inf_tol == 1e-8
@@ -456,8 +545,9 @@ def test_runner_tol_sets_the_three_kkt_tolerances():
 
 def test_runner_reproduces_the_previous_default_options():
     # The pre-Breedveld default: both condensed dense configs, the loader's
-    # start, monotone μ, the filter line search, no corrector — which the old
-    # runner built as ``Options(max_iter, max_time, **config)`` alone.
+    # start, monotone μ, the filter line search, no corrector, ipax's own
+    # centrality floor — which the old runner built as
+    # ``Options(max_iter, max_time, **config)`` alone.
     from benchmarks.runners import trots as runner
 
     parser = runner._build_parser()
@@ -474,6 +564,8 @@ def test_runner_reproduces_the_previous_default_options():
             "filter",
             "--corrections",
             "none",
+            "--kappa-centrality",
+            "1e-2",
         ],
     )
     labels = args.config.split(",")

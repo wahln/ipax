@@ -233,6 +233,16 @@ See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the short contributor guide and
   developed and tuned for radiation therapy treatment planning*, COAP 68:209–242.
 - Friedlander & Orban (2012), *A primal–dual regularized interior-point method for convex quadratic programs*, Math. Prog. Comp. 4:71–107
 
+## Third-party data
+
+[`benchmarks/corpus/data/breedveld2017/`](./benchmarks/corpus/data/breedveld2017/)
+holds the TROTS timing tables from the supplement of Breedveld, van den Berg &
+Heijmen (2017), converted to JSON with the values unchanged. That directory is
+licensed under CC BY 4.0 (attribution and license text inside it), not
+Apache-2.0. It ships with the source distribution only; the `ipax` wheel does
+not include it.
+
 ## License
 
-Apache-2.0 — see [`LICENSE`](./LICENSE).
+Apache-2.0 — see [`LICENSE`](./LICENSE), except for the third-party data
+directory above.

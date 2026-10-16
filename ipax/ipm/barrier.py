@@ -20,7 +20,7 @@ import math
 from collections import deque
 from typing import TYPE_CHECKING
 
-from ipax.backend.namespace import array_namespace
+from ipax.backend.namespace import array_namespace, device
 
 if TYPE_CHECKING:
     from ipax.options import BarrierOptions
@@ -262,9 +262,18 @@ def boundary_ratio(v: Array, dv: Array, tau: float) -> Array:
         raise ValueError("tau must be in (0, 1]")
     xp = array_namespace(v, dv)
     blocking = dv < 0.0
-    safe_denom = xp.where(blocking, -dv, xp.ones_like(dv))
-    ratios = xp.where(blocking, tau * v / safe_denom, xp.full_like(v, math.inf))
-    return xp.min(ratios)
+    # Every pass here is a full sweep over the slacks on an RT-scale m ≫ n
+    # problem, and the rule runs several times per iteration (twice per
+    # direction). The fill values are 0-d arrays (broadcast by ``where``;
+    # ``full`` fills on the device, no host transfer) instead of materialized
+    # ``ones_like``/``full_like`` vectors, and the corrector's τ = 1 skips the
+    # multiply (``1·v = v`` exactly): the same per-component ratios, so the
+    # minimum is bitwise unchanged.
+    one = xp.full((), 1.0, dtype=dv.dtype, device=device(dv))
+    inf = xp.full((), math.inf, dtype=v.dtype, device=device(v))
+    safe_denom = xp.where(blocking, -dv, one)
+    numerator = v if tau == 1.0 else tau * v
+    return xp.min(xp.where(blocking, numerator / safe_denom, inf))
 
 
 def fraction_to_boundary(v: Array, dv: Array, tau: float) -> float:

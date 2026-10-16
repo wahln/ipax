@@ -29,6 +29,7 @@ LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
 Globalization = Literal["filter", "breedveld"]
 MuSchedule = Literal["monotone", "adaptive", "breedveld", "probing", "quality"]
 MuFallback = Literal["kkt-error", "never"]
+ProbingSigma = Literal["nww", "mehrotra"]
 FreeModeAcceptance = Literal["obj-constr-filter", "rigorous"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
@@ -37,6 +38,7 @@ DenseKKTRoute = Literal["condensed", "augmented"]
 SparseKKTRoute = Literal["auto", "augmented", "normal_equations"]
 ScalingMethod = Literal["none", "gradient-based"]
 CorrectionsMethod = Literal["none", "mehrotra", "gondzio"]
+GondzioVariant = Literal["ipax", "breedveld"]
 
 
 def _validate_optional_positive(
@@ -96,8 +98,33 @@ class BarrierOptions:
     # constraint scale on RT-scale problems (Protons_01: feasibility at iter ~17 vs
     # ~42 with the flat floor). OPT-IN pending a full-corpus sweep of the default.
     slack_init_scale: float = 0.0
+    # Centering rule of the ``mu_schedule="probing"`` oracle (the affine-probe
+    # Mehrotra σ). Only applies with ``Options.mu_schedule="probing"``: every
+    # other schedule ignores it, including ``"quality"``, whose fallback always
+    # uses the NWW rule. ``"nww"`` (default) is Nocedal, Wächter & Waltz 2009,
+    # eqs. (3.2)–(3.5): σ = (μ_aff/μ_gap)³ against the current average
+    # complementarity μ_gap, maximal (τ = 1) probe step, σ clipped at 1 so
+    # probing never raises μ above the current gap. ``"mehrotra"`` is the
+    # textbook unclipped rule as Breedveld et al. 2017 run it (Mehrotra 1992;
+    # Breedveld 2017 supplement eqs. (4)–(7), with the supplement's μ_prev
+    # read as the eq. (10) gap measured at the current iterate): the same σ
+    # against the same μ_gap, but the probe step cut back by the
+    # fraction-to-boundary τ of ``BreedveldOptions.tau`` (his §2.1, 0.995) and
+    # σ **unclipped** (σ > 1 raises μ above the current gap). The remaining
+    # safeguards still apply to both: the ``max(mu_min, tol/10)`` floor, the
+    # El-Bakry centrality floor (``kappa_centrality=0.0`` opts out) and the
+    # KKT-error fallback (``fallback="never"`` opts out). OPT-IN: the
+    # unclipped σ is the rule the NWW default clips *because* a quasi-Newton
+    # probe can inflate the products (tests/regression/
+    # test_mu_oracle_inflation.py) — pair it with the exact Hessian. (Reading
+    # μ_prev as the previous barrier *target* instead was tested and diverges:
+    # μ_{k+1} = μ_aff³/μ_k².) If the unclipped σ overflows (σ·μ_gap not
+    # finite) the rule holds μ at μ_gap.
+    probing_sigma: ProbingSigma = "nww"
 
     def __post_init__(self) -> None:
+        if self.probing_sigma not in ("nww", "mehrotra"):
+            raise ValueError("probing_sigma must be 'nww' or 'mehrotra'")
         if not 0.0 < self.fallback_kappa < 1.0:
             raise ValueError("fallback_kappa must lie in (0, 1)")
         if self.fallback_window < 0:
@@ -372,7 +399,12 @@ class RegularizationOptions:
 
 @dataclass(frozen=True, slots=True)
 class BreedveldOptions:
-    """Alternative step controller (Breedveld 2017 §2, eqs. 34–36)."""
+    """Alternative step controller (Breedveld 2017 §2, eqs. 34–36).
+
+    ``tau`` is also the probe's fraction-to-boundary scaling of the
+    ``BarrierOptions.probing_sigma="mehrotra"`` μ oracle — under *any*
+    ``globalization``, including the default filter line search.
+    """
 
     tau: float = 0.995  # fraction-to-boundary scaling
     backtrack: float = 0.9  # multiplicative backtracking factor
@@ -747,17 +779,41 @@ class CorrectionsOptions:
 
     ``gondzio_gamma`` sets the centrality neighborhood and
     ``gondzio_max_corrections`` caps its extra solves per outer iteration.
+
+    ``gondzio_variant`` picks the Gondzio correction loop and only applies
+    with ``method="gondzio"`` (ignored otherwise). ``"ipax"``
+    (default) probes trial step lengths enlarged by ``+0.1``, projects the
+    trial products into the symmetric box ``[γμ, μ/γ]`` and keeps a
+    correction that grows the summed step length by ``0.02``.
+    ``"breedveld"`` is Breedveld et al. 2017's variant (supplement A.2,
+    eqs. (10)–(15)), run after the full Mehrotra corrector: trial step
+    ``α̌ = min(1.1·α, 1)``; each trial product ``t`` below ``0.2·μ`` is
+    corrected by ``0.2·μ − t``, each above ``8·μ`` by
+    ``max(8·μ − t, −5·8·μ)`` (eqs. (13)–(14) in the *capped* reading: the
+    literal reading of the ``5·β_max`` assignment as a second target tier is
+    non-monotone in ``t``, so ipax caps the downward correction of large
+    outliers as Gondzio 1996 does — see
+    ``ipax.ipm.corrections._breedveld_correction``); a correction kept only
+    when the step length grows to at least ``1.07·α``. Both stop at the first
+    rejected correction or after ``gondzio_max_corrections``. Under both
+    variants the Mehrotra corrector that precedes the loop still clips its
+    second-order targets into ``[γμ, μ/γ]`` with ``γ = gondzio_gamma``
+    (Colombo & Gondzio 2008) — ``gondzio_gamma`` is *not* inert under
+    ``"breedveld"``. OPT-IN.
     """
 
     method: CorrectionsMethod = "none"
     gondzio_max_corrections: int = 2  # Gondzio K_max (extra corrector solves)
     gondzio_gamma: float = 0.1  # centrality-box fraction γ ∈ (0, 1)
+    gondzio_variant: GondzioVariant = "ipax"
 
     def __post_init__(self) -> None:
         if self.method not in ("none", "mehrotra", "gondzio"):
             raise ValueError(
                 "corrections method must be 'none', 'mehrotra', or 'gondzio'"
             )
+        if self.gondzio_variant not in ("ipax", "breedveld"):
+            raise ValueError("gondzio_variant must be 'ipax' or 'breedveld'")
         if self.gondzio_max_corrections < 0:
             raise ValueError("gondzio_max_corrections must be non-negative")
         if not 0.0 < self.gondzio_gamma < 1.0:
@@ -1025,6 +1081,7 @@ __all__ = [
     "DenseOptions",
     "FreeModeAcceptance",
     "Globalization",
+    "GondzioVariant",
     "HessianMode",
     "KrylovMethod",
     "KrylovOptions",
@@ -1036,6 +1093,7 @@ __all__ = [
     "MuSchedule",
     "OptimalityConditionOptions",
     "Options",
+    "ProbingSigma",
     "RegularizationOptions",
     "RestorationLinearSolver",
     "RestorationOptions",

@@ -194,6 +194,24 @@ ipax.Options(corrections="mehrotra")
 Corrections degenerate to the plain step on problems with no inequalities or
 bounds, so they never hurt there. Tune Gondzio via
 [`CorrectionsOptions`](../reference.md#ipax.options.CorrectionsOptions).
+`CorrectionsOptions(method="gondzio", gondzio_variant="breedveld")`
+*(opt-in)* runs Breedveld et al. 2017's Gondzio loop instead (supplement A.2):
+after the full Mehrotra corrector (whose second-order targets are still
+clipped into [γμ, μ/γ] with `gondzio_gamma`), the trial step
+α̌ = min(1.1·α, 1), a centrality correction of each trial product t —
+0.2·μ − t below 0.2·μ, max(8·μ − t, −5·8·μ) above 8·μ, zero in between —
+and a correction kept only when the step length grows to at least 1.07·α.
+`gondzio_variant` only applies with `method="gondzio"`.
+
+!!! note "Capped reading of eqs. (13)–(14)"
+    The supplement's eqs. (13)–(14) assign `5 β_max μ − t` to products above
+    `5 β_max μ` *after* assigning `β_max μ − t` to those above `β_max μ`.
+    Read literally as a second target tier, the correction is non-monotone in
+    t (μ = 1: t = 39 → −31, t = 41 → −1, t = 1000 → −960). ipax instead
+    caps the downward correction of large outliers at `5 β_max μ` in
+    magnitude, which is monotone in t and matches Gondzio (1996)'s outlier
+    cap. This is ipax's interpretation of the supplement, not a verbatim
+    transcription.
 
 ## Globalization
 
@@ -342,6 +360,19 @@ opt-in.
   corrector this costs one extra KKT solve per iteration; with corrections
   active the affine solve is shared. Rescues 12–18 problems per config that
   monotone misses — worth trying when monotone stalls.
+  `BarrierOptions(probing_sigma="mehrotra")` *(opt-in)* is the textbook
+  unclipped rule as Breedveld et al. 2017 run it (Mehrotra 1992; supplement
+  A.1, eqs. (4)–(7)): the same σ = (μ_aff/μ)³ against the current average
+  complementarity, but σ is **not clipped** at 1 (μ may rise above the current
+  gap) and the affine probe is cut back by `BreedveldOptions.tau` (0.995)
+  instead of taking the maximal step — under either `globalization`, not only
+  `"breedveld"`. `probing_sigma` only applies with `mu_schedule="probing"`;
+  should the unclipped σ overflow, μ is held at the current gap. The default
+  `"nww"` clips σ because a
+  quasi-Newton probe can inflate the complementarity products — use the
+  unclipped rule with `hessian="exact"`. The μ floor, the centrality floor and
+  the KKT-error fallback below still apply (`kappa_centrality=0.0` /
+  `fallback="never"` opt out of them).
 - `"adaptive"` — LOQO centrality rule: μ = σ·(average complementarity), where σ
   grows with the deviation of the smallest complementarity product from the
   average (Nocedal, Wächter & Waltz 2009, eq. (3.6)). Re-targeted every

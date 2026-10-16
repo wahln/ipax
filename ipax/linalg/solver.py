@@ -74,9 +74,48 @@ class LinearSolveError(RuntimeError):
         self.iterate = iterate
 
 
+def numerical_failure_types() -> tuple[type[BaseException], ...]:
+    """Exception types that signal a *numerical* failure of a KKT solve.
+
+    The only exceptions a solve site may translate into
+    :class:`LinearSolveError` — and so hand to the IPM's δ_w regularization
+    ladder and, once that is exhausted, to feasibility restoration (Wächter &
+    Biegler 2006, §3.1 → §3.3):
+
+    * :class:`LinearSolveError` itself (already classified, e.g. by a sparse
+      or dense LDLᵀ adapter at its backend boundary);
+    * the backends' own linear-algebra failure types — NumPy/SciPy/CuPy
+      ``LinAlgError``, Torch ``torch.linalg.LinAlgError`` — which the core may
+      not name (invariant #1), so they come from
+      :func:`ipax.backend.errors.backend_linalg_error_types`;
+    * Python's ``ArithmeticError`` family (``FloatingPointError`` under an
+      ``errstate(... "raise")``, ``ZeroDivisionError``, ``OverflowError``) —
+      overflow/underflow at a bad trial iterate.
+
+    Everything else — a ``TypeError``/``AttributeError``/``ValueError`` from a
+    user operator or callback, ``NotImplementedError`` (capability absent, the
+    solvers' fallback signal), ``MemoryError`` — is not numerical trouble a
+    larger δ_w could cure and must propagate unchanged. Use it in the clause
+    itself (``except numerical_failure_types() as exc:``): the expression is
+    evaluated only when an exception is already propagating, so the lookup
+    costs nothing on a successful solve.
+    """
+    from ipax.backend.errors import backend_linalg_error_types
+
+    return (LinearSolveError, ArithmeticError, *backend_linalg_error_types())
+
+
 @runtime_checkable
 class LinearSolver(Protocol):
-    """Solve ``K x = rhs`` for a KKT or condensed operator ``K``."""
+    """Solve ``K x = rhs`` for a KKT or condensed operator ``K``.
+
+    Failure contract: a *numerical* failure of ``factor``/``solve`` (a
+    singular or, where the solver checks it, indefinite system) raises
+    :class:`LinearSolveError` — or returns a non-finite solution, which the
+    driver treats the same way — so the IPM escalates δ_w. Any other exception
+    (in particular one raised by the operator's own callbacks) must propagate
+    unchanged; :func:`numerical_failure_types` is the dividing line.
+    """
 
     def factor(self, K: LinearOperator) -> None:
         """Prepare/factor the operator."""
@@ -284,6 +323,7 @@ __all__ = [
     "LinearSolveError",
     "LinearSolver",
     "SolverKind",
+    "numerical_failure_types",
     "select_restoration_solver",
     "select_solver",
 ]

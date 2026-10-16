@@ -111,3 +111,30 @@ def test_boundary_ratio_validates_inputs(namespace):
         boundary_ratio(v, dv, 0.0)
     with pytest.raises(ValueError, match="tau"):
         fraction_to_boundary(array(namespace, []), array(namespace, []), 1.5)
+
+
+def test_boundary_ratio_tau_one_branch_matches_the_general_formula(namespace):
+    """The τ = 1 fast path (skips ``τ·v``) equals the general ``τ·v/(−dv)``
+    formula evaluated at τ = 1 bitwise, and keeps the input dtype (float32
+    included) — Wächter & Biegler 2006, eq. (15)."""
+    import math
+
+    from ipax.ipm.barrier import boundary_ratio
+
+    xp = namespace
+    values = [0.3, 1.7, 2.9, 0.11, 5.0]
+    steps = [-0.7, 0.2, -3.3, -0.05, 0.0]
+    for dtype in (getattr(xp, "float64", None), getattr(xp, "float32", None)):
+        if dtype is None:
+            continue
+        v = xp.asarray(values, dtype=dtype)
+        dv = xp.asarray(steps, dtype=dtype)
+        got = boundary_ratio(v, dv, 1.0)
+        # The τ < 1 formula, spelled out with τ = 1.0.
+        blocking = dv < 0.0
+        denom = xp.where(blocking, -dv, xp.ones_like(dv))
+        inf = xp.full_like(v, math.inf)
+        expected = xp.min(xp.where(blocking, (1.0 * v) / denom, inf))
+        assert got.dtype == dtype
+        assert got.shape == ()
+        assert float(got) == float(expected)

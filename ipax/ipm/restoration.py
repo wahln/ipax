@@ -34,7 +34,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from ipax.backend.operators import LinearOperator, VStack
-from ipax.linalg.solver import LinearSolveError
+from ipax.linalg.solver import LinearSolveError, numerical_failure_types
 
 if TYPE_CHECKING:
     from ipax.linalg.solver import LinearSolver
@@ -450,14 +450,15 @@ def restore(
         # backend's solve raise or return a non-finite step; both count as a
         # rejected trial. The dense exception type is backend-specific (numpy
         # ``LinAlgError``, torch ``_LinAlgError``, …) and cannot be named
-        # without importing a concrete library (invariant #1), so it is caught
-        # broadly. The iterative route raises ``LinearSolveError`` only for
-        # numerical trouble — any other exception is an operator-callback or
-        # configuration bug and propagates — and a work-capped solve hands
-        # back its truncated iterate, which is a descent direction for the SPD
-        # Gauss-Newton model (Steihaug 1983): it is tried like any direction
-        # rather than discarded, so the ladder is not climbed on Krylov work
-        # limits alone.
+        # without importing a concrete library (invariant #1), so it is
+        # recognized through ``numerical_failure_types()``; anything else (a
+        # resource failure, a bug) propagates. The iterative route raises
+        # ``LinearSolveError`` only for numerical trouble — any other exception
+        # is an operator-callback or configuration bug and propagates — and a
+        # work-capped solve hands back its truncated iterate, which is a
+        # descent direction for the SPD Gauss-Newton model (Steihaug 1983): it
+        # is tried like any direction rather than discarded, so the ladder is
+        # not climbed on Krylov work limits alone.
         accepted = False
         direction_tried = False
         while lam <= _LM_MAX:
@@ -471,11 +472,9 @@ def restore(
                     normal.damping = lam
                     linear_solver.factor(normal)
                     dx = linear_solver.solve(-grad)
-            except MemoryError:  # a genuine resource failure must propagate
-                raise
             except LinearSolveError as exc:
                 dx = exc.iterate
-            except Exception:
+            except numerical_failure_types():
                 if normal is not None:
                     raise
                 dx = None  # backend-specific dense singular-solve error
@@ -495,8 +494,8 @@ def restore(
             # the iterative route, never obtaining a direction at all is not a
             # certificate (a Krylov breakdown says nothing about local
             # feasibility). The dense route keeps its established
-            # exception-to-NO_DESCENT semantics: its λ = 1e16 rung is always
-            # solvable, so that case is a non-finite Jacobian.
+            # numerical-failure-to-NO_DESCENT semantics: its λ = 1e16 rung is
+            # always solvable, so that case is a non-finite Jacobian.
             certified = normal is None or direction_tried
             if certified and not escape_used:
                 # Same saddle probe as the gradient test: a symmetric trap

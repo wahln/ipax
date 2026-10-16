@@ -92,6 +92,8 @@ strategies. The core only ever sees these protocol types — see
 
 ::: ipax.linalg.solver.LinearSolveError
 
+::: ipax.linalg.solver.numerical_failure_types
+
 ::: ipax.linalg.solver.select_solver
 
 ## Backend introspection

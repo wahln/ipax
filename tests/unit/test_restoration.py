@@ -435,6 +435,50 @@ def test_restoration_survives_singular_gauss_newton_system(namespace):
     assert bool(xp.all(xp.isfinite(x_new)))
 
 
+@pytest.mark.parametrize(
+    "bug",
+    [
+        TypeError("asarray() got an unexpected keyword argument 'device'"),
+        MemoryError("host allocation failed"),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+def test_dense_gauss_newton_solve_propagates_non_numerical_errors(
+    namespace, monkeypatch, bug
+):
+    # The dense LM solve treats only a numerical failure
+    # (``numerical_failure_types()``) as a rejected trial; a bug or a resource
+    # failure must leave ``restore`` as itself instead of being turned into a
+    # NO_DESCENT "infeasibility certificate".
+    xp = namespace
+    x = array(xp, [1.0, 1.0])
+
+    def raising_solve(*args, **kwargs):
+        del args, kwargs
+        raise bug
+
+    monkeypatch.setattr(xp.linalg, "solve", raising_solve)
+
+    with pytest.raises(type(bug)) as info:
+        restore(
+            xp=xp,
+            x=x,
+            s=xp.zeros((0,), dtype=x.dtype),
+            m=0,
+            m_eq=1,
+            eq_fn=lambda z: array(xp, [1.0]),
+            eq_jac_fn=lambda z: as_operator(array(xp, [[1.0, 2.0]])),
+            ineq_fn=_no_ineq,
+            ineq_jac_fn=_no_ineq,
+            mask_l=xp.zeros((2,), dtype=xp.bool),
+            mask_u=xp.zeros((2,), dtype=xp.bool),
+            lower_safe=xp.zeros((2,), dtype=x.dtype),
+            upper_safe=xp.zeros((2,), dtype=x.dtype),
+            tol=1e-8,
+        )
+    assert info.value is bug
+
+
 def test_rejected_lm_trials_reuse_the_jacobian(namespace):
     # Levenberg-Marquardt damping control: a rejected trial step must retry with
     # a larger damping WITHOUT rebuilding the Jacobian/normal matrix — they

@@ -335,6 +335,15 @@ Steps:
   programming." *Journal of Optimization Theory and Applications* 89(3), 507–541.
   <https://doi.org/10.1007/BF02275347> (centrality condition behind the
   free-mode μ floor)
+- Mehrotra, S. (1992). "On the implementation of a primal–dual interior point
+  method." *SIAM Journal on Optimization* 2(4), 575–601.
+  <https://doi.org/10.1137/0802028> (Mehrotra predictor–corrector and σ rule;
+  `BarrierOptions.probing_sigma="mehrotra"`)
+- Gondzio, J. (1996). "Multiple centrality corrections in a primal–dual method
+  for linear programming." *Computational Optimization and Applications* 6,
+  137–156. <https://doi.org/10.1007/BF00249643> (multiple centrality
+  corrections; the outlier cap behind the capped reading of the Breedveld
+  Gondzio variant, `gondzio_variant="breedveld"`)
 - Colombo, M. & Gondzio, J. (2008). "Further development of multiple centrality
   correctors for interior point methods." *Computational Optimization and
   Applications* 41(3), 277–305. <https://doi.org/10.1007/s10589-007-9106-0>

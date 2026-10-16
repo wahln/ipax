@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from ipax.backend.namespace import array_namespace
-from ipax.backend.operators import Diagonal, Identity, LinearOperator
+from ipax.backend.operators import Diagonal, Identity, LinearOperator, forward_gram
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -521,8 +521,9 @@ class _CondensedOperator(LinearOperator):
         inequality Jacobian exposes :meth:`~ipax.backend.operators.LinearOperator.
         gram`; either absent returns ``None`` so the caller densifies instead.
         ``gram_dtype`` forwards the mixed-precision accumulate request; operators
-        predating the keyword (``TypeError``) are retried without it, so the
-        request degrades to an exact Gram rather than failing.
+        predating the keyword (the ``TypeError`` naming it) are retried without
+        it, so the request degrades to an exact Gram rather than failing; any
+        other ``TypeError`` from inside the Gram is a bug and propagates.
         """
         if not isinstance(self._sigma_s, (Diagonal, Identity)):
             return None
@@ -530,12 +531,13 @@ class _CondensedOperator(LinearOperator):
         try:
             if gram_dtype is None:
                 return self._ineq_jac.gram(weights)
-            try:
-                return self._ineq_jac.gram(
-                    weights, accumulate_dtype=gram_dtype, hinted_only=hinted_only
-                )
-            except TypeError:
-                return self._ineq_jac.gram(weights)
+            # The one shared keyword-compat retry (pre-keyword signatures only).
+            return forward_gram(
+                self._ineq_jac,
+                weights,
+                accumulate_dtype=gram_dtype,
+                hinted_only=hinted_only,
+            )
         except NotImplementedError:
             return None
 
