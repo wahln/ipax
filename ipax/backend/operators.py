@@ -260,7 +260,8 @@ class LinearOperator(ABC):
         apply to the Gram part only; ``self``'s own part must stay in native
         precision. Declining is always valid: raise ``NotImplementedError``
         (the default) and the caller forms the two terms separately, bit for
-        bit as without this hook.
+        bit as without this hook — but decide *before* forming anything, as
+        the caller pays for the two-pass assembly in full after a decline.
         """
         del jac, weights, accumulate_dtype, hinted_only
         raise NotImplementedError("operator does not fuse an inequality Gram")

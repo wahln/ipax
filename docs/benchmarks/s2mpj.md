@@ -47,11 +47,11 @@ from every problem file:
 
 | | |
 | --- | --- |
-| date | 2026-09-06 (v31) |
+| date | 2026-10-11 (v36; v31 of 2026-09-06 is the previous baseline) |
 | CPU | 13th Gen Intel Core i9-13900HX (32 logical CPUs) |
 | OS | Windows 11 (10.0.26200), AMD64 |
 | Python | 3.14.6 |
-| ipax | 0.10.1 + the 0.11.0 performance/restoration arc (develop @ `761ac00`) |
+| ipax | 0.11.0 + the Breedveld follow-ups chain (`feat/breedveld-followups` @ `53acd09`) |
 | NumPy / SciPy | 2.4.6 / 1.17.1 |
 | PyTorch | 2.12.0+cpu |
 | sparse factorization | Feral LDLᵀ (CPU) |
@@ -136,14 +136,14 @@ broken, every config positive. The intervening work was the `0.11.0`
 performance and restoration arc, landed and gated sweep by sweep (v23 … v31;
 every default-affecting commit carries its own full-corpus gate):
 
-| config | v22 | v27 | v29 | v30 | v31 | Δ |
-| --- | --- | --- | --- | --- | --- | --- |
-| `lbfgs/dense`  | 774 | 773 | 779 | 779 | 779 | **+5** |
-| `lbfgs/krylov` | 752 | 757 | 758 | 758 | 764 | **+12** |
-| `lbfgs/sparse` | 780 | 782 | 785 | 785 | 785 | **+5** |
-| `exact/dense`  | 770 | 766 | 774 | 776 | 777 | **+7** |
-| `exact/krylov` | 706 | 711 | 712 | 712 | 713 | **+7** |
-| `exact/sparse` | 796 | 797 | 798 | 798 | 798 | **+2** |
+| config | v22 | v27 | v29 | v30 | v31 | v36 | Δ |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `lbfgs/dense`  | 774 | 773 | 779 | 779 | 779 | 780 | **+6** |
+| `lbfgs/krylov` | 752 | 757 | 758 | 758 | 764 | 764 | **+12** |
+| `lbfgs/sparse` | 780 | 782 | 785 | 785 | 785 | 785 | **+5** |
+| `exact/dense`  | 770 | 766 | 774 | 776 | 777 | 777 | **+7** |
+| `exact/krylov` | 706 | 711 | 712 | 712 | 713 | 713 | **+7** |
+| `exact/sparse` | 796 | 797 | 798 | 798 | 798 | 798 | **+2** |
 
 The one **route change** is deliberate and documented: on `lbfgs/krylov`
 **387 problems** report `krylov (cg, pc=lbfgs-exact)` instead of
@@ -206,6 +206,25 @@ Sweep by sweep:
   documented optimum, `HS98`/`HS13` converge in fewer iterations to the
   same value, `OET7` a worse unscored basin, `CRESC50` incorrect either way).
   No marked problem changed `correct`.
+- **v31 → v36 (2026-10-11), +1 (1 fixed / 0 broken): the release gate of
+  the Breedveld follow-ups chain** (rounds 3–7 on `feat/breedveld-followups`,
+  `53acd09`: the TROTS tiled Gram and exact Hessian, the Breedveld start,
+  common step and SOC, the restoration Cholesky option, the overflow guards
+  on the dense and structured diagonals, the cuDSS refinement, inertia and
+  reproducibility work, `SparseOptions`, the `dpotrf` Cholesky, the fused
+  Hessian + Gram hook). 4617/6600 correct. Five configs have **zero flips
+  and zero route changes**; `lbfgs/dense` has the one fix (`ELATTAR`, the
+  basin move v32 already described) and the 12 `pd-hint->lu` markers, which
+  are the v32 set exactly — label-only on seven rows, and the five rows with
+  a different trajectory (`CRESC50`, `ELATTAR`, `HS13`, `HS98`, `OET7`)
+  reproduce **bit for bit on `develop` before the chain**, so none of the
+  chain's commits moves a NumPy trajectory on the corpus. Identical-`n_iter`
+  wall ratio 0.975 (1319 rows): no timing bias. The 53 objective drifts are
+  41 unscored rows (the `DMN15xxx`/`DIAMON3DLS` `max_time` family and Krylov's
+  inexact solves) and 12 scored ones under 6 % that did not change
+  `correct`; `OET7` on `exact/krylov` moved to a worse unscored basin, as it
+  does in most sweeps. Report: `benchmarks/reports/s2mpj_v36.*`, diff:
+  `s2mpj_v36_vs_v31.txt`.
 
 Two sweeps in the series are **not** in the table because they were not
 baselines: **v28** (2026-09-03) ran on a throttled machine (2.87× slower on
@@ -1428,6 +1447,62 @@ either, so the v33 baseline stands. The HN A/B (24 threads) was
 bit-identical as well. The harness (`s2mpj_arm.py`,
 `compare_bitwise.py`) and the reports are in the session scratchpad
 (`sweep_potrf/`, local, not committed).
+
+### CuPy sparse route after the follow-ups chain (2026-10-16)
+
+The release gate's CuPy half: both sparse configs over the full corpus
+(`--all --include-objective-free --backends cupy --config
+lbfgs/sparse,exact/sparse --cupy-certificates --max-iter 10000 --max-time
+300 --jobs 2`) on `feat/breedveld-followups` @ `bfc2a66`, with the
+defaults a user gets — refinement on, the reproducible kernels, cuDSS
+`DETERMINISTIC_MODE` off. 6.4 h on two GPU workers, no crash, no device
+reset. Compared with the same rows of the NumPy v36 gate and with the
+pre-refinement v33 CuPy run:
+
+| config | CuPy v33 (2026-09-28) | **CuPy v37** | NumPy v36 | CuPy − NumPy |
+| --- | ---: | ---: | ---: | ---: |
+| `exact/sparse` | 779 | **797** | 798 | −1 |
+| `lbfgs/sparse` | 762 | **769** | 785 | −16 |
+
+The gap to NumPy on these two configs is −17, down from −39 at v33
+(−14 was the refinement A/B's projection on the perturbed-pivot subset).
+Against the NumPy rows: 15 fixed, 32 broken. Every broken row was re-run
+**alone** (one process, one job, same budget) after the sweep:
+
+| alone re-run of the 32 broken rows | rows | problems |
+| --- | ---: | --- |
+| recovered (correct alone: GPU-sharing timing or run-to-run noise) | 6 | `ACOPP30`, `CURLY10`, `GASOIL`, `HS109`, `HS116`, `S365` |
+| still `max_time` alone (CuPy slower per iteration on small problems) | 7 | `BATCH`, `DEMBO7`, `NUFFIELD`, `ORTHREGE`, `FLETCHBV`, `KISSING2`, `VANDERM2` |
+| confirmed, same status and (almost always) the same iteration count | 19 | `CATENARY`, `DJTL`, `HS13` (×2), `HS36`, `KOEBHELB`, `POWERSUMNE`, `SSEBNLN`, `CYCLOOCF`, `DMN15332LS`, `GAUSS1LS`, `HEART6LS`, `PALMER2E`, `PALMER4C`, `POWELLBSLS`, `SBRYBND`, `VESUVIALS`, `VESUVIOLS`, `VESUVIOULS` |
+
+Net after the re-runs: −11 against NumPy. Two things the re-runs show:
+
+- **The route is deterministic in practice now.** With the reproducible
+  products and COO builds (2026-10-02) the alone re-run reproduced the
+  sweep's status *and iteration count* on 24 of the 32 rows, cuDSS
+  `DETERMINISTIC_MODE` off. Before that work, identical re-runs of the
+  same rows differed routinely (`ACOPR14` 25 vs 38 iterations). The
+  remaining noise is GPU sharing between the two workers (the six
+  recovered rows) and the factorization itself.
+- **The 19 confirmed rows are route differences, not noise:** cuDSS's
+  static pivoting with refinement against Feral's threshold-pivoting
+  LDLᵀ on the same KKT systems. `HS36` (14 NumPy iterations, never
+  converges on CuPy), `POWERSUMNE` (restoration fails at iteration 6) and
+  `CATENARY` (the certificate's scale blind spot: a −100 residual under a
+  7e6 right-hand side) are small enough to bisect; the `VESUVI*` and
+  `PALMER*` families stall or stop `acceptable` at the same iterate every
+  time. They are offset by 15 fixes on the same configs (`DISCS`, `MSS1`,
+  `MINSURFO`, `SPINOP`, `PALMER1`/`4`, `ORTHRGDM`/`S`, …), so the per-config
+  counts are at parity on `exact/sparse` and 16 rows behind on
+  `lbfgs/sparse`.
+
+Certificates over the 2202 rows: 1188 rows met perturbed pivots
+(607k of 1.33M factorizations); refinement rescued 35,149 solves the
+unrefined certificate would have rejected, in 179 rows; 89,149 solves in
+104 rows were still rejected to the regularization ladder; two rows had
+non-finite factorizations. Reports: `benchmarks/reports/s2mpj_v37_cupy.*`,
+the alone re-runs `s2mpj_v37_cupy_rerun_{exact,lbfgs}.*`, the diff
+`s2mpj_v37_cupy_vs_v36_numpy.txt`.
 
 ## Reproducing
 

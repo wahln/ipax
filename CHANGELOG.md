@@ -372,7 +372,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   - Each entry receives the same single addition, so the Gram and the dense
     Hessian are **bitwise identical** (sha256-tested against the NumPy
     scatter; `Head-and-Neck_01`'s 10-iteration trajectory is bit-identical).
-  - Numba is optional, in the `bench` extra. It is imported lazily and
+  - Numba is optional, in its own `trots` extra (not part of `dev` or
+    `bench`: Numba lags new Python/NumPy releases). It is imported lazily and
     compiled or loaded from its cache when the operator is built, never in
     a timed iteration.
   - Without Numba, if compilation fails, or with the new

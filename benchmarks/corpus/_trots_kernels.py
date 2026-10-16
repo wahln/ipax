@@ -95,7 +95,10 @@ def compiled_scatter_lower_rows() -> Callable[..., None] | None:
     try:
         import numba
     except ImportError:
-        _LOG.debug("numba not importable: the TROTS loader keeps its NumPy scatter")
+        _LOG.info(
+            "numba not importable: the TROTS loader uses its NumPy scatter "
+            "(same bits, slower); install the `trots` extra for the compiled kernel"
+        )
         return None
     import numpy as np
 

@@ -693,9 +693,10 @@ backends produce the same trajectory:
 
 The GPU run fits the card after the device-memory work above; the NumPy
 per-iteration cost was the single-lane Gram. The 2026-10-02 host levers
-bring the NumPy run to 959 s (20.0 s per iteration) and an opt-in float32
-Gram brings CuPy to 309 s; see "Head-and-Neck_01 speed profile
-(2026-10-02)" below.
+bring the NumPy run to 959 s (20.0 s per iteration), the 2026-10-03
+levers (compiled scatter, `dpotrf`, fused Hessian + Gram) to 749 s
+(15.3 s per iteration), and an opt-in float32 Gram brings CuPy to 283 s;
+see "Head-and-Neck_01 speed profile (2026-10-02)" below.
 
 **Recommendation: keep both opt-in.** Neither lever becomes a runner
 default. `--common-step` costs iterations on 8 of the other 10 cases (up to
@@ -996,6 +997,29 @@ that happens after roughly 33 of the 46 iterations on CuPy. NumPy's
 default route is 1.9× faster than on 2026-09-29. The CuPy float32 run is
 within 11 % of the paper's wall time.
 
+**Re-time after the 2026-10-03 levers (2026-10-16).** The same runs on
+`feat/breedveld-followups` @ `bfc2a66`, idle machine, one process at a
+time, with the compiled compacted scatter, the `dpotrf` Cholesky and the
+fused Hessian + Gram product all in (each measured under load on
+2026-10-03; this is the first idle measurement of the three together):
+
+| backend | `--gram-dtype` | status | iterations | KKT | objective | wall | initialization | per iteration |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **NumPy** | auto | optimal | 46 | 1.0e-9 | 3.5422668310 | **749 s** | 44 s | **15.3 s** |
+| NumPy | float32 | optimal | 46 | 1.0e-9 | 3.5422668310 | 688 s | 44 s | 14.0 s |
+| **CuPy** | auto | optimal | 46 | 1.0e-9 | 3.5422668310 | **485 s** | 13 s | **10.3 s** |
+| **CuPy** | float32 | optimal | 46 | 1.0e-9 | 3.5422668310 | **283 s** | 15 s | **5.8 s** |
+| paper (16-core Xeon, 2017) | (mixed precision) | — | 45 | — | — | 279 s | 7.8 s | 6.2 s |
+
+Same 46 iterations and objective as every run above. NumPy's default
+route is now 2.4× faster than on 2026-09-29 (37.9 → 15.3 s per
+iteration) and the CuPy float32 run matches the paper's wall time
+(283 s vs 279 s) with a faster iteration (5.8 s vs 6.2 s). The 44 s
+NumPy initialization is mostly the eq. (26) LSQR dual start; the opt-in
+`--lsqr-iter 5` gives a bit-identical start on this case and removes
+about 37 s of it (see "LSQR dual start across the corpus" above), which would put the
+NumPy run near 710 s.
+
 **What remains, and why.**
 
 - **NumPy, 20 s per iteration (default).** 12 s is `syrk` on 3.0·10¹²
@@ -1065,7 +1089,7 @@ within 11 % of the paper's wall time.
   float32 route holds. The rest is the 1.4 s Cholesky.
 - **Initialization, 39–41 s on NumPy, 12–13 s on CuPy.** LSQR is 30 s of
   the NumPy figure. The opt-in `--lsqr-iter 5` is bit-identical on every
-  corpus case and saves ~37 s per solve (see "LSQR dual start" above).
+  corpus case and saves ~37 s per solve (see "LSQR dual start across the corpus" above).
 
 Reproduce: the runner with `--cases Head-and-Neck_01 --common-step
 --max-iter 300 --max-time 3600`, adding `--backend cupy` and/or
@@ -1090,8 +1114,9 @@ Gram and the exact Hessian are **bitwise unchanged** (sha256, see below).
 The host Hessian's scatter goes through the same function, so it is covered
 too.
 
-- **Install.** Numba is optional and comes with the `bench` extra
-  (`pip install -e ".[bench]"`). It is never imported by `ipax`.
+- **Install.** Numba is optional and comes with the `trots` extra
+  (`pip install -e ".[sparse-cpu,trots]"`), which is not part of `dev`.
+  It is never imported by `ipax`.
 - **Fallback.** Without Numba, or if it fails to compile (a logged
   warning), the loader runs the NumPy scatter with the same results.
   `TiledGramConfig(compiled_scatter=False)` forces the fallback; it exists
