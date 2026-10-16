@@ -8,7 +8,9 @@ reference everywhere is the dense ``Aᵀ diag(w) A`` or the plain
 
 from __future__ import annotations
 
+import gc
 import math
+import weakref
 
 import numpy as np
 import pytest
@@ -237,6 +239,59 @@ def test_small_work_runs_on_one_lane(monkeypatch):
     assert _rel(np.asarray(op.gram(w)), _dense_gram(a, w)) < 1e-12
 
 
+def _gram_with_lane_budget(a, w, budget, **cfg):
+    cfg.setdefault("block_rows", 64)
+    cfg.setdefault("flop_ratio_threshold", 1.0)
+    cfg.setdefault("lane_min_flops", 1.0)  # lane count tracks the budget, not flops
+    op = trots.TiledGramCSROperator(
+        a, np, config=trots.TiledGramConfig(lane_budget_bytes=budget, **cfg)
+    )
+    return np.asarray(op.gram(w))
+
+
+def test_lane_budget_bytes_changes_the_gram_only_by_round_off():
+    # TiledGramConfig's docstring is explicit: the lane count fixes the
+    # summation order, and it is a function of lane_budget_bytes (and the
+    # data) alone -- so changing the budget in a way that changes the lane
+    # count may change the Gram's last bits (float addition is not
+    # associative), which is why the budget has no machine-dependent default.
+    # This pins the size of that difference, not its presence. This is the verification the 2026-09-28 profile's
+    # lane_budget_bytes=4<<30 lever asked for: budgets are scaled down so a
+    # tiny matrix (not a multi-GB one) already exercises 1 vs 2 vs 5 vs 8
+    # lanes, via the same `lane_budget_bytes // (8*nx*nx)` arithmetic the
+    # config uses at n≈1e4 in production (see docs/benchmarks/trots.md's
+    # Head-and-Neck_01 profile, which confirms the same non-identity on the
+    # real linear block: max|diff| ~ 1e-16 absolute).
+    a = _random_sparse(2000, 60, 0.2, 40)
+    w = np.random.default_rng(41).uniform(0.0, 5.0, a.shape[0])
+    per_lane = 8 * a.shape[1] * a.shape[1]  # one lane's n×n float64 accumulator
+
+    one_lane = _gram_with_lane_budget(a, w, per_lane)
+    two_lanes = _gram_with_lane_budget(a, w, 2 * per_lane)
+    five_lanes = _gram_with_lane_budget(a, w, 5 * per_lane)
+
+    # Any difference is round-off, not a bug: tiny relative to the matrix,
+    # and every candidate agrees with the dense reference to 1e-12.
+    assert _rel(one_lane, two_lanes) < 1e-9
+    assert _rel(one_lane, _dense_gram(a, w)) < 1e-12
+    assert _rel(two_lanes, _dense_gram(a, w)) < 1e-12
+    assert _rel(five_lanes, _dense_gram(a, w)) < 1e-12
+
+
+def test_lane_budget_bytes_is_identical_once_the_lane_count_saturates():
+    # A budget change that does NOT change the actual lane count (both above
+    # the thread/flops cap) must not change a single bit: the byte budget
+    # only enters through the lane *count*.
+    a = _random_sparse(2000, 60, 0.2, 40)
+    w = np.random.default_rng(41).uniform(0.0, 5.0, a.shape[0])
+    per_lane = 8 * a.shape[1] * a.shape[1]
+
+    capped = _gram_with_lane_budget(a, w, 8 * per_lane, threads=8)
+    also_capped = _gram_with_lane_budget(a, w, 100 * per_lane, threads=8)
+
+    np.testing.assert_array_equal(capped, also_capped)
+
+
 def test_operator_presents_the_original_row_order():
     # The RCM permutation is private to the Gram plan: matvec/rmatvec/COO are
     # the plain CSR operator's, row for row.
@@ -252,6 +307,58 @@ def test_operator_presents_the_original_row_order():
         (np.asarray(vals), (np.asarray(rows), np.asarray(cols))), shape=shape
     )
     assert (rebuilt.tocsr() != a).nnz == 0
+
+
+def _mirror_lower_row_loop_reference(out):
+    """The original ``_mirror_lower`` (a per-row Python loop), kept verbatim
+    as the reference for the blocked replacement's bit-identity test."""
+    out = np.ascontiguousarray(out)
+    n = out.shape[0]
+    for j in range(n):
+        out[j, j + 1 :] = out[j + 1 :, j]
+    return out
+
+
+@pytest.mark.parametrize("n", [0, 1, 2, 255, 256, 257, 511, 600, 1200])
+@pytest.mark.parametrize("block", [64, 256, 512, 1024])
+def test_mirror_lower_matches_row_loop_reference(n, block, monkeypatch):
+    # The blocked mirror (cache-friendly tiles) is a pure data copy, so it
+    # must reproduce the row-loop's array bit for bit at every size relative
+    # to the block (below it, exactly at it, and straddling it) and at every
+    # block size, including a signed zero (a copy must preserve -0.0, not
+    # normalize it through arithmetic).
+    monkeypatch.setattr(trots, "_HOST_MIRROR_BLOCK", block)
+    rng = np.random.default_rng(1000 + n)
+    a = rng.standard_normal((n, n))  # upper triangle: garbage, fully overwritten
+    tril_rows, tril_cols = np.tril_indices(n)
+    a[tril_rows, tril_cols] = rng.standard_normal(tril_rows.shape[0])
+    if n > 1:
+        a[1, 0] = -0.0  # an off-diagonal entry that gets mirrored (plain
+        # assignment, not arithmetic, so it cannot be normalized to +0.0)
+
+    got = trots._mirror_lower(a.copy())
+    want = _mirror_lower_row_loop_reference(a.copy())
+
+    np.testing.assert_array_equal(got, want)
+    if n > 1:
+        # -0.0 survives a pure copy (mirrored from [1, 0] into [0, 1]).
+        assert np.signbit(got[0, 1])
+
+
+def test_mirror_lower_default_block_divides_unevenly_at_hn_scale():
+    # A regression pin for the ragged last panel at n not a multiple of the
+    # default block (Head-and-Neck_01 is n=9984, not tested directly here to
+    # keep the unit suite fast).
+    n = 1000  # not a multiple of trots._HOST_MIRROR_BLOCK (512)
+    assert n % trots._HOST_MIRROR_BLOCK != 0
+    rng = np.random.default_rng(2024)
+    lower = np.tril(rng.standard_normal((n, n)))
+    a = lower + np.triu(rng.standard_normal((n, n)), 1)
+
+    got = trots._mirror_lower(a.copy())
+    want = _mirror_lower_row_loop_reference(a.copy())
+
+    np.testing.assert_array_equal(got, want)
 
 
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")
@@ -307,6 +414,32 @@ def test_repeated_weights_are_memoized():
     assert op.gram_compute_count == 2
     np.testing.assert_array_equal(first, again)
     np.testing.assert_allclose(other, 2.0 * first, rtol=1e-13)
+
+
+def test_superseded_memo_is_released_before_the_next_product(monkeypatch):
+    # The memo serves repeats of the *same* weights (δ_w retries); a new
+    # weight vector supersedes it, so it must not stay alive (an n×n array)
+    # while the next Gram is accumulated beside it.
+    a = _random_sparse(300, 20, 0.1, 18)
+    op = _op(a, block_rows=64)
+    w = np.random.default_rng(19).uniform(0.1, 5.0, a.shape[0])
+    held = []
+    memos = []
+    real = trots._accumulate_tiles
+
+    def spy(*args, **kwargs):
+        gc.collect()
+        held.append([ref() is not None for ref in memos])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(trots, "_accumulate_tiles", spy)
+    op.gram(w)
+    memos.append(weakref.ref(op._memo[None][1]))
+    op.gram(w * 2.0)
+
+    assert held == [[], [False]]
+    assert op.gram_compute_count == 2
+    assert None in op._memo  # the new product is memoized
 
 
 def test_shared_structure_segments_merge_weights_and_add_aux_borders():
@@ -1075,6 +1208,39 @@ def test_device_memo_keeps_one_slot_per_effective_precision(namespace):
     np.testing.assert_allclose(other, 2.0 * first, rtol=1e-13)
 
 
+def test_device_superseded_memo_is_released_before_the_next_product(
+    namespace, monkeypatch
+):
+    # Device twin of the host test: on Head-and-Neck_01 the stale n×n memo
+    # (0.76 GB) sat beside the new Gram's result and tile buffers at the
+    # Gram's memory peak.
+    xp = namespace
+    _device_namespace(xp)
+    a = _random_sparse(300, 20, 0.1, 36)
+    op = trots.TiledGramCSROperator(
+        a, xp, config=trots.TiledGramConfig(block_rows=64, flop_ratio_threshold=1.0)
+    )
+    w = np.random.default_rng(37).uniform(0.1, 5.0, a.shape[0])
+    held = []
+    memos = []
+    real = trots._device_run
+
+    def spy(*args, **kwargs):
+        gc.collect()
+        held.append([ref() is not None for ref in memos])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(trots, "_device_run", spy)
+    op.gram(xp.asarray(w))
+    memos.append(weakref.ref(op._memo[None][1]))
+    op.gram(xp.asarray(w))  # a memo hit: no product
+    op.gram(xp.asarray(w * 2.0))
+
+    assert held == [[], [False]]
+    assert op.gram_compute_count == 2
+    assert None in op._memo
+
+
 def test_device_operator_presents_the_original_row_order(namespace):
     xp = namespace
     _device_namespace(xp)
@@ -1090,6 +1256,116 @@ def test_device_operator_presents_the_original_row_order(namespace):
     rows, cols, vals, shape = op.to_coo()
     rebuilt = sp.coo_matrix((_host(vals), (_host(rows), _host(cols))), shape=shape)
     assert (rebuilt.tocsr() != a).nnz == 0
+
+
+def _cupy_namespace(namespace):
+    """Skip unless ``namespace`` is a CuPy namespace (the device CSR path)."""
+    if _device_namespace(namespace) != "cupy":
+        pytest.skip("the single-copy device CSR is the CuPy adapter's")
+    import cupy
+
+    return cupy
+
+
+@pytest.mark.parametrize("gated", [False, True])
+def test_device_operator_holds_the_block_once(namespace, gated):
+    # Regression (Head-and-Neck_01 on an 8 GB card): the CuPy operator kept
+    # the block's COO triplets (int64 rows and columns plus the values) next
+    # to the sparse adapter's CSR copy, 36 bytes per nonzero where the CSR
+    # alone is 12, and building that CSR from the triplets peaked at ~3.5x
+    # the block. The CSR is now the only device copy: its values are the
+    # operator's COO values (one buffer), built straight from the host CSR.
+    cupy = _cupy_namespace(namespace)
+    xp = namespace
+    a = _banded(6000, 400, 30, 41)
+    cfg = trots.TiledGramConfig(
+        block_rows=256, flop_ratio_threshold=0.0 if gated else 1.0
+    )
+    rng = np.random.default_rng(42)
+    x = xp.asarray(rng.standard_normal(a.shape[1]))
+    pool = cupy.get_default_memory_pool()
+    cupy.cuda.Device().synchronize()
+    before = pool.used_bytes()
+
+    op = trots.TiledGramCSROperator(a, xp, config=cfg)
+    y = op.matvec(x)  # builds the adapter operator
+
+    cupy.cuda.Device().synchronize()
+    held = pool.used_bytes() - before
+    assert op.tiled is not gated
+    # The CSR (8-byte values + 4-byte column indices per nonzero) plus
+    # O(rows) index pointers and the product vector.
+    assert held <= 12 * a.nnz + 16 * (a.shape[0] + 1) + 8 * a.shape[0] + 2**16
+    csr = op._adapter_op().cupy_matrix
+    assert csr.data.data.ptr == op.coo_values().data.ptr  # one values buffer
+    np.testing.assert_allclose(_host(y), a @ _host(x), rtol=1e-12, atol=1e-12)
+
+
+def test_device_operator_matches_the_plain_operator_bitwise(namespace):
+    # The single-copy CSR is the same canonical CSR the adapter built from the
+    # triplets before (same indices, values and index dtypes), so the adapter
+    # products are bit-identical to the plain CSROperator's, and the COO
+    # triplets it rebuilds on demand are the plain operator's. The transpose
+    # products (rmatvec, rmatmat, the column energies of gram_diagonal) are
+    # the exception: cuSPARSE accumulates them with atomics, so
+    # they differ in the last bits between two calls on the same matrix.
+    _cupy_namespace(namespace)
+    xp = namespace
+    a = _banded(900, 60, 4, 43)
+    cfg = trots.TiledGramConfig(block_rows=64, flop_ratio_threshold=1.0)
+    op = trots.TiledGramCSROperator(a, xp, config=cfg)
+    plain = CSROperator(
+        xp.asarray(np.asarray(a.indptr, dtype=np.int64)),
+        xp.asarray(np.asarray(a.indices, dtype=np.int64)),
+        xp.asarray(a.data),
+        a.shape,
+        symmetric=False,
+    )
+    rng = np.random.default_rng(44)
+    x = xp.asarray(rng.standard_normal(a.shape[1]))
+    y = xp.asarray(rng.standard_normal(a.shape[0]))
+    X = xp.asarray(rng.standard_normal((a.shape[1], 3)))
+    Y = xp.asarray(rng.standard_normal((a.shape[0], 3)))
+    w = xp.asarray(rng.uniform(0.1, 5.0, a.shape[0]))
+    v = xp.asarray(rng.uniform(0.1, 5.0, a.shape[1]))
+    pairs = [
+        (op.matvec(x), plain.matvec(x)),
+        (op.matmat(X), plain.matmat(X)),
+        (op.row_inf_norms(), plain.row_inf_norms()),
+        (op.row_gram_diagonal(v), plain.row_gram_diagonal(v)),
+        (op.coo_values(), plain.coo_values()),
+        *zip(op.to_coo()[:3], plain.to_coo()[:3], strict=True),
+    ]
+    for got, ref in pairs:
+        assert got.dtype == ref.dtype
+        np.testing.assert_array_equal(_host(got), _host(ref))
+    assert op.to_coo()[3] == plain.to_coo()[3]
+    for got, ref in (
+        (op.diagonal(), plain.diagonal()),
+        (op.dense_matrix(), plain.dense_matrix()),
+        *zip(op.gram_coo(w)[:3], plain.gram_coo(w)[:3], strict=True),
+    ):
+        assert got.dtype == ref.dtype
+        np.testing.assert_array_equal(_host(got), _host(ref))
+    for probe in (
+        "shape",
+        "gram_accumulate_dtype_hint",
+        "gram_capable",
+        "gram_coo_capable",
+        "gram_fill_estimate",
+        "coo_pattern_signature",
+        "symmetry_hint",
+    ):
+        got, ref = getattr(op, probe), getattr(plain, probe)
+        assert (got if probe == "shape" else got()) == (
+            ref if probe == "shape" else ref()
+        ), probe
+    for got, ref in (
+        (op.rmatvec(y), plain.rmatvec(y)),
+        (op.rmatmat(Y), plain.rmatmat(Y)),
+        (op.gram_diagonal(w), plain.gram_diagonal(w)),  # (A∘A)ᵀ w
+    ):
+        np.testing.assert_allclose(_host(got), _host(ref), rtol=1e-13, atol=0)
 
 
 def test_device_gate_keeps_the_plain_path(namespace):

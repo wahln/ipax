@@ -987,14 +987,47 @@ def _tile_gram_into(
     acc[np.ix_(tile.cols, tile.cols)] += g
 
 
+#: Row-block size for the host mirror below: bounded temporaries (block²
+#: indices) and O(n/block) NumPy calls instead of either a full n² index
+#: gather (measured 4-6x slower: a 9984² index pair is itself ~1.6 GB) or a
+#: per-row Python loop (the latter cost 0.35 s at n≈1e4 on Head-and-Neck_01
+#: — see docs/benchmarks/trots.md's Head-and-Neck_01 profile). 512, 1024 and
+#: 128-2048 were measured within noise of each other at n=9984 (provisional,
+#: on a machine shared with other work); 512 keeps a block's two float64
+#: panels (block² and block·(n-block)) modest relative to host cache sizes.
+#: Mirrors :data:`_DEVICE_MIRROR_BLOCK`'s role for the device kernel and
+#: ``ipax.backend.sparse.cupy._GRAM_MIRROR_BLOCK`` for the core's own CuPy
+#: Gram, both sized for device memory instead.
+_HOST_MIRROR_BLOCK = 512
+
+
 def _mirror_lower(out: Any) -> Any:
-    """Copy the lower triangle onto the upper one (bitwise-exact symmetry)."""
+    """Copy the lower triangle onto the upper one (bitwise-exact symmetry),
+    in ``_HOST_MIRROR_BLOCK`` panels: each diagonal block mirrors internally
+    via a block-sized index gather, and the panel right of it is a single
+    transposed-slice copy. Pure copies (no arithmetic), so this produces
+    exactly the same array as a per-row copy loop, including ``-0.0`` — see
+    ``test_mirror_lower_matches_row_loop_reference`` in
+    ``tests/unit/test_trots_tiled_gram.py``.
+    """
     import numpy as np
 
     out = np.ascontiguousarray(out)
     n = out.shape[0]
-    for j in range(n):
-        out[j, j + 1 :] = out[j + 1 :, j]
+    block = _HOST_MIRROR_BLOCK
+    tri = None
+    for j0 in range(0, n, block):
+        j1 = min(n, j0 + block)
+        if j1 - j0 == block:
+            if tri is None:
+                tri = np.triu_indices(block, 1)
+            rows, cols = tri
+        else:
+            rows, cols = np.triu_indices(j1 - j0, 1)
+        diag = out[j0:j1, j0:j1]
+        diag[rows, cols] = diag[cols, rows]
+        if j1 < n:
+            out[j0:j1, j1:] = out[j1:, j0:j1].T
     return out
 
 
@@ -1172,14 +1205,25 @@ class TiledGramCSROperator(CSROperator):
 
         csr = sp.csr_matrix(csr)
         csr.sort_indices()
-        super().__init__(
-            xp.asarray(np.asarray(csr.indptr, dtype=np.int64)),
-            xp.asarray(np.asarray(csr.indices, dtype=np.int64)),
-            _from_numpy(xp, csr.data),
-            (int(csr.shape[0]), int(csr.shape[1])),
-            symmetric=False,
-            values_dtype_hint=values_dtype_hint,
+        #: Whether the block is held once, as the CuPy adapter's device CSR
+        #: (see :meth:`_hold_device_csr`); else as the plain COO triplets.
+        self._csr_only = (
+            not _is_host_numpy(xp)
+            and _device_kind(xp) == "cupy"
+            and int(csr.nnz) < 2**31
+            and bool(csr.has_canonical_format)
         )
+        if self._csr_only:
+            self._hold_device_csr(csr, xp, values_dtype_hint)
+        else:
+            super().__init__(
+                xp.asarray(np.asarray(csr.indptr, dtype=np.int64)),
+                xp.asarray(np.asarray(csr.indices, dtype=np.int64)),
+                _from_numpy(xp, csr.data),
+                (int(csr.shape[0]), int(csr.shape[1])),
+                symmetric=False,
+                values_dtype_hint=values_dtype_hint,
+            )
         self._xp_ns = xp
         if plan is None:
             plan = TiledGramPlan.build(
@@ -1231,6 +1275,93 @@ class TiledGramCSROperator(CSROperator):
                 sparse_ratio=self.config.device_sparse_tile_flop_ratio,
             )
 
+    # -- the single device copy (CuPy) -------------------------------------------
+    def _hold_device_csr(
+        self, csr: Any, xp: Namespace, values_dtype_hint: str | None
+    ) -> None:
+        """Hold the block once on a CuPy device: the sparse adapter's CSR.
+
+        The plain :class:`~ipax.backend.operators.CSROperator` stores COO
+        triplets (int64 rows and columns, the values) and its CuPy adapter
+        builds a second, CSR copy from them for the products — 36 device
+        bytes per nonzero where the CSR alone is 12, and the COO→CSR
+        conversion (sort, duplicate sum) peaked at about 3.5× the block.
+        On Head-and-Neck_01 (104 M nonzeros) that was 2.5 GB of triplets
+        beside the 1.3 GB CSR and an 8.8 GB transient, past an 8 GB card.
+
+        ``csr`` is canonical (sorted, duplicate-free), so its arrays already
+        are that adapter CSR: the same indices, values and index dtypes, so
+        every product is the same computation (bit-identical, except the
+        transpose products, which cuSPARSE accumulates with atomics and
+        which vary in the last bits between any two calls). They are
+        uploaded once and wrapped
+        in the adapter's operator directly (``canonical=True``); the values
+        array doubles as :meth:`coo_values`, and :meth:`to_coo` rebuilds the
+        row and column vectors on demand without keeping them. The base
+        class's COO-built delegate is thereby preset, so ``_adapter_op``
+        never converts. (An application-edge shortcut: the core's sparse
+        protocol only has ``from_coo``.)
+        """
+        import cupyx.scipy.sparse as cxs
+        import numpy as np
+
+        from ipax.backend.namespace import array_namespace
+        from ipax.backend.sparse.cupy import SparseOperator
+
+        values = _from_numpy(xp, csr.data)
+        shape = (int(csr.shape[0]), int(csr.shape[1]))
+        matrix = cxs.csr_matrix(
+            (
+                values,
+                xp.asarray(np.asarray(csr.indices, dtype=np.int32)),
+                xp.asarray(np.asarray(csr.indptr, dtype=np.int32)),
+            ),
+            shape=shape,
+        )
+        # Sorted and duplicate-free (checked by the caller): say so, as the
+        # adapter's own conversion does, or cupyx would re-check it.
+        matrix.has_canonical_format = True
+        ns = array_namespace(values)
+        # The _SparseStructured state the base constructor would set, with
+        # the adapter operator preset and no triplets. Coupled to that
+        # private class: its only readers of ``_rows``/``_cols`` are
+        # ``to_coo`` (overridden below) and ``_adapter_op`` (short-circuited
+        # by the preset delegate); the CuPy tests run every public method of
+        # this operator against the plain one.
+        self._rows = None
+        self._cols = None
+        self._values = matrix.data
+        self._shape = shape
+        self._symmetric = False
+        self._pattern_key = None
+        self._values_dtype_hint = values_dtype_hint
+        self._delegate = SparseOperator(matrix, ns, symmetric=False, canonical=True)
+
+    def to_coo(
+        self, like: Array | None = None
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        if not self._csr_only:
+            return super().to_coo(like)
+        from ipax.backend.namespace import array_namespace
+        from ipax.backend.operators import _expand_indptr
+
+        # The plain operator's triplets exactly (int64 rows expanded from the
+        # row pointer, int64 columns, the values), rebuilt on every call and
+        # not kept: the dense routes never ask. The sparse routes do, each
+        # iteration once lowered (the loader's operator carries no pattern
+        # key, so the lowering's row selection re-derives its triplets per
+        # call, as it did before); that costs two nnz-sized int64
+        # temporaries per call, and those routes are impractical at the row
+        # counts where the saving matters.
+        del like
+        ns = array_namespace(self._values)
+        matrix = self._adapter_op().cupy_matrix
+        rows = _expand_indptr(
+            ns, ns.astype(matrix.indptr, ns.int64), int(self._values.shape[0])
+        )
+        cols = ns.astype(matrix.indices, ns.int64)
+        return rows, cols, self._values, self._shape
+
     # -- the Gram ---------------------------------------------------------------
     def gram(
         self,
@@ -1269,6 +1400,10 @@ class TiledGramCSROperator(CSROperator):
         memo = self._memo.get(accumulate_dtype)
         if memo is not None and np.array_equal(w, memo[0]):
             return self._xp_ns.asarray(memo[1])
+        # Superseded: release it before the new product is accumulated beside
+        # it (an n×n array; the caller holds its own reference if it needs it).
+        self._memo.pop(accumulate_dtype, None)
+        memo = None
         out = self._tiled_gram(w, acc_dtype)
         self._memo[accumulate_dtype] = (np.array(w, copy=True), out)
         self.gram_compute_count += 1
@@ -1355,6 +1490,11 @@ class TiledGramCSROperator(CSROperator):
                 assert memo is not None
                 return memo[1]
             host = host[1:]
+        # Superseded: release it before the new product is accumulated beside
+        # it (an n×n device array — 0.76 GB on Head-and-Neck_01, at the
+        # Gram's peak next to its result and tile buffers).
+        self._memo.pop(key, None)
+        memo = None
         out = self._device_tiled_gram(w, acc_name, prepared, host, aux)
         self._memo[key] = (xp.asarray(w, copy=True), out)
         self.gram_compute_count += 1

@@ -85,6 +85,46 @@ def test_cholesky_solve_gap_filler_accepts_matrix_rhs(namespace, tol):
     assert_allclose(namespace, namespace.matmul(a, x), rhs, **tol)
 
 
+@pytest.mark.parametrize("order", ["C", "F"])
+@pytest.mark.parametrize("n_rhs", [None, 3])
+def test_cupy_cholesky_solve_reads_the_factor_in_place(
+    backend_name, namespace, order, n_rhs
+):
+    # Regression (TROTS Head-and-Neck_01, n = 9984): cupyx's
+    # ``solve_triangular`` copied the C-ordered Cholesky factor to Fortran
+    # order on each of the two triangular solves, an n×n transient (0.76 GB
+    # there, at the dense route's memory peak) per right-hand side. The
+    # factor's transpose is a Fortran-ordered view, so the adapter now solves
+    # with it (flipping the triangle and the transpose flag) and never copies.
+    if backend_name != "cupy":
+        pytest.skip("the CuPy adapter's triangular solves")
+    import cupy
+    import numpy as np
+
+    xp = namespace
+    n = 192
+    rng = np.random.default_rng(5)
+    b = rng.standard_normal((n, n))
+    a = b @ b.T + n * np.eye(n)
+    factor = xp.linalg.cholesky(xp.asarray(a))
+    factor = cupy.asfortranarray(factor) if order == "F" else factor
+    shape = (n,) if n_rhs is None else (n, n_rhs)
+    rhs = rng.standard_normal(shape)
+    solve_fn = _require_gap_filler(namespace)
+    pool = cupy.get_default_memory_pool()
+    sizes: list[int] = []
+
+    def allocator(size: int):
+        sizes.append(size)
+        return pool.malloc(size)
+
+    with cupy.cuda.using_allocator(allocator):
+        x = solve_fn(factor, xp.asarray(rhs))
+
+    assert max(sizes, default=0) < n * n * 8  # nothing factor-sized
+    np.testing.assert_allclose(a @ cupy.asnumpy(x), rhs, rtol=1e-10, atol=1e-10)
+
+
 def test_cholesky_solve_gap_filler_availability(backend_name, namespace):
     # numpy (SciPy) and torch are the CI backends and must provide the
     # primitive; array-api-strict deliberately has none (the pure fallback is

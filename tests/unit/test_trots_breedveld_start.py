@@ -503,6 +503,34 @@ def test_lsqr_iteration_limit_is_logged(monkeypatch, caplog):
     assert "iteration limit" in caplog.text
 
 
+def test_truncating_lsqr_is_not_safe_in_general(monkeypatch):
+    # 2026-09-28 profile follow-up: on the measured TROTS corpus, every LSQR
+    # multiplier ends up below the floor of 5 (see docs/benchmarks/trots.md's
+    # Head-and-Neck_01 profile), so the floored dual start does not depend on
+    # the LSQR iterate at all on those cases -- but that is a corpus fact, not
+    # a property of the code. This instance (``_instance``'s docstring:
+    # "exercises both sides of every floor") is the counterexample: an early
+    # exit before LSQR converges changes the floored y0/z0/mu0 outright,
+    # which is why no such shortcut is shipped as a default (a bound on the
+    # *current* LSQR iterate's infinity norm cannot certify that later
+    # iterations will not cross the floor -- LSQR's ‖y_k‖ is monotonically
+    # non-decreasing, so a small early iterate proves nothing about later
+    # ones; only running to convergence, or to the iteration cap, does).
+    inst = _instance()
+    problem = trots.TROTSProblem(inst, np)
+    x0 = problem.initial_point(strategy="breedveld")
+
+    warm_full, mu0_full = problem.breedveld_warm_start(x0, scaling="none")
+
+    monkeypatch.setattr(trots, "_BREEDVELD_LSQR_ITER", 1)  # an early exit
+    warm_early, mu0_early = problem.breedveld_warm_start(x0, scaling="none")
+
+    assert not np.array_equal(
+        np.asarray(warm_full.y_ineq), np.asarray(warm_early.y_ineq)
+    )
+    assert mu0_early != pytest.approx(mu0_full, rel=1e-6)
+
+
 def test_lsqr_port_matches_scipy():
     # trots._lsqr (the device LSQR) transcribes SciPy's Paige–Saunders
     # iteration: on the host it reproduces SciPy's iterate, stop code and

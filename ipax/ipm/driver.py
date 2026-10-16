@@ -2020,6 +2020,12 @@ class IPMDriver:
                 last_line_search_iters = result.n_trials
                 if result.accepted and result.augment:
                     filt.augment(theta0, phi0)
+            # The line search was ``soc``'s only consumer. Its defaults bind this
+            # iteration's ``w`` and ``ineq_jac``; left bound, the closure would
+            # keep both (with any dense memo they hold, n×n each) alive until
+            # the next iteration redefines it — after that iteration's KKT
+            # assembly and factorization, i.e. through its memory peak.
+            del soc
 
             if (
                 restoration

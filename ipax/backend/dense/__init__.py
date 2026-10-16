@@ -137,4 +137,55 @@ def get_dense_cholesky_solve(xp: Namespace) -> Callable[[Array, Array], Array] |
     return None
 
 
-__all__ = ["get_dense_cholesky_solve", "get_dense_symmetric_indefinite_adapter"]
+def get_dense_diagonal_adder(xp: Namespace) -> Callable[[Array, Array], Array] | None:
+    """Return ``(matrix, diagonal) -> matrix + diag(diagonal)`` in O(n), or ``None``.
+
+    Gap-filler for a missing Array-API primitive: the standard has no
+    strided diagonal setter, so a pure-standard caller must build the
+    diagonal update via ``xp.eye(n) * diagonal`` — an extra O(n²) identity
+    allocation and elementwise multiply on top of the O(n²) copy already
+    needed to return a new matrix. Per-backend adapters instead mutate a
+    writable O(n) diagonal view of a fresh copy:
+
+    ===========  ================================================
+    backend      primitive
+    ===========  ================================================
+    numpy        ``numpy.einsum("ii->i", a)`` (writable diagonal view)
+    torch        ``torch.Tensor.diagonal()`` (writable view) + ``add_``
+    ===========  ================================================
+
+    ``None`` for any other backend (CuPy, JAX, array-api-strict) or when the
+    concrete library import fails: the caller falls back to the ``eye``-based
+    formula, losing only the speedup, never correctness (both formulas are
+    bitwise identical for finite inputs, at the same promoted dtype — see
+    each adapter's docstring for the NEP 50 / Torch promotion subtlety this
+    must reproduce). CuPy is left on the fallback here: its
+    ``ndarray.diagonal()`` is documented as a writable view (unlike NumPy's
+    own method), which would make the same O(n) update correct, but this has
+    not been exercised on real CUDA hardware.
+    """
+    from ipax.backend.namespace import _namespace_name
+
+    name = _namespace_name(xp)
+    if name == "numpy":
+        try:
+            from ipax.backend.dense.numpy_scipy import (
+                add_diagonal as _numpy_add_diagonal,
+            )
+        except ImportError:
+            return None
+        return _numpy_add_diagonal
+    if name == "torch":
+        try:
+            from ipax.backend.dense.torch import add_diagonal as _torch_add_diagonal
+        except ImportError:
+            return None
+        return _torch_add_diagonal
+    return None
+
+
+__all__ = [
+    "get_dense_cholesky_solve",
+    "get_dense_diagonal_adder",
+    "get_dense_symmetric_indefinite_adapter",
+]

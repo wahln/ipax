@@ -34,10 +34,63 @@ def cholesky_solve(factor: Any, rhs: Any) -> np.ndarray:
     factor cannot be back-substituted portably. Wraps ``scipy.linalg.cho_solve``
     (LAPACK ``?potrs``), O(n²) per right-hand side. ``check_finite=False``:
     the factor came from a ``cholesky`` that already succeeded on this data.
+
+    ``numpy.linalg.cholesky`` returns ``L`` C-contiguous, but LAPACK's
+    ``potrs`` wants a Fortran-ordered factor; SciPy's f2py wrapper bridges the
+    mismatch with a full ``O(n²)`` copy on *every* back-solve (measured 0.91 s
+    vs 0.053 s at n≈10⁴; see CHANGELOG). ``L``'s transpose view ``Lᵀ`` is
+    Fortran-contiguous over the same data at zero cost, and is exactly the
+    upper factor ``U`` with ``A = Uᵀ U``: passing ``(U, lower=False)`` runs
+    the mathematically identical ``potrs`` with ``uplo='U'`` (solves
+    ``Uᵀ y = b``, ``U x = y``) without the copy. If a caller ever hands in a
+    factor that is already Fortran-ordered (not the case for the
+    ``xp.linalg.cholesky`` caller today, but not guaranteed by the gap-filler
+    contract either), the plain lower-``L`` call is used instead so neither
+    orientation pays a copy.
     """
-    result: np.ndarray = _scipy_cho_solve(
-        (np.asarray(factor), True), np.asarray(rhs), check_finite=False
-    )
+    ell = np.asarray(factor)
+    b = np.asarray(rhs)
+    if ell.flags["F_CONTIGUOUS"] and not ell.flags["C_CONTIGUOUS"]:
+        result: np.ndarray = _scipy_cho_solve((ell, True), b, check_finite=False)
+    else:
+        result = _scipy_cho_solve((ell.T, False), b, check_finite=False)
+    return result
+
+
+def add_diagonal(matrix: Any, diagonal: Any) -> np.ndarray:
+    """Return ``matrix + diag(diagonal)`` in O(n) beyond the unavoidable copy.
+
+    Gap-filler for a missing Array-API primitive: the standard has no
+    strided diagonal setter (no portable way to add to a matrix's diagonal
+    without either mutating in place through non-standard fancy indexing, or
+    building a full ``eye(n) * diagonal`` term — an extra O(n²) allocation
+    and elementwise multiply on top of the O(n²) copy that is unavoidable to
+    return a new matrix). ``numpy.einsum("ii->i", a)`` is NumPy's documented
+    idiom for a writable O(n) view of ``a``'s diagonal (unlike
+    ``a.diagonal()``, which is read-only since NumPy 1.9); ``diagonal`` may
+    be a vector or a scalar (broadcasts, e.g. a ``delta_w * I`` term).
+
+    Bitwise identical (for finite inputs) to ``matrix + xp.eye(n) *
+    diagonal``: every off-diagonal term is ``x + 0 = x`` exactly, and every
+    diagonal term is the same single float addition — *at the same dtype*
+    the old expression would have promoted to. That promotion is not always
+    ``matrix.dtype``: under NEP 50, ``eye(dtype=matrix.dtype) * diagonal``
+    keeps ``matrix.dtype`` when ``diagonal`` is a Python scalar (a "weak"
+    type) but promotes to ``diagonal``'s dtype when it is a wider-precision
+    array — e.g. a float64 vector against a float32 ``matrix``. Casting
+    ``diagonal`` to ``matrix.dtype`` unconditionally silently narrows that
+    case, and double-rounds a float32 scalar delta computed via a float64
+    intermediate. ``np.result_type`` reproduces the old expression's exact
+    NEP 50 promotion decision without paying for the O(n²) multiply.
+
+    Non-finite inputs need not reproduce the old formula's off-diagonal
+    ``0 * inf/nan`` footprint. KKT assembly marks non-finite addends as NaN
+    before calling this helper: an infinite pivot alone can back-substitute
+    to a finite zero and bypass the driver's finite-solution check.
+    """
+    dtype = np.result_type(np.asarray(matrix).dtype, diagonal)
+    result = np.array(matrix, dtype=dtype, copy=True)
+    np.einsum("ii->i", result)[...] += np.asarray(diagonal, dtype=dtype)
     return result
 
 
@@ -162,4 +215,4 @@ class ScipyLDLFactorization:
         return self._inertia
 
 
-__all__ = ["ScipyLDLFactorization", "cholesky_solve"]
+__all__ = ["ScipyLDLFactorization", "add_diagonal", "cholesky_solve"]

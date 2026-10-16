@@ -141,6 +141,107 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   - Torch-CUDA is untested; Torch is validated on CPU tensors.
 
 ### Changed
+- **Dense KKT route: two O(n²)-per-iteration costs removed from the hot path**
+  (`ipax/backend/dense/numpy_scipy.py`, `ipax/backend/dense/torch.py`,
+  `ipax/backend/dense/__init__.py`, `ipax/ipm/kkt.py`), found profiling TROTS
+  `Head-and-Neck_01` (n=9984) on NumPy:
+  - **Cholesky back-solve layout.** `get_dense_cholesky_solve`'s NumPy/SciPy
+    adapter passed the C-ordered lower factor from `np.linalg.cholesky`
+    straight into `scipy.linalg.cho_solve`; SciPy's f2py wrapper bridges the
+    C→Fortran mismatch with a full O(n²) copy on *every* back-solve. The
+    factor's transpose view `Lᵀ` is Fortran-contiguous over the same memory
+    at zero cost and is exactly the upper factor `U` (`A = Uᵀ U`), so
+    `(U, lower=False)` runs the same LAPACK `potrs` without the copy.
+    Verified bitwise identical on the tested NumPy/OpenBLAS build across
+    n ∈ {10, 100, 500, 2000, 5000}, float32/float64, 1- and multi-column
+    right-hand sides, and well-/ill-conditioned SPD matrices (40/40
+    configurations, see `tests/unit/test_dense_numpy_scipy_cholesky.py`);
+    LAPACK's `uplo='U'` and `'L'` `potrs` paths are not guaranteed bit-for-bit
+    identical in general (different trsm kernels internally), so a different
+    BLAS build is only guaranteed numerically equivalent, not bitwise.
+    Provisional NumPy timings (interleaved medians of 7 samples, shared CPU): a single
+    back-solve at n=2000 23 ms → 3.0 ms, n=5000 334 ms → 31 ms, n=10000
+    1010 ms → 79 ms. Torch's `cholesky_solve` was already unaffected
+    (`torch.linalg.cholesky` returns its factor Fortran-ordered, so the
+    existing call already avoided the copy — confirmed on CPU, measured
+    faster than either C- or F-ordered SciPy path at the same sizes). CuPy's
+    `cholesky_solve` (`cupyx.scipy.linalg.solve_triangular` ×2) was found by
+    reading to have the same C→F copy on both triangular solves (CuPy's own
+    `cholesky` also returns a C-ordered factor); that copy is removed by the
+    `Head-and-Neck_01` GPU-memory entry below, verified on CUDA hardware.
+  - **`_add_dense_diagonal`.** Built `diag(diagonal)` via `xp.eye(n) *
+    diagonal` — an extra O(n²) identity allocation and elementwise multiply
+    on top of the O(n²) copy already unavoidable to return a new matrix
+    (about 0.5 s/iteration at n≈10⁴ in the profile). New
+    `get_dense_diagonal_adder` backend gap-filler (NumPy, Torch) copies the
+    matrix once and updates only the diagonal in O(n) through a writable
+    view (`numpy.einsum("ii->i", a)`; `torch.Tensor.diagonal()` +
+    `add_()`), also applied to the adjacent `delta_w * I` regularization term
+    in the same function. Bitwise identical to the `eye`-based formula for
+    finite inputs, at the promoted dtype: NEP 50 / Torch's own type-promotion
+    rules keep `matrix.dtype` for a Python-scalar `diagonal` (a "weak" type)
+    but promote to `diagonal`'s dtype for a same-valued array (a "strong"
+    type, e.g. a float64 vector against a float32 `matrix`) —
+    `numpy.result_type`/`torch.result_type` reproduce that exact promotion
+    decision. No adapter for CuPy/JAX/array-api-strict — the `eye`-based
+    fallback is unchanged there,
+    so only correctness, not speed, is guaranteed. Provisional NumPy timings
+    (interleaved medians of 7 samples): n=2000 32 ms → 7.2 ms, n=5000
+    179 ms → 47 ms, n=10000 682 ms → 173 ms (the remaining cost is the
+    unavoidable O(n²) copy). Bitwise identical ⇒ no S2MPJ round-off change;
+    the corpus sweep is not required for this change.
+- **TROTS `Head-and-Neck_01` fits the 8 GB GPU** (CuPy, runner default:
+  exact Hessian, Mehrotra, Breedveld start). Duplicate device copies were
+  removed without changing the arithmetic: peak pool use 11.2 → 6.5 GB, pool
+  size 13.6 → 7.3 GB, and 7 iterations run under a 7.5 GB pool limit;
+  per iteration 18.6–39.5 s → 11.2 s, initialization 54 → 19.5 s (RTX 4070
+  Laptop under CPU load, provisional). The trajectory agrees to 1.2·10⁻¹³
+  relative, within CuPy's run-to-run spread. `Protons_01` and `Liver_01`
+  keep their iteration counts (93, 57) and statuses; their final objectives
+  move by 2.8·10⁻⁹ and 2·10⁻¹⁶ relative, where two runs of the old code
+  already differ by 2.3·10⁻⁹ on `Protons_01`. In detail:
+  - *Loader* (`benchmarks/corpus/trots.py`): on CuPy the tiled
+    linear-block operator (`TiledGramCSROperator`) holds the block once, as
+    the sparse adapter's device CSR (12 B/nnz), instead of COO triplets
+    beside that CSR (36 B/nnz). The canonical host CSR is uploaded as
+    that CSR, so the device COO→CSR conversion is gone; it peaked at 8.8 GB
+    on this case and was where a 7.6 GB limit failed. `to_coo()` rebuilds
+    the triplets on demand. Products are bit-identical except the
+    atomics-accumulated transpose products. The tiled Gram's
+    last-weights memo is now released before the next Gram is accumulated
+    beside it (NumPy and CuPy).
+  - *Dense assembly* (`ipax/ipm/kkt.py`): the condensed matrix adds the
+    Gram term into the assembly's own fresh block in place
+    (`dense += gram`), which saves an `n×n` temporary at the route's memory
+    peak. Bit-identical on every backend; immutable-array namespaces rebind
+    as before.
+  - *CuPy dense adapter* (`ipax/backend/dense/cupy.py`, `cholesky_solve`):
+    the back-substitution solves with the C-ordered factor's transpose view,
+    which is Fortran-ordered, so `cupyx`'s `solve_triangular` no longer
+    copies the factor on each of its two calls (an `n×n` copy each, 0.76 GB
+    here). Same triangular systems, different cuBLAS kernel: bit-identical
+    for matrix right-hand sides, last-bit differences for vectors
+    (≤ 5·10⁻¹⁵ relative at `n = 9984`). CuPy only.
+
+  `docs/benchmarks/trots.md` (Head-and-Neck profile) has the per-component
+  attribution before and after.
+- **TROTS loader, host tiled Gram: blocked lower-to-upper mirror**
+  (`benchmarks/corpus/trots.py`, `_mirror_lower`, host NumPy only; the
+  already-blocked CuPy/Torch device mirror in `_DeviceGramContext` and the
+  core's `ipax.backend.sparse.cupy._mirror_lower_to_upper` were unaffected).
+  The per-row Python copy loop cost 0.35 s per call at `n ≈ 10⁴` on
+  `Head-and-Neck_01` (2026-09-28 profile). Replaced with the same
+  cache-blocked panel scheme as the device mirror (`_HOST_MIRROR_BLOCK = 512`
+  rows: a `triu_indices` gather on each diagonal block, a transposed-slice
+  copy for the panel right of it) — a pure data copy, so the result is
+  bitwise identical to the old loop's, including `-0.0`, for every matrix
+  size relative to the block (below, at, and straddling it); see
+  `test_mirror_lower_matches_row_loop_reference` in
+  `tests/unit/test_trots_tiled_gram.py`. Re-timed on an idle machine at
+  n = 9984 (medians of 5, interleaved): 2.5 → 0.36 s on the Fortran-ordered
+  accumulator of the dense-chunk path; unchanged on the C-ordered buffers of
+  the tiled Gram and the grouped exact Hessian, where both forms take
+  0.3–2.4 s depending on page-fault state.
 - **TROTS loader, device tiled Gram: size-aware sparse-tile choice and
   shared tile buffers** (`benchmarks/corpus/trots.py`, CuPy only; the NumPy
   kernels are unchanged). A plan's sparse tile now keeps cuSPARSE SpGEMM only
@@ -304,6 +405,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     exactly. `--slack-init-scale` applies only with `--init ipax`.
 
 ### Fixed
+- **Overflowing dense KKT diagonals cannot masquerade as finite steps.**
+  Mark non-finite diagonal addends as NaN before the optimized update or
+  portable fallback, so the existing numerical-failure handling rejects
+  them before bound-dual recovery can compute `inf * 0`. The check uses
+  O(n) device operations and adds no host synchronization. Regression
+  coverage exercises finite bound data that overflow on division, with
+  exact and L-BFGS Hessians on multiple backends.
+- **An iteration's Hessian and inequality Jacobian no longer outlive it**
+  (`ipax/ipm/driver.py`). The line search's second-order-correction closure
+  binds them as default arguments, and it stayed bound until the next
+  iteration redefined it. That was after the next KKT assembly and
+  factorization, so every memo the previous operators held stayed alive
+  through the next iteration's memory peak. On TROTS `Head-and-Neck_01` on
+  CuPy those were the loader Hessian's dense memo and the nonlinear rows'
+  Gram memo, two `n×n` arrays of 0.76 GB each. The closure is now released
+  after the line search. No arithmetic changes: 129 small solves
+  fingerprint bit-identically on NumPy, Torch and array-api-strict.
 - **The dense solver's positive-definiteness probe now works on CuPy**
   (`ipax/linalg/dense.py`, `ipax/linalg/solver.py`). CuPy's
   `linalg.cholesky` does not raise on a non-PD matrix (under its default

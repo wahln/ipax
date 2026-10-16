@@ -420,10 +420,43 @@ iterations 1 to the last one. Initialization is listed separately.
   to 10.4–12.2 s (3 fresh-weight samples each, results equal to 3·10⁻²⁰
   relative). The exact iteration drops from 36.8 to 24.4 s (Gram 11.1 s,
   Hessian 7.1 s), with the same trajectory. That is a lever, not the
-  default. The back-solves are the core's `scipy.linalg.cho_solve` copying
+  default — **verified 2026-09-28: the Gram is not bit-identical across
+  `lane_budget_bytes`.** `TiledGramConfig`'s own docstring already says why:
+  the lane *count* fixes the tile→lane assignment and with it the
+  summation order, and float addition is not associative. Checked both on a
+  small synthetic instance parametrized to hit 1/2/5/8 lanes through the
+  same `lane_budget_bytes // (8·nx²)` arithmetic (`max|diff|` up to `9e-13`
+  absolute — see `test_lane_budget_bytes_changes_the_gram_only_by_round_off`
+  in `tests/unit/test_trots_tiled_gram.py`) and on `Head-and-Neck_01`'s real
+  linear block at `1, 2, 4, 8` GiB (fresh weights each call; `max|diff|`
+  `4.4·10⁻¹⁶`–`6.7·10⁻¹⁶` absolute against the 1 GiB Gram — consistent with
+  the "3·10⁻²⁰ relative" already noted above). Because it is not
+  bit-identical, `lane_budget_bytes`' default stays `1 << 30`; a size-aware
+  default was considered (more lanes when the host has the memory) but is
+  not shipped, since it would silently change every existing Gram's last
+  bits on a bigger machine. `TiledGramConfig(lane_budget_bytes=4 << 30)` (or
+  higher, memory permitting) remains an explicit, opt-in lever for this
+  case. The back-solves are the core's `scipy.linalg.cho_solve` copying
   the C-ordered factor to Fortran order on every solve: 0.91 s per solve
   against 0.053 s on an F-ordered factor, measured standalone at
   `n = 9984`.
+- **NumPy: the lower-to-upper mirror was a per-row Python loop.**
+  `_mirror_lower` copied `out[j, j+1:] = out[j+1:, j]` in a loop over all
+  `n = 9984` rows, once per Gram (and once per exact-Hessian dense
+  formation). Replaced with the same cache-blocked panel scheme the device
+  mirror already used (`_HOST_MIRROR_BLOCK = 512`: a `triu_indices` gather
+  per diagonal block, one transposed-slice copy for the panel beside it) —
+  a pure data copy, bitwise identical to the old loop's output for every
+  size relative to the block (see
+  `test_mirror_lower_matches_row_loop_reference`). Provisional, standalone
+  at `n = 9984`, interleaved medians of 3 (shared machine): row loop
+  0.41 s, blocked 0.39–0.41 s — a modest, noisy win on this run, well short
+  of erasing the loop's cost outright; block sizes 128–2048 were within
+  the same noise band, so 512 was kept as a reasonable middle value rather
+  than a measured optimum. The fully vectorized alternatives
+  (`np.tril(out) + np.tril(out, -1).T`, or a single whole-matrix
+  `triu_indices` assignment) were 4–6× *slower* at this size — their
+  temporaries are themselves gigabyte-scale at `n = 9984`.
 - **CuPy, before:** 3 of the plan's 8 sparse tiles (`Σ nnz_row² / b·c² ≈
   4·10⁻³`, up to 2048 × 9684) took 37.7 s by SpGEMM against 3.1 s
   densified. One of them needs a 25 GB SpGEMM buffer. The CuPy pool grew
@@ -435,13 +468,139 @@ iterations 1 to the last one. Initialization is listed separately.
   5·10⁻¹⁰ at iteration 12 of the exact arm. The Gram alone now takes
   7.5 s, of which `syrk` is 7.24 s: 2.2 TFLOP of compacted tiles at about
   300 GFLOP/s, this card's fp64 ceiling. In the solve it takes 8.5–10.5 s.
-  The whole problem still does not fit in 8 GB. The CuPy pool sits at
-  12.4–13.9 GB, and with a 7.6 GB pool limit the start already fails
+  The whole problem still did not fit in 8 GB. The CuPy pool sat at
+  12.4–13.9 GB, and with a 7.6 GB pool limit the start already failed
   converting the lowered block from COO to CSR. So the dense `n×n`
-  factorization and the back-solves run in fallback memory. Standalone at
+  factorization and the back-solves ran in fallback memory. Standalone at
   `n = 9984`, the Cholesky takes 1.2 s and a two-sided solve 0.02 s. With
   6 GB of ballast allocated first, they take 5.2 s and 2.5 s, which is the
-  4.9 s and 4.8 s in the table.
+  4.9 s and 4.8 s in the table. The next item removed that.
+- **CuPy, device memory (2026-09-28, provisional).** The case now fits: 7
+  iterations of the exact arm under a 7.5 GB pool limit, peak pool use
+  6.51 GB (was 11.21 GB) and pool size 7.31 GB (was 13.56 GB), 11.2 s per
+  iteration against 18.6–39.5 s before on the same laptop, and the
+  initialization 19.5 s against 54 s. Both runs were measured under CPU load
+  from other jobs, one process per arm, so the times are provisional. The
+  trajectory is the same: objective and KKT error agree to 1.2·10⁻¹³
+  relative through iteration 7, which is the CuPy run-to-run spread (two
+  runs of the old code differ by 1.6·10⁻¹³: cuSPARSE's transpose products
+  accumulate with atomics). In the solve the Cholesky now takes 1.19 s and a
+  back-solve under 0.01 s, the standalone times. The attribution below walks
+  the problem, driver and solver objects for live CuPy arrays (between
+  iterations 2 and 3; `n² · 8` bytes = 760 MiB at `n = 9984`):
+
+  | component | before | after | what changed |
+  | --- | ---: | ---: | --- |
+  | linear block, COO triplets (int64 rows, int64 columns, values) | 2530 MiB | — | a duplicate of the adapter's CSR: the loader's CuPy operator now holds only that CSR |
+  | linear block, adapter CSR (values, int32 columns) | 1265 MiB | 1265 MiB | the only copy of the block used by the products |
+  | device tiles of the linear block and the Hessian structures | 1256 MiB | 1256 MiB | the tiled Gram's own layout (RCM-permuted, compacted) |
+  | device evaluation matrices (`_dev_mats`) | 186 MiB | 186 MiB | |
+  | linear-block Gram memo | 760 MiB | 760 MiB | now released before the next Gram is accumulated beside it |
+  | nonlinear-rows Gram memo (adapter) | 760 MiB | 760 MiB | |
+  | exact Hessian dense memo | 760 MiB | 760 MiB | |
+  | condensed matrix `N` | 760 MiB | 760 MiB | |
+  | Cholesky factor | 760 MiB | 760 MiB | |
+  | **pool in use between iterations** | **8.87 GB** | **6.40 GB** | |
+
+  The peaks sat higher than that. The old start converted the lowered
+  block's triplets to CSR on the device, which peaked at 8.84 GB; the block
+  is now uploaded as that CSR (1.43 GB peak). The previous iteration's
+  Hessian and nonlinear rows, with their two `n×n` memos, stayed alive
+  through the next iteration's assembly: the driver's second-order-correction
+  closure held them as default arguments. It is now released after the line
+  search. Each back-solve copied the factor to Fortran order (two
+  760 MiB copies per solve); the CuPy adapter now solves with the factor's
+  transpose view, which is Fortran-ordered, and copies nothing. The last
+  addition of the assembly (`N = block + Gram`) now adds into the assembly's
+  own block in place. The largest remaining peak is the linear-block Gram
+  itself (6.51 GB: its result and tile buffers next to the Hessian memo, the
+  assembly block and the nonlinear-rows memo). The smaller cases follow the
+  same trajectories on CuPy: `Protons_01` and `Liver_01` keep their
+  iteration counts (93 and 57) and statuses, and their final objectives move
+  by 2.8·10⁻⁹ and 2·10⁻¹⁶ relative; two runs of the old code already differ
+  by 2.3·10⁻⁹ on `Protons_01`. Its peak pool use drops from 1.63 to
+  0.70 GB. The L-BFGS arm also runs under the 7.5 GB limit (6 iterations,
+  peak 7.06 GB, 8.8–10.1 s per iteration after the first, provisional; its
+  peak phase was not attributed).
+
+**LSQR dual start across the corpus (2026-09-28, provisional).** The
+Head-and-Neck_01 profile's initialization bullet above flags the LSQR dual
+start (`breedveld_warm_start`, eq. (26)) as 26.8–29.6 s of the ~35–39 s
+initialization, hitting its 200-iteration cap. Measured on the runner's
+`init="breedveld"` primal start, `lsqr="host"`, same laptop, one process per
+case, no other load:
+
+| case | n | lowered rows | LSQR itn | istop | LSQR (s) | warm start (s) | y₀ > 5 | z₀ > 5 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Protons_01 | 1,101 | 369,445 | 63 | converged | 4.93 | 9.95 | 0 / 1,101 | 1,080 / 1,101 |
+| Protons_02 | 2,083 | 419,447 | 91 | converged | 9.97 | 12.38 | 0 / 2,083 | 2,062 / 2,083 |
+| Liver_01 | 1,124 | 121,975 | 200 | cap | 16.86 | 18.27 | 0 / 1,124 | 125 / 1,124 |
+| Liver_02 | 967 | 119,826 | 64 | converged | 5.65 | 8.22 | 0 / 967 | 61 / 967 |
+| Prostate_CK_01 | 2,266 | 89,195 | 200 | cap | 33.04 | 40.85 | 0 / 2,266 | 1,918 / 2,266 |
+| Prostate_CK_02 | 2,733 | 87,017 | 200 | cap | 26.90 | 36.88 | 0 / 2,733 | 2,355 / 2,733 |
+| Prostate_VMAT_101 | 1,976 | 81,279 | 200 | cap | 23.13 | 24.51 | 0 / 1,976 | 1,936 / 1,976 |
+| Prostate_VMAT_102 | 2,259 | 99,911 | 180 | converged | 24.48 | 31.41 | 0 / 2,259 | 2,188 / 2,259 |
+| Head-and-Neck_01 | 9,984 | 100,246 | 200 | cap | 33.56 | 46.97 | 0 / 9,984 | 4,790 / 9,984 |
+| Prostate_BT_01 | 55 | 6,338 | 200 | cap | 0.10 | 0.11 | 0 / 55 | 55 / 55 |
+| Prostate_BT_02 | 70 | 5,747 | 200 | cap | 0.10 | 0.11 | 0 / 70 | 70 / 70 |
+
+`y₀ > 5` counts the LSQR multiplier components that clear the floor of 5
+*before* the elementwise `max(y, 5)` (eq. (26)); it is **zero on every one
+of the 11 cases** — every LSQR multiplier the corpus produces, converged or
+capped at 200 iterations, is discarded by the floor, and `y0` is the
+constant vector `5·1`. `z₀ > 5` (eq. (27), `z0 = max(∇f + Jᵀy0, 5)` on the
+bounded entries) is *not* uniformly floored, but since `y0` is the same
+constant `5·1` regardless of the exact (possibly unconverged) LSQR iterate,
+`z0` and `μ0` (eq. (10)) do not depend on LSQR's numeric output either — only
+on whether it stayed under the floor.
+
+That raised an obvious question: given `y0` is always `5·1` here, can LSQR
+be skipped or truncated? An early-exit was evaluated for a
+**bit-identical** result — the same `WarmStart` arrays and `μ0` — against
+three cheaper variants on all 11 cases, `lsqr="host"` fresh weights each run
+(patching `scipy.sparse.linalg.lsqr` to return early):
+
+| case | full (s) | skip (y=0), Δt | iter_lim=5, Δt | iter_lim=20, Δt |
+| --- | ---: | ---: | ---: | ---: |
+| Protons_01 | 7.82 | 2.47 s, bit-identical | 1.88 s, bit-identical | 2.31 s, bit-identical |
+| Protons_02 | 11.66 | 2.99 s, bit-identical | 4.62 s, bit-identical | 5.61 s, bit-identical |
+| Liver_01 | 15.41 | 0.94 s, bit-identical | 2.25 s, bit-identical | 3.54 s, bit-identical |
+| Liver_02 | 4.23 | 0.59 s, bit-identical | 0.82 s, bit-identical | 1.98 s, bit-identical |
+| Prostate_CK_01 | 26.79 | 4.15 s, bit-identical | 6.03 s, bit-identical | 8.10 s, bit-identical |
+| Prostate_CK_02 | 34.22 | 5.67 s, bit-identical | 9.23 s, bit-identical | 14.62 s, bit-identical |
+| Prostate_VMAT_101 | 35.82 | 1.50 s, bit-identical | 3.37 s, bit-identical | 6.18 s, bit-identical |
+| Prostate_VMAT_102 | 42.83 | 9.72 s, bit-identical | 12.51 s, bit-identical | 15.00 s, bit-identical |
+| Head-and-Neck_01 | 44.21 | 8.41 s, bit-identical | 11.79 s, bit-identical | 12.82 s, bit-identical |
+| Prostate_BT_01 | 0.12 | 0.011 s, bit-identical | 0.013 s, bit-identical | 0.021 s, bit-identical |
+| Prostate_BT_02 | 0.12 | 0.012 s, bit-identical | 0.014 s, bit-identical | 0.021 s, bit-identical |
+
+Even **`iter_lim=0` (`y=0`, LSQR not run at all)** reproduces `warm.y_ineq`,
+`warm.z_lower`, `warm.s` and `μ0` bit-for-bit against the full 200-iteration
+run on **every one of the 11 corpus-sweep cases** — because `y0` was always
+going to be floored to `5·1` regardless of the exact LSQR iterate.
+
+**This is not shipped, and is not proposed as a default**, for the reason
+the task set out to check: it is not provable ahead of time. The natural
+candidate certificate — stop once the current iterate's `‖y_k‖∞ < 5` — is
+*not* sufficient in general, because LSQR's iterate norm is monotonically
+non-decreasing (Paige & Saunders 1982): a small early iterate proves nothing
+about later ones, which could still cross the floor before convergence or
+the cap. A synthetic counterexample confirms the general case is real, not
+hypothetical: `tests/unit/test_trots_breedveld_start.py`'s existing
+`_instance()` fixture is built to exercise *both* sides of every floor
+(its docstring says so), and
+`test_truncating_lsqr_is_not_safe_in_general` shows a 1-iteration early
+exit there changes `y0` outright (`μ0` 818.95 → 706.52, more than 20 of 51
+multipliers move) — i.e. the moment a problem's true dual multipliers are
+not uniformly small, an early exit silently returns the wrong start. No
+general, cheap, provably bit-identical shortcut was found; the corpus
+result above is a property of TROTS's scaling (small gradients relative to
+the floor of 5), not of the code. **Proposal for discussion, not shipped:**
+an opt-in `breedveld_warm_start(..., lsqr_iter_lim=...)` (or a `lsqr_tol`)
+that a caller sets *after* confirming, as this measurement did, that their
+corpus's multipliers land under the floor — trading the current unconditional
+200-iteration/1e-6 budget for an explicit, documented one when the caller
+has already done that check.
 
 Device Gram of the linear block alone (fresh weights, one process per arm,
 because two copies of the problem overflow the card):
@@ -559,7 +718,9 @@ per-block carrying the smaller error), the rank-k update leaves the Gram
 exactly symmetric, and the objective matches the native run.
 
 Whether the reduction pays on GPU at Head-and-Neck scale (`n ≈ 10⁴`) is
-**unmeasured**: that case saturates an 8 GB card's memory pool and drives it
+**unmeasured**: when this was measured, that case saturated an 8 GB card's
+memory pool (it fits since the 2026-09-28 device-memory changes of the
+Head-and-Neck profile; this arm was not re-run) and drove it
 into clock throttling (2535 → 765 MHz), and repeat runs disagreed by more than
 an order of magnitude in both the absolute times and the ratio. It needs
 hardware with the headroom to answer it. Note also that `auto` would not engage
@@ -583,6 +744,15 @@ hand-lowered layout, which measured 3057 MiB in the CuPy pool on
 second time). The migrated layout has **not** been re-measured on device, and
 the one-time lowering transiently holds the declared and the lowered triplets
 together. The Head-and-Neck saturation above was measured before both changes.
+That accounting holds for the plain operator. Since 2026-09-28 the loader's
+tiled operator on CuPy (`TiledGramCSROperator`, the default wherever a
+group's plan passes the gate) holds only the adapter's device CSR, 12 B/nnz:
+the host CSR is canonical, so it is uploaded as that CSR directly, and the
+COO triplets are rebuilt on demand for the sparse routes. The lowering wraps
+the loader's operator in a signed row selection and copies nothing. On
+`Head-and-Neck_01` (104 M nonzeros) the block is 1.26 GB on the device, down
+from 3.8 GB, and building it peaks at 1.43 GB instead of 8.84 GB (see the
+Head-and-Neck profile).
 The lowered row order also differs from the old hand-lowering (per precision
 group, finite-lower rows now precede finite-upper rows); the constraint set is
 identical.
@@ -1205,8 +1375,9 @@ fluence-map shape in dimensionality, sparsity, and conditioning.
   Gram from 29 s to 21 s) — a practical-budget scale limit of the generic
   routes. As of 2026-09-28, the laptop measurements in the Head-and-Neck
   profile above give 36.8 s (exact) and 27.2 s (L-BFGS) per iteration on
-  NumPy, and 25.2 s and 14.0 s on an 8 GB GPU that the case overfills,
-  against the paper's 6.2 s. RT-specific dose-matrix kernels stay out of the `ipax` core (see
+  NumPy, and 25.2 s and 14.0 s on an 8 GB GPU that the case overfilled;
+  11.2 s (exact) once it fit the card (provisional), against the paper's
+  6.2 s. RT-specific dose-matrix kernels stay out of the `ipax` core (see
   `AGENTS.md`). The loader is the RT-specific layer: its tiled Gram above
   (including the float32 `ssyrk` tiles for float32-sourced data) is where that
   structure is exploited, while custom mixed-precision tiled BLAS stays out of

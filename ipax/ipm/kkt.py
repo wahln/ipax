@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -318,10 +319,42 @@ def _diagonal_solve(d: Array, rhs: Array, xp: Namespace) -> Array:
     raise ValueError("diagonal solve requires a vector or matrix RHS")
 
 
-def _add_dense_diagonal(matrix: Array, diagonal: Array) -> Array:
-    """Return ``matrix + diag(diagonal)`` without an identity matmat probe."""
-    xp = array_namespace(matrix, diagonal)
-    n = int(diagonal.shape[0])
+def _add_dense_diagonal(matrix: Array, diagonal: Array | float) -> Array:
+    """Return ``matrix + diag(diagonal)`` without an identity matmat probe.
+
+    ``diagonal`` may be a vector (one addend per diagonal entry) or a Python
+    scalar (a ``delta * I`` term, broadcasting to every diagonal entry).
+    Routes through the ``get_dense_diagonal_adder`` backend gap-filler when
+    available: the ``linalg`` extension has no strided diagonal setter, so a
+    pure-standard fallback must build the diagonal via ``xp.eye(n) *
+    diagonal`` — an extra O(n²) identity allocation and elementwise multiply
+    on top of the O(n²) copy already needed to return a new matrix. Both
+    formulas are bitwise identical for finite inputs, including the dtype
+    they promote to (see the adapters' docstrings for the NEP 50 / Torch
+    promotion subtlety this must reproduce). Non-finite addends are marked
+    as NaN: an infinite pivot can otherwise yield a finite zero direction,
+    hiding overflow from the driver's numerical-failure check.
+    """
+    from ipax.backend.dense import get_dense_diagonal_adder
+
+    xp = array_namespace(matrix)
+    # Sigma_x = z / (x - l) can overflow even for finite bound data. Inf
+    # pivots can back-substitute to finite zeros, then bound-dual recovery
+    # computes inf * 0 (Breedveld 2017, eqs. 14-17). Mark invalid addends
+    # before either assembly route: NaN forces a numerical failure or a
+    # non-finite solution, both covered by the LinearSolver contract.
+    # The vector check stays on device, in O(n), with no host synchronization.
+    if isinstance(diagonal, (int, float)):
+        if not math.isfinite(diagonal):
+            diagonal = float("nan")
+    else:
+        diagonal = xp.where(
+            xp.isfinite(diagonal), diagonal, xp.full_like(diagonal, float("nan"))
+        )
+    add_diagonal = get_dense_diagonal_adder(xp)
+    if add_diagonal is not None:
+        return add_diagonal(matrix, diagonal)
+    n = int(matrix.shape[0])
     return matrix + xp.eye(n, dtype=matrix.dtype) * diagonal
 
 
@@ -411,6 +444,11 @@ class _CondensedOperator(LinearOperator):
         Shared by :meth:`dense_matrix` (condensed route: folds the inequality
         Gram term ``∇gᵀ Σ_s ∇g`` into this via a matmul) and
         :meth:`augmented_dense_matrix` (augmented route: borders it instead).
+
+        Always a fresh array, never ``W``'s own dense form (which an operator
+        may return by reference or from a memo): the ``Sigma_x`` term is added
+        out of place. :meth:`_dense_matrix_impl` relies on this to accumulate
+        the Gram term into it in place.
         """
         template = like
         if template is None:
@@ -427,8 +465,7 @@ class _CondensedOperator(LinearOperator):
             dense = dense + self._sigma_x.dense_matrix(dense)
 
         if self._delta_w != 0.0:
-            xp = array_namespace(dense)
-            dense = dense + self._delta_w * xp.eye(self.shape[0], dtype=dense.dtype)
+            dense = _add_dense_diagonal(dense, self._delta_w)
         return dense
 
     def dense_matrix(self, like: Array | None = None) -> Array:
@@ -474,7 +511,13 @@ class _CondensedOperator(LinearOperator):
             # ``gram`` (e.g. a dense/matrix-free Jacobian) or Σ_s is non-diagonal.
             gram = self._sparse_gram(dense, gram_dtype, hinted_only)
             if gram is not None:
-                dense = dense + xp.astype(gram, dense.dtype, copy=False)
+                # In place: ``dense`` is this assembly's own fresh block (see
+                # logical_dense_block), so accumulating into it is invisible
+                # to every caller and saves the n×n sum at the route's memory
+                # peak (block, Gram and sum alive together — 0.76 GB each on
+                # TROTS Head-and-Neck_01). A namespace with immutable arrays
+                # (JAX) rebinds instead, exactly as before.
+                dense += xp.astype(gram, dense.dtype, copy=False)
             else:
                 jac = self._ineq_jac.dense_matrix(dense)
                 reduce_densified = gram_dtype is not None and (
