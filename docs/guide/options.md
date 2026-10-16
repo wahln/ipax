@@ -223,6 +223,25 @@ and a correction kept only when the step length grows to at least 1.07·α.
 - `"breedveld"` — a lighter Markov-filter + ratio-control step controller tuned
   for convex/RT-like problems ([`BreedveldOptions`](../reference.md#ipax.options.BreedveldOptions)).
 
+Both strategies move the primal and the dual variables by separate
+fraction-to-boundary step lengths (the IPOPT convention, Wächter & Biegler
+2006, eq. (15)). `BreedveldOptions(common_step=True)` makes the `"breedveld"`
+controller take one step length for both, `α = min(α_p, α_d)`, as Breedveld's
+own solver does (Breedveld et al. 2017, §2.1): the ratio control and the
+Markov backtracking then shrink that single α (the predictor–corrector's
+step-length probes keep separate lengths). It is opt-in (the filter line search
+ignores it). On TROTS `Head-and-Neck_01` the separate lengths of the first
+step (`α_p = 0.84`, `α_d = 0.27`) send the objective from 4.6 to 7.9·10⁸,
+which the ratio control does not reject; see the
+[TROTS benchmark page](../benchmarks/trots.md) for the diagnosis.
+
+```python
+from ipax import Options
+from ipax.options import BreedveldOptions
+
+opts = Options(globalization="breedveld", breedveld=BreedveldOptions(common_step=True))
+```
+
 ### Restoration linear solver
 
 Feasibility restoration solves a damped Gauss-Newton model of the constraint

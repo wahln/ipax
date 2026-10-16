@@ -71,3 +71,54 @@ def test_overflowing_bound_diagonal_cannot_return_a_finite_step(namespace, hessi
     # Both outcomes are part of the LinearSolver numerical-failure contract;
     # the driver rejects a non-finite solution before recovering bound duals.
     assert not bool(xp.all(xp.isfinite(dx)))
+
+
+@pytest.mark.filterwarnings("ignore:overflow encountered:RuntimeWarning")
+@pytest.mark.filterwarnings("ignore:invalid value encountered:RuntimeWarning")
+@pytest.mark.parametrize("stage", ["seed", "pairs"])
+def test_overflowing_bound_diagonal_cannot_return_a_finite_structured_step(
+    namespace, stage
+):
+    """The structured (no-inequality-rows) L-BFGS solve has the same hole.
+
+    ``dense_structured_solve`` (no dense materialization) divides by the
+    Sigma_x-derived diagonal ``D`` instead of adding it to an explicit
+    matrix, so a bare ``+inf`` entry silently becomes ``finite / inf = 0``
+    there rather than the ``0 * inf = NaN`` poisoning a dense add reproduces
+    (Breedveld 2017, eqs. 14-17). Without a fix this route returns a finite
+    masked step for ``Sigma_x = [inf, 1]`` — verified on db75a27. Two stages
+    exercise both structured branches: ``"seed"`` (no curvature pairs yet,
+    ``W = I``) takes ``_seed_diagonal_solve``; ``"pairs"`` (one curvature
+    pair) takes the Woodbury/compact-form route (``_woodbury_blocks_cached``
+    / ``_woodbury_solve_blocks``), the one named in db75a27's known-gap note.
+    ``solver._matrix`` staying ``None`` confirms neither stage silently fell
+    through to dense materialization (which db75a27 already covers).
+    """
+    xp = namespace
+    z_lower = array(xp, [1e308, 1.0])
+    gap = array(xp, [0.1, 1.0])
+    sigma_l = z_lower / gap
+    assert not bool(xp.all(xp.isfinite(sigma_l)))
+
+    W = LBFGSOperator(2, LBFGSOptions())
+    if stage == "pairs":
+        # s^T y = 2.75 > 0 well clear of Powell damping: a plain accepted pair.
+        W.update(array(xp, [1.0, 0.5]), array(xp, [2.0, 1.5]))
+        assert W.has_curvature_pairs()
+    dtype = sigma_l.dtype
+    op = build_condensed_operator(
+        W,
+        Diagonal(sigma_l),
+        Diagonal(xp.zeros((0,), dtype=dtype)),
+        Dense(xp.zeros((0, 2), dtype=dtype)),
+        RegularizationState(),
+    )
+    solver = DenseSolver()
+    try:
+        solver.factor(op)
+        dx = solver.solve(array(xp, [1.0, 1.0]))
+    except LinearSolveError:
+        assert solver._matrix is None
+        return
+    assert solver._matrix is None
+    assert not bool(xp.all(xp.isfinite(dx)))

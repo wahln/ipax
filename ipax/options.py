@@ -405,6 +405,30 @@ class BreedveldOptions:
     ``tau`` is also the probe's fraction-to-boundary scaling of the
     ``BarrierOptions.probing_sigma="mehrotra"`` μ oracle — under *any*
     ``globalization``, including the default filter line search.
+
+    ``common_step`` (default ``False``; only read with
+    ``globalization="breedveld"``) moves the primal and the dual variables by
+    **one** step length, as Breedveld's own solver does on every problem with
+    a nonlinear term (Breedveld 2017 §2.1: ``α = min(α_z, α_w, α_x, α_y)``;
+    for *purely linear* problems the paper pairs ``α_x = α_w`` and
+    ``α_y = α_z`` separately, which this option does not reproduce):
+    ``α = min(α_p, α_d)`` of the fraction-to-boundary rule at
+    ``tau``, which the ratio control / Markov backtracking then shrinks as a
+    single length for ``(x, s, y_eq)`` and ``(y_ineq, z_L, z_U)`` together.
+    Only the step taken is coupled: the predictor–corrector's step-length
+    probes (the Mehrotra probe and keep-fraction test, the Gondzio
+    acceptance tests, the ``"quality"`` oracle) keep separate primal and
+    dual lengths — coupling them too re-targets μ and was measured worse on
+    the diagnosis case below. By default ipax takes separate
+    primal and dual lengths — the IPOPT filter line-search convention
+    (Wächter & Biegler 2006, eq. (15)), which lets the multipliers advance by
+    their own boundary length; the filter line search ignores this option.
+    Diagnosed on a convex radiotherapy benchmark (TROTS Head-and-Neck_01,
+    2026-09-28): separate first-step lengths ``α_p = 0.84``, ``α_d = 0.27``
+    from a start with every inequality multiplier at a large floor took the
+    objective from 4.6 to 7.9e8 without the ratio control (eq. (36))
+    rejecting the step; see ``docs/benchmarks/trots.md`` for the trajectory
+    and the measured effect of this option.
     """
 
     tau: float = 0.995  # fraction-to-boundary scaling
@@ -412,6 +436,8 @@ class BreedveldOptions:
     max_backtrack: int = 20
     armijo_c: float = 1e-4  # Markov-filter sufficient-decrease constant
     ratio_limit: float = 20.0  # eq. (36): f⁺γ_y⁺ / fγ_y ratio-control bound
+    # §2.1 / Algorithm 1: one step length for primal and dual (see docstring).
+    common_step: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -358,6 +358,48 @@ def _add_dense_diagonal(matrix: Array, diagonal: Array | float) -> Array:
     return matrix + xp.eye(n, dtype=matrix.dtype) * diagonal
 
 
+def _sanitize_diagonal_operator(sigma_x: LinearOperator) -> LinearOperator:
+    """Mark non-finite ``Sigma_x`` entries as NaN once, where it is received.
+
+    ``Sigma_x = z / (x - l)`` [``+ z_u / (u - x)``] can overflow to ``+inf``
+    for finite bound data. An infinite pivot can back-substitute to a finite
+    zero step component, which then makes bound-dual recovery compute
+    ``inf * 0`` (Breedveld 2017, eqs. 14-17). ``_add_dense_diagonal`` already
+    turns an addend like this into a NaN pivot before the dense *add*, because
+    the O(n) backend adapter no longer poisons the row through
+    ``0 * inf = NaN`` the way the portable ``eye``-multiply fallback does.
+    The structured L-BFGS solve (``_CondensedOperator.dense_structured_solve``
+    and its Woodbury-preconditioner twin ``lbfgs_inverse_apply``) has the same
+    hole through the opposite operation: both *divide* a finite right-hand
+    side by a ``Sigma_x``-derived diagonal ``D`` (``_seed_diagonal_solve``,
+    ``_woodbury_diagonal``), and ``finite / inf = 0`` silently drops that
+    component instead of raising or poisoning — the add there keeps the inf
+    itself, only the later division masks it, so the dense-add fix does not
+    cover it. Sanitizing ``Sigma_x`` once here, at construction — the one
+    place ``_CondensedOperator`` receives it — means every consumer (the
+    dense add, the structured/Woodbury division, and the Krylov exact-inverse
+    dispatch, which reads the same ``self._sigma_x`` through
+    ``lbfgs_inverse_apply``) sees the same NaN in place of inf, without
+    duplicating the check at each division/addition site. It also reaches
+    the sparse/normal-equations COO assembly and the Jacobi ``diagonal()`` for
+    free, both of which would otherwise carry the same bare inf into their
+    own consumers.
+
+    Only a :class:`Diagonal` block carries this risk (the driver and every
+    caller in this module always pass one for ``Sigma_x``; an ``Identity``
+    seed is always finite ones, and any other operator can't be rewrapped
+    safely here). Finite entries are returned unchanged, so this is
+    bit-identical for every problem that never overflows. O(n) device
+    comparison + select, no host synchronization — the same primitive
+    ``_add_dense_diagonal`` already uses.
+    """
+    if not isinstance(sigma_x, Diagonal):
+        return sigma_x
+    d = sigma_x.diagonal()
+    xp = array_namespace(d)
+    return Diagonal(xp.where(xp.isfinite(d), d, xp.full_like(d, float("nan"))))
+
+
 def _dense_or_matmat_probe(op: LinearOperator, n_cols: int, like: Array) -> Array:
     """Materialize ``op`` to dense, falling back to a ``matmat`` identity probe.
 
@@ -399,7 +441,7 @@ class _CondensedOperator(LinearOperator):
         if sigma_s.shape != (ineq_jac.shape[0], ineq_jac.shape[0]):
             raise ValueError("sigma_s must match the inequality dimension")
         self._W = W
-        self._sigma_x = sigma_x
+        self._sigma_x = _sanitize_diagonal_operator(sigma_x)
         self._sigma_s = sigma_s
         self._ineq_jac = ineq_jac
         self._delta_w = delta_w

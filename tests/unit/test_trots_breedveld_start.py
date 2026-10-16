@@ -531,6 +531,67 @@ def test_truncating_lsqr_is_not_safe_in_general(monkeypatch):
     assert mu0_early != pytest.approx(mu0_full, rel=1e-6)
 
 
+def test_lsqr_iter_is_an_opt_in_parameter():
+    # 2026-09-28: the iteration cap of the counterexample above is now a
+    # keyword parameter, not just a monkeypatchable module constant.
+    # ``lsqr_iter=5`` reproduces the module constant's early exit (the 7 of 11
+    # corpus-sweep cases hitting the 200 cap all bottom out well below 5) and
+    # must change the floored start on this counterexample instance; passing
+    # the current default explicitly must reproduce the implicit default
+    # bit-for-bit.
+    inst = _instance()
+    problem = trots.TROTSProblem(inst, np)
+    x0 = problem.initial_point(strategy="breedveld")
+
+    warm_default, mu0_default = problem.breedveld_warm_start(x0, scaling="none")
+    warm_explicit, mu0_explicit = problem.breedveld_warm_start(
+        x0, scaling="none", lsqr_iter=trots._BREEDVELD_LSQR_ITER
+    )
+    np.testing.assert_array_equal(warm_default.y_ineq, warm_explicit.y_ineq)
+    assert mu0_default == mu0_explicit
+
+    warm_capped, mu0_capped = problem.breedveld_warm_start(
+        x0, scaling="none", lsqr_iter=5
+    )
+    assert not np.array_equal(
+        np.asarray(warm_default.y_ineq), np.asarray(warm_capped.y_ineq)
+    )
+    assert mu0_capped != pytest.approx(mu0_default, rel=1e-6)
+
+
+def test_lsqr_tol_is_an_opt_in_parameter():
+    inst = _instance()
+    problem = trots.TROTSProblem(inst, np)
+    x0 = problem.initial_point(strategy="breedveld")
+
+    warm_default, mu0_default = problem.breedveld_warm_start(x0, scaling="none")
+    warm_explicit, mu0_explicit = problem.breedveld_warm_start(
+        x0, scaling="none", lsqr_tol=trots._BREEDVELD_LSQR_TOL
+    )
+    np.testing.assert_array_equal(warm_default.y_ineq, warm_explicit.y_ineq)
+    assert mu0_default == mu0_explicit
+
+    # A much looser tolerance stops LSQR earlier, same as a small iter cap.
+    warm_loose, mu0_loose = problem.breedveld_warm_start(
+        x0, scaling="none", lsqr_tol=1e-1
+    )
+    assert not np.array_equal(
+        np.asarray(warm_default.y_ineq), np.asarray(warm_loose.y_ineq)
+    )
+    assert mu0_loose != pytest.approx(mu0_default, rel=1e-6)
+
+
+def test_lsqr_iter_and_tol_are_validated():
+    problem = trots.TROTSProblem(_instance(), np)
+    x0 = problem.initial_point(strategy="breedveld")
+    with pytest.raises(ValueError, match="lsqr_iter must be >= 1"):
+        problem.breedveld_warm_start(x0, lsqr_iter=0)
+    with pytest.raises(ValueError, match="lsqr_tol must be > 0"):
+        problem.breedveld_warm_start(x0, lsqr_tol=0.0)
+    with pytest.raises(ValueError, match="lsqr_tol must be > 0"):
+        problem.breedveld_warm_start(x0, lsqr_tol=-1e-6)
+
+
 def test_lsqr_port_matches_scipy():
     # trots._lsqr (the device LSQR) transcribes SciPy's Paige–Saunders
     # iteration: on the host it reproduces SciPy's iterate, stop code and
@@ -761,6 +822,69 @@ def test_runner_rejects_slack_init_scale_under_breedveld_init(capsys):
     assert "--slack-init-scale" in capsys.readouterr().err
 
 
+def test_runner_lsqr_iter_and_tol_are_breedveld_init_levers():
+    from benchmarks.runners import trots as runner
+
+    parser = runner._build_parser()
+    args = runner._parse_args(
+        parser, ["--init", "breedveld", "--lsqr-iter", "5", "--lsqr-tol", "1e-3"]
+    )
+    assert (args.lsqr_iter, args.lsqr_tol) == (5, 1e-3)
+
+
+@pytest.mark.parametrize("flag", ["--lsqr-iter", "--lsqr-tol"])
+def test_runner_rejects_lsqr_overrides_under_ipax_init(capsys, flag):
+    # These parameters only affect the Breedveld dual start's LSQR solve
+    # (eq. (26)); the ipax start never runs it, so the flag would be ignored.
+    from benchmarks.runners import trots as runner
+
+    value = "5" if flag == "--lsqr-iter" else "1e-3"
+    with pytest.raises(SystemExit) as excinfo:
+        runner.main(["--init", "ipax", flag, value])
+    assert excinfo.value.code == 2
+    assert flag in capsys.readouterr().err
+
+
+def test_runner_wires_lsqr_iter_and_tol_into_the_breedveld_start(monkeypatch):
+    from benchmarks.runners import trots as runner
+
+    inst = _instance()
+    monkeypatch.setattr(runner, "load_trots_file", lambda path: inst)
+    monkeypatch.setattr(runner, "reference_for", lambda case, root: None)
+    captured = {}
+
+    def fake_run_case(bench, **kwargs):
+        captured["bench"] = bench
+        return "row"
+
+    monkeypatch.setattr(runner, "run_case", fake_run_case)
+    args = runner._build_parser().parse_args(
+        ["--init", "breedveld", "--lsqr-iter", "5"]
+    )
+    opts = runner._solve_options(args, "exact/dense")
+
+    runner._solve_case(
+        "root",
+        "Synthetic",
+        "exact/dense",
+        opts,
+        np,
+        init="breedveld",
+        lsqr_iter=args.lsqr_iter,
+        lsqr_tol=args.lsqr_tol,
+    )
+    bench = captured["bench"]
+    problem, placeholder = bench.build(np)
+    x0, warm, _ = bench.prepare_solve(problem, placeholder, opts)
+    capped_warm, capped_mu0 = problem.breedveld_warm_start(
+        x0, scaling=opts.scaling, lsqr_iter=5
+    )
+    default_warm, default_mu0 = problem.breedveld_warm_start(x0, scaling=opts.scaling)
+    np.testing.assert_array_equal(_host(warm.y_ineq), _host(capped_warm.y_ineq))
+    assert not np.array_equal(_host(warm.y_ineq), _host(default_warm.y_ineq))
+    assert capped_mu0 != pytest.approx(default_mu0, rel=1e-6)
+
+
 @pytest.mark.parametrize("init", ["breedveld", "ipax"])
 def test_runner_case_wires_the_initialisation(monkeypatch, init):
     from benchmarks.runners import trots as runner
@@ -850,3 +974,140 @@ def test_runner_times_the_least_squares_start_as_initialisation(monkeypatch, ini
     assert calls == ["prepare"]  # one least-squares solve, inside the timed hook
     assert result.prepare_time >= 0.2
     assert result.solve_time >= result.prepare_time
+
+
+# --------------------------------------------------------------------------- #
+# Units-aware dual floor (Head-and-Neck_01 diagnosis, 2026-09-28) and the
+# runner's --dual-floor / --common-step levers
+# --------------------------------------------------------------------------- #
+def test_dual_floor_default_is_the_papers_floor():
+    inst = _instance()
+    problem = trots.TROTSProblem(inst, np)
+    x0 = problem.initial_point(strategy="breedveld")
+    implicit, mu_implicit = problem.breedveld_warm_start(x0, scaling="none")
+    explicit, mu_explicit = problem.breedveld_warm_start(
+        x0, scaling="none", dual_floor=5.0
+    )
+    for a, b in (
+        (implicit.s, explicit.s),
+        (implicit.y_ineq, explicit.y_ineq),
+        (implicit.z_lower, explicit.z_lower),
+    ):
+        np.testing.assert_array_equal(_host(a), _host(b))
+    assert mu_implicit == mu_explicit
+
+
+def test_dual_floor_floors_the_multipliers_and_keeps_the_slack_floor():
+    # eqs. (26)–(27) with the floor ``dual_floor`` on y0 and z0; the slacks of
+    # eq. (28) keep the paper's floor of 5 (the diagnosis lowered only the
+    # multipliers), and μ0 is eq. (10) of the resulting start.
+    inst = _instance()
+    problem = trots.TROTSProblem(inst, np)
+    x0 = _host(problem.initial_point(strategy="breedveld"))
+    floor = 1e-6
+
+    warm, mu0 = problem.breedveld_warm_start(x0, scaling="none", dual_floor=floor)
+
+    low = _lowered_host(inst, x0)
+    s, y, zl = _host(warm.s), _host(warm.y_ineq), _host(warm.z_lower)
+    y_ls = _lsqr_reference(low, x0)
+    np.testing.assert_allclose(y, np.maximum(y_ls, floor), rtol=1e-10, atol=1e-12)
+    assert np.any(y_ls < 5.0) and np.all(y >= floor)
+    g = np.asarray(low.ineq_constraints(x0))
+    np.testing.assert_allclose(s, np.maximum(-g, 5.0), rtol=1e-12, atol=0)
+    lo = _host(low.bounds()[0])
+    bounded = np.isfinite(lo)
+    raw_z = np.asarray(low.gradient(x0)) + np.asarray(low.ineq_jacobian(x0).rmatvec(y))
+    np.testing.assert_allclose(
+        zl[bounded], np.maximum(raw_z[bounded], floor), rtol=1e-10, atol=1e-12
+    )
+    assert np.all(zl[~bounded] == 0.0)
+    m = s.shape[0]
+    expected_mu = (float(s @ y) + float(zl[bounded] @ (x0 - lo)[bounded])) / (
+        m + int(bounded.sum())
+    )
+    assert mu0 == pytest.approx(expected_mu, rel=1e-12)
+    # A lower floor gives a smaller μ0 than the paper's floor of 5.
+    assert mu0 < problem.breedveld_warm_start(x0, scaling="none")[1]
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_dual_floor_must_be_positive_and_finite(bad):
+    problem = trots.TROTSProblem(_instance(), np)
+    x0 = problem.initial_point(strategy="breedveld")
+    with pytest.raises(ValueError, match="dual_floor"):
+        problem.breedveld_warm_start(x0, dual_floor=bad)
+
+
+def test_runner_common_step_and_dual_floor_default_off():
+    from benchmarks.runners import trots as runner
+
+    args = runner._build_parser().parse_args([])
+    assert args.common_step is False
+    assert args.dual_floor == 5.0
+    opts = runner._solve_options(args, "exact/dense")
+    assert opts.breedveld.common_step is False
+
+
+def test_runner_common_step_sets_the_breedveld_option():
+    from benchmarks.runners import trots as runner
+
+    args = runner._parse_args(runner._build_parser(), ["--common-step"])
+    opts = runner._solve_options(args, "exact/dense")
+    assert opts.breedveld.common_step is True
+    # Only the flag differs from the default options.
+    default = runner._solve_options(
+        runner._build_parser().parse_args([]), "exact/dense"
+    )
+    assert (
+        dataclasses.replace(
+            opts, breedveld=dataclasses.replace(opts.breedveld, common_step=False)
+        )
+        == default
+    )
+
+
+@pytest.mark.parametrize(
+    ("argv", "flag"),
+    [
+        (["--init", "ipax", "--dual-floor", "1e-6"], "--dual-floor"),
+        (["--globalization", "filter", "--common-step"], "--common-step"),
+        (["--dual-floor", "0"], "--dual-floor"),
+    ],
+)
+def test_runner_rejects_ignored_or_invalid_levers(capsys, argv, flag):
+    # A dual floor only exists for the Breedveld start, the common step only
+    # for the Breedveld controller: an argument error, not a silent no-op.
+    from benchmarks.runners import trots as runner
+
+    with pytest.raises(SystemExit) as excinfo:
+        runner._parse_args(runner._build_parser(), argv)
+    assert excinfo.value.code == 2
+    assert flag in capsys.readouterr().err
+
+
+def test_runner_case_wires_the_dual_floor(monkeypatch):
+    from benchmarks.runners import trots as runner
+
+    inst = _instance()
+    monkeypatch.setattr(runner, "load_trots_file", lambda path: inst)
+    monkeypatch.setattr(runner, "reference_for", lambda case, root: None)
+    captured = {}
+    monkeypatch.setattr(
+        runner, "run_case", lambda bench, **kw: captured.setdefault("bench", bench)
+    )
+    args = runner._parse_args(runner._build_parser(), ["--dual-floor", "1e-6"])
+    opts = runner._solve_options(args, "exact/dense")
+    runner._solve_case(
+        "root", "Synthetic", "exact/dense", opts, np, dual_floor=args.dual_floor
+    )
+    bench = captured["bench"]
+    problem, placeholder = bench.build(np)
+    x0, warm, new_opts = bench.prepare_solve(problem, placeholder, opts)
+
+    ref_warm, mu0 = problem.breedveld_warm_start(
+        x0, scaling=opts.scaling, dual_floor=1e-6
+    )
+    np.testing.assert_array_equal(_host(warm.y_ineq), _host(ref_warm.y_ineq))
+    np.testing.assert_array_equal(_host(warm.z_lower), _host(ref_warm.z_lower))
+    assert new_opts.barrier.mu_init == mu0

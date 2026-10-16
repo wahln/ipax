@@ -7,6 +7,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **`TROTSProblem.breedveld_warm_start(lsqr_iter=, lsqr_tol=)`** (`benchmarks/corpus/trots.py`):
+  opt-in overrides for the eq. (26) LSQR dual solve's iteration cap and
+  `atol = btol` (default `None`: the module constants, 200 / `1e-6`,
+  unchanged). On the measured TROTS corpus 7 of 11 cases hit the 200-iteration
+  cap and every LSQR multiplier still ends up floored to 5, so `lsqr_iter=5`
+  reproduces the full run's `WarmStart` and `μ0` bit-for-bit there while
+  cutting the LSQR wall from 46.6 s to 7.2 s on `Head-and-Neck_01` and 25.3 s
+  to 3.7 s on `Prostate_CK_01` (NumPy, provisional, shared machine). This is
+  not provable in general (an early exit can change the floored start on a
+  differently-conditioned instance — see
+  `test_truncating_lsqr_is_not_safe_in_general`), so the default stays 200.
+  The TROTS runner gains matching `--lsqr-iter`/`--lsqr-tol` flags, accepted
+  only with `--init breedveld`.
+- **`BreedveldOptions.common_step`** (`False` default): opt-in single step
+  length for the `globalization="breedveld"` controller, as Breedveld et al.
+  2017 run it (§2.1, Algorithm 1): `α = min(α_p, α_d)` of the
+  fraction-to-boundary rule moves the primal and the dual variables, and the
+  ratio control / Markov backtracking shrinks that one α (the
+  predictor–corrector's step-length probes keep separate lengths). ipax's separate primal and dual lengths
+  (the IPOPT convention) stay the default and the filter line search ignores
+  the option; the default path is bit-identical. Diagnosed on TROTS
+  `Head-and-Neck_01`, where the separate first-step lengths (0.84 / 0.27)
+  send the objective from 4.6 to 7.9·10⁸.
+- **TROTS loader/runner: units-aware dual floor and common-step lever.**
+  `TROTSProblem.breedveld_warm_start(..., dual_floor=5.0)` sets the floor of
+  the §3.1 multipliers `y0`, `z0` (eqs. (26)–(27); the slacks keep the
+  paper's 5); the runner gains `--dual-floor` (default 5, only with
+  `--init breedveld`) and `--common-step` (only with `--globalization
+  breedveld`). On `Head-and-Neck_01` every LSQR multiplier is below 2·10⁻⁵,
+  so the floor of 5 sets `μ0 = 665`; `--dual-floor 1e-6` gives `μ0 = 1.8·10⁻⁴`.
+  Runner defaults unchanged.
 - **`RestorationOptions.dense_factorization`** (`"lu"` default | `"cholesky"`):
   opt-in Cholesky solve for the dense feasibility-restoration route. Each
   Levenberg–Marquardt trial matrix `Jᵀ Σ J + λ I` is symmetric positive
@@ -139,6 +170,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     2.91 s → 0.22 s in float64 and 0.19 s → 0.057 s in float32; 36 L-BFGS/dense
     iterations 2.87 → 0.29 s per iteration on the same trajectory.
   - Torch-CUDA is untested; Torch is validated on CPU tensors.
+- **The S2MPJ sweep runs on CuPy** (`benchmarks/runners/s2mpj.py`,
+  `benchmarks/corpus/s2mpj.py`, new `benchmarks/runners/_cupy_certificates.py`).
+  - Fixed: the S2MPJ host bridge could not run on CuPy before. It relied on an
+    implicit `np.asarray`, which CuPy refuses, and it always built the SciPy
+    sparse operator, which cuDSS cannot factor. The bridge now copies device
+    arrays with `get()` and uploads each Jacobian and Hessian once into the
+    CuPy adapter's `SparseOperator`. `--backends cupy` therefore runs every
+    config, with cuDSS on the sparse ones. NumPy and Torch are unchanged.
+  - `--cupy-certificates` counts, per solve, the cuDSS perturbed-pivot residual
+    certificate and the dense pivot-checked Cholesky. It bins every certified
+    relative residual by decade and writes the counts to
+    `<out>.certs.<pid>.jsonl`. It wraps the adapter from the benchmark side and
+    leaves `ipax/` untouched.
+  - First corpus run of the certificate (docs/benchmarks/s2mpj.md, "CuPy
+    sparse-direct route"). `db75a27`, four configs, CuPy against NumPy at the
+    gate budget: correct changed by +2 (`lbfgs/dense`), −9 (`exact/dense`), −21
+    (`lbfgs/sparse`) and −18 (`exact/sparse`).
+  - On `lbfgs/sparse`, 893 of 1100 problems factor with perturbed pivots.
+    99 784 of 695 428 certified solves are rejected, and the residuals are
+    continuous across the `1e-2` threshold.
+  - Re-running each flip with the certificate relaxed or off gives 5 true
+    positives (off fails) and 3 false positives. The larger CuPy-vs-NumPy gap
+    comes from accepted perturbed-pivot solves with residuals of 1e-5–1e-2:
+    a strict `1e-6` fixes 8 of 17 such stalls.
+  - The threshold stays at `1e-2`. Iterative refinement on perturbed-pivot
+    factorizations is the recommended follow-up.
 
 ### Changed
 - **Dense KKT route: two O(n²)-per-iteration costs removed from the hot path**
@@ -405,6 +462,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     exactly. `--slack-init-scale` applies only with `--init ipax`.
 
 ### Fixed
+- **TROTS LSQR tolerance validation:** reject non-finite `lsqr_tol` values
+  as well as non-positive ones. The runner rejects invalid `--lsqr-tol`
+  arguments before loading data or preparing a warm start.
+- **The structured L-BFGS condensed solve had the same overflow hole as the
+  dense diagonal add, through division instead of addition.** An overflowed
+  `Sigma_x = z / (x - l)` (finite bound data, overflow on division) reaching
+  `dense_structured_solve`'s Woodbury/compact-form route (no inequality
+  rows) divides a finite right-hand side by an infinite diagonal entry
+  (`finite / inf = 0`), silently returning a finite zero step component
+  instead of failing — the division-side counterpart of the previous entry's
+  `0 * inf = NaN` addition-side hole, both feeding the same bound-dual
+  `inf * 0` (Breedveld 2017, eqs. 14-17). Fixed once at the single point the
+  condensed operator receives `Sigma_x` (`ipax/ipm/kkt.py`,
+  `_CondensedOperator.__init__`), marking non-finite entries as NaN there so
+  every consumer sees the same sanitized diagonal instead of duplicating the
+  check per call site: the dense route, the structured/Woodbury solve, the
+  Krylov exact-inverse dispatch that shares the same factors, the sparse/
+  normal-equations COO assembly, and the Jacobi preconditioner diagonal. O(n)
+  device operations, no host synchronization; bit-identical for finite
+  inputs. The plain Krylov route (matrix-free `matvec`) was already safe:
+  multiplying by an infinite entry naturally poisons to NaN or inf rather
+  than masking to zero.
 - **Overflowing dense KKT diagonals cannot masquerade as finite steps.**
   Mark non-finite diagonal addends as NaN before the optimized update or
   portable fallback, so the existing numerical-failure handling rejects

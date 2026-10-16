@@ -520,6 +520,12 @@ class IPMDriver:
         self._mu_schedule: MuSchedule = options.mu_schedule
         if self._mu_schedule in ("probing", "quality") and not self._corrector.active:
             self._corrector = CenteringOnly()
+        # One step length for the primal and dual updates (Breedveld 2017
+        # §2.1, Algorithm 1) — a Breedveld-controller option, inert under the
+        # filter line search (see BreedveldOptions.common_step).
+        self._common_step: bool = (
+            options.globalization == "breedveld" and options.breedveld.common_step
+        )
         self._problem_time_total = 0.0
         self._cache = _PointCache()
         # Whether any finite lower/upper bound exists; refined in ``run`` from
@@ -1099,6 +1105,8 @@ class IPMDriver:
         rstate = _RestorationState()
         breedveld = BreedveldController(opts.breedveld)
         use_breedveld = opts.globalization == "breedveld"
+        # One primal/dual step length (Breedveld 2017 §2.1); see BreedveldOptions.
+        common_step = self._common_step
 
         ones = xp.ones((n,), dtype=dtype)
 
@@ -1676,6 +1684,11 @@ class IPMDriver:
             alpha_d = self._alpha_dual(
                 step, y_ineq, z_lower, z_upper, m, mask_l, mask_u, tau
             )
+            if common_step:
+                # Breedveld 2017 §2.1 / Algorithm 1, eq. (11): one step length
+                # for all of (x, s, y, z), the smallest fraction-to-boundary
+                # length; the controller's backtracking shrinks it as one.
+                alpha_p_max = alpha_d = min(alpha_p_max, alpha_d)
 
             # Trial points by step length, so the overshoot guard, the SOC and
             # the accepted-step update reuse the very array the line search
@@ -1955,6 +1968,10 @@ class IPMDriver:
                     eval_point=eval_point,
                     iteration=it,
                 )
+                if common_step:
+                    # Breedveld 2017 §2.1, eq. (11): the accepted (possibly
+                    # backtracked) α also moves the duals.
+                    alpha_d = alpha_p
             elif (
                 self._mu_schedule != "monotone"
                 and free_mode
@@ -2609,6 +2626,12 @@ class IPMDriver:
                 mask_u=recover_kwargs["mask_u"],
             )
         )
+        # BreedveldOptions.common_step couples only the step the driver takes
+        # (see ``run``); these probes keep separate primal and dual lengths.
+        # Coupling them too was measured on TROTS Head-and-Neck_01 (2026-09-28)
+        # and not adopted: the coupled affine probe re-targets μ and gave an
+        # objective excursion 4.6 → 95 at iteration 2 that the step-only
+        # coupling (the diagnosis' lever) does not have.
         context = CorrectionContext(
             affine=affine_step,
             s=recover_kwargs["s"],

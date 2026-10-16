@@ -411,7 +411,8 @@ iterations 1 to the last one. Initialization is listed separately.
   in the first `linear_ineq()` call), and the LSQR dual start (26.8 s on
   CuPy, 29.6 s through SciPy on NumPy). LSQR stops at its 200-iteration cap
   on this case ("LSQR stopped at its iteration limit"). The runner rows
-  include this time.
+  include this time. See "LSQR dual start across the corpus" below for the
+  opt-in `lsqr_iter`/`lsqr_tol` override this motivated.
 - **NumPy: the tiled Gram dominates.** It is one accumulation lane here,
   because the 1 GiB lane budget holds a single `n²` accumulator at
   `n = 9984`, and in the exact arm the Hessian's tiled products add 11 s.
@@ -523,6 +524,183 @@ iterations 1 to the last one. Initialization is listed separately.
   peak 7.06 GB, 8.8–10.1 s per iteration after the first, provisional; its
   peak phase was not attributed).
 
+**Head-and-Neck_01 trajectory (2026-09-28).** The problem is convex
+(`δ_w = 0` at every iteration), yet the runner defaults blow up on the
+first step. Every LSQR multiplier of eq. (26) is below 2·10⁻⁵ in magnitude,
+so the §3.1 floor of 5 sets all 100,246 inequality multipliers to 5 and
+`μ0 = 665`: a barrier force of about 2.5·10⁸ × ‖∇f‖. ipax then takes
+separate primal and dual step lengths (`α_p = 0.84`, `α_d = 0.27`), and the
+corrected direction drops the PTV mean dose from 56 to 22 Gy, sending the
+LTCP objective from 4.6 to 7.9·10⁸. The ratio control (eq. (36)) does not
+reject the step. Two opt-in levers address this. The first is
+`BreedveldOptions(common_step=True)` (runner `--common-step`): Breedveld's
+own single step length `α = min(α_p, α_d)` (§2.1; the paper keeps the
+common step for every problem with a nonlinear term and pairs the
+primal/dual lengths separately only on purely linear problems such as the
+proton cases — the option applies it everywhere). It couples only the
+step that is taken; the corrector's probes keep separate lengths. The
+second is a units-aware multiplier floor, `breedveld_warm_start(...,
+dual_floor=1e-6)` (runner `--dual-floor 1e-6`), which gives `μ0 = 1.8·10⁻⁴`
+(the slacks keep the floor of 5). Only the two together remove the
+excursion.
+
+The table below is the runner with its defaults plus the listed flags, on
+NumPy with the default 1 GiB lane budget. It records iterations, not time
+(the machine was shared). `f` is the TROTS objective of the iterate.
+
+| Head-and-Neck_01 | f at it. 1 | largest f, it. 1–10 | f at it. 10 | f / KKT at it. 20 |
+| --- | ---: | ---: | ---: | ---: |
+| runner defaults (diagnosis harness) | 7.9·10⁸ | 7.9·10⁸ | — (it. 6: 7.3·10⁶) | — |
+| `--dual-floor 1e-6` | 1.3·10¹⁰ | 1.3·10¹⁰ | — (it. 9: 1.0·10⁷) | — |
+| `--common-step` | 11.6 | 2.7·10³ | 16.1 | — |
+| `--common-step --dual-floor 1e-6` | 4.09 | 4.24 | 3.90 | 3.5575 / 3.8 |
+| reference (paper) | | | | 3.5423 |
+
+Both `--common-step` rows reproduce the diagnosis harness's trajectories
+(the harness monkeypatched these two levers). They match to five digits
+through iteration 10. From iteration 13 the runner row drifts in the
+fourth digit (3.5575 against the harness's 3.5576 at iteration 20). The
+harness used a 4 GiB lane budget, and the Gram's last bits depend on it
+(see above). The run is not converged at iteration 20. The 23 `Sm2` quadratic smoothing constraints overshoot, which
+is a separate open item. A variant that also couples the corrector's probes
+reached a similar point at iteration 20 (f = 3.5786, KKT 1.6), but only
+after an excursion to f = 95 at iteration 2, so it was not adopted.
+
+The same flags on the two cases the runner defaults already converge are
+the first data point for a sweep across all sites. The defaults are
+unchanged: bit-identical final objective and KKT against the pre-change
+code.
+
+| case | runner defaults | `--common-step` | `--dual-floor 1e-6` | both |
+| --- | --- | --- | --- | --- |
+| Protons_01 | acceptable, 93 it, 32.647594 | acceptable, 116 it | optimal, 77 it | acceptable, 86 it |
+| Liver_01 | optimal, 57 it, −1.0370696 | optimal, 46 it | optimal, 81 it | optimal, 118 it |
+
+Every row certifies the same objective to at least 7 significant figures.
+Reproduce with `--cases Head-and-Neck_01 --max-iter 20 --common-step
+--dual-floor 1e-6`.
+
+### Common step and dual floor across the corpus (2026-09-28)
+
+The two-case spot check above was run to completion by coincidence (its
+iteration counts already match the full run below); this section runs the
+same three arms — `--common-step`, `--dual-floor 1e-6`, both together — to
+their terminal status on all 11 corpus cases, at the runner's own budget
+(`--max-iter 800 --max-time 1800`, Head-and-Neck `--max-time 3600`), to
+decide whether either lever should become a runner default. NumPy, one
+process per case, at most 3 concurrent solves and never two Head-and-Neck
+solves at once (a second, GPU-bound agent shared the machine throughout, so
+every wall-clock figure below is **provisional** — read iteration counts and
+statuses as the evidence, not the seconds). The "defaults" column reuses the
+2026-09-27 corpus-sweep table above unchanged (the NumPy default path is
+fingerprint-identical since then), except the exact-Hessian rows for
+`Prostate_VMAT_101`/`102` and `Head-and-Neck_01`, which that table listed
+under L-BFGS: their exact-arm defaults come from the exact-Hessian rows
+of the same table (`VMAT_101` 60 it, `VMAT_102` 74 it) and the
+Head-and-Neck_01 profile section (does not converge).
+
+| case | paper it | defaults (reused) | `--common-step` | `--dual-floor 1e-6` | both |
+| --- | ---: | --- | --- | --- | --- |
+| Protons_01 | 79 | acceptable, 93 it, 32.647594 (−0.125%) | acceptable, 116 it, 32.654422 (−0.104%) | optimal, 77 it, 32.654422 (−0.104%) | acceptable, 86 it, 32.654422 (−0.104%) |
+| Protons_02 | 65 | optimal, 80 it | optimal, 96 it, 42.921087 (−0.039%) | optimal, 74 it, 42.921087 (−0.039%) | optimal, 90 it, 42.921087 (−0.039%) |
+| Liver_01 | 36 | optimal, 57 it, −1.0370696 | optimal, 46 it, −1.0370702 (≈0%) | optimal, 81 it, −1.0370702 (≈0%) | optimal, 118 it, −1.0370702 (≈0%) |
+| Liver_02 | 43 | optimal, 39 it | optimal, 49 it, −0.1598682 (≈0%) | optimal, 90 it, −0.1598682 (≈0%) | optimal, 123 it, −0.1598682 (≈0%) |
+| Prostate_CK_01 | 46 | optimal, 39 it | optimal, 56 it, 2.8258065 (≈0%) | optimal, 121 it, 2.8258065 (≈0%) | optimal, 94 it, 2.8258065 (≈0%) |
+| Prostate_CK_02 | 39 | optimal, 48 it | optimal, 53 it, 1.3383233 (≈0%) | optimal, 93 it, 1.3383233 (≈0%) | optimal, 64 it, 1.3383233 (≈0%) |
+| Prostate_VMAT_101 (exact) | 57 | optimal, 60 it | optimal, 117 it, 21.878745 (≈0%) | optimal, 129 it, 21.878745 (≈0%) | optimal, 143 it, 21.878745 (≈0%) |
+| Prostate_VMAT_102 (exact) | 44 | optimal, 74 it | optimal, 65 it, 20.238272 (≈0%) | **stalled, 49 it, 51.111085 (+152.5%)** | optimal, 99 it, 20.238272 (≈0%) |
+| Head-and-Neck_01 (exact) | 45 | no convergence | optimal, 46 it, 3.5422668 (+0.00013%) | max_time, 53 it, 3.5422838 (+0.00061%), KKT 2.8e-3 | optimal, 47 it, 3.5422668 (+0.00013%) |
+| Prostate_BT_01 | — | optimal, 111 it, −0.780 | optimal, 112 it, −0.780264 | optimal, 92 it, −0.780264 | optimal, 96 it, −0.780271 |
+| Prostate_BT_02 | — | optimal, 83 it, −0.753 | optimal, 123 it, −0.752723 | optimal, 100 it, −0.752723 | optimal, 123 it, −0.752723 |
+
+Percentages are relative to the dataset's published reference objective
+(`benchmarks.corpus.trots_reference` has no entry for the `Prostate_BT_*`
+cases, so those two report the raw objective as before). Every case matches
+its reference to well under the 1e-3 relative flag except two: `Protons_01`
+sits at its already-documented ≈0.1% "below reference" certification in
+*every* arm including the reused defaults (a known property of this case,
+not something either lever introduces — see the Breedveld-parity recipe
+section above), and `Prostate_VMAT_102` under `--dual-floor 1e-6` alone,
+which is a genuine failure, not a rounding artefact: `stalled` at a
+constraint violation of 52.4 and an objective 152% above the reference.
+
+**Per-lever tally, against the reused defaults column (the 10 non-Head-and-Neck
+cases; Head-and-Neck is called out separately since its default does not
+converge at all):**
+
+- **`--common-step` alone:** reduces iterations on 2/10 (`Liver_01` 57→46,
+  `Prostate_VMAT_102` 74→65), increases them on the other 8 — sharply on the
+  proton cases (`Protons_01` 93→116, `Protons_02` 80→96) and `Prostate_VMAT_101`
+  (60→117, +95%). No status changes on the 10. Objective moves beyond 1e-6
+  relative to the default arm only on `Protons_01` (32.647594→32.654422,
+  +2.1e-4 relative — still on the same "below reference" side, not a
+  regression). On `Head-and-Neck_01` it is the lever that fixes the
+  divergence outright: **optimal at 46 iterations**, within one iteration of
+  the paper's 45.
+- **`--dual-floor 1e-6` alone:** reduces iterations on 3/10 (`Protons_01`
+  93→77, `Protons_02` 80→74, `Prostate_BT_01` 111→92), increases them on 6/10
+  (up to `Prostate_CK_01` 39→121, +210%), and **changes the status on 1/10**:
+  `Prostate_VMAT_102` goes from `optimal` (74 it) to `stalled` (49 it, KKT
+  57.4) — a real regression, not noise, and disqualifying on its own for a
+  default. On `Head-and-Neck_01` it does not fully recover either: `max_time`
+  at 53 iterations, KKT 2.8e-3, objective within 0.0006% of the reference —
+  close, but not a certified point within the budget.
+- **Both together:** reduces iterations on 2/10 (`Protons_01` 93→86,
+  `Prostate_BT_01` 111→96), increases them on the other 8, and recovers
+  `Prostate_VMAT_102`'s stall back to `optimal` (99 it) — the pairing cures
+  `--dual-floor`'s regression there, at roughly `--common-step`'s own
+  iteration cost. On `Head-and-Neck_01` it converges (**optimal, 47
+  iterations**), one more than `--common-step` alone and with an
+  objective that agrees with it to 6 significant figures — pairing
+  `--dual-floor` on top buys nothing further on this case.
+
+**Protons (purely linear).** Breedveld's paper pairs separate primal/dual
+step lengths on the proton sites and uses the common step only where a
+problem has a nonlinear term (§2.1); `--common-step` applies it
+unconditionally, so Protons is exactly the site his own algorithm would
+*not* couple. The measurement matches that expectation: `--common-step`
+costs the most iterations of the three levers on both proton cases (+23,
++16), while `--dual-floor` alone — a units fix unrelated to step coupling —
+is the one lever that *helps* here (93→77, 80→74), consistent with every
+LSQR multiplier being floored regardless of arm (see the LSQR section
+below) and the floor of 5 being the wrong scale for gradients this small.
+
+**Head-and-Neck (does it now converge?).** Yes, both `--common-step` alone
+and `--common-step --dual-floor 1e-6` converge it to `optimal` within the
+3600 s budget — 46 and 47 iterations, KKT 1e-9, objective within 0.0002% of
+the reference either way, against the paper's 45 iterations. This updates
+the trajectory section above: the 2026-09-28 diagnosis needed both levers to
+avoid the barrier excursion within the first 20 iterations it examined, but
+run to completion `--common-step` alone is sufficient — `--dual-floor`
+changes nothing once the common step is applied (46 vs 47 iterations, same
+objective to 6 figures) and does not by itself replace it (`max_time`, KKT
+2.8e-3, not certified).
+
+Re-timed on an idle machine (2026-09-29, the runner with `--common-step`,
+default 1 GiB lane budget, `--max-iter 300 --max-time 3600`), the two
+backends produce the same trajectory:
+
+| backend | status | iterations | KKT | objective vs reference | wall | initialization | per iteration |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NumPy | optimal | 46 | 1.0e-9 | 4.5e-12 | 1786 s | 41 s | 37.9 s |
+| CuPy (RTX 4070 Laptop, 8 GB) | optimal | 46 | 1.0e-9 | 4.5e-12 | 526 s | 13 s | 11.1 s |
+| paper (16-core Xeon) | — | 45 | — | — | 279 s | 7.8 s | 6.2 s |
+
+The GPU run fits the card after the device-memory work above; the NumPy
+per-iteration cost is the single-lane Gram (a 2–4 GiB `lane_budget_bytes`
+brings it to ~24 s, see the profile section).
+
+**Recommendation: keep both opt-in.** Neither lever becomes a runner
+default. `--common-step` costs iterations on 8 of the other 10 cases (up to
++95%) for a fix only `Head-and-Neck_01` needs; `--dual-floor` alone
+regresses `Prostate_VMAT_102` from `optimal` to `stalled` at a 152%-wrong
+objective, which rules it out as a default on correctness grounds alone. The
+runner's existing recipe already reaches `optimal`/`acceptable` on 10 of 11
+cases; `Head-and-Neck_01` is the one exception, and `--common-step` (alone,
+without `--dual-floor`) is now the documented per-case override for it —
+matching the page's existing pattern of proton- and site-specific lever
+combinations rather than corpus-wide defaults.
+
 **LSQR dual start across the corpus (2026-09-28, provisional).** The
 Head-and-Neck_01 profile's initialization bullet above flags the LSQR dual
 start (`breedveld_warm_start`, eq. (26)) as 26.8–29.6 s of the ~35–39 s
@@ -595,12 +773,22 @@ multipliers move) — i.e. the moment a problem's true dual multipliers are
 not uniformly small, an early exit silently returns the wrong start. No
 general, cheap, provably bit-identical shortcut was found; the corpus
 result above is a property of TROTS's scaling (small gradients relative to
-the floor of 5), not of the code. **Proposal for discussion, not shipped:**
-an opt-in `breedveld_warm_start(..., lsqr_iter_lim=...)` (or a `lsqr_tol`)
-that a caller sets *after* confirming, as this measurement did, that their
-corpus's multipliers land under the floor — trading the current unconditional
-200-iteration/1e-6 budget for an explicit, documented one when the caller
-has already done that check.
+the floor of 5), not of the code. **Shipped as opt-in, not a new default:**
+`breedveld_warm_start(..., lsqr_iter=, lsqr_tol=)` (and the runner's
+matching `--lsqr-iter`/`--lsqr-tol`, `--init breedveld` only) let a caller
+set an explicit, lower LSQR budget *after* confirming, as this measurement
+did, that their corpus's multipliers land under the floor — the module
+constants (200 iterations, `atol = btol = 1e-6`) stay the default because
+the bit-identity above is a corpus fact, not something the code can
+guarantee. Re-measured through the new parameter on two cases (NumPy,
+`scaling="none"`, provisional, shared machine — full
+`breedveld_warm_start` wall, not LSQR alone, so it also includes the
+lowered-Jacobian setup):
+
+| case | default (200 it) | `lsqr_iter=5` | `WarmStart`/`μ0` |
+| --- | ---: | ---: | --- |
+| Head-and-Neck_01 | 46.6 s | 7.2 s | bit-identical |
+| Prostate_CK_01 | 25.3 s | 3.7 s | bit-identical |
 
 Device Gram of the linear block alone (fresh weights, one process per arm,
 because two copies of the problem overflow the card):

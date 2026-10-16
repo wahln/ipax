@@ -35,6 +35,15 @@ inflate under CPU oversubscription, so pin BLAS threads (e.g.
 native crash in a worker breaks the whole pool — each worker records what it is
 running in a pid-suffixed ``.inflight`` marker, so at most N candidates are named
 and ``--resume --exclude <name>`` steps past the culprit.
+
+``--backends cupy`` runs the solver's linear algebra on the GPU (the model is
+still evaluated on the host through the bridge, so it measures correctness, not
+GPU speed): the sparse configs factor with cuDSS through the CuPy adapter.
+``--cupy-certificates`` additionally records, per CuPy case, how often the
+adapter's silent-failure certificates fired (cuDSS ``NPIVOTS > 0`` residual
+certificate, dense pivot-checked Cholesky) into pid-suffixed
+``<out>.certs.<pid>.jsonl`` side files — see
+:mod:`benchmarks.runners._cupy_certificates`.
 """
 
 from __future__ import annotations
@@ -43,6 +52,7 @@ import argparse
 import dataclasses
 import json
 import os
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -312,6 +322,7 @@ def _run_problem_cases(
     global_max_vars: int,
     max_build_seconds: float,
     inflight_prefix: str | None = None,
+    certificate_prefix: str | None = None,
 ) -> tuple[list[CaseResult], str | None]:
     """Run one problem across the config matrix; ``(rows, skip_reason)``.
 
@@ -342,6 +353,7 @@ def _run_problem_cases(
             configs,
             global_max_vars,
             max_build_seconds,
+            certificate_prefix,
         )
     finally:
         if marker is not None:
@@ -357,6 +369,7 @@ def _run_problem_cases_inner(
     configs: list[ConfigSpec],
     global_max_vars: int,
     max_build_seconds: float,
+    certificate_prefix: str | None = None,
 ) -> tuple[list[CaseResult], str | None]:
     """The sweep proper; see :func:`_run_problem_cases`."""
     xp = import_namespace(backend)
@@ -409,15 +422,37 @@ def _run_problem_cases_inner(
         cap = _effective_cap(route_cap, global_max_vars)
         if cap and n_vars > cap:
             continue
-        rows.append(
-            run_case(
-                cases_by_mode[_problem_mode(options)],
-                config=label,
-                options=options,
-                xp=xp,
-                backend=backend,
+        case = cases_by_mode[_problem_mode(options)]
+        if certificate_prefix is None or backend != "cupy":
+            rows.append(
+                run_case(case, config=label, options=options, xp=xp, backend=backend)
             )
-        )
+            continue
+        # Count CuPy's silent-failure certificates for this one solve; one
+        # pid-suffixed side file per worker, so concurrent workers never
+        # interleave writes.
+        from benchmarks.runners._cupy_certificates import CertificateCounter
+
+        started = time.time()
+        with CertificateCounter() as counter:
+            row = run_case(case, config=label, options=options, xp=xp, backend=backend)
+        rows.append(row)
+        record = {
+            "backend": backend,
+            "problem": row.problem,
+            "config": label,
+            "status": row.status,
+            # Wall-clock span (epoch seconds): lets a GPU reset (a Windows TDR
+            # kills every CUDA context on the device) be matched to the
+            # cases it overlapped, which must then be re-run.
+            "t_start": started,
+            "t_end": time.time(),
+            **counter.summary(),
+        }
+        with open(
+            f"{certificate_prefix}.{os.getpid()}.jsonl", "a", encoding="utf-8"
+        ) as fh:
+            fh.write(json.dumps(record) + "\n")
     return rows, None if rows else "too_large"
 
 
@@ -441,7 +476,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--backends",
         default="numpy",
-        help="comma-separated host backends to bridge (numpy,torch)",
+        help="comma-separated backends to bridge (numpy,torch; cupy runs the "
+        "solver on the GPU with host-evaluated models, cuDSS on the sparse configs)",
     )
     parser.add_argument(
         "--names",
@@ -641,6 +677,13 @@ def main(argv: list[str] | None = None) -> int:
         "skipping them",
     )
     parser.add_argument(
+        "--cupy-certificates",
+        action="store_true",
+        help="on the cupy backend, record per case how often the cuDSS "
+        "perturbed-pivot residual certificate and the dense pivot-checked "
+        "Cholesky fired, into <out>.certs.<pid>.jsonl side files",
+    )
+    parser.add_argument(
         "--jobs",
         type=int,
         default=1,
@@ -712,6 +755,9 @@ def main(argv: list[str] | None = None) -> int:
     json_path = out.with_suffix(".json")
     md_path = out.with_suffix(".md")
     inflight_path = out.with_suffix(".inflight")
+    certificate_prefix = (
+        str(out.with_suffix(".certs")) if args.cupy_certificates else None
+    )
 
     results: list[CaseResult] = []
     if args.resume and json_path.exists():
@@ -757,6 +803,7 @@ def main(argv: list[str] | None = None) -> int:
             args.max_vars,
             args.max_build_seconds,
             str(inflight_path),
+            certificate_prefix,
         )
 
     def _record(

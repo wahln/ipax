@@ -29,7 +29,11 @@ Two jobs, both gated on a local TROTS dataset (``IPAX_TROTS_DIR`` or ``--dir``):
    the paper's §3.1 initialisation (``--init breedveld``): the least-squares
    fluence rescaled towards its mean and floored at 5 (eqs. (23)–(24)), LSQR
    multipliers with floored bound multipliers and slacks (eqs. (26)–(28)), and
-   ``μ0`` their average complementarity (eq. (10)). The initialisation's time
+   ``μ0`` their average complementarity (eq. (10)); ``--lsqr-iter``/
+   ``--lsqr-tol`` override the eq. (26) LSQR's iteration cap/tolerance
+   (``--init breedveld`` only), opt-in because a lower cap is only known to
+   reproduce the default bit-for-bit on the measured corpus, not in general
+   (docs/benchmarks/trots.md's "LSQR dual start"). The initialisation's time
    — the starting point included, under either ``--init`` — counts toward the
    reported solve time. μ comes from the Mehrotra probing oracle
    (``--mu-schedule probing``, the closest transcription of Breedveld's
@@ -69,12 +73,14 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import ipax
 from benchmarks.corpus.trots import (
+    _BREEDVELD_START_FLOOR,
     TROTSExactProblem,
     TROTSProblem,
     list_trots_cases,
@@ -85,7 +91,7 @@ from benchmarks.corpus.trots import (
 )
 from benchmarks.corpus.trots_reference import breedveld2017_reference
 from benchmarks.harness import capture_environment, run_case
-from ipax.options import BarrierOptions, OptimalityConditionOptions
+from ipax.options import BarrierOptions, BreedveldOptions, OptimalityConditionOptions
 from ipax.testing.backends import import_namespace
 
 if TYPE_CHECKING:
@@ -172,14 +178,22 @@ def _solve_case(
     plain_gram: bool = False,
     per_term_hessian: bool = False,
     init: str = "breedveld",
+    lsqr_iter: int | None = None,
+    lsqr_tol: float | None = None,
+    dual_floor: float = _BREEDVELD_START_FLOOR,
 ):
     """Score one solve via the shared harness (wrapping the case as a corpus problem).
+
+    ``dual_floor`` is the Breedveld start's multiplier floor
+    (:meth:`TROTSProblem.breedveld_warm_start`; default the paper's 5).
 
     ``plain_gram`` builds the problem with ``tiled_gram=False`` (the core's
     plain Gram for the linear block, dense row chunks for the exact Hessian);
     ``per_term_hessian`` keeps the exact Hessian's original per-term SpGEMM
     path (``grouped_hessian=False``). Both are A/B levers; unset, the loader
-    defaults apply.
+    defaults apply. ``lsqr_iter``/``lsqr_tol`` override the Breedveld dual
+    start's LSQR iteration cap / tolerance (``init="breedveld"`` only; see
+    :meth:`TROTSProblem.breedveld_warm_start`).
 
     The starting point is produced by the case's ``prepare_solve`` hook, which
     the harness times as initialisation and counts in the solve time (the
@@ -231,7 +245,13 @@ def _solve_case(
         # (eqs. (26)–(28)) and μ0 (eq. (10)).
         start = problem.initial_point(strategy="breedveld")
         # μ0 in solver space: the solve's scaling multiplies it by s_f.
-        warm, mu0 = problem.breedveld_warm_start(start, scaling=options.scaling)
+        warm, mu0 = problem.breedveld_warm_start(
+            start,
+            scaling=options.scaling,
+            lsqr_iter=lsqr_iter,
+            lsqr_tol=lsqr_tol,
+            dual_floor=dual_floor,
+        )
         barrier = dataclasses.replace(options.barrier, mu_init=mu0)
         return start, warm, dataclasses.replace(options, barrier=barrier)
 
@@ -267,6 +287,7 @@ def _solve_options(args: argparse.Namespace, label: str) -> ipax.Options:
         globalization=args.globalization,
         corrections=args.corrections,
         barrier=BarrierOptions(**barrier_kwargs),
+        breedveld=BreedveldOptions(common_step=args.common_step),
         optimality=OptimalityConditionOptions(
             dual_inf_tol=args.tol,
             constr_viol_tol=args.tol,
@@ -365,6 +386,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "ipax's own default is 1e-2; the old proton stack used 1e-4)",
     )
     parser.add_argument(
+        "--lsqr-iter",
+        type=int,
+        default=None,
+        help="LSQR iteration cap for the Breedveld dual start's eq. (26) solve "
+        "(default 200 via TROTSProblem.breedveld_warm_start); only with "
+        "--init breedveld -- an error with --init ipax, which does not run it",
+    )
+    parser.add_argument(
+        "--lsqr-tol",
+        type=float,
+        default=None,
+        help="LSQR atol = btol for the Breedveld dual start's eq. (26) solve "
+        "(default 1e-6 via TROTSProblem.breedveld_warm_start); only with "
+        "--init breedveld -- an error with --init ipax, which does not run it",
+    )
+    parser.add_argument(
         "--plain-gram",
         action="store_true",
         help="disable the loader's tiled per-structure Gram (tiled_gram=False)",
@@ -373,6 +410,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--per-term-hessian",
         action="store_true",
         help="exact configs: the per-term SpGEMM Hessian (grouped_hessian=False)",
+    )
+    # Head-and-Neck_01 diagnosis levers (2026-09-28, docs/benchmarks/trots.md).
+    parser.add_argument(
+        "--common-step",
+        action="store_true",
+        help="BreedveldOptions(common_step=True): one step length "
+        "min(alpha_primal, alpha_dual) for the primal and dual updates, as "
+        "Breedveld et al. 2017 §2.1 (only with --globalization breedveld)",
+    )
+    parser.add_argument(
+        "--dual-floor",
+        type=float,
+        default=_BREEDVELD_START_FLOOR,
+        help="floor of the Breedveld start's multipliers y0, z0 (eqs. (26)-(27); "
+        "default 5 as in the paper; the slacks keep 5); only with --init "
+        "breedveld",
     )
     return parser
 
@@ -386,6 +439,29 @@ def _parse_args(
         parser.error(
             "--slack-init-scale applies only with --init ipax; the Breedveld "
             "start (--init breedveld) sets the slacks itself (eq. (28))"
+        )
+    if args.lsqr_iter is not None and args.init != "breedveld":
+        parser.error(
+            "--lsqr-iter applies only with --init breedveld; --init ipax does "
+            "not run the Breedveld dual start's eq. (26) LSQR solve"
+        )
+    if args.lsqr_tol is not None and args.init != "breedveld":
+        parser.error(
+            "--lsqr-tol applies only with --init breedveld; --init ipax does "
+            "not run the Breedveld dual start's eq. (26) LSQR solve"
+        )
+    if args.lsqr_tol is not None and not (
+        math.isfinite(args.lsqr_tol) and args.lsqr_tol > 0.0
+    ):
+        parser.error("--lsqr-tol must be positive and finite")
+    if args.dual_floor != _BREEDVELD_START_FLOOR and args.init != "breedveld":
+        parser.error("--dual-floor applies only with --init breedveld")
+    if not (math.isfinite(args.dual_floor) and args.dual_floor > 0.0):
+        parser.error("--dual-floor must be positive and finite")
+    if args.common_step and args.globalization != "breedveld":
+        parser.error(
+            "--common-step applies only with --globalization breedveld (the "
+            "filter line search keeps separate primal and dual step lengths)"
         )
     return args
 
@@ -447,6 +523,9 @@ def main(argv: list[str] | None = None) -> int:
                     plain_gram=args.plain_gram,
                     per_term_hessian=args.per_term_hessian,
                     init=args.init,
+                    lsqr_iter=args.lsqr_iter,
+                    lsqr_tol=args.lsqr_tol,
+                    dual_floor=args.dual_floor,
                 )
                 row = _solve_row(result)
                 solve_rows.append(row)

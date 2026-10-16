@@ -656,6 +656,147 @@ history and the v15 report.
     identically on all three `lbfgs/*` routes and already solved to `~1.4e-16`
     by every `exact/*` route regardless (see `benchmarks/routing_hints.py`).
 
+## CuPy sparse-direct route (2026-09-28)
+
+The first corpus run of the CuPy backend, made to validate two CuPy-only
+changes that had only been checked on HS problems and RT-like runs: the cuDSS
+adapter's **residual certificate** for perturbed-pivot factorizations
+(`cf66a86`: when cuDSS reports `NPIVOTS > 0`, a solve column with
+`‖b − A x‖∞ > 1e-2 ‖b‖∞` is rejected as a numerical failure so the δ_w/δ_c
+ladder regularizes, together with a rejection of KKT matrices with inf/NaN
+entries and the pivot-checked dense Cholesky `checked_cholesky`), and the dense
+`cholesky_solve` through the factor's transpose view (`cfd9d71`).
+
+**Setup.** `feat/trots-round-4` @ `db75a27`; RTX 4070 Laptop (8 GB), CuPy
+14.1.1, cuDSS 0.7.1.6 through nvmath-python 0.9.0. The four configs that reach
+the changed code (`lbfgs/dense`, `exact/dense`, `lbfgs/sparse`,
+`exact/sparse`) over the whole corpus at the gate budget (`--max-iter 10000
+--max-time 300 --include-objective-free`), on CuPy and — as the reference, same
+commit, same flags — on NumPy (Feral LDLᵀ on the sparse configs). The NumPy arm
+reproduces v31 to ±1 per config (780/776/784/798), so it is a sound reference.
+The model is still evaluated on the host through the S2MPJ bridge, which the
+runner now supports on CuPy (`--backends cupy`); `--cupy-certificates` counted,
+per solve, how often each certificate fired and binned every certified relative
+residual by decade. `SPECANNE` is excluded on CuPy: one `exact/dense`
+iteration (9 variables, 5000 equality rows, a 5009×5009 dense saddle) ran for
+over 85 minutes with the card's memory full, and `max_time` is only checked
+between iterations. CuPy ran 2–4 problems at a time on one GPU, and
+wall-clock times are **not** comparable: on rows with identical iteration
+counts the median CuPy/NumPy time ratio is 5.8 (`exact/dense`) to 15.5
+(`exact/sparse`). That is the host-bridged evaluation and kernel-launch cost
+at CUTEst sizes, and it is why the `max_time` column grows.
+
+| config | rows | correct NumPy → CuPy | fixed / broken | `max_time` NumPy → CuPy | rows with `NPIVOTS > 0` | perturbed-pivot solves | rejected by the certificate (rows) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `lbfgs/dense`  | 1097 | 780 → 782 (**+2**)  | 9 / 7   | 5 → 16  | — | — | — |
+| `exact/dense`  | 1097 | 775 → 766 (**−9**)  | 2 / 11  | 16 → 55 | — | — | — |
+| `lbfgs/sparse` | 1100 | 783 → 762 (**−21**) | 6 / 27  | 6 → 33  | 893 (427k of 540k factorizations) | 695 428 | 99 784 (162) |
+| `exact/sparse` | 1100 | 797 → 779 (**−18**) | 10 / 28 | 13 → 44 | 288 (111k of 565k) | 193 061 | 13 203 (72) |
+
+The dense pivot check ran 4.4 M times on `exact/dense`, where 3.76 M of those
+calls (755 problems) found the matrix not positive definite. That is the PD
+probe doing its job: NumPy's Cholesky raises on the same inputs. On
+`lbfgs/dense` it ran 20 k times (the hinted-reuse path) and found 36
+breakdowns. The non-finite-matrix rejection fired on two problems
+(`LUKVLE8`, 9 480 times, which ends in `numerical_error` on NumPy too, and
+`RAT43`, 40 times).
+
+**Where the certified residuals fall.** The residual of a perturbed-pivot solve
+does not split into "consistent, ~1e-8" and "inconsistent, O(1)". The
+distribution is continuous across the threshold:
+
+| certified relative residual | < 1e-8 | [1e-8, 1e-4) | [1e-4, 1e-3) | [1e-3, 1e-2) | [1e-2, 1e-1) | [1e-1, 1) | [1, 1e3) | ≥ 1e3 | non-finite |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `lbfgs/sparse` | 395 140 | 172 948 | 10 853 | 16 703 | *28 904* | *12 506* | *24 027* | *21 335* | *13 012* |
+| `exact/sparse` | 128 402 | 24 777 | 15 132 | 11 547 | *1 139* | *705* | *7 107* | *3 374* | *878* |
+
+(Italic columns are rejected.) About 28 k accepted solves lie within one decade
+below `1e-2` and 30 k rejected ones within one decade above it.
+
+**What the 100 correct-flips are.** Each flip was classed by what differed. A
+*timing* flip is a CuPy `max_time` stop at fewer iterations than NumPy needed,
+so the run was on its way and the wall clock is the difference. On the dense
+configs, a *dense* flip is anything else. On the sparse configs,
+*certificate fired* means at least one rejection in that solve, *pivots
+accepted* means perturbed pivots with no rejection, and *no pivots* means
+neither.
+
+| config | timing | dense route | certificate fired | pivots accepted | no pivots |
+| --- | --- | --- | --- | --- | --- |
+| `lbfgs/dense`  | 0 / 1 | 9 / 6 | — | — | — |
+| `exact/dense`  | 0 / 7 | 2 / 4 | — | — | — |
+| `lbfgs/sparse` | 0 / 6 | — | 3 / 8  | 3 / 12 | 0 / 1 |
+| `exact/sparse` | 0 / 4 | — | 2 / 11 | 5 / 10 | 3 / 3 |
+
+(fixed / broken.) Every *certificate fired* row, plus the two timing rows
+where it fired (`SPINLS`, `VANDERM3`), was then re-run alone on the idle GPU
+three times: as-is, with the threshold at `1.0`, and with the certificate off
+(a no-op). The 17 non-timing *pivots accepted* breaks were re-run as-is and
+with a strict `1e-6`, and three `exact/dense` breaks were re-run with the
+pivot check off. All re-runs used the same budget. One
+confound first: the **CuPy sparse route is not run-to-run deterministic**.
+Identical re-runs moved `ACOPR14` `exact/sparse` from 25 to 38 iterations,
+`YORKNET` from 2055 to 120 and `COSHFUN` from `max_time` to `optimal`. The
+dense route reproduced the sweep exactly. So the evidence below is one or two
+samples per row.
+
+- **The certificate made no difference: 11 rows.** `DEMYMALO`, `GIGOMEZ1`,
+  `HS106`, `MADSSCHJ`, `POLAK1`, `POLAK3`, `POLAK6`, `POWERSUMNE`, `SPIRAL`
+  (both sparse configs) and `ORTHREGE` fail the same way in all three arms, so
+  the failure comes from elsewhere. Most of them accept thousands of solves
+  at residuals of 1e-4–1e-2 (see the pivots-accepted group below).
+- **Run-to-run noise or timing: 7 rows.** `ARGTRIGLS`, `POWELLSQ`, `TRIGON1`,
+  `DJTL` and `VANDERM3` (`lbfgs/sparse`) are correct in every re-run arm.
+  `CURLY20` and `CURLY30` flip between arms with no pattern.
+- **True positives: 5 rows.** With the certificate off, `WOMFLET`, `YORKNET`,
+  `SPINLS`, `COSHFUN` (`exact/sparse`) and `HEART6LS` (`lbfgs/sparse`) stall or
+  hit `max_time`, and with it they converge. Off, those runs accept solves
+  with residuals from 0.2 (`HEART6LS`) up to 2e14 (`SPINLS`).
+- **False positives: 3 rows.** `ACOPR30` and `HS109` (`lbfgs/sparse`) fail as-is
+  but converge with the threshold at `1.0` or off; `ROTDISC` (`exact/sparse`)
+  converges only with the certificate off, in NumPy's 21 iterations.
+- **The `[1e-2, 1)` band cuts both ways.** Accepting it fixed `ACOPR30` and
+  `HS109`, and took `COSHFUN` from 791 iterations to 17. Rejecting it was
+  needed for `YORKNET`: at `1.0` it runs into `max_time`.
+- **Accepted-but-inaccurate solves are the larger effect.** A strict `1e-6`
+  turned **8 of the 17** re-run *pivots accepted* breaks correct: `CATENARY`,
+  `MAKELA1`, `MAKELA2`, `MIFFLIN2`, `ROSENMMX` (`exact/sparse`, e.g. `MAKELA1`
+  stalled at 291 iterations → optimal in 22), `GAUSS1LS`, `KIRBY2LS`,
+  `PALMER2E` (`lbfgs/sparse`). It left 8 unchanged and made `SBRYBND` (wrong
+  either way) worse. On these degenerate problems — the minimax family among
+  them — cuDSS's static pivoting accepts Newton steps with residuals of
+  1e-5–1e-2 at every iteration, and the IPM stalls where Feral's LDLᵀ does not.
+- **Dense route: not the changed code.** `DJTL`, `ELATTAR` and `POWERSUMNE`
+  (`exact/dense`) fail identically with the pivot check off. They are the
+  known knife-edge rows, moved by GPU round-off, and `lbfgs/dense` nets +2.
+
+**Verdict on `_PERTURBED_SOLVE_MAX_RESIDUAL = 1e-2`: keep it for now.** The
+certificate is needed: turning it off loses 5 rows that converge with it. Moving
+the threshold within `[1e-2, 1]` trades 2 rows (`ACOPR30`, `HS109`) against 1
+(`YORKNET`), and on a non-deterministic route with one sample per row that is
+not a basis for a default change. The CuPy-vs-NumPy gap on the sparse configs
+is `−39` over the two, or `−29` without the timing flips. Only 3 of those rows
+trace to the threshold's rejections. The larger part comes from solves the
+certificate *accepts*: perturbed-pivot solves whose residual is too large for
+a good Newton step, yet far below "inconsistent". A single threshold cannot
+separate these from the benign ones, and the distribution above shows why.
+For scale, IPOPT treats a KKT solve as singular when its residual ratio after
+iterative refinement stays above `residual_ratio_singular = 1e-5`. The
+principled next step is iterative refinement on perturbed-pivot
+factorizations, then certifying the refined residual. The refinement can be
+cuDSS's own refinement steps or one correction solve that reuses the residual
+the certificate already forms. That needs a core change and its own corpus A/B
+on both sparse configs, so it is out of scope for this benchmark-only pass.
+
+The reports are `benchmarks/reports/s2mpj_v33_cupy.json` /
+`s2mpj_v33_numpy.json`, with the per-solve certificate counts in
+`s2mpj_v33_cupy_certs_all.jsonl` and the re-runs in
+`s2mpj_v33_cupy_counterfactual.jsonl`. To reproduce the CuPy arm, add
+`--backends cupy --cupy-certificates --config lbfgs/dense,exact/dense,lbfgs/sparse,exact/sparse`
+to the gate command below, and run at most a few problems at a time. A
+Windows GPU reset (TDR) during a three-process run killed every CUDA context
+on the card, and the affected rows had to be discarded and re-run.
+
 ## Reproducing
 
 From a checkout with `IPAX_S2MPJ_DIR` pointing at an

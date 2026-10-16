@@ -3093,6 +3093,9 @@ class TROTSProblem(Problem):
         *,
         scaling: ScalingOptions | ScalingMethod | None = None,
         lsqr: Literal["auto", "host", "device"] = "auto",
+        lsqr_iter: int | None = None,
+        lsqr_tol: float | None = None,
+        dual_floor: float = _BREEDVELD_START_FLOOR,
     ) -> tuple[WarmStart, float]:
         """Breedveld et al. 2017 §3.1 dual start and ``μ0`` at the primal ``x0``.
 
@@ -3124,6 +3127,16 @@ class TROTSProblem(Problem):
         (default) is ``"device"`` on CuPy namespaces and ``"host"`` otherwise
         (NumPy, Torch, JAX, ``array_api_strict``).
 
+        ``lsqr_iter`` and ``lsqr_tol`` override the LSQR iteration cap and
+        ``atol = btol`` of eq. (26) (default ``None``: the module constants
+        ``_BREEDVELD_LSQR_ITER`` = 200, ``_BREEDVELD_LSQR_TOL`` = 1e-6).
+        An explicit ``lsqr_tol`` must be positive and finite. A lower cap
+        is opt-in, not a new default: on the measured TROTS corpus
+        every LSQR multiplier is floored anyway regardless (see
+        ``docs/benchmarks/trots.md``'s "LSQR dual start" note), but that is a
+        corpus fact, not something a smaller cap can be shown to preserve in
+        general (see ``test_truncating_lsqr_is_not_safe_in_general``).
+
         The floor of 5 and eq. (10) are in the problem's original units (the
         paper's μ0 has no centering factor σ). ``scaling`` is the solve's
         ``Options.scaling`` (a :class:`~ipax.options.ScalingOptions` or a
@@ -3137,26 +3150,41 @@ class TROTSProblem(Problem):
         exactly as the solver does (Wächter & Biegler 2006, §3.8; ``s_f = 1``
         for ``method="none"``). The warm-start arrays stay in original units.
 
+        ``dual_floor`` (default: the paper's 5) replaces the floor of the
+        *multipliers* ``y0`` and ``z0`` (eqs. (26)–(27)); the slacks ``w0``
+        keep the floor of 5 (eq. (28)). The paper's floor is not
+        units-aware: on Head-and-Neck_01 (2026-09-28 diagnosis) every LSQR
+        multiplier is ``|y| < 2e-5``, so all 100 246 of them land on 5 and
+        ``μ0 = 665``, a barrier force ~2.5e8 × ‖∇f‖; ``dual_floor=1e-6``
+        (the diagnosis' lever, which likewise left the slacks at 5) gives
+        ``μ0 = 1.8e-4``. Must be positive and finite.
+
         Returns ``(WarmStart(s, y_ineq, z_lower), μ0)`` with the arrays in
         ``x0``'s namespace and on its device. Raises ``ValueError`` when the
         problem has neither inequalities nor finite lower bounds (eq. (10) is
         then undefined), or for ``lsqr="device"`` on a non-CuPy namespace.
         """
+        if not (math.isfinite(dual_floor) and dual_floor > 0.0):
+            raise ValueError(
+                f"dual_floor must be positive and finite, got {dual_floor!r}"
+            )
         import numpy as np
 
         from ipax.backend.namespace import array_namespace, device
         from ipax.result import WarmStart
 
-        lsq = self._breedveld_least_squares(x0, lsqr)
+        lsq = self._breedveld_least_squares(
+            x0, lsqr, lsqr_iter=lsqr_iter, lsqr_tol=lsqr_tol
+        )
         ns, y = lsq.ns, lsq.y
         if lsq.jac is None:
             jt_y = ns.zeros_like(lsq.x)
         else:
-            y = ns.maximum(y, _BREEDVELD_START_FLOOR)
+            y = ns.maximum(y, dual_floor)
             jt_y = lsq.vec(lsq.jac.rmatvec(y))
         # eq. (27): bound multipliers from stationarity, on bounded entries.
         bounded = ns.isfinite(lsq.lower)
-        z = ns.where(bounded, ns.maximum(lsq.grad + jt_y, _BREEDVELD_START_FLOOR), 0.0)
+        z = ns.where(bounded, ns.maximum(lsq.grad + jt_y, dual_floor), 0.0)
         # eq. (28): slacks, g(x0) + w0 = 0 pushed inside by the floor.
         w = ns.maximum(-lsq.g, _BREEDVELD_START_FLOOR)
         # eq. (10): the average complementarity.
@@ -3189,7 +3217,12 @@ class TROTSProblem(Problem):
         return warm, mu0
 
     def _breedveld_least_squares(
-        self, x0: Array, lsqr: Literal["auto", "host", "device"] = "auto"
+        self,
+        x0: Array,
+        lsqr: Literal["auto", "host", "device"] = "auto",
+        *,
+        lsqr_iter: int | None = None,
+        lsqr_tol: float | None = None,
     ) -> _BreedveldLSQ:
         """The pieces of :meth:`breedveld_warm_start` before its floors.
 
@@ -3197,7 +3230,9 @@ class TROTSProblem(Problem):
         lower bounds and the *unfloored* LSQR multipliers of eq. (26), all in
         one namespace: NumPy on the host twin (``lsqr="host"``) or the
         problem's CuPy namespace (``lsqr="device"``; see
-        :meth:`breedveld_warm_start` for ``"auto"``).
+        :meth:`breedveld_warm_start` for ``"auto"``). ``lsqr_iter``/
+        ``lsqr_tol`` override the LSQR iteration cap / ``atol = btol`` of
+        eq. (26) (``None``: the module constants).
         """
         import numpy as np
 
@@ -3208,6 +3243,12 @@ class TROTSProblem(Problem):
             raise ValueError(
                 f"unknown lsqr {lsqr!r}; expected 'auto', 'host' or 'device'"
             )
+        if lsqr_iter is not None and lsqr_iter < 1:
+            raise ValueError(f"lsqr_iter must be >= 1, got {lsqr_iter}")
+        if lsqr_tol is not None and not (math.isfinite(lsqr_tol) and lsqr_tol > 0):
+            raise ValueError(f"lsqr_tol must be > 0 and finite, got {lsqr_tol}")
+        iter_lim = _BREEDVELD_LSQR_ITER if lsqr_iter is None else lsqr_iter
+        tol = _BREEDVELD_LSQR_TOL if lsqr_tol is None else lsqr_tol
         if lsqr == "device" and not self._eval_device:
             raise ValueError(
                 "Breedveld start: lsqr='device' needs a CuPy namespace "
@@ -3251,9 +3292,9 @@ class TROTSProblem(Problem):
                     -grad,
                     m,
                     ns,
-                    atol=_BREEDVELD_LSQR_TOL,
-                    btol=_BREEDVELD_LSQR_TOL,
-                    iter_lim=_BREEDVELD_LSQR_ITER,
+                    atol=tol,
+                    btol=tol,
+                    iter_lim=iter_lim,
                 )
             else:
                 import scipy.sparse.linalg as spla
@@ -3268,16 +3309,16 @@ class TROTSProblem(Problem):
                 y, istop, itn = spla.lsqr(
                     jt,
                     -grad,
-                    atol=_BREEDVELD_LSQR_TOL,
-                    btol=_BREEDVELD_LSQR_TOL,
-                    iter_lim=_BREEDVELD_LSQR_ITER,
+                    atol=tol,
+                    btol=tol,
+                    iter_lim=iter_lim,
                 )[:3]
             if istop == 7:  # SciPy's code for "iteration limit reached"
                 _LOG.warning(
                     "Breedveld start: LSQR stopped at its iteration limit (%d) "
                     "before reaching atol = btol = %g; using its last iterate",
                     itn,
-                    _BREEDVELD_LSQR_TOL,
+                    tol,
                 )
         return _BreedveldLSQ(
             ns=ns,
