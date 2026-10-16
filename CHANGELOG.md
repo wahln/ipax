@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-17
+
 ### Added
 - **`LinearOperator.dense_matrix_with_gram(jac, weights)`**, an optional capability of the Hessian operator: the dense condensed route asks `W` for `W + jacᵀ diag(weights) jac` in one call, so a curvature that is a weighted Gram over rows it shares with the inequality Jacobian can multiply those rows once with the summed weights (Breedveld et al. 2017, eq. (48)). `Σ_x` and `δ_w` are added afterwards, out of place; the mixed-precision request applies to the Gram part only. The default raises `NotImplementedError`, and so does an operator that declines a call; the block is then assembled in two passes exactly as before, so every problem that does not implement it (the whole S2MPJ corpus) is unchanged. The `LinearOperator` contract battery checks implementations against `W + Jᵀ diag(w) J`.
   - The TROTS loader implements it on its exact Hessian (`TiledGramConfig.merge_hessian_gram`, default on): a structure that is both curved and in the linear block is multiplied once per iteration with `h_s + σ_s`, through the core's public Gram chain, on NumPy, CuPy and Torch. Of the default corpus only `Head-and-Neck_01` has such a structure: 21.5 → 19.9 s per iteration on NumPy (medians of three interleaved 10-iteration runs) and 11.7 → 11.1 s on CuPy, with trajectories equal to round-off (≤ 7·10⁻¹³ relative over 10 iterations). Every other corpus case declines up front and is unchanged bit for bit.
@@ -558,7 +560,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Multi-backend (NumPy + PyTorch in CI; CuPy/JAX supported) with `array-api-strict` as the purity gate; import-purity gate (`scripts/check_purity.py`) enforcing invariants #1/#4.
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/ regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/wahln/ipax/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/wahln/ipax/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/wahln/ipax/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/wahln/ipax/compare/v0.9.0...v0.10.0
