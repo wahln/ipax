@@ -485,7 +485,9 @@ iterations 1 to the last one. Initialization is listed separately.
   trajectory is the same: objective and KKT error agree to 1.2·10⁻¹³
   relative through iteration 7, which is the CuPy run-to-run spread (two
   runs of the old code differ by 1.6·10⁻¹³: cuSPARSE's transpose products
-  accumulate with atomics). In the solve the Cholesky now takes 1.19 s and a
+  accumulate with atomics, the same non-determinism documented under
+  [Reproducibility on CUDA](../guide/backends.md#reproducibility-on-cuda)).
+  In the solve the Cholesky now takes 1.19 s and a
   back-solve under 0.01 s, the standalone times. The attribution below walks
   the problem, driver and solver objects for live CuPy arrays (between
   iterations 2 and 3; `n² · 8` bytes = 760 MiB at `n = 9984`):
@@ -846,6 +848,43 @@ the NumPy and CuPy exact rows agree to 10 digits. Reproduce with the
 runner's defaults, `--cases Head-and-Neck_01 --max-iter 15 --max-time 480`,
 adding `--backend cupy` or `--config lbfgs/dense`.
 
+
+### Breedveld second-order correction (2026-09-29)
+
+`BreedveldOptions.max_soc` (opt-in, default `0`) adds a Wächter–Biegler
+second-order correction to the Breedveld controller: when the full step
+fails the Markov test without reducing the constraint violation, the step's
+factorization is reused once to correct the constraint residual and the
+corrected point is judged by the same test at the full length (see the
+[options guide](../guide/options.md#globalization)). Breedveld's
+own solver has no such correction. A/B with the runner's defaults on NumPy,
+`--breedveld-soc 0` vs `1`, one solve at a time (`--max-iter 800
+--max-time 1800`; Head-and-Neck_01 with `--common-step --max-iter 20`):
+
+| case | SOC | status | it. | objective | KKT | wall | accepted / attempts |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| Liver_01 | off | optimal | 57 | −1.0370702 | 1.0e-9 | 68 s | — |
+| Liver_01 | on | optimal | 51 | −1.0370702 | 1.5e-9 | 65 s | 1 / 1 |
+| Protons_01 | off | acceptable | 93 | 32.64759 | 2.2e-8 | 60 s | — |
+| Protons_01 | on | acceptable | 93 | 32.64759 | 2.2e-8 | 60 s | 0 / 0 |
+| Prostate_CK_01 | off | optimal | 39 | 2.825813 | 7.0e-9 | 119 s | — |
+| Prostate_CK_01 | on | optimal | 39 | 2.825813 | 7.0e-9 | 120 s | 0 / 0 |
+| Prostate_VMAT_101 | off | optimal | 60 | 21.87875 | 2.0e-9 | 193 s | — |
+| Prostate_VMAT_101 | on | optimal | 60 | 21.87875 | 2.0e-9 | 191 s | 0 / 0 |
+| Prostate_VMAT_102 | off | optimal | 75 | 20.23827 | 1.0e-9 | 301 s | — |
+| Prostate_VMAT_102 | on | optimal | 75 | 20.23827 | 1.0e-9 | 303 s | 0 / 0 |
+| Head-and-Neck_01 (20 it.) | off | max_iter | 21 | 754.73 | 4.2 | 937 s | — |
+| Head-and-Neck_01 (20 it.) | on | max_iter | 21 | 754.73 | 4.2 | 895 s | 0 / 0 |
+
+The correction fires on one case. Liver_01 rejects one full step that
+worsens feasibility; the corrected point passes and the run ends six
+iterations earlier at the same objective. The other five cases never reject
+a full step with a growing constraint violation above the feasibility gate
+(`max(kkt_tol, 1e-8)`), so the option costs nothing there and the arms are
+identical to the digit — the Head-and-Neck rows differ only in wall time.
+With one beneficiary in six and no downside, `max_soc` stays opt-in; try
+`max_soc=1` on a `"breedveld"` run with nonlinear constraints that
+backtracks on infeasibility-increasing steps.
 
 
 ### Mixed-precision Gram (`gram_dtype="auto"`, the default)

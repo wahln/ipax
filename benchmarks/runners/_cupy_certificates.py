@@ -6,7 +6,8 @@ results itself (``fix(cupy): classify CuPy's silent linear-algebra failures``):
 - the cuDSS adapter (:class:`ipax.backend.sparse.cupy.CuDSSSparseSolver`)
   reads ``NPIVOTS`` once per factorization and, when cuDSS perturbed pivots,
   certifies every solve by its relative residual
-  (``_PERTURBED_SOLVE_MAX_RESIDUAL``), raising ``LinearSolveError`` otherwise;
+  (the solver's ``perturbed_max_residual``, ``SparseOptions.perturbed_pivot_max_residual``
+  on the solve path), raising ``LinearSolveError`` otherwise;
 - the dense solver runs a pivot-checked Cholesky
   (:func:`ipax.linalg.solver.checked_cholesky`) where the backend's Cholesky
   breakdown is silent.
@@ -23,13 +24,20 @@ on exit) and records
 - ``perturbed_solves`` certified and ``rejected_solves`` among them, with the
   certified relative residual ``max_j ‖b_j − A x_j‖∞ / ‖b_j‖∞`` of each binned
   by decade (accepted and rejected separately) plus its extreme values — the
-  margin the ``1e-2`` threshold actually has on the corpus;
+  margin the threshold actually has on the corpus. The certified residual is
+  the one *after* the adapter's iterative refinement; ``unrefined_bins`` bins
+  the residual of the solve before it, ``refinement_steps`` histograms the
+  steps taken, ``rescued_solves`` counts solves the certificate would have
+  rejected unrefined but accepted refined, and ``max_refinement_steps`` /
+  ``perturbed_max_residual`` record the policy the solver ran with;
 - ``dense_checked_cholesky`` calls and ``dense_cholesky_rejections`` (pivot
   check tripped).
 
-The residual is recomputed here (one extra SpMV + host sync, only on perturbed
-factorizations), so instrumented timings are not comparable with an
-uninstrumented run; the solve itself is untouched. Nothing in ``ipax/`` is
+The unrefined residual is recomputed here (one extra SpMV + host sync, only on
+perturbed factorizations), so instrumented timings are not comparable with an
+uninstrumented run; the solve itself is untouched (the refined residual and
+the step count are the solver's own ``last_residual_ratio`` /
+``last_refinement_steps``). Nothing in ``ipax/`` is
 modified: the wrappers call the original methods and re-raise their verdicts.
 """
 
@@ -76,6 +84,11 @@ class CertificateCounter:
         self.min_rejected_ratio: float | None = None
         self.dense_checked_cholesky = 0
         self.dense_cholesky_rejections = 0
+        self.unrefined_bins: dict[str, int] = {}
+        self.refinement_steps: dict[str, int] = {}
+        self.rescued_solves = 0
+        self.max_refinement_steps: int | None = None
+        self.perturbed_max_residual: float | None = None
         self._restore: list[tuple[Any, str, Any]] = []
 
     # -- patching -----------------------------------------------------------
@@ -106,20 +119,40 @@ class CertificateCounter:
                     counter.max_npivots = max(counter.max_npivots, int(npivots))
             return int(npivots)
 
-        def certify_solve(solver: Any, b: Any, x: Any) -> None:
+        def certify_solve(solver: Any, b: Any, x: Any) -> Any:
+            # Unrefined ratio of the solve cuDSS returned (instrumentation).
             residual = b - solver._residual_matrix @ x
             r_norm = cupy.max(cupy.abs(residual), axis=0)
             b_norm = cupy.max(cupy.abs(b), axis=0)
             ratios = cupy.where(
                 b_norm > 0, r_norm / cupy.where(b_norm > 0, b_norm, 1.0), r_norm
             )
-            ratio = float(cupy.max(ratios))
-            if not math.isfinite(ratio) or bool(cupy.any(~cupy.isfinite(ratios))):
-                ratio = math.inf
+            unrefined = float(cupy.max(ratios))
+            if not math.isfinite(unrefined) or bool(cupy.any(~cupy.isfinite(ratios))):
+                unrefined = math.inf
+            label = _decade(unrefined)
+            counter.unrefined_bins[label] = counter.unrefined_bins.get(label, 0) + 1
             counter.perturbed_solves += 1
+            threshold = getattr(solver, "_perturbed_max_residual", None)
+            counter.max_refinement_steps = getattr(
+                solver, "_max_refinement_steps", None
+            )
+            counter.perturbed_max_residual = threshold
+
+            def settle() -> float:
+                steps = str(getattr(solver, "last_refinement_steps", 0))
+                counter.refinement_steps[steps] = (
+                    counter.refinement_steps.get(steps, 0) + 1
+                )
+                refined = getattr(solver, "last_residual_ratio", None)
+                if refined is None or not math.isfinite(refined):
+                    return unrefined if refined is None else math.inf
+                return float(refined)
+
             try:
-                orig_certify_solve(solver, b, x)
+                x_out = orig_certify_solve(solver, b, x)
             except LinearSolveError:
+                ratio = settle()
                 counter.rejected_solves += 1
                 label = _decade(ratio)
                 counter.rejected_bins[label] = counter.rejected_bins.get(label, 0) + 1
@@ -129,10 +162,14 @@ class CertificateCounter:
                 ):
                     counter.min_rejected_ratio = ratio
                 raise
+            ratio = settle()
+            if threshold is not None and not unrefined <= threshold:
+                counter.rescued_solves += 1
             label = _decade(ratio)
             counter.accepted_bins[label] = counter.accepted_bins.get(label, 0) + 1
             if counter.max_accepted_ratio is None or ratio > counter.max_accepted_ratio:
                 counter.max_accepted_ratio = ratio
+            return x_out
 
         def checked_cholesky(xp: Any, matrix: Any) -> Any:
             counter.dense_checked_cholesky += 1
@@ -172,6 +209,13 @@ class CertificateCounter:
             "min_rejected_ratio": self.min_rejected_ratio,
             "dense_checked_cholesky": self.dense_checked_cholesky,
             "dense_cholesky_rejections": self.dense_cholesky_rejections,
+            "unrefined_bins": dict(sorted(self.unrefined_bins.items())),
+            "refinement_steps": dict(
+                sorted(self.refinement_steps.items(), key=lambda kv: int(kv[0]))
+            ),
+            "rescued_solves": self.rescued_solves,
+            "max_refinement_steps": self.max_refinement_steps,
+            "perturbed_max_residual": self.perturbed_max_residual,
         }
 
 

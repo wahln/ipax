@@ -159,8 +159,11 @@ def _case_result(problem: str, **overrides):
         "error": None,
     }
     values.update(overrides)
+    # prepare_time/soc_attempted/soc_accepted default to 0(.0) for these
+    # fabricated paper-comparison rows — no real solve ran to attribute them.
+    _defaulted = {"prepare_time", "soc_attempted", "soc_accepted"}
     assert set(values) >= {
-        f.name for f in fields(CaseResult) if f.name != "prepare_time"
+        f.name for f in fields(CaseResult) if f.name not in _defaulted
     }
     return CaseResult(**values)
 

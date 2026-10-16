@@ -1067,12 +1067,61 @@ def test_runner_common_step_sets_the_breedveld_option():
     )
 
 
+def test_runner_breedveld_soc_defaults_off_and_sets_the_option():
+    from benchmarks.runners import trots as runner
+
+    default_args = runner._build_parser().parse_args([])
+    assert default_args.breedveld_soc == 0
+    default = runner._solve_options(default_args, "exact/dense")
+    assert default.breedveld.max_soc == 0
+
+    args = runner._parse_args(runner._build_parser(), ["--breedveld-soc", "2"])
+    opts = runner._solve_options(args, "exact/dense")
+    assert opts.breedveld.max_soc == 2
+    # Only the flag differs from the default options.
+    assert (
+        dataclasses.replace(
+            opts, breedveld=dataclasses.replace(opts.breedveld, max_soc=0)
+        )
+        == default
+    )
+    # 0 is the default and stays valid under the filter line search.
+    runner._parse_args(
+        runner._build_parser(), ["--globalization", "filter", "--breedveld-soc", "0"]
+    )
+
+
+def test_runner_solve_line_shows_soc_counts_only_when_attempted():
+    # The counts themselves come from benchmarks.harness.run_case, which sums
+    # the public IterationRecord.soc_attempted/.used_soc off Result.history
+    # (see tests/integration/test_benchmark_harness.py); this only checks the
+    # console line's own formatting.
+    from benchmarks.runners import trots as runner
+
+    row = {
+        "status": "optimal",
+        "n_iter": 10,
+        "kkt_error": 1e-9,
+        "constraint_violation": 0.0,
+        "solve_time": 1.0,
+        "ref_iters": None,
+        "ref_time_s": None,
+        "soc_attempted": 0,
+        "soc_accepted": 0,
+    }
+    assert "soc=" not in runner._solve_line("case", "exact/dense", row)
+    row.update(soc_attempted=5, soc_accepted=3)
+    assert "soc=3/5" in runner._solve_line("case", "exact/dense", row)
+
+
 @pytest.mark.parametrize(
     ("argv", "flag"),
     [
         (["--init", "ipax", "--dual-floor", "1e-6"], "--dual-floor"),
         (["--globalization", "filter", "--common-step"], "--common-step"),
         (["--dual-floor", "0"], "--dual-floor"),
+        (["--globalization", "filter", "--breedveld-soc", "1"], "--breedveld-soc"),
+        (["--breedveld-soc", "-1"], "--breedveld-soc"),
     ],
 )
 def test_runner_rejects_ignored_or_invalid_levers(capsys, argv, flag):

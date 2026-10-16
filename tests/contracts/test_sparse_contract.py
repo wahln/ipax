@@ -45,6 +45,29 @@ class SparseDirectSolverContract:
 
         assert_allclose(namespace, actual, array(namespace, [1.0, 2.0, 2.0]), **tol)
 
+    @pytest.mark.parametrize("refinement_steps", [0, 10])
+    def test_optional_perturbed_pivot_hook_keeps_solves_exact(
+        self, namespace, tol, refinement_steps
+    ):
+        # ``configure_perturbed_pivots`` is optional (adapters that never
+        # perturb pivots omit it and the facade skips them). Where present,
+        # any valid policy must leave a well-posed factor/solve exact.
+        with implemented(self.implementation_reason):
+            adapter = self.make_adapter(namespace)
+            configure = getattr(adapter, "configure_perturbed_pivots", None)
+            if configure is None:
+                pytest.skip("adapter has no perturbed-pivot hook")
+            configure(refinement_steps=refinement_steps, max_residual=1e-2)
+            rows = namespace.asarray([0, 1, 1, 2])
+            cols = namespace.asarray([0, 0, 1, 2])
+            values = array(namespace, [2.0, 1.0, 3.0, 4.0])
+            K = adapter.from_coo(rows, cols, values, shape=(3, 3))
+            solver = adapter.solver()
+            solver.factor(K)
+            actual = solver.solve(array(namespace, [2.0, 7.0, 8.0]))
+
+        assert_allclose(namespace, actual, array(namespace, [1.0, 2.0, 2.0]), **tol)
+
     def test_reports_inertia_when_available(self, namespace):
         with implemented("inertia reporting"):
             adapter = self.make_adapter(namespace)

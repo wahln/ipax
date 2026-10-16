@@ -43,7 +43,11 @@ GPU speed): the sparse configs factor with cuDSS through the CuPy adapter.
 adapter's silent-failure certificates fired (cuDSS ``NPIVOTS > 0`` residual
 certificate, dense pivot-checked Cholesky) into pid-suffixed
 ``<out>.certs.<pid>.jsonl`` side files — see
-:mod:`benchmarks.runners._cupy_certificates`.
+:mod:`benchmarks.runners._cupy_certificates`. ``--cudss-refinement-steps``
+and ``--cudss-max-residual`` override the perturbed-pivot solve policy the
+CuPy rows run with (``SparseOptions.perturbed_pivot_refinement_steps`` /
+``perturbed_pivot_max_residual``: maximum iterative-refinement steps,
+post-refinement certificate threshold), for A/B sweeps of those defaults.
 """
 
 from __future__ import annotations
@@ -323,6 +327,7 @@ def _run_problem_cases(
     max_build_seconds: float,
     inflight_prefix: str | None = None,
     certificate_prefix: str | None = None,
+    cudss_policy: tuple[int | None, float | None] = (None, None),
 ) -> tuple[list[CaseResult], str | None]:
     """Run one problem across the config matrix; ``(rows, skip_reason)``.
 
@@ -354,6 +359,7 @@ def _run_problem_cases(
             global_max_vars,
             max_build_seconds,
             certificate_prefix,
+            cudss_policy,
         )
     finally:
         if marker is not None:
@@ -370,9 +376,12 @@ def _run_problem_cases_inner(
     global_max_vars: int,
     max_build_seconds: float,
     certificate_prefix: str | None = None,
+    cudss_policy: tuple[int | None, float | None] = (None, None),
 ) -> tuple[list[CaseResult], str | None]:
     """The sweep proper; see :func:`_run_problem_cases`."""
     xp = import_namespace(backend)
+    if backend == "cupy" and cudss_policy != (None, None):
+        configs = _with_cudss_policy(configs, *cudss_policy)
 
     # Optional build guard: abandon a problem whose sized build is too slow
     # (pure-Python O(n²)) before it stalls an unattended sweep.
@@ -454,6 +463,36 @@ def _run_problem_cases_inner(
         ) as fh:
             fh.write(json.dumps(record) + "\n")
     return rows, None if rows else "too_large"
+
+
+def _with_cudss_policy(
+    configs: list[ConfigSpec], steps: int | None, max_residual: float | None
+) -> list[ConfigSpec]:
+    """``configs`` with the perturbed-pivot policy overridden in ``Options.sparse``.
+
+    ``None`` keeps a config's own value (the ``SparseOptions`` default). The
+    policy reaches the cuDSS adapter through the public options path
+    (``SparseDirectSolver`` → the adapter's ``configure_perturbed_pivots``),
+    and is validated by ``SparseOptions`` itself. Only the sparse-route
+    configs read it; the others carry it inertly.
+    """
+    overrides: dict[str, object] = {}
+    if steps is not None:
+        overrides["perturbed_pivot_refinement_steps"] = steps
+    if max_residual is not None:
+        overrides["perturbed_pivot_max_residual"] = max_residual
+    if not overrides:
+        return configs
+    return [
+        (
+            label,
+            dataclasses.replace(
+                options, sparse=dataclasses.replace(options.sparse, **overrides)
+            ),
+            cap,
+        )
+        for label, options, cap in configs
+    ]
 
 
 def _row_to_case_result(row: dict[str, object]) -> CaseResult:
@@ -684,6 +723,21 @@ def main(argv: list[str] | None = None) -> int:
         "Cholesky fired, into <out>.certs.<pid>.jsonl side files",
     )
     parser.add_argument(
+        "--cudss-refinement-steps",
+        type=int,
+        default=None,
+        help="on the cupy backend, override the maximum iterative-refinement "
+        "steps on perturbed-pivot factorizations "
+        "(SparseOptions.perturbed_pivot_refinement_steps; default 10; 0 = off)",
+    )
+    parser.add_argument(
+        "--cudss-max-residual",
+        type=float,
+        default=None,
+        help="on the cupy backend, override the post-refinement certificate "
+        "threshold (SparseOptions.perturbed_pivot_max_residual; default 1e-2)",
+    )
+    parser.add_argument(
         "--jobs",
         type=int,
         default=1,
@@ -748,7 +802,26 @@ def main(argv: list[str] | None = None) -> int:
         configs = [spec for spec in configs if spec[0] in wanted]
         if not configs:
             parser.error(f"--config {args.config!r} matched no known config labels")
+    # Validate the cuDSS policy flags here (the same bounds SparseOptions
+    # enforces) so a bad value fails the parse instead of the first worker
+    # mid-sweep.
+    if args.cudss_refinement_steps is not None and args.cudss_refinement_steps < 0:
+        parser.error("--cudss-refinement-steps must be >= 0")
+    if args.cudss_max_residual is not None and not (
+        0.0 < args.cudss_max_residual < float("inf")
+    ):
+        parser.error("--cudss-max-residual must be finite and > 0")
     environment = capture_environment()
+    # The cuDSS perturbed-pivot policy the CuPy rows ran with (None = the
+    # SparseOptions default at this commit), so an A/B arm is identifiable from
+    # its report and a resume cannot silently mix two policies. The keys keep
+    # the adapter's parameter names so earlier reports still resume.
+    cudss_policy = {
+        "max_refinement_steps": args.cudss_refinement_steps,
+        "perturbed_max_residual": args.cudss_max_residual,
+    }
+    if "cupy" in backends:
+        environment["cudss_policy"] = cudss_policy
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -763,6 +836,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.resume and json_path.exists():
         prior = json.loads(json_path.read_text())
         environment = prior.get("environment", environment)
+        if "cupy" in backends:
+            ran = environment.get("cudss_policy", dict.fromkeys(cudss_policy))
+            if ran != cudss_policy:
+                parser.error(
+                    f"--resume of {json_path} would mix cuDSS policies: the "
+                    f"report ran {ran}, this run asks for {cudss_policy}"
+                )
+            environment["cudss_policy"] = cudss_policy
         results = [_row_to_case_result(row) for row in prior.get("results", [])]
         print(f"resuming from {json_path}: {len(results)} rows kept")
     # ``done`` is keyed by (backend, name) so a multi-backend resume re-runs the
@@ -804,6 +885,7 @@ def main(argv: list[str] | None = None) -> int:
             args.max_build_seconds,
             str(inflight_path),
             certificate_prefix,
+            (args.cudss_refinement_steps, args.cudss_max_residual),
         )
 
     def _record(

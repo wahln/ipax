@@ -7,6 +7,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **`SparseOptions.perturbed_pivot_refinement_steps`** (default `10`) and
+  **`SparseOptions.perturbed_pivot_max_residual`** (default `1e-2`): the
+  perturbed-pivot solve policy of static-pivoting sparse factorizations (today
+  the CUDA/cuDSS route; see Fixed below) is now a public option, settable from
+  `ipax.solve(...)`. Previously only the adapter constructors could set it.
+  - The policy reaches the adapter through an optional, duck-typed
+    `configure_perturbed_pivots(refinement_steps=, max_residual=)` hook that
+    the `SparseDirectSolver` facade calls once when it creates the adapter.
+    The CuPy adapter implements the hook and the device-routing adapter
+    (Torch/JAX) forwards it. Adapters that never perturb pivots (SciPy/Feral)
+    do not implement it and ignore the fields, so the adapter protocol is
+    unchanged.
+  - Both fields are validated on construction: a non-negative integer and a
+    finite positive float, with `bool` rejected. The defaults equal the
+    adapter's constants (a unit test pins them), so default behaviour is
+    unchanged.
+  - The S2MPJ runner's `--cudss-refinement-steps` / `--cudss-max-residual` now
+    set these options on the CuPy configs instead of patching the adapter's
+    module constants in each worker.
+- **`IterationRecord.used_soc` / `.soc_attempted`**: each row of `Result.history`
+  now reports whether it is a second-order-corrected point (W&B 2006 §2.4 filter
+  correction, or the opt-in `BreedveldOptions.max_soc` Markov correction) and
+  whether a correction was tried this iteration, accepted or not. The console table gains a
+  trailing `C` tag alongside the existing `R`/`*`. `benchmarks/harness.CaseResult`
+  gains matching `soc_attempted`/`soc_accepted` counts (summed off the new
+  fields), and the TROTS runner's `soc_attempted`/`soc_accepted` counters are now
+  read from `Result.history` for *either* globalization instead of a
+  `BreedveldController.search` monkeypatch that only covered the Breedveld
+  controller.
+- **`BreedveldOptions.max_soc`** (`0` default = off): opt-in second-order
+  correction for the `globalization="breedveld"` controller (Wächter &
+  Biegler 2006, §2.4 / A-5.5–A-5.8, adapted to the Markov acceptance of
+  Breedveld 2017, eqs. (34)–(35)). When the first, full-length trial is
+  rejected without reducing the constraint violation (and is not itself
+  feasible to `max(kkt_tol, 1e-8)`), the filter SOC's closure runs `max_soc`
+  accumulated correction rounds (same factorization-reuse policy; its round
+  count is now taken from the active controller's option) and the corrected
+  point is judged once by the Markov test at the full step; a rejected
+  correction falls back to backtracking. The
+  ratio-control iterations are untouched, and `common_step` moves the duals by
+  the accepted length. Breedveld's own solver has no SOC — this is an ipax
+  addition; the default path is bit-identical. The TROTS runner gains
+  `--breedveld-soc N` (only with `--globalization breedveld`) and every solve
+  row counts `soc_attempted` / `soc_accepted` (see the
+  `IterationRecord.used_soc` entry above). TROTS A/B (NumPy, six cases): only
+  Liver_01 triggers it (one accepted correction, 57 → 51 iterations, same
+  objective); Protons, CyberKnife, both VMAT cases and 20 Head-and-Neck
+  iterations make no attempt and are identical — it stays opt-in.
 - **`TROTSProblem.breedveld_warm_start(lsqr_iter=, lsqr_tol=)`** (`benchmarks/corpus/trots.py`):
   opt-in overrides for the eq. (26) LSQR dual solve's iteration cap and
   `atol = btol` (default `None`: the module constants, 200 / `1e-6`,
@@ -195,7 +243,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     comes from accepted perturbed-pivot solves with residuals of 1e-5–1e-2:
     a strict `1e-6` fixes 8 of 17 such stalls.
   - The threshold stays at `1e-2`. Iterative refinement on perturbed-pivot
+    factorizations is the recommended follow-up (since done; see Fixed).
     factorizations is the recommended follow-up.
+  - Documented that the CuPy sparse-direct route (cuDSS) and the CuPy
+    device-tiled Gram assembly are not run-to-run deterministic — identical
+    re-runs of the corpus sweep moved `ACOPR14` `exact/sparse` from 25 to 38
+    iterations, `YORKNET` from 2055 to 120, and flipped `COSHFUN` from
+    `max_time` to `optimal` — while the CuPy dense route reproduced that sweep exactly and the
+    NumPy/Torch-CPU routes are deterministic. New "Reproducibility on CUDA" subsection in
+    `docs/guide/backends.md`, cross-linked from the S2MPJ and TROTS benchmark
+    reports.
 
 ### Changed
 - **Dense KKT route: two O(n²)-per-iteration costs removed from the hot path**
@@ -462,6 +519,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     exactly. `--slack-init-scale` applies only with `--init ipax`.
 
 ### Fixed
+- **cuDSS solves on perturbed-pivot factorizations are now iteratively
+  refined** (`ipax/backend/sparse/cupy.py`). cuDSS's static pivoting replaces a
+  pivot that is too small by `±ε`, so it factors `A + E` instead of `A`. The
+  CuPy adapter's residual certificate used to accept such solves as long as
+  their relative residual was below `1e-2`. On degenerate but well-conditioned
+  KKT systems these solves were off by 1e-5–1e-2 at every iteration. An example
+  is the minimax epigraph variable's zero Hessian diagonal, which a 2×2 pivot
+  would pair off. `MAKELA1` stalled for 291 iterations where Feral's LDLᵀ
+  converges.
+  - When cuDSS reports `NPIVOTS > 0`, each solve is now refined against the
+    unperturbed matrix, `x += (A+E)⁻¹ (b − A x)` (Li & Demmel 2003; Higham
+    2002, ch. 12), before the certificate judges it.
+  - The stopping rules are IPOPT's (`PDFullSpaceSolver::Solve`): at most 10
+    steps, stop at IPOPT's residual ratio `1e-10`, and stop at the first step
+    that does not reduce the certified ratio. Unlike IPOPT, each column keeps
+    its best iterate, because refinement diverges when `‖(A+E)⁻¹E‖ > 1`.
+  - cuDSS's own refinement (`CUDSS_CONFIG_IR_N_STEPS`) was measured and
+    rejected. It runs a fixed number of steps (the pinned cuDSS 0.7 ignores
+    `IR_TOL`), and on a `ROTDISC` system those steps diverge from 1.3e-5 to
+    8e7.
+  - Unperturbed factorizations pay nothing. A perturbed one pays one SOLVE
+    phase, one SpMV and one host sync per step taken: 0.3–0.4 steps per
+    perturbed solve on the corpus.
+  - The policy is exposed as `max_refinement_steps` /
+    `perturbed_max_residual` on `CuPySparseAdapter`, `CuPySparseSolver` and
+    `CuDSSSparseSolver`, and through `SparseOptions` (see Added). The defaults
+    are unchanged apart from refinement being on.
+  - CuPy corpus A/B over the rows that meet perturbed pivots, against the v33
+    run (docs/benchmarks/s2mpj.md, "Addendum (2026-09-29)"):
+    - `exact/sparse`: +15, 16 fixed / 1 broken, all confirmed by a lone
+      re-run. The whole minimax family now converges near NumPy's iteration
+      counts.
+    - `lbfgs/sparse`: +14 in the sweep, 12 fixed / 2 broken confirmed alone.
+    - Rejected solves fall from 99 784 in 162 rows to 96 463 in 57 rows
+      (`lbfgs/sparse`), and 36 022 solves the certificate would have rejected
+      are rescued.
+    - A `1e-5` post-refinement certificate (IPOPT's `residual_ratio_singular`)
+      nets +2 / −2 once re-runs are counted, and more than doubles the
+      rejections, so the threshold stays at `1e-2`.
+  - The S2MPJ runner gains `--cudss-refinement-steps` / `--cudss-max-residual`
+    A/B levers. They are validated at parse time and recorded in the report's
+    `environment.cudss_policy`, and `--resume` refuses to mix policies.
+    `--cupy-certificates` now bins the residual before and after refinement,
+    histograms the steps, and counts rescued solves.
 - **TROTS LSQR tolerance validation:** reject non-finite `lsqr_tol` values
   as well as non-positive ones. The runner rejects invalid `--lsqr-tol`
   arguments before loading data or preparing a warm start.

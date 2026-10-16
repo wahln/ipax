@@ -21,6 +21,8 @@ needs lives here so the algorithm code stays declarative.
 from __future__ import annotations
 
 import math
+import numbers
+import operator
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -429,6 +431,32 @@ class BreedveldOptions:
     objective from 4.6 to 7.9e8 without the ratio control (eq. (36))
     rejecting the step; see ``docs/benchmarks/trots.md`` for the trajectory
     and the measured effect of this option.
+
+    ``max_soc`` (default ``0`` = off; only read with
+    ``globalization="breedveld"``) adds a second-order correction (SOC) to
+    the Markov acceptance, following Wächter & Biegler 2006, §2.4 /
+    Algorithm A-5.5–A-5.8: when the *first* trial (the full
+    fraction-to-boundary step) is rejected by eqs. (34)–(35), did not
+    reduce the constraint violation (``θ_t ≥ θ0``) and is not itself feasible
+    to ``max(kkt_tol, 1e-8)`` (a deviation: a round-off residual has nothing
+    to correct), the filter line search's correction closure runs
+    ``max_soc`` accumulated rounds — each re-solves the step's KKT system
+    with the constraint residual at the corrected point as right-hand side,
+    under the same factorization-reuse policy — and the final corrected point
+    is judged once by the same Markov test at the full step length (a fixed
+    round count in place of A-5.9's κ_soc-guarded loop). An accepted
+    correction is taken at that length (so with ``common_step`` it also sets
+    the dual step); a rejected one falls back to the usual ``0.9``
+    backtracking, whose budget it does not consume. The ratio-control
+    iterations (eq. (36)) are unaffected. This is an ipax addition:
+    Breedveld's own solver has no second-order correction — the paper's
+    controller (§2) only backtracks. Try it when a Breedveld run with
+    *nonlinear* constraints backtracks heavily on steps that worsen
+    feasibility (the Maratos effect SOC exists to repair); on problems whose
+    constraints are all linear the Newton step keeps the linearized residual
+    exact up to round-off, which the feasibility gate above screens out.
+    Must be a non-negative integer; ``LineSearchOptions.max_soc`` governs the
+    filter line search only.
     """
 
     tau: float = 0.995  # fraction-to-boundary scaling
@@ -438,6 +466,18 @@ class BreedveldOptions:
     ratio_limit: float = 20.0  # eq. (36): f⁺γ_y⁺ / fγ_y ratio-control bound
     # §2.1 / Algorithm 1: one step length for primal and dual (see docstring).
     common_step: bool = False
+    # W&B 2006 §2.4 second-order corrections on a rejected full step (see
+    # docstring); 0 keeps Breedveld's backtracking-only controller.
+    max_soc: int = 0
+
+    def __post_init__(self) -> None:
+        count = self.max_soc
+        try:
+            valid = not isinstance(count, bool) and operator.index(count) >= 0
+        except TypeError:
+            valid = False
+        if not valid:
+            raise ValueError("max_soc must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -779,15 +819,64 @@ class SparseOptions:
     end-to-end. Whenever the NE prerequisites are unmet, or the problem is
     not tall, auto stays on ``"augmented"`` — so non-tall problems are
     untouched by construction.
+
+    **Perturbed-pivot solves.** A sparse factorization that uses *static
+    pivoting* does not reorder around a pivot that is too small; it replaces
+    it by a tiny ``±ε`` and so factors ``A + E`` instead of ``A`` (the GESP
+    strategy; Li & Demmel 2003). An adapter doing so pairs the factorization
+    with iterative refinement against the unperturbed ``A``,
+    ``x ← x + (A+E)⁻¹ (b − A x)`` (Higham 2002, ch. 12), and then certifies
+    the solve: a right-hand-side column whose relative residual
+    ``‖b − A x‖∞ / ‖b‖∞`` still exceeds a threshold raises
+    :class:`~ipax.linalg.solver.LinearSolveError`, so the IPM regularizes the
+    system on its δ_w ladder (Wächter & Biegler 2006, §3.1) instead of taking
+    a step from a solve that does not solve it — the inexact-Newton condition
+    ``‖b − A x‖ ≤ η ‖b‖`` (Dembo, Eisenstat & Steihaug 1982). Only solves on
+    a factorization that actually perturbed a pivot pay for either.
+
+    ``perturbed_pivot_refinement_steps`` (default ``10``, IPOPT's
+    ``max_refinement_steps``) caps the refinement steps per solve; ``0``
+    disables refinement, leaving the bare certificate. The loop stops earlier
+    once the residual reaches working accuracy or a step stops reducing it
+    (IPOPT's ``PDFullSpaceSolver`` stopping rules).
+    ``perturbed_pivot_max_residual`` (default ``1e-2``) is the certificate's
+    threshold ``η`` on the refined residual: lower it to reject inexact
+    solves sooner (more δ_w escalations), raise it to accept them. It must be
+    finite and positive — an infinite threshold would silently switch the
+    certificate off. Adapters whose factorizations never perturb a pivot
+    (threshold-pivoting LDLᵀ, LU) ignore both fields; the backends guide says
+    which adapters read them. The defaults are those adapters' own defaults,
+    so leaving the fields alone changes nothing.
     """
 
     kkt_route: SparseKKTRoute = "auto"
+    # Perturbed-pivot solve policy (see docstring); read only by adapters whose
+    # factorization uses static pivoting.
+    perturbed_pivot_refinement_steps: int = 10
+    perturbed_pivot_max_residual: float = 1e-2
 
     def __post_init__(self) -> None:
         if self.kkt_route not in ("auto", "augmented", "normal_equations"):
             raise ValueError(
                 "sparse kkt_route must be 'auto', 'augmented' or 'normal_equations'"
             )
+        steps = self.perturbed_pivot_refinement_steps
+        try:
+            valid = not isinstance(steps, bool) and operator.index(steps) >= 0
+        except TypeError:
+            valid = False
+        if not valid:
+            raise ValueError(
+                "perturbed_pivot_refinement_steps must be a non-negative integer"
+            )
+        # Typed ``object``: user code may pass anything (a bool, a string).
+        threshold: object = self.perturbed_pivot_max_residual
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, numbers.Real)
+            or not 0.0 < float(threshold) < math.inf
+        ):
+            raise ValueError("perturbed_pivot_max_residual must be finite and positive")
 
 
 @dataclass(frozen=True, slots=True)

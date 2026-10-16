@@ -62,6 +62,49 @@ device the arrays live on. The sparse-direct route on CUDA uses NVIDIA **cuDSS**
 user-managed so the CuPy wheel matches your toolkit — see
 [Getting started](../getting-started.md#install).
 
+cuDSS uses *static pivoting*: a pivot too small to divide by is replaced by a
+tiny `±ε`, so the factorization is of a slightly perturbed matrix. When cuDSS
+reports such perturbed pivots, the adapter iteratively refines each solve
+against the unperturbed matrix (IPOPT's stopping rules, at most 10 steps) and
+then rejects a solve whose relative residual still exceeds `1e-2` as singular,
+which hands it to the regularization ladder. Factorizations without perturbed
+pivots are neither refined nor checked. Both numbers are
+[`SparseOptions` fields](options.md#sparse-direct-solves-on-perturbed-pivots)
+(`perturbed_pivot_refinement_steps`, `perturbed_pivot_max_residual`). The measured effect on the S2MPJ
+corpus is in the
+[CuPy sparse-direct benchmark](../benchmarks/s2mpj.md#cupy-sparse-direct-route-2026-09-28).
+
+### Reproducibility on CUDA
+
+On the CPU backends (NumPy/SciPy, Torch-CPU) every route is deterministic:
+identical inputs and options reproduce identical iteration counts and
+iterates run to run. On CUDA that holds only approximately. The CuPy
+sparse-direct route (cuDSS) and the CuPy device-tiled Gram assembly are
+not deterministic — cuSPARSE and cuDSS do not promise
+bitwise-reproducible results across runs, and last-bit differences in their
+SpMV/SpMM and atomic-accumulation kernels have been observed to change
+solver behavior. An interior-point method amplifies those last-bit
+differences into different step-length and acceptance decisions, so a
+CuPy-sparse re-run of the same problem and options can land on a different
+iteration count and, on hard problems, a different terminal status than a
+previous run. A full-corpus re-run showed this concretely: identical CuPy
+sparse-route re-runs moved one problem from 25 to 38 iterations, another
+from 2055 to 120, and flipped a third from a `max_time` stop to `optimal`
+convergence — see the [CuPy sparse-direct route
+section](../benchmarks/s2mpj.md#cupy-sparse-direct-route-2026-09-28) of the
+S2MPJ benchmark report. The CuPy dense route reproduced the same sweep
+exactly, but cuBLAS's last bits can still depend on the allocation history
+of the process, so a bitwise-identical CUDA rerun is an observation, not a
+guarantee.
+
+For a trustworthy CuPy-sparse A/B comparison: repeat each arm's runs and
+compare distributions rather than single rows, or A/B on the dense route or
+a CPU backend instead, where a single run is representative.
+cuDSS itself offers a `DETERMINISTIC_MODE` that made repeated
+factorizations bitwise identical in a
+[micro-study](../benchmarks/s2mpj.md#cudss-matching-and-pivot-options-2026-09-30)
+at 1.2–3× the factorization time; `ipax` does not enable it.
+
 ## Choosing a solver route per backend
 
 The [`linsolve`](options.md#linear-solver) option is independent of the backend,

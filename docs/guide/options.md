@@ -156,6 +156,36 @@ in [`KrylovOptions`](../reference.md#ipax.options.KrylovOptions).
     for **moderate `n` with a genuinely sparse Jacobian**, and even there its
     edge over the dense route is small once BLAS is threaded.
 
+### Sparse-direct solves on perturbed pivots
+
+Some sparse factorizations use *static pivoting*: instead of reordering around
+a pivot that is too small, they replace it by a tiny `±ε` and factor a slightly
+perturbed matrix. An adapter that does this refines each solve on such a
+factorization against the unperturbed matrix. It then rejects a solve whose
+relative residual is still too large, which sends the step to the
+regularization ladder. Two fields of
+[`SparseOptions`](../reference.md#ipax.options.SparseOptions) set this policy:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `perturbed_pivot_refinement_steps` | `10` | Maximum refinement steps per solve (IPOPT's `max_refinement_steps`); `0` turns refinement off. |
+| `perturbed_pivot_max_residual` | `1e-2` | Reject a solve whose refined relative residual `‖b − A x‖∞ / ‖b‖∞` exceeds this. Finite and positive. |
+
+```python
+from ipax.options import SparseOptions
+
+opts = ipax.Options(
+    linsolve="sparse",
+    sparse=SparseOptions(perturbed_pivot_refinement_steps=0),  # unrefined
+)
+```
+
+Today the CUDA sparse route (cuDSS, reached from CuPy, Torch-CUDA and JAX-GPU
+arrays) is the only one that perturbs pivots; see
+[Backends & hardware](backends.md#gpu). The CPU route (Feral `LDLᵀ`, SuperLU)
+ignores both fields. The defaults are the ones the CUDA adapter has always
+used, so leaving them alone changes nothing.
+
 ## Problem scaling
 
 Badly scaled problems converge faster with gradient-based auto-scaling (IPOPT's
@@ -240,6 +270,37 @@ from ipax import Options
 from ipax.options import BreedveldOptions
 
 opts = Options(globalization="breedveld", breedveld=BreedveldOptions(common_step=True))
+```
+
+`BreedveldOptions(max_soc=N)` *(opt-in, default `0` = off)* adds a
+second-order correction to the `"breedveld"` controller — the Maratos-effect
+repair the filter line search already has (Wächter & Biegler 2006, §2.4).
+Breedveld's own solver has no second-order correction: the paper's controller
+(Breedveld et al. 2017, §2) only backtracks, so this is an ipax addition. When
+the *first* trial — the full fraction-to-boundary step — fails the Markov test
+(eqs. (34)–(35)) without reducing the constraint violation, and is not itself
+feasible to `max(kkt_tol, 1e-8)`, the filter's correction runs `N` accumulated
+rounds, each re-solving the step's KKT system with the constraint residual at
+the corrected point as the right-hand side (the same factorization-reuse
+policy), and the final corrected point is judged once by the same Markov test
+at the full step length. An accepted correction is taken at that length — with
+`common_step=True` it also moves the duals — and a rejected one falls back to
+the usual `0.9` backtracking without shortening its budget. The ratio-control
+iterations (eq. (36)) are unchanged. `LineSearchOptions.max_soc` governs the
+filter line search only; the two counts are independent.
+
+The correction only has something to do on problems with *nonlinear*
+constraints — with linear constraints the Newton step satisfies the
+linearization exactly, so a trial worsens feasibility only at round-off, which
+the feasibility gate screens out — so try it when a `"breedveld"` run with
+nonlinear constraints backtracks heavily on steps that increase the constraint
+violation. On the TROTS corpus it fires on one of six cases
+(Liver_01: one accepted correction, 57 → 51 iterations) and is inert on the
+rest, so it stays off by default — see the
+[Breedveld SOC A/B](../benchmarks/trots.md#breedveld-second-order-correction-2026-09-29).
+
+```python
+opts = Options(globalization="breedveld", breedveld=BreedveldOptions(max_soc=1))
 ```
 
 ### Restoration linear solver

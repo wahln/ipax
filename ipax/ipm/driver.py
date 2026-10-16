@@ -1107,6 +1107,13 @@ class IPMDriver:
         use_breedveld = opts.globalization == "breedveld"
         # One primal/dual step length (Breedveld 2017 §2.1); see BreedveldOptions.
         common_step = self._common_step
+        # Second-order-correction rounds of the *active* globalization: each
+        # step controller carries its own count (W&B 2006 §2.4 for the filter
+        # line search; the opt-in ``BreedveldOptions.max_soc`` for Breedveld's
+        # Markov acceptance, off by default), so neither reads the other's.
+        soc_rounds = (
+            opts.breedveld.max_soc if use_breedveld else opts.line_search.max_soc
+        )
 
         ones = xp.ones((n,), dtype=dtype)
 
@@ -1130,6 +1137,12 @@ class IPMDriver:
         # that row.
         last_line_search_iters = 0
         pending_restored = False
+        # Second-order-correction bookkeeping for the *next* row, mirroring
+        # ``pending_restored``: set from the local ``used_soc``/``soc_attempted``
+        # the step search computes below, and consumed (then cleared) when
+        # that row's ``IterationRecord`` is built.
+        pending_used_soc = False
+        pending_soc_attempted = False
 
         has_lower, has_upper = self._has_lower, self._has_upper
 
@@ -1257,8 +1270,12 @@ class IPMDriver:
                 step_solve_time=last_step_solve_time,
                 line_search_iters=last_line_search_iters,
                 restored=pending_restored,
+                used_soc=pending_used_soc,
+                soc_attempted=pending_soc_attempted,
             )
             pending_restored = False
+            pending_used_soc = False
+            pending_soc_attempted = False
             if self._record_transform is not None:
                 record = self._record_transform(record)
             problem_time_mark = self._problem_time_total
@@ -1784,6 +1801,10 @@ class IPMDriver:
                 return math.isfinite(e_t) and e_t <= (1.0 - gamma_e) * e0
 
             soc_point: tuple[Array, Array] | None = None
+            # Set True the moment ``soc`` below actually runs a correction
+            # (i.e. past its own-enabled guard) — an attempt, whether or not
+            # it is accepted; ``pending_soc_attempted`` reads it at the tail.
+            soc_attempted = False
 
             def is_strictly_interior(x_t: Array, s_t: Array) -> bool:
                 if m > 0 and not bool(xp.all(s_t > 0.0)):
@@ -1857,9 +1878,10 @@ class IPMDriver:
                 170 in-SOC ladders ended regularized — where the policy
                 above now subsumes it.)
                 """
-                nonlocal soc_point
-                if opts.line_search.max_soc <= 0:
+                nonlocal soc_point, soc_attempted
+                if soc_rounds <= 0:
                     return None
+                soc_attempted = True
 
                 base_x, base_s = trial_point(alpha)
                 corr_x = xp.zeros_like(x)
@@ -1867,7 +1889,7 @@ class IPMDriver:
                 empty_ineq = xp.zeros((0,), dtype=dtype)
                 own_factor = False  # retained factorization made by this loop
 
-                for _ in range(opts.line_search.max_soc):
+                for _ in range(soc_rounds):
                     x_c = base_x + corr_x
                     s_c = base_s + corr_s if m > 0 else s
                     if not is_strictly_interior(x_c, s_c):
@@ -1960,17 +1982,29 @@ class IPMDriver:
             used_soc = False
             used_free_acceptance = False
             if use_breedveld:
-                alpha_p, restoration, last_line_search_iters = breedveld.search(
+                b_result = breedveld.search(
                     alpha_max=alpha_p_max,
                     theta0=theta0,
                     phi0=phi0,
                     dphi=dphi,
                     eval_point=eval_point,
                     iteration=it,
+                    # Opt-in W&B 2006 §2.4 correction of a rejected full step,
+                    # ``soc_rounds`` = BreedveldOptions.max_soc rounds (the
+                    # controller never calls it when that count is 0).
+                    soc=soc,
+                    # A trial feasible to the restoration/re-center feasibility
+                    # notion has no residual worth correcting (see ``search``).
+                    soc_theta_min=feasible_theta_tol(opts.optimality.kkt_tol),
                 )
+                alpha_p = b_result.alpha
+                restoration = b_result.restoration
+                used_soc = b_result.used_soc
+                last_line_search_iters = b_result.n_trials
                 if common_step:
                     # Breedveld 2017 §2.1, eq. (11): the accepted (possibly
-                    # backtracked) α also moves the duals.
+                    # backtracked) α also moves the duals — after an accepted
+                    # correction that is the full length the SOC was judged at.
                     alpha_d = alpha_p
             elif (
                 self._mu_schedule != "monotone"
@@ -2037,7 +2071,7 @@ class IPMDriver:
                 last_line_search_iters = result.n_trials
                 if result.accepted and result.augment:
                     filt.augment(theta0, phi0)
-            # The line search was ``soc``'s only consumer. Its defaults bind this
+            # The step search was ``soc``'s only consumer. Its defaults bind this
             # iteration's ``w`` and ``ineq_jac``; left bound, the closure would
             # keep both (with any dense memo they hold, n×n each) alive until
             # the next iteration redefines it — after that iteration's KKT
@@ -2142,10 +2176,19 @@ class IPMDriver:
                 prev_x = None
                 last_step_solve_time = self._step_solve_seconds
                 pending_restored = True
+                # A correction may have been tried (and rejected) before this
+                # step's search gave up and fell to restoration; ``used_soc``
+                # is already False here by construction (the search only
+                # reports it on an acceptance, mutually exclusive with
+                # ``restoration``), but the attempt itself is still worth the
+                # next row.
+                pending_soc_attempted = soc_attempted
                 continue
 
             # Adopt the evaluated trial arrays themselves (bitwise the same
             # values as ``x + α Δx``) so the loop-top callbacks hit the cache.
+            pending_used_soc = used_soc and soc_point is not None
+            pending_soc_attempted = soc_attempted
             if used_soc and soc_point is not None:
                 x, s_next = soc_point
             else:

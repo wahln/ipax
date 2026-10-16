@@ -23,6 +23,14 @@
 Each adapter implements :class:`~ipax.backend.operators.LinearOperator`
 (``SparseOperator``) plus the ``SparseDirectSolver`` protocol from
 ``ipax.linalg.solver``.
+
+Optional adapter hook: ``configure_perturbed_pivots(*, refinement_steps,
+max_residual)``. An adapter whose factorization uses static pivoting (the CuPy
+adapter's cuDSS solver; the device-routing adapter forwards it) implements it
+to receive ``SparseOptions``' perturbed-pivot solve policy; the
+``SparseDirectSolver`` facade looks it up by duck typing and calls it once,
+right after creating the adapter. Adapters that never perturb a pivot (SciPy's
+Feral LDLᵀ / SuperLU) do not implement it.
 """
 
 from __future__ import annotations

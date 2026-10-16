@@ -50,6 +50,16 @@ Two jobs, both gated on a local TROTS dataset (``IPAX_TROTS_DIR`` or ``--dir``):
    filter --corrections none --kappa-centrality 1e-2`` (the RT recipes of
    ``docs/benchmarks/trots.md`` add levers on top of it).
 
+   ``--breedveld-soc N`` (off by default; only with ``--globalization
+   breedveld``) adds a second-order correction of ``N`` accumulated rounds
+   to the Breedveld controller's rejected full step
+   (``BreedveldOptions.max_soc``, Wächter & Biegler 2006 §2.4 — an ipax
+   addition, not part of the paper's solver). Every solve row carries
+   ``soc_attempted`` / ``soc_accepted`` (summed from the public
+   ``IterationRecord.soc_attempted`` / ``.used_soc`` on ``Result.history``),
+   whichever globalization produced them — the filter line search has its
+   own ``LineSearchOptions.max_soc`` correction, on by default.
+
    Each solve row also carries the paper's own result for the case, the
    Mehrotra-method iterations and seconds of Breedveld et al. 2017's timing
    supplement (``ref_iters`` / ``ref_time_s`` in the JSON report, "paper" on
@@ -287,7 +297,9 @@ def _solve_options(args: argparse.Namespace, label: str) -> ipax.Options:
         globalization=args.globalization,
         corrections=args.corrections,
         barrier=BarrierOptions(**barrier_kwargs),
-        breedveld=BreedveldOptions(common_step=args.common_step),
+        breedveld=BreedveldOptions(
+            common_step=args.common_step, max_soc=args.breedveld_soc
+        ),
         optimality=OptimalityConditionOptions(
             dual_inf_tol=args.tol,
             constr_viol_tol=args.tol,
@@ -420,6 +432,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "Breedveld et al. 2017 §2.1 (only with --globalization breedveld)",
     )
     parser.add_argument(
+        "--breedveld-soc",
+        type=int,
+        default=0,
+        help="BreedveldOptions(max_soc=N): a second-order correction of N "
+        "accumulated rounds on a rejected full step (Waechter & Biegler 2006 "
+        "§2.4; an ipax addition, not in Breedveld et al. 2017); default 0 = "
+        "off; N > 0 only with --globalization breedveld. Every solve row "
+        "counts soc_attempted / soc_accepted",
+    )
+    parser.add_argument(
         "--dual-floor",
         type=float,
         default=_BREEDVELD_START_FLOOR,
@@ -462,6 +484,13 @@ def _parse_args(
         parser.error(
             "--common-step applies only with --globalization breedveld (the "
             "filter line search keeps separate primal and dual step lengths)"
+        )
+    if args.breedveld_soc < 0:
+        parser.error("--breedveld-soc must be a non-negative integer")
+    if args.breedveld_soc > 0 and args.globalization != "breedveld":
+        parser.error(
+            "--breedveld-soc applies only with --globalization breedveld (the "
+            "filter line search's corrections are LineSearchOptions.max_soc)"
         )
     return args
 
@@ -575,11 +604,16 @@ def _solve_line(case: str, label: str, row: dict[str, object]) -> str:
         if ref_iters is None or ref_time is None
         else f"paper iters={ref_iters} t={ref_time:.1f}s"
     )
+    soc = (
+        f"soc={row['soc_accepted']}/{row['soc_attempted']}  "
+        if row.get("soc_attempted")
+        else ""
+    )
     return (
         f"  {case:20s} [{label:12s}] {row['status']!s:12s} "
         f"iters={row['n_iter']:4d} kkt={row['kkt_error']:.2e} "
         f"cviol={row['constraint_violation']:.2e} t={row['solve_time']:.1f}s  "
-        f"({paper})"
+        f"{soc}({paper})"
     )
 
 

@@ -359,8 +359,28 @@ Steps:
 - Li, X. S. & Demmel, J. W. (2003). "SuperLU_DIST: A scalable distributed-memory
   sparse direct solver for unsymmetric linear systems." *ACM Transactions on
   Mathematical Software* 29(2), 110–140. <https://doi.org/10.1145/779359.779361>
-  (static pivoting; why a cuDSS factorization with perturbed pivots is certified
-  by its residual in the CuPy sparse adapter)
+  (static pivoting paired with iterative refinement; why a cuDSS factorization
+  with perturbed pivots is refined and then certified by its residual in the
+  CuPy sparse adapter)
+- Higham, N. J. (2002). *Accuracy and Stability of Numerical Algorithms*, 2nd
+  ed. SIAM. <https://doi.org/10.1137/1.9780898718027> (ch. 12, iterative
+  refinement: the contraction ≈ ‖(A+E)⁻¹E‖ behind the cuDSS perturbed-pivot
+  refinement)
+- IPOPT's iterative-refinement rules: `PDFullSpaceSolver::Solve` and the
+  options `max_refinement_steps = 10`, `residual_ratio_max = 1e-10`,
+  `residual_improvement_factor = 1`, `residual_ratio_singular = 1e-5`
+  (<https://coin-or.github.io/Ipopt/OPTIONS.html>, IPOPT 3.14; the stopping
+  rules of the cuDSS perturbed-pivot refinement)
+- Duff, I. S. & Koster, J. (2001). "On algorithms for permuting large entries to
+  the diagonal of a sparse matrix." *SIAM Journal on Matrix Analysis and
+  Applications* 22(4), 973–996. <https://doi.org/10.1137/S0895479899358443>
+  (maximum weighted matching with scaling — cuDSS's `USE_MATCHING`; measured
+  and not adopted, docs/benchmarks/s2mpj.md "cuDSS matching and pivot options")
+- Duff, I. S. & Pralet, S. (2005). "Strategies for scaling and pivoting for
+  sparse symmetric indefinite problems." *SIAM Journal on Matrix Analysis and
+  Applications* 27(2), 313–340. <https://doi.org/10.1137/04061043X>
+  (symmetric matching into 2×2 pivots, which preserves the LDLᵀ inertia — the
+  option cuDSS 0.7 lacks)
 - Dembo, R. S., Eisenstat, S. C. & Steihaug, T. (1982). "Inexact Newton methods."
   *SIAM Journal on Numerical Analysis* 19(2), 400–408.
   <https://doi.org/10.1137/0719025> (the inexact-Newton forcing of the Krylov

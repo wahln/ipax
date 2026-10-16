@@ -112,6 +112,29 @@ class DeviceRoutingSparseAdapter:
     def __init__(self) -> None:
         self._delegate: Any = None
         self._delegate_kind: int | None = None
+        # Perturbed-pivot policy to hand to a delegate that reads it (the
+        # CuPy/cuDSS adapter); ``None`` = never configured, delegate defaults.
+        self._perturbed_pivots: tuple[int | None, float | None] | None = None
+
+    def configure_perturbed_pivots(
+        self, *, refinement_steps: int | None, max_residual: float | None
+    ) -> None:
+        """Forward the perturbed-pivot policy to the device's adapter.
+
+        Remembered and applied to every delegate this adapter resolves (and
+        to the current one), through the delegate's own optional
+        ``configure_perturbed_pivots`` hook: the CUDA (cuDSS) delegate reads
+        it, the CPU (SciPy) delegate has no hook and ignores it.
+        """
+        self._perturbed_pivots = (refinement_steps, max_residual)
+        if self._delegate is not None:
+            self._configure(self._delegate)
+
+    def _configure(self, delegate: Any) -> None:
+        configure = getattr(delegate, "configure_perturbed_pivots", None)
+        if self._perturbed_pivots is not None and configure is not None:
+            steps, max_residual = self._perturbed_pivots
+            configure(refinement_steps=steps, max_residual=max_residual)
 
     def _resolve(self, like: Array) -> Any:
         kind = _dlpack_device_kind(like)
@@ -130,6 +153,7 @@ class DeviceRoutingSparseAdapter:
                 "reinterprets COO buffers onto the SciPy (CPU) and cuDSS (CUDA) "
                 "adapters, which covers host and NVIDIA CUDA arrays only"
             )
+        self._configure(delegate)
         self._delegate_kind = kind
         return delegate
 

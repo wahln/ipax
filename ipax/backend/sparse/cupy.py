@@ -28,10 +28,12 @@ rejected up front (as the SciPy adapter's ``_reject_non_finite`` does), and
 cuDSS's static pivoting silently replaces a too-small pivot by
 ``PIVOT_EPSILON`` — an exactly singular system then "solves" to a finite,
 meaningless vector (``±1/ε``) with a plausible inertia. A solve on such a
-perturbed factorization is therefore certified by its residual (see
-:meth:`CuDSSSparseSolver._certify_perturbed_solve`) and raises
-:class:`LinearSolveError` when it does not solve the system at all; an
-accepted solve is returned unchanged.
+perturbed factorization is therefore iteratively refined against the
+unperturbed matrix (GESP pairs static pivoting with refinement; Li & Demmel
+2003) and then certified by its residual (see
+:meth:`CuDSSSparseSolver._certify_perturbed_solve`), raising
+:class:`LinearSolveError` when it does not solve the system at all.
+Factorizations without perturbed pivots are neither refined nor certified.
 
 ``ipax`` deliberately does not choose a CUDA toolkit, CuPy wheel, or cuDSS
 runtime for the user. The ``[sparse-cuda]`` extra installs only the
@@ -42,6 +44,8 @@ user-managed CUDA dependencies.
 from __future__ import annotations
 
 import ctypes
+import math
+import numbers
 import warnings
 from typing import TYPE_CHECKING, Any, cast
 
@@ -107,8 +111,36 @@ _GRAM_MIRROR_BLOCK = 1024
 # an inexact Newton step, set where only a solve that failed to solve the
 # system at all trips it — an inconsistent singular system leaves an O(1)
 # residual (0.25 on the 2×2 contract case), a near-singular consistent one
-# ~1e-8 (a degenerate L-BFGS border).
+# ~1e-8 (a degenerate L-BFGS border). Judged *after* the refinement below.
 _PERTURBED_SOLVE_MAX_RESIDUAL = 1e-2
+# Iterative refinement of a solve on a perturbed-pivot factorization (and
+# only there): ``x += (A+E)⁻¹ (b − A x)`` against the unperturbed ``A``. Static
+# pivoting is paired with refinement by design — the perturbation ``E`` only
+# has to be small enough for the refinement to converge (Li & Demmel 2003,
+# GESP; Higham 2002, *Accuracy and Stability of Numerical Algorithms*, 2nd
+# ed., ch. 12: each step contracts the error by ≈ ‖(A+E)⁻¹E‖). The stopping
+# rules follow IPOPT's ``PDFullSpaceSolver::Solve`` (IPOPT 3.14 options
+# ``max_refinement_steps = 10``, ``residual_ratio_max = 1e-10``,
+# ``residual_improvement_factor = 1``): stop after
+# ``_PERTURBED_MAX_REFINEMENT_STEPS`` steps, once IPOPT's residual ratio
+# ``‖r‖∞ / (min(‖x‖∞, 1e6 ‖b‖∞) + ‖b‖∞)`` (its ``ComputeResidualRatio``,
+# ``max_cond = 1e6``) is at most ``_PERTURBED_REFINEMENT_TOL``, or at the
+# first step that does not reduce the certified ratio ``‖r‖∞ / ‖b‖∞``. Two
+# deliberate deviations: each column keeps its *best* iterate rather than
+# the last, because ‖(A+E)⁻¹E‖ > 1 does occur (a ROTDISC KKT system: 1.3e-5
+# unrefined, 20 after five steps, 8e7 after ten); and a solve already at the
+# target takes no step (IPOPT: ``min_refinement_steps = 1``). The target is
+# floored at ``_PERTURBED_REFINEMENT_EPS_FACTOR`` unit roundoffs of the
+# factorization's dtype, so a float32 system stops at its attainable
+# accuracy instead of stagnating toward 1e-10. cuDSS's own in-solve
+# refinement (``CUDSS_CONFIG_IR_N_STEPS``) was measured and not used: it runs
+# a fixed step count (``IR_TOL`` is ignored by the pinned cuDSS 0.7 runtime),
+# so it can neither stop early nor stop that divergence.
+_PERTURBED_MAX_REFINEMENT_STEPS = 10
+_PERTURBED_REFINEMENT_TOL = 1e-10
+_PERTURBED_REFINEMENT_IMPROVEMENT = 1.0
+_PERTURBED_REFINEMENT_EPS_FACTOR = 100.0
+_IPOPT_RESIDUAL_MAX_COND = 1e6
 
 
 def _mirror_lower_to_upper(out: Any) -> None:
@@ -135,6 +167,44 @@ def _mirror_lower_to_upper(out: Any) -> None:
         diag[rows, cols] = diag[cols, rows]
         if j1 < n:
             out[j0:j1, j1:] = out[j1:, j0:j1].T
+
+
+def _resolve_refinement_policy(
+    max_refinement_steps: int | None, perturbed_max_residual: float | None
+) -> tuple[int, float]:
+    """Validated ``(max_steps, threshold)`` of the perturbed-pivot policy.
+
+    ``None`` takes the module default (``_PERTURBED_MAX_REFINEMENT_STEPS`` /
+    ``_PERTURBED_SOLVE_MAX_RESIDUAL``), read at call time.
+    """
+    # Typed ``object``: callers (runner flags, user code) may pass anything.
+    steps: object = (
+        _PERTURBED_MAX_REFINEMENT_STEPS
+        if max_refinement_steps is None
+        else max_refinement_steps
+    )
+    threshold: object = (
+        _PERTURBED_SOLVE_MAX_RESIDUAL
+        if perturbed_max_residual is None
+        else perturbed_max_residual
+    )
+    if (
+        isinstance(steps, bool)
+        or not isinstance(steps, numbers.Integral)
+        or int(steps) < 0
+    ):
+        raise ValueError(f"max_refinement_steps must be an int >= 0, got {steps!r}")
+    # An infinite threshold would silently disable the certificate; NaN and
+    # non-positive values fail ``0 < x``.
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, numbers.Real)
+        or not 0.0 < float(threshold) < math.inf
+    ):
+        raise ValueError(
+            f"perturbed_max_residual must be finite and > 0, got {threshold!r}"
+        )
+    return int(steps), float(threshold)
 
 
 class _CuDSSUnavailableError(ImportError):
@@ -682,10 +752,34 @@ class CuDSSSparseSolver:
     symmetric/Hermitian non-positive-definite matrix types, so this wrapper
     requests a symmetric lower-triangle LDL^T factorization whenever inertia is
     required.
+
+    A solve on a factorization in which cuDSS perturbed pivots (static
+    pivoting) is iteratively refined against the unperturbed matrix (at most
+    ``max_refinement_steps`` steps; 0 disables it) and then certified: a
+    right-hand-side column whose relative residual ``‖b − A x‖∞ / ‖b‖∞``
+    still exceeds ``perturbed_max_residual`` raises
+    :class:`LinearSolveError`. Both default to the module constants
+    ``_PERTURBED_MAX_REFINEMENT_STEPS`` and ``_PERTURBED_SOLVE_MAX_RESIDUAL``
+    (read at construction). A factorization without perturbed pivots is
+    neither refined nor certified.
     """
 
-    def __init__(self, *, require_inertia: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        require_inertia: bool = False,
+        max_refinement_steps: int | None = None,
+        perturbed_max_residual: float | None = None,
+    ) -> None:
         self._require_inertia = require_inertia
+        self._max_refinement_steps, self._perturbed_max_residual = (
+            _resolve_refinement_policy(max_refinement_steps, perturbed_max_residual)
+        )
+        # Outcome of the last perturbed-pivot solve (host values the
+        # refinement already read, kept for diagnostics/instrumentation):
+        # refinement steps taken and the certified worst-column ratio.
+        self.last_refinement_steps = 0
+        self.last_residual_ratio: float | None = None
         self._cudss: Any | None = None
         self._handle: int | None = None
         self._config: int | None = None
@@ -848,7 +942,7 @@ class CuDSSSparseSolver:
                 b = cupy.reshape(b, (int(b.shape[0]), 1))
             x = self._solve_columns(b)
             if perturbed:
-                self._certify_perturbed_solve(b, x)
+                x = self._certify_perturbed_solve(b, x)
             result = x[:, 0] if was_vector else x
             return cast("Array", to_xp_array(result, self._xp))
 
@@ -898,47 +992,134 @@ class CuDSSSparseSolver:
             self._npivots = self._read_npivots()
         return self._npivots
 
-    def _certify_perturbed_solve(self, b: Any, x: Any) -> None:
-        """Raise unless a solve on a perturbed-pivot factor solves ``A x = b``.
+    def _certify_perturbed_solve(self, b: Any, x: Any) -> Any:
+        """Refine a solve on a perturbed-pivot factor, then certify it.
+
+        Returns the refined solution; raises :class:`LinearSolveError` unless
+        it solves ``A x = b``.
 
         cuDSS's static pivoting replaces a pivot below ``PIVOT_EPSILON`` by
         ``±ε`` and so factors ``A + E`` instead of ``A`` (the GESP strategy;
-        Li & Demmel 2003, ACM TOMS 29(2)). That is harmless when ``A`` is
-        merely ill-conditioned or the tiny pivot an artefact of the ordering
-        (a zero diagonal a 2×2 block pairs off): the residual ``b − A x`` stays
-        small and the solution is kept *unchanged*. But when ``A x = b`` has no
-        solution — ``A`` singular, ``b`` outside its range — the ``+ε`` pivot
-        turns the missing component into an ``O(‖b‖/ε)`` spike along the null
-        space: a finite, meaningless vector (the ``±1e13`` of a 2×2 singular
-        system), with a plausible inertia. Its residual is the component of
-        ``b`` outside ``range(A)``, which no solution can reduce, so the solve
-        fails the inexact-Newton condition ``‖b − A x‖ ≤ η ‖b‖`` (Dembo,
-        Eisenstat & Steihaug 1982) for any useful forcing term: rejected at
-        ``η = _PERTURBED_SOLVE_MAX_RESIDUAL``, a percent-level residual no
-        Newton step survives, while the near-singular *consistent* systems an
-        IPM routinely produces (a degenerate L-BFGS border: eigenvalues down to
-        1e-14, perturbed-solve residuals ~1e-8) pass untouched. The rejection
-        is the numerical failure it is — the δ_w/δ_c ladder then regularizes
-        the system (Wächter & Biegler 2006, §3.1), as on the CPU when SuperLU
-        raises or Feral reports a zero pivot. One SpMV and one host sync, only
-        on perturbed factorizations; each column of an ``(n, k)`` right-hand
-        side is certified on its own.
+        Li & Demmel 2003, ACM TOMS 29(2)). When ``A`` is merely
+        ill-conditioned, or the tiny pivot is an artefact of the ordering (a
+        zero diagonal a 2×2 block would pair off — the minimax epigraph
+        variable of a MAKELA-type KKT system), the unrefined solve is an
+        inexact solve of ``A x = b`` — residuals of 1e-5..1e-2 on the CuPy
+        corpus sweep, enough to stall the IPM — and iterative refinement
+        against ``A`` recovers it: ``x ← x + (A+E)⁻¹ (b − A x)`` (Higham
+        2002, ch. 12), stopped by IPOPT's rules (see
+        ``_PERTURBED_MAX_REFINEMENT_STEPS``), each column keeping its best
+        iterate.
+
+        But when ``A x = b`` has no solution — ``A`` singular, ``b`` outside
+        its range — the ``+ε`` pivot turns the missing component into an
+        ``O(‖b‖/ε)`` spike along the null space: a finite, meaningless vector
+        (the ``±1e13`` of a 2×2 singular system), with a plausible inertia.
+        Its residual is the component of ``b`` outside ``range(A)``, which no
+        solution and no refinement step can reduce, so the solve fails the
+        inexact-Newton condition ``‖b − A x‖ ≤ η ‖b‖`` (Dembo, Eisenstat &
+        Steihaug 1982) for any useful forcing term: rejected at ``η =
+        perturbed_max_residual`` (default ``_PERTURBED_SOLVE_MAX_RESIDUAL``),
+        judged on the refined residual. The rejection is the numerical
+        failure it is — the δ_w/δ_c ladder then regularizes the system
+        (Wächter & Biegler 2006, §3.1), as on the CPU when SuperLU raises or
+        Feral reports a zero pivot. Each column of an ``(n, k)`` right-hand
+        side is certified and keeps its best iterate on its own (a small
+        inconsistent column must not hide behind a large consistent one);
+        the loop stops when the worst column stops improving.
+
+        Cost, only on perturbed factorizations: one SpMV and one host sync
+        (the ratio read that decides whether to refine, which is also the
+        certificate), plus one cuDSS SOLVE phase, one SpMV and one host sync
+        per refinement step taken — typically 1–3, at most
+        ``max_refinement_steps``. The per-step sync is the early exit: a
+        fixed-count refinement without it runs every step even when the
+        first one reached the target, and cannot stop where
+        ``‖(A+E)⁻¹E‖ > 1`` makes it diverge.
         """
+        self.last_refinement_steps = 0
+        self.last_residual_ratio = None
         matrix = self._residual_matrix
         assert matrix is not None
-        residual = b - matrix @ x
-        # Per right-hand-side column: a small inconsistent column must not
-        # hide behind a large consistent one. NaN compares false, so a
-        # non-finite residual is rejected too.
-        certified = cupy.all(
-            cupy.max(cupy.abs(residual), axis=0)
-            <= _PERTURBED_SOLVE_MAX_RESIDUAL * cupy.max(cupy.abs(b), axis=0)
+        ncols = int(b.shape[1])
+        if ncols == 0:
+            return x
+        b_norm = cupy.max(cupy.abs(b), axis=0)
+        b_nonzero = b_norm > 0
+        b_safe = cupy.where(b_nonzero, b_norm, 1.0)
+        target = max(
+            _PERTURBED_REFINEMENT_TOL,
+            _PERTURBED_REFINEMENT_EPS_FACTOR * float(cupy.finfo(self._dtype).eps),
         )
-        if not bool(certified):
+
+        def measure(x_: Any) -> tuple[Any, Any, Any]:
+            """Residual and per-column (certified, IPOPT-stopping) ratios."""
+            r_ = b - matrix @ x_
+            r_norm = cupy.max(cupy.abs(r_), axis=0)
+            # Certified ratio ‖r‖∞/‖b‖∞; a zero column of b has ratio 0 only
+            # when solved exactly. NaN counts as ∞ (never certified).
+            cert = cupy.where(
+                b_nonzero, r_norm / b_safe, cupy.where(r_norm == 0, 0.0, cupy.inf)
+            )
+            cert = cupy.where(cupy.isnan(cert), cupy.inf, cert)
+            # IPOPT's ComputeResidualRatio: ‖r‖/(min(‖x‖, max_cond ‖b‖) + ‖b‖).
+            denom = (
+                cupy.minimum(
+                    cupy.max(cupy.abs(x_), axis=0), _IPOPT_RESIDUAL_MAX_COND * b_norm
+                )
+                + b_norm
+            )
+            stop = cupy.where(
+                denom > 0, r_norm / cupy.where(denom > 0, denom, 1.0), r_norm
+            )
+            stop = cupy.where(cupy.isnan(stop), cupy.inf, stop)
+            return r_, cert, stop
+
+        def worst(cert: Any, stop: Any) -> tuple[float, float]:
+            """Worst-column ratios, both in one host sync."""
+            pair = cupy.asnumpy(cupy.stack((cupy.max(cert), cupy.max(stop))))
+            return float(pair[0]), float(pair[1])
+
+        r, cert, stop = measure(x)
+        worst_cert, worst_stop = worst(cert, stop)
+        steps = 0
+        while (
+            steps < self._max_refinement_steps
+            and worst_stop > target
+            and worst_cert < math.inf
+        ):
+            x_new = x + self._solve_columns(r)
+            r_new, cert_new, stop_new = measure(x_new)
+            steps += 1
+            if ncols == 1:
+                # The dominant vector case: compare on the host after the sync.
+                new_cert, new_stop = worst(cert_new, stop_new)
+                if new_cert < worst_cert:
+                    x, r = x_new, r_new
+            else:
+                # Keep each column's best iterate (refinement diverges where
+                # ‖(A+E)⁻¹E‖ > 1, and then the unrefined column is better).
+                better = cert_new < cert
+                x = cupy.where(better, x_new, x)
+                r = cupy.where(better, r_new, r)
+                cert = cupy.where(better, cert_new, cert)
+                stop = cupy.where(better, stop_new, stop)
+                new_cert, new_stop = worst(cert, stop)
+            improved = new_cert < _PERTURBED_REFINEMENT_IMPROVEMENT * worst_cert
+            if new_cert < worst_cert:
+                worst_cert, worst_stop = new_cert, new_stop
+            if not improved:
+                break
+        self.last_refinement_steps = steps
+        self.last_residual_ratio = worst_cert
+        if not worst_cert <= self._perturbed_max_residual:
             raise LinearSolveError(
                 f"cuDSS perturbed {self._npivots} pivot(s) and the solve does not "
-                "satisfy the system: it is singular for this right-hand side"
+                "satisfy the system: it is singular for this right-hand side "
+                f"(relative residual {worst_cert:.1e} after {steps} refinement "
+                "step(s))"
             )
+        return x
 
     @property
     def inertia(self) -> tuple[int, int, int]:
@@ -1330,10 +1511,20 @@ class CuPySparseSolver:
     """CUDA sparse-direct solver preferring cuDSS and falling back to spsolve."""
 
     def __init__(
-        self, *, require_inertia: bool = False, prefer_cudss: bool = True
+        self,
+        *,
+        require_inertia: bool = False,
+        prefer_cudss: bool = True,
+        max_refinement_steps: int | None = None,
+        perturbed_max_residual: float | None = None,
     ) -> None:
         self._require_inertia = require_inertia
         self._prefer_cudss = prefer_cudss
+        # Validated up front and forwarded to the cuDSS solver (see
+        # :class:`CuDSSSparseSolver`); unused by the spsolve fallback.
+        self._max_refinement_steps, self._perturbed_max_residual = (
+            _resolve_refinement_policy(max_refinement_steps, perturbed_max_residual)
+        )
         self._inner: CuDSSSparseSolver | CuPySpsolveSolver | None = None
         self._cudss_unavailable = False
 
@@ -1343,7 +1534,11 @@ class CuPySparseSolver:
     def factor(self, K: LinearOperator) -> None:
         if self._prefer_cudss and not self._cudss_unavailable:
             if not isinstance(self._inner, CuDSSSparseSolver):
-                self._inner = CuDSSSparseSolver(require_inertia=self._require_inertia)
+                self._inner = CuDSSSparseSolver(
+                    require_inertia=self._require_inertia,
+                    max_refinement_steps=self._max_refinement_steps,
+                    perturbed_max_residual=self._perturbed_max_residual,
+                )
             try:
                 self._inner.factor(K)
             except ImportError as exc:
@@ -1398,12 +1593,41 @@ class CuPySparseAdapter:
     ``pattern_signature``. On a fixed KKT pattern this replaces the per-iteration
     device ``tocsr().sum_duplicates().sort_indices()`` with a single scatter-add
     (see :mod:`ipax.backend.sparse._canonical`).
+
+    ``max_refinement_steps`` / ``perturbed_max_residual`` set the cuDSS
+    solvers' perturbed-pivot policy (see :class:`CuDSSSparseSolver`); ``None``
+    keeps the module defaults. :meth:`configure_perturbed_pivots` changes it
+    after construction — the route by which
+    ``SparseOptions.perturbed_pivot_refinement_steps`` /
+    ``perturbed_pivot_max_residual`` reach this adapter.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_refinement_steps: int | None = None,
+        perturbed_max_residual: float | None = None,
+    ) -> None:
+        self._max_refinement_steps, self._perturbed_max_residual = (
+            _resolve_refinement_policy(max_refinement_steps, perturbed_max_residual)
+        )
         self._signature: object | None = None
         self._compiled: CompiledCompressed | None = None
         self._meta: tuple[tuple[int, int], int] | None = None
+
+    def configure_perturbed_pivots(
+        self, *, refinement_steps: int | None, max_residual: float | None
+    ) -> None:
+        """Set the perturbed-pivot policy of the solvers made from now on.
+
+        The optional adapter hook through which the ``SparseDirectSolver``
+        facade forwards ``SparseOptions``' policy (called once, before
+        :meth:`solver`); ``None`` takes the module default. Validated as in
+        the constructor; a rejected policy leaves the current one in place.
+        """
+        self._max_refinement_steps, self._perturbed_max_residual = (
+            _resolve_refinement_policy(refinement_steps, max_residual)
+        )
 
     def from_coo(
         self,
@@ -1493,7 +1717,11 @@ class CuPySparseAdapter:
 
     def solver(self, *, require_inertia: bool = False) -> CuPySparseSolver:
         """Return the CUDA sparse-direct solver (cuDSS default, spsolve fallback)."""
-        return CuPySparseSolver(require_inertia=require_inertia)
+        return CuPySparseSolver(
+            require_inertia=require_inertia,
+            max_refinement_steps=self._max_refinement_steps,
+            perturbed_max_residual=self._perturbed_max_residual,
+        )
 
 
 __all__ = [

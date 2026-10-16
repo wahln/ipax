@@ -234,6 +234,18 @@ class SolverKind(Protocol):
         ...
 
 
+def _sparse_direct_solver(form: str, options: Options) -> LinearSolver:
+    """A ``SparseDirectSolver`` carrying ``Options.sparse``' perturbed-pivot policy."""
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    sparse = options.sparse
+    return SparseDirectSolver(
+        form=form,
+        perturbed_pivot_refinement_steps=sparse.perturbed_pivot_refinement_steps,
+        perturbed_pivot_max_residual=sparse.perturbed_pivot_max_residual,
+    )
+
+
 def select_solver(
     *,
     n_vars: int,
@@ -275,8 +287,6 @@ def select_solver(
     if mode == "sparse":
         if not capabilities.has_sparse_adapter:
             raise RuntimeError("sparse linear solving is unavailable for this backend")
-        from ipax.linalg.sparse import SparseDirectSolver
-
         form = options.sparse.kkt_route
         if form == "auto":
             # Same tall gate and measured thresholds as the linsolve="auto"
@@ -302,7 +312,7 @@ def select_solver(
                     density = ineq_density() if ineq_density is not None else None
                     if density is not None and density >= _TALL_DENSE_MIN_DENSITY:
                         form = "normal_equations"
-        return SparseDirectSolver(form=form)
+        return _sparse_direct_solver(form, options)
 
     dense_viable = has_dense_solve() and (
         not has_equalities or "cholesky" in capabilities.linalg_functions
@@ -334,9 +344,7 @@ def select_solver(
         if density is None or density < _TALL_DENSE_MIN_DENSITY:
             fill = ineq_gram_fill()
             if fill is not None and fill <= _TALL_SPARSE_NE_MAX_FILL:
-                from ipax.linalg.sparse import SparseDirectSolver
-
-                return SparseDirectSolver(form="normal_equations")
+                return _sparse_direct_solver("normal_equations", options)
 
     if n_vars < _DENSE_AUTO_MAX_VARS and dense_viable:
         return DenseSolver(options.dense)

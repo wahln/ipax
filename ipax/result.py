@@ -94,6 +94,14 @@ class IterationRecord:
     complementarity: float = float("inf")
     line_search_iters: int = 0  # backtracking trials in the search reaching this row
     restored: bool = False  # this iterate is the result of a restoration jump
+    # This iterate is a second-order-corrected point (W&B 2006 §2.4 filter
+    # correction, or the opt-in ``BreedveldOptions.max_soc`` Markov correction).
+    used_soc: bool = False
+    # A second-order correction was tried while producing this iterate,
+    # accepted or not (at most one per iteration; see ``used_soc``). May be
+    # True together with ``restored``: the search tried and rejected a
+    # correction before falling back to feasibility restoration.
+    soc_attempted: bool = False
 
 
 @dataclass(frozen=True, slots=True)

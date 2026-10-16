@@ -52,6 +52,8 @@ validated on construction.
 
 ::: ipax.options.RestorationOptions
 
+::: ipax.options.SparseOptions
+
 ::: ipax.options.BreedveldOptions
 
 ## Results and diagnostics

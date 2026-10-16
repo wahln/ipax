@@ -64,6 +64,12 @@ def cupy_sparse_module(monkeypatch: pytest.MonkeyPatch):
     cupy.sqrt = np.sqrt
     cupy.isfinite = np.isfinite
     cupy.all = np.all
+    cupy.where = np.where
+    cupy.isnan = np.isnan
+    cupy.inf = np.inf
+    cupy.minimum = np.minimum
+    cupy.stack = np.stack
+    cupy.any = np.any
     cupy.triu_indices = np.triu_indices
 
     # ``cupy.cublas.syrk`` fake with real cuBLAS semantics: only the requested
@@ -521,6 +527,319 @@ def test_cudss_perturbed_certificate_is_per_column(cupy_sparse_module, monkeypat
     rhs = np.asarray([[1e6, 0.0], [0.0, 1.0]])
     with pytest.raises(LinearSolveError):
         solver.solve(rhs)
+
+
+class _RefiningFakeCudss(_PivotingFakeCudss):
+    """Fake cuDSS whose SOLVE uses a *perturbed* factor ``A + E``.
+
+    Models static pivoting: every SOLVE phase returns ``(A + E)⁻¹ b`` while the
+    adapter measures residuals against the true ``A`` it assembled. ``A`` and
+    ``E`` are dense NumPy arrays the test chooses; ``solves`` counts SOLVE
+    phases (the initial solve plus one per refinement step).
+    """
+
+    def __init__(self, npivots: int, A: np.ndarray, E: np.ndarray) -> None:
+        super().__init__(npivots)
+        self.A = np.asarray(A, dtype=np.float64)
+        self.perturbed = self.A + np.asarray(E, dtype=np.float64)
+        self.solves = 0
+
+    def execute(self, _handle, phase, _config, _data, _matrix, solution, rhs) -> None:
+        self.phases.append(int(phase))
+        if int(phase) != int(_Phase.SOLVE):
+            return
+        self.solves += 1
+        nrows, ncols, _, solution_ptr, _, _ = self.dense_matrices[solution]
+        _, _, _, rhs_ptr, _, _ = self.dense_matrices[rhs]
+        length = nrows * ncols
+        # Column-major buffers (cuDSS supports COL_MAJOR only).
+        b = np.array((ctypes.c_double * length).from_address(rhs_ptr))
+        x = np.linalg.solve(self.perturbed, b.reshape(ncols, nrows).T)
+        out = (ctypes.c_double * length).from_address(solution_ptr)
+        out[:] = np.asarray(x.T, dtype=np.float64).ravel().tolist()
+
+
+def _refining_solver(module, monkeypatch, fake, **policy):
+    monkeypatch.setattr(module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(module, "_ptr", lambda arr: int(arr.ctypes.data))
+    n = fake.A.shape[0]
+    rows, cols = np.nonzero(np.ones((n, n)))
+    adapter = module.CuPySparseAdapter(**policy)
+    operator = adapter.from_coo(
+        rows, cols, fake.A[rows, cols], shape=(n, n), symmetric=True
+    )
+    solver = adapter.solver()
+    solver.factor(operator)
+    return solver
+
+
+# A saddle point whose (0, 0) entry is exactly zero: a symmetric factorization
+# without 2×2 pivots meets a zero pivot there and static pivoting perturbs it
+# (the minimax epigraph variable of MAKELA1 / MIFFLIN2 has this structure).
+# Well conditioned, so the unperturbed system is benign.
+_SADDLE = np.asarray([[0.0, 1.0, 1.0], [1.0, 4.0, 0.0], [1.0, 0.0, 3.0]])
+_SADDLE_RHS = np.asarray([1.0, 2.0, 3.0])
+
+
+def _perturbation(value: float) -> np.ndarray:
+    E = np.zeros((3, 3))
+    E[0, 0] = value
+    return E
+
+
+def _relative_residual(A, b, x):
+    return float(np.max(np.abs(b - A @ np.asarray(x))) / np.max(np.abs(b)))
+
+
+def test_cudss_refines_a_perturbed_factor_to_the_unperturbed_solution(
+    cupy_sparse_module, monkeypatch
+):
+    # E = 1e-3 on the zero pivot: unrefined, the solve misses the system by a
+    # relative residual ~3e-4 — accepted by the 1e-2 certificate, but a poor
+    # Newton step (the CuPy sweep's accepted-but-inaccurate class). Refining
+    # against A contracts the error by ≈ ‖(A+E)⁻¹E‖ ≈ 2e-3 per step, so the
+    # IPOPT target 1e-10 is reached in three steps and the loop stops there.
+    reference = np.linalg.solve(_SADDLE, _SADDLE_RHS)
+    unrefined = _refining_solver(
+        cupy_sparse_module,
+        monkeypatch,
+        _RefiningFakeCudss(1, _SADDLE, _perturbation(1e-3)),
+        max_refinement_steps=0,
+    )
+    x0 = unrefined.solve(_SADDLE_RHS)
+    assert 1e-5 < _relative_residual(_SADDLE, _SADDLE_RHS, x0) < 1e-2
+    assert unrefined._inner.last_refinement_steps == 0
+
+    fake = _RefiningFakeCudss(1, _SADDLE, _perturbation(1e-3))
+    solver = _refining_solver(cupy_sparse_module, monkeypatch, fake)
+    x = solver.solve(_SADDLE_RHS)
+    assert _relative_residual(_SADDLE, _SADDLE_RHS, x) <= 1e-10
+    np.testing.assert_allclose(x, reference, rtol=1e-9, atol=0.0)
+    assert solver._inner.last_refinement_steps == 3
+    assert fake.solves == 1 + 3
+    assert solver._inner.last_residual_ratio <= 1e-10
+
+
+def test_cudss_refinement_rescues_a_consistent_solve_the_certificate_rejected(
+    cupy_sparse_module, monkeypatch
+):
+    # A larger perturbation (contraction ≈ 0.2) leaves the unrefined solve
+    # above the 1e-2 certificate — a false positive on a consistent system;
+    # refinement brings it well below, within the step cap.
+    from ipax.linalg.solver import LinearSolveError
+
+    unrefined = _refining_solver(
+        cupy_sparse_module,
+        monkeypatch,
+        _RefiningFakeCudss(1, _SADDLE, _perturbation(0.1)),
+        max_refinement_steps=0,
+    )
+    with pytest.raises(LinearSolveError, match="perturbed 1 pivot"):
+        unrefined.solve(_SADDLE_RHS)
+
+    fake = _RefiningFakeCudss(1, _SADDLE, _perturbation(0.1))
+    solver = _refining_solver(cupy_sparse_module, monkeypatch, fake)
+    x = solver.solve(_SADDLE_RHS)
+    assert _relative_residual(_SADDLE, _SADDLE_RHS, x) <= 1e-4
+    steps = cupy_sparse_module._PERTURBED_MAX_REFINEMENT_STEPS
+    assert solver._inner.last_refinement_steps == steps  # capped, still improving
+    assert fake.solves == 1 + steps
+
+
+def test_cudss_refinement_cannot_rescue_an_inconsistent_system(
+    cupy_sparse_module, monkeypatch
+):
+    # Singular A = [[1, 1], [1, 1]], b outside its range: the ±1/ε spike's
+    # residual is b's component outside range(A), which no refinement step
+    # reduces — one non-improving step, then the LinearSolveError the δ_w/δ_c
+    # ladder acts on.
+    from ipax.linalg.solver import LinearSolveError
+
+    fake = _RefiningFakeCudss(1, np.ones((2, 2)), np.diag([0.0, 1e-13]))
+    solver = _refining_solver(cupy_sparse_module, monkeypatch, fake)
+    with pytest.raises(LinearSolveError, match="after 1 refinement step"):
+        solver.solve(np.asarray([1.0, 2.0]))
+    assert fake.solves == 2
+
+
+def test_cudss_refinement_keeps_the_better_iterate_when_it_diverges(
+    cupy_sparse_module, monkeypatch
+):
+    # ‖(A+E)⁻¹E‖ > 1 (E = 1 on the zero pivot): a refinement step *raises*
+    # the residual (0.4 → 0.96). The loop stops at that step and returns the
+    # unrefined solution, never the worse one (a threshold of 1.0 accepts it,
+    # isolating the keep-best rule from the certificate).
+    policy = {"perturbed_max_residual": 1.0}
+    unrefined = _refining_solver(
+        cupy_sparse_module,
+        monkeypatch,
+        _RefiningFakeCudss(1, _SADDLE, _perturbation(1.0)),
+        max_refinement_steps=0,
+        **policy,
+    )
+    x0 = unrefined.solve(_SADDLE_RHS)
+
+    fake = _RefiningFakeCudss(1, _SADDLE, _perturbation(1.0))
+    solver = _refining_solver(cupy_sparse_module, monkeypatch, fake, **policy)
+    x = solver.solve(_SADDLE_RHS)
+    np.testing.assert_array_equal(x, x0)
+    assert solver._inner.last_refinement_steps == 1
+    assert fake.solves == 2
+
+
+def test_cudss_unperturbed_factor_pays_no_refinement(cupy_sparse_module, monkeypatch):
+    # NPIVOTS = 0: one SOLVE phase per solve and no residual SpMV — the path
+    # is exactly what it was before refinement existed.
+    fake = _RefiningFakeCudss(0, _SADDLE + np.eye(3), np.zeros((3, 3)))
+    calls = {"n": 0}
+    original = cupy_sparse_module.CuDSSSparseSolver._certify_perturbed_solve
+
+    def spy(self, b, x):
+        calls["n"] += 1
+        return original(self, b, x)
+
+    monkeypatch.setattr(
+        cupy_sparse_module.CuDSSSparseSolver, "_certify_perturbed_solve", spy
+    )
+    solver = _refining_solver(cupy_sparse_module, monkeypatch, fake)
+    for _ in range(3):
+        solver.solve(_SADDLE_RHS)
+    assert fake.solves == 3
+    assert calls["n"] == 0
+
+
+def test_cudss_refinement_policy_is_threaded_and_validated(
+    cupy_sparse_module, monkeypatch
+):
+    fake = _RefiningFakeCudss(1, _SADDLE, _perturbation(0.1))
+    solver = _refining_solver(
+        cupy_sparse_module,
+        monkeypatch,
+        fake,
+        max_refinement_steps=2,
+        perturbed_max_residual=1e-5,
+    )
+    inner = solver._inner
+    assert (inner._max_refinement_steps, inner._perturbed_max_residual) == (2, 1e-5)
+    from ipax.linalg.solver import LinearSolveError
+
+    # Two steps of contraction ≈ 0.2 leave ~1e-3: above the tighter threshold.
+    with pytest.raises(LinearSolveError, match="after 2 refinement step"):
+        solver.solve(_SADDLE_RHS)
+
+    adapter_cls = cupy_sparse_module.CuPySparseAdapter
+    for bad in ({"max_refinement_steps": -1}, {"max_refinement_steps": 1.5}):
+        with pytest.raises(ValueError, match="max_refinement_steps"):
+            adapter_cls(**bad)
+    for value in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="perturbed_max_residual"):
+            adapter_cls(perturbed_max_residual=value)
+    with pytest.raises(ValueError, match="max_refinement_steps"):
+        cupy_sparse_module.CuDSSSparseSolver(max_refinement_steps=True)
+
+
+def test_cudss_refinement_keeps_the_best_iterate_per_column(
+    cupy_sparse_module, monkeypatch
+):
+    # Two decoupled saddle blocks with different perturbations: refinement
+    # contracts block 1 (E = 1e-3) and diverges on block 2 (E = 1). Column 0
+    # lives on block 1, column 1 on block 2. The diverging column must come
+    # back bit-equal to its unrefined solve while the converging one is
+    # refined; the loop stops at the first step where the *worst* column
+    # does not improve (here: step 1). Threshold 1.0 isolates keep-best from
+    # the certificate.
+    A = np.zeros((6, 6))
+    A[:3, :3] = _SADDLE
+    A[3:, 3:] = _SADDLE
+    E = np.zeros((6, 6))
+    E[0, 0] = 1e-3
+    E[3, 3] = 1.0
+    rhs = np.zeros((6, 2))
+    rhs[:3, 0] = _SADDLE_RHS
+    rhs[3:, 1] = _SADDLE_RHS
+    policy = {"perturbed_max_residual": 1.0}
+    unrefined = _refining_solver(
+        cupy_sparse_module,
+        monkeypatch,
+        _RefiningFakeCudss(1, A, E),
+        max_refinement_steps=0,
+        **policy,
+    )
+    x0 = unrefined.solve(rhs)
+
+    fake = _RefiningFakeCudss(1, A, E)
+    solver = _refining_solver(cupy_sparse_module, monkeypatch, fake, **policy)
+    x = solver.solve(rhs)
+    np.testing.assert_array_equal(x[:, 1], x0[:, 1])
+    r0 = _relative_residual(A, rhs[:, 0], x0[:, 0])
+    r1 = _relative_residual(A, rhs[:, 0], x[:, 0])
+    assert r1 < 1e-2 * r0
+    assert solver._inner.last_refinement_steps == 1
+    assert fake.solves == 2
+
+
+def test_cudss_non_finite_perturbed_solve_is_rejected_without_refinement(
+    cupy_sparse_module, monkeypatch
+):
+    # A solve that comes back non-finite has an ∞ ratio: nothing to refine
+    # (no extra SOLVE phase), rejected as before.
+    from ipax.linalg.solver import LinearSolveError
+
+    class NaNSolve(_RefiningFakeCudss):
+        def execute(self, _h, phase, _c, _d, _m, solution, rhs) -> None:
+            super().execute(_h, phase, _c, _d, _m, solution, rhs)
+            if int(phase) == int(_Phase.SOLVE):
+                nrows, ncols, _, ptr, _, _ = self.dense_matrices[solution]
+                (ctypes.c_double * (nrows * ncols)).from_address(ptr)[0] = float("nan")
+
+    fake = NaNSolve(1, _SADDLE, _perturbation(1e-3))
+    solver = _refining_solver(cupy_sparse_module, monkeypatch, fake)
+    with pytest.raises(LinearSolveError, match="after 0 refinement step"):
+        solver.solve(_SADDLE_RHS)
+    assert fake.solves == 1
+
+
+def test_cudss_refinement_target_is_floored_at_the_dtype_roundoff(
+    cupy_sparse_module, monkeypatch
+):
+    # A float32 factorization cannot reach 1e-10: the target is floored at
+    # _PERTURBED_REFINEMENT_EPS_FACTOR float32 roundoffs (≈1.2e-5), so a
+    # solve already below that takes no refinement step.
+    fake = _RefiningFakeCudss(1, _SADDLE, _perturbation(1e-3))
+    solver = _refining_solver(cupy_sparse_module, monkeypatch, fake)
+    inner = solver._inner
+    monkeypatch.setattr(inner, "_dtype", np.dtype(np.float32))
+    b = np.asarray(_SADDLE_RHS)[:, None]
+    x = np.linalg.solve(_SADDLE, b) + 1e-8  # ratio ≈ 1e-8: above 1e-10
+    inner._certify_perturbed_solve(b, x)
+    assert inner.last_refinement_steps == 0
+    monkeypatch.setattr(inner, "_dtype", np.dtype(np.float64))
+    inner._certify_perturbed_solve(b, x)
+    assert inner.last_refinement_steps >= 1
+
+
+def test_cudss_certificate_counter_sees_the_refined_solve(
+    cupy_sparse_module, monkeypatch
+):
+    # The benchmark-side counter wraps the certificate: it must hand the
+    # refined solution back (the wrapper's return is load-bearing) and bin
+    # the unrefined vs the certified (refined) residual.
+    from benchmarks.runners._cupy_certificates import CertificateCounter
+
+    fake = _RefiningFakeCudss(1, _SADDLE, _perturbation(0.1))
+    solver = _refining_solver(cupy_sparse_module, monkeypatch, fake)
+    with CertificateCounter() as counter:
+        x = solver.solve(_SADDLE_RHS)
+    assert _relative_residual(_SADDLE, _SADDLE_RHS, x) <= 1e-4
+    summary = counter.summary()
+    assert summary["perturbed_solves"] == 1
+    assert summary["rejected_solves"] == 0
+    assert summary["rescued_solves"] == 1  # 3.4e-2 unrefined > 1e-2 threshold
+    assert summary["unrefined_bins"] == {"1e-2": 1}
+    steps = cupy_sparse_module._PERTURBED_MAX_REFINEMENT_STEPS
+    assert summary["refinement_steps"] == {str(steps): 1}
+    assert summary["max_refinement_steps"] == steps
+    assert summary["perturbed_max_residual"] == 1e-2
 
 
 def test_cudss_non_finite_matrix_is_a_linear_solve_error(
@@ -1104,3 +1423,68 @@ def test_cupy_gram_dense_strategy_nonfinite_weights_fall_back(
     finite = np.isfinite(expected)
     np.testing.assert_array_equal(np.isfinite(actual), finite)
     np.testing.assert_allclose(actual[finite], expected[finite], rtol=1e-12)
+
+
+def test_sparse_options_defaults_match_the_cudss_adapter_policy(cupy_sparse_module):
+    # SparseOptions documents the adapter defaults as literals (the core may
+    # not import an adapter); this pins the two against drift.
+    from ipax.options import SparseOptions
+
+    options = SparseOptions()
+    assert (
+        options.perturbed_pivot_refinement_steps
+        == cupy_sparse_module._PERTURBED_MAX_REFINEMENT_STEPS
+    )
+    assert (
+        options.perturbed_pivot_max_residual
+        == cupy_sparse_module._PERTURBED_SOLVE_MAX_RESIDUAL
+    )
+
+
+def test_cupy_adapter_hook_sets_the_policy_of_later_solvers(
+    cupy_sparse_module, monkeypatch
+):
+    # ``configure_perturbed_pivots`` is how SparseOptions reaches the adapter
+    # (the SparseDirectSolver facade calls it once, before ``solver()``).
+    fake = _RefiningFakeCudss(1, _SADDLE, _perturbation(1e-3))
+    monkeypatch.setattr(cupy_sparse_module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(cupy_sparse_module, "_ptr", lambda arr: int(arr.ctypes.data))
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    adapter.configure_perturbed_pivots(refinement_steps=0, max_residual=0.5)
+    rows, cols = np.nonzero(np.ones((3, 3)))
+    operator = adapter.from_coo(
+        rows, cols, _SADDLE[rows, cols], shape=(3, 3), symmetric=True
+    )
+    solver = adapter.solver()
+    solver.factor(operator)
+    x = solver.solve(_SADDLE_RHS)
+    inner = solver._inner
+    assert (inner._max_refinement_steps, inner._perturbed_max_residual) == (0, 0.5)
+    assert inner.last_refinement_steps == 0
+    assert fake.solves == 1
+    # Unrefined: the perturbed factor's inexact solve is returned as is.
+    assert _relative_residual(_SADDLE, _SADDLE_RHS, x) > 1e-6
+
+
+def test_cupy_adapter_hook_none_keeps_the_module_default(cupy_sparse_module):
+    adapter = cupy_sparse_module.CuPySparseAdapter(
+        max_refinement_steps=2, perturbed_max_residual=1e-5
+    )
+    adapter.configure_perturbed_pivots(refinement_steps=None, max_residual=None)
+    assert (adapter._max_refinement_steps, adapter._perturbed_max_residual) == (
+        cupy_sparse_module._PERTURBED_MAX_REFINEMENT_STEPS,
+        cupy_sparse_module._PERTURBED_SOLVE_MAX_RESIDUAL,
+    )
+
+
+def test_cupy_adapter_hook_validates_the_policy(cupy_sparse_module):
+    adapter = cupy_sparse_module.CuPySparseAdapter()
+    with pytest.raises(ValueError, match="max_refinement_steps"):
+        adapter.configure_perturbed_pivots(refinement_steps=-1, max_residual=None)
+    with pytest.raises(ValueError, match="perturbed_max_residual"):
+        adapter.configure_perturbed_pivots(refinement_steps=None, max_residual=0.0)
+    # A rejected policy leaves the previous one in place.
+    assert (adapter._max_refinement_steps, adapter._perturbed_max_residual) == (
+        cupy_sparse_module._PERTURBED_MAX_REFINEMENT_STEPS,
+        cupy_sparse_module._PERTURBED_SOLVE_MAX_RESIDUAL,
+    )
