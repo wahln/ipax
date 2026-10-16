@@ -9,7 +9,9 @@ reference everywhere is the dense ``Aᵀ diag(w) A`` or the plain
 from __future__ import annotations
 
 import gc
+import itertools
 import math
+import os
 import weakref
 
 import numpy as np
@@ -18,6 +20,7 @@ import pytest
 sp = pytest.importorskip("scipy.sparse")
 trots = pytest.importorskip("benchmarks.corpus.trots")
 
+from benchmarks.corpus import _trots_kernels as kernels  # noqa: E402
 from ipax.backend.operators import CSROperator  # noqa: E402
 
 
@@ -123,6 +126,79 @@ def test_sparse_tile_kernel_matches_dense_reference():
 
     assert all(t.sparse for p in op._plans for t in p.tiles)
     assert _rel(np.asarray(op.gram(w)), _dense_gram(a, w)) < 1e-12
+
+
+@pytest.mark.parametrize("accumulate", [None, "float32"])
+@pytest.mark.parametrize("signed", [False, True])
+def test_wide_sparse_tiles_are_densified_on_the_host(signed, accumulate, monkeypatch):
+    # 100 entries per row over 2000 columns: Σ nnz_row² is 0.25% of b·c²
+    # (sparse by the 1% rule) but 5× the tile's b·c entries, so the host
+    # densifies it (host_sparse_entry_ratio = 4); the plan's flag and flop
+    # count -- the gate statistic, the lane deal, the device kernels -- stay.
+    rng = np.random.default_rng(58)
+    a = sp.random(256, 2000, density=0.05, format="csr", random_state=rng)
+    a.data = rng.uniform(0.5, 2.0, a.nnz)
+    w = rng.uniform(-1.0 if signed else 0.1, 2.0, a.shape[0])
+    cfg = {"block_rows": 64, "threads": 1}
+    new, old = _op(a, **cfg), _op(a, host_sparse_entry_ratio=None, **cfg)
+    tiles = [t for p in new._plans for t in p.tiles]
+    assert tiles and all(t.sparse and t.host_sparse is False for t in tiles)
+    assert [t.flops for t in tiles] == [t.flops for p in old._plans for t in p.tiles]
+    assert all(t.sparse and t.host_sparse is None for p in old._plans for t in p.tiles)
+
+    kernels = []
+    real = trots._densify
+
+    def spy(csr, acc_dtype, scale=None, pool=None):
+        kernels.append(csr.shape)
+        return real(csr, acc_dtype, scale, pool)
+
+    monkeypatch.setattr(trots, "_densify", spy)
+    g_new = np.asarray(new.gram(w, accumulate_dtype=accumulate))
+    assert len(kernels) == len(tiles)  # every tile took the dense kernel
+    kernels.clear()
+    g_old = np.asarray(old.gram(w, accumulate_dtype=accumulate))
+    assert kernels == []  # ... and none of them without the width rule
+    ref = _dense_gram(a, w)
+    # float32 requests round the densified tile (ssyrk), as for any dense
+    # tile; the old SpGEMM stayed float64 for these tiles.
+    tol = 1e-12 if accumulate is None else 1e-5
+    assert g_new.dtype == np.float64
+    assert _rel(g_new, ref) < tol and _rel(g_old, ref) < 1e-12
+    np.testing.assert_array_equal(g_new, g_new.T)
+
+
+def test_multi_lane_grams_keep_spgemm_for_wide_sparse_tiles(monkeypatch):
+    # On lanes the SpGEMMs run in parallel and the deal follows the plan's
+    # flop counts: the width rule applies to single-lane Grams only.
+    rng = np.random.default_rng(59)
+    a = sp.random(256, 2000, density=0.05, format="csr", random_state=rng)
+    a.data = rng.uniform(0.5, 2.0, a.nnz)
+    w = rng.uniform(0.1, 2.0, a.shape[0])
+    op = _op(a, block_rows=64, threads=2, lane_min_flops=1.0, lane_budget_bytes=1 << 30)
+    assert all(t.host_sparse is False for p in op._plans for t in p.tiles)
+    kernels = []
+    real = trots._densify
+    monkeypatch.setattr(
+        trots,
+        "_densify",
+        lambda *args, **kw: kernels.append(1) or real(*args, **kw),
+    )
+    g = np.asarray(op.gram(w))
+    assert kernels == []
+    assert _rel(g, _dense_gram(a, w)) < 1e-12
+
+
+def test_narrow_sparse_tiles_stay_sparse_on_the_host():
+    a = _banded(800, 50, 2, 8)  # ~4 entries per row over ≤ 50 columns
+    op = _op(a, block_rows=100, sparse_tile_flop_ratio=1.0)
+    assert all(t.host_sparse is True for p in op._plans for t in p.tiles)
+
+
+@pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+def test_host_sparse_entry_ratio_is_validated(bad):
+    with pytest.raises(ValueError, match="host_sparse_entry_ratio"):
+        trots.TiledGramConfig(host_sparse_entry_ratio=bad)
 
 
 @pytest.mark.parametrize("threads", [1, 3])
@@ -359,6 +435,165 @@ def test_mirror_lower_default_block_divides_unevenly_at_hn_scale():
     want = _mirror_lower_row_loop_reference(a.copy())
 
     np.testing.assert_array_equal(got, want)
+
+
+def _full_block_scatter(acc, cols, g, pool=None, kernel=None):
+    # The scatter before 2026-10-02: the whole c×c block at ix_(cols, cols),
+    # on the calling thread.
+    del pool, kernel
+    acc[np.ix_(cols, cols)] += g
+
+
+@pytest.mark.parametrize("weights", ["positive", "signed"])
+@pytest.mark.parametrize("scatter_threads", [1, 3, 8])
+@pytest.mark.parametrize("lanes", [1, 2])
+def test_row_chunked_scatter_is_bitwise_the_full_block_scatter(
+    weights, scatter_threads, lanes, monkeypatch
+):
+    # Every lower-triangle entry receives the same single addition in both
+    # schemes and the mirror overwrites the upper one, so the Gram is the
+    # same to the bit -- for every thread count, on the multi-lane path
+    # (private accumulators, chunked without a pool), and on the gemm
+    # (signed) path whose products carry a nonzero upper triangle.
+    monkeypatch.setattr(trots, "_SCATTER_POOL_MIN_ENTRIES", 1)  # pool every tile
+    monkeypatch.setattr(trots, "_SCATTER_CHUNK_MIN_ENTRIES", 1)  # chunk every tile
+    a = _random_sparse(900, 70, 0.15, 50)
+    rng = np.random.default_rng(51)
+    low = 0.1 if weights == "positive" else -1.0
+    w = rng.uniform(low, 2.0, a.shape[0])
+    cfg = {
+        "block_rows": 64,
+        "threads": lanes,
+        "lane_min_flops": 1.0,
+        "sparse_tile_flop_ratio": 0.0,
+        # The NumPy row-chunked scatter, Numba installed or not (the
+        # compiled kernel has its own sha256 tests below).
+        "compiled_scatter": False,
+    }
+
+    new = np.asarray(_op(a, scatter_threads=scatter_threads, **cfg).gram(w))
+    monkeypatch.setattr(trots, "_scatter_lower", _full_block_scatter)
+    old = np.asarray(_op(a, **cfg).gram(w))
+
+    np.testing.assert_array_equal(new, old)
+    assert _rel(new, _dense_gram(a, w)) < 1e-12
+
+
+@pytest.mark.skipif((os.cpu_count() or 1) < 2, reason="needs a 2-worker pool")
+def test_the_pool_starts_threads_only_for_wide_tiles(monkeypatch):
+    import concurrent.futures
+
+    made = []
+    real_pool = concurrent.futures.ThreadPoolExecutor
+
+    class CountingPool(real_pool):
+        def __init__(self, *args, **kwargs):
+            made.append(kwargs.get("max_workers"))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", CountingPool)
+    a = _random_sparse(600, 50, 0.2, 52)
+    w = np.random.default_rng(53).uniform(0.1, 2.0, a.shape[0])
+    cfg = {"block_rows": 64, "threads": 1, "sparse_tile_flop_ratio": 0.0}
+
+    ref = np.asarray(_op(a, scatter_threads=3, **cfg).gram(w))  # c² < threshold
+    assert made == []
+
+    monkeypatch.setattr(trots, "_SCATTER_POOL_MIN_ENTRIES", 1)
+    pooled = np.asarray(_op(a, scatter_threads=3, **cfg).gram(w))
+    assert made == [min(3, os.cpu_count() or 1)]  # one pool per Gram, lazily
+    np.testing.assert_array_equal(pooled, ref)
+
+    made.clear()
+    single = np.asarray(_op(a, scatter_threads=1, **cfg).gram(w))
+    assert made == []  # one worker: no pool at all
+    np.testing.assert_array_equal(single, ref)
+
+
+@pytest.mark.skipif((os.cpu_count() or 1) < 2, reason="needs a 2-worker pool")
+@pytest.mark.parametrize("acc", [np.float64, np.float32])
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
+@pytest.mark.parametrize("scaled", [False, True])
+def test_densify_on_the_pool_is_bitwise_the_whole_tile_toarray(
+    dtype, scaled, acc, monkeypatch
+):
+    # Row-chunked windows, densified into one output and scaled in place:
+    # the same values and products as toarray() and *= on the whole tile.
+    # Mismatched dtypes are densified per window and cast into their rows
+    # (the per-element astype cast), also on the pool.
+    monkeypatch.setattr(trots, "_SCATTER_POOL_MIN_ENTRIES", 1)
+    csr = _random_sparse(203, 37, 0.3, 54).astype(dtype)
+    # Values that pin the cast: an overflow to inf and a round-to-even tie.
+    csr.data[0] = 1e39 if dtype == np.float64 else csr.data[0]
+    csr.data[1] = 1.0 + 2.0**-24 if dtype == np.float64 else csr.data[1]
+    # Non-canonical storage: unsorted indices and duplicate entries (which
+    # csr_todense adds in storage order, window or whole tile alike).
+    rng = np.random.default_rng(57)
+    for r in range(csr.shape[0]):
+        lo, hi = csr.indptr[r], csr.indptr[r + 1]
+        order = rng.permutation(hi - lo)
+        csr.indices[lo:hi] = csr.indices[lo:hi][order]
+        csr.data[lo:hi] = csr.data[lo:hi][order]
+    if csr.indptr[-1] > 1:
+        csr.indices[1] = csr.indices[0] if csr.indptr[1] > 1 else csr.indices[1]
+    csr.has_sorted_indices = False
+    # The kernel's own reference: whole-tile toarray, astype, then *= by
+    # the accumulate-dtype scale (_tile_work casts √w to it).
+    scale = np.random.default_rng(55).uniform(0.1, 2.0, 203).astype(acc)
+    with np.errstate(over="ignore"):
+        want = csr.toarray().astype(acc)
+        if scaled:
+            want *= scale[:, None]
+    calls = []
+    with trots._host_pool(trots.TiledGramConfig(scatter_threads=4)) as pool:
+        real_map = pool.map
+        pool.map = lambda fn, bounds: calls.append(1) or real_map(fn, bounds)
+        with np.errstate(over="ignore"):
+            got = trots._densify(csr, acc, scale if scaled else None, pool)
+
+    assert calls  # the pooled path, whatever the dtypes
+    assert got.dtype == acc
+    np.testing.assert_array_equal(got.view(np.uint8), want.view(np.uint8))
+
+
+@pytest.mark.skipif((os.cpu_count() or 1) < 2, reason="needs a 2-worker pool")
+@pytest.mark.parametrize("n", [600, 1000, 1031])
+def test_mirror_lower_on_the_pool_matches_the_row_loop(n, monkeypatch):
+    monkeypatch.setattr(trots, "_HOST_MIRROR_BLOCK", 64)  # many panels
+    monkeypatch.setattr(trots, "_SCATTER_POOL_MIN_ENTRIES", 1)
+    rng = np.random.default_rng(56)
+    a = rng.standard_normal((n, n))
+    a[1, 0] = -0.0
+    calls = []
+    with trots._host_pool(trots.TiledGramConfig(scatter_threads=4)) as pool:
+        real_map = pool.map
+        pool.map = lambda fn, bounds: calls.append(len(bounds)) or real_map(fn, bounds)
+        got = trots._mirror_lower(a.copy(), pool)
+    assert calls  # the panels ran on the pool
+
+    np.testing.assert_array_equal(got, _mirror_lower_row_loop_reference(a.copy()))
+    assert np.signbit(got[0, 1])
+
+
+@pytest.mark.parametrize("c", [1, 2, 7, 100, 9684])
+@pytest.mark.parametrize("chunks", [1, 4, 32, 200])
+def test_lower_row_bounds_cover_the_rows_in_equal_area_chunks(c, chunks):
+    bounds = trots._lower_row_bounds(c, chunks)
+
+    assert bounds[0] == 0 and bounds[-1] == c
+    assert all(r0 < r1 for r0, r1 in itertools.pairwise(bounds))
+    assert len(bounds) - 1 <= min(chunks, c)
+    if c >= 100 * chunks:
+        # Row r holds r + 1 lower entries: each chunk ~ c²/(2·chunks) of them.
+        areas = [
+            (r1 * (r1 + 1) - r0 * (r0 + 1)) / 2 for r0, r1 in itertools.pairwise(bounds)
+        ]
+        assert max(areas) <= 1.1 * min(areas)
+
+
+def test_scatter_threads_must_be_positive():
+    with pytest.raises(ValueError, match="scatter_threads"):
+        trots.TiledGramConfig(scatter_threads=0)
 
 
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")
@@ -1958,3 +2193,262 @@ def test_cupy_dense_workspace_is_bitwise_the_allocating_path(
     fresh = trots.TiledGramCSROperator(a, xp, config=cfg)
     alloc = _host(fresh.gram(xp.asarray(w), accumulate_dtype=accumulate))
     np.testing.assert_array_equal(with_work, alloc)
+
+
+# --------------------------------------------------------------------------- #
+# The compiled compacted scatter (benchmarks/corpus/_trots_kernels.py)
+# --------------------------------------------------------------------------- #
+# The kernel is plain Python compiled by Numba when it is installed. CI has no
+# Numba: there the plain-Python kernel pins the semantics on small blocks and
+# the NumPy fallback is what runs; the compiled kernel's tests skip.
+
+
+def _numba_kernel():
+    pytest.importorskip("numba")
+    trots._compiled_scatter.cache_clear()
+    kernel = trots._compiled_scatter()
+    assert kernel is not None
+    return kernel
+
+
+def _tile_product(rng, c, layout, dtype):
+    # The two shapes the loader produces: a syrk product (F-ordered, lower
+    # triangle only, upper exactly zero) and a gemm product (C-ordered, full).
+    d = rng.standard_normal((5, c)).astype(dtype)
+    if layout == "syrk":
+        from scipy.linalg.blas import get_blas_funcs
+
+        g = get_blas_funcs("syrk", dtype=dtype)(1.0, d.T, trans=0, lower=1)
+        assert g.flags.f_contiguous
+        return g
+    w = rng.uniform(-1.0, 1.0, 5).astype(dtype)
+    return np.ascontiguousarray(d.T @ (w[:, None] * d))
+
+
+def _accumulator(rng, n, view):
+    # A random accumulator, either C-contiguous or a leading sub-block view
+    # of a wider array (the Gram's out[:nx, :nx] with auxiliary columns).
+    base = rng.standard_normal((n + 3, n + 3) if view else (n, n))
+    return (base[:n, :n] if view else base), base
+
+
+def _special_values(acc, cols, g):
+    # Signed zeros and a NaN in the product, onto signed-zero accumulator
+    # entries: -0 + -0 = -0, -0 + +0 = +0, x + NaN = NaN (its payload).
+    c = int(cols.shape[0])
+    if c < 2:
+        return
+    g[1, 0], g[c - 1, c - 1], g[1, 1] = -0.0, 0.0, np.nan
+    acc[cols[1], cols[0]] = -0.0
+    acc[cols[c - 1], cols[c - 1]] = -0.0
+
+
+def _lower_bits(a):
+    return np.tril(np.asarray(a)).view(np.uint8)
+
+
+@pytest.mark.parametrize("c", [1, 2, 9, 37])
+@pytest.mark.parametrize("layout", ["syrk", "gemm"])
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
+@pytest.mark.parametrize("view", [False, True])
+def test_scatter_kernel_is_bitwise_the_numpy_scatter_on_the_lower_triangle(
+    c, layout, dtype, view
+):
+    # The plain-Python kernel (what Numba compiles): every lower-triangle
+    # entry receives the NumPy scatter's single addition, a float32 product
+    # widened exactly; nothing outside the block's lower triangle is
+    # touched; row ranges split anywhere, run in any order, give the same
+    # bits.
+    rng = np.random.default_rng(100 + c)
+    n = 50
+    cols = np.sort(rng.choice(n, size=c, replace=False)).astype(np.int64)
+    g = _tile_product(rng, c, layout, dtype)
+    acc, base = _accumulator(rng, n, view)
+    _special_values(acc, cols, g)
+    ref = acc.copy()
+    trots._scatter_lower(ref, cols, g)  # the NumPy scatter (no kernel)
+    before, base_before = acc.copy(), base.copy()
+    cuts = sorted({0, c, *rng.integers(0, c + 1, size=3).tolist()})
+    for r0, r1 in reversed(list(itertools.pairwise(cuts))):
+        kernels.scatter_lower_rows(acc, cols, g, r0, r1)
+
+    np.testing.assert_array_equal(_lower_bits(acc), _lower_bits(ref))
+    np.testing.assert_array_equal(np.triu(acc, 1), np.triu(before, 1))
+    np.testing.assert_array_equal(base[n:], base_before[n:])
+    np.testing.assert_array_equal(base[:, n:], base_before[:, n:])
+
+
+@pytest.mark.parametrize("c", [40, 300, 1000])
+@pytest.mark.parametrize("layout", ["syrk", "gemm"])
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
+@pytest.mark.parametrize("pooled", [False, True])
+def test_compiled_scatter_is_bitwise_the_numpy_scatter(
+    c, layout, dtype, pooled, monkeypatch
+):
+    kernel = _numba_kernel()
+    monkeypatch.setattr(trots, "_SCATTER_POOL_MIN_ENTRIES", 1)
+    rng = np.random.default_rng(200 + c)
+    n = 1200
+    cols = np.sort(rng.choice(n, size=c, replace=False)).astype(np.int64)
+    g = _tile_product(rng, c, layout, dtype)
+    acc, _ = _accumulator(rng, n, view=True)
+    _special_values(acc, cols, g)
+    ref = acc.copy()
+    with trots._host_pool(trots.TiledGramConfig(scatter_threads=4)) as pool:
+        use = pool if pooled else None
+        trots._scatter_lower(ref, cols, g, use)
+        trots._scatter_lower(acc, cols, g, use, kernel)
+
+    np.testing.assert_array_equal(_lower_bits(acc), _lower_bits(ref))
+
+
+def test_the_numpy_scatter_is_the_fallback_without_numba(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "numba", None)  # `import numba` fails
+    trots._compiled_scatter.cache_clear()
+    try:
+        assert kernels.compiled_scatter_lower_rows() is None
+        assert trots._compiled_scatter() is None
+        assert trots._scatter_kernel(trots.TiledGramConfig()) is None
+        seen = []
+        real = trots._scatter_lower
+
+        def spy(acc, cols, g, pool=None, kernel=None):
+            seen.append(kernel)
+            real(acc, cols, g, pool, kernel)
+
+        monkeypatch.setattr(trots, "_scatter_lower", spy)
+        a = _random_sparse(600, 50, 0.2, 60)
+        w = np.random.default_rng(61).uniform(0.1, 2.0, a.shape[0])
+        g = np.asarray(_op(a, block_rows=64, sparse_tile_flop_ratio=0.0).gram(w))
+    finally:
+        trots._compiled_scatter.cache_clear()  # later tests see the real import
+
+    assert seen
+    assert all(k is None for k in seen)
+    assert _rel(g, _dense_gram(a, w)) < 1e-12
+
+
+def test_a_numba_that_fails_to_compile_falls_back_with_a_warning(monkeypatch, caplog):
+    import sys
+    import types
+
+    def njit(**_kw):
+        def build(_fn):
+            def broken(*_a):
+                raise RuntimeError("llvmlite exploded")
+
+            return broken
+
+        return build
+
+    monkeypatch.setitem(sys.modules, "numba", types.SimpleNamespace(njit=njit))
+    with caplog.at_level("WARNING", logger=kernels.__name__):
+        assert kernels.compiled_scatter_lower_rows() is None
+    assert "NumPy" in caplog.text
+
+
+def test_compiled_scatter_false_keeps_the_numpy_scatter(monkeypatch):
+    def unwanted():
+        raise AssertionError("compiled_scatter=False must not load the kernel")
+
+    monkeypatch.setattr(trots, "_compiled_scatter", unwanted)
+    a = _random_sparse(600, 50, 0.2, 62)
+    w = np.random.default_rng(63).uniform(0.1, 2.0, a.shape[0])
+    op = _op(a, block_rows=64, sparse_tile_flop_ratio=0.0, compiled_scatter=False)
+    assert _rel(np.asarray(op.gram(w)), _dense_gram(a, w)) < 1e-12
+
+
+@pytest.mark.parametrize("source", ["python", "numba"])
+@pytest.mark.parametrize("weights", ["positive", "signed"])
+@pytest.mark.parametrize("lanes", [1, 2])
+@pytest.mark.parametrize("accumulate", [None, "float32"])
+def test_gram_sha256_is_the_same_with_and_without_the_scatter_kernel(
+    source, weights, lanes, accumulate, monkeypatch
+):
+    import hashlib
+
+    kernel = _numba_kernel() if source == "numba" else kernels.scatter_lower_rows
+    monkeypatch.setattr(trots, "_SCATTER_POOL_MIN_ENTRIES", 1)  # pool every tile
+    a = _random_sparse(900, 70, 0.15, 64)
+    a.data = a.data.astype(np.float32).astype(np.float64)
+    rng = np.random.default_rng(65)
+    w = rng.uniform(0.1 if weights == "positive" else -1.0, 2.0, a.shape[0])
+    cfg = {
+        "block_rows": 64,
+        "threads": lanes,
+        "lane_min_flops": 1.0,
+        "sparse_tile_flop_ratio": 0.0,
+        "scatter_threads": 3,
+    }
+
+    def digest(compiled):
+        op = _op(a, compiled_scatter=compiled, **cfg)
+        g = np.asarray(op.gram(w, accumulate_dtype=accumulate))
+        return hashlib.sha256(np.ascontiguousarray(g).tobytes()).hexdigest()
+
+    old = digest(False)
+    monkeypatch.setattr(trots, "_compiled_scatter", lambda: kernel)
+    assert digest(True) == old
+
+
+@pytest.mark.parametrize("scatter_threads", [1, 4])
+def test_the_scatter_kernel_runs_on_the_scatter_threads_pool(
+    scatter_threads, monkeypatch
+):
+    # One thread knob: the kernel runs in the pool's equal-area row chunks
+    # (TiledGramConfig.scatter_threads workers, 4 chunks each) off the
+    # calling thread, or as a single [0, c) call on it without a pool.
+    # Numba's own threading layer is never used.
+    import threading
+
+    if (os.cpu_count() or 1) < scatter_threads:
+        pytest.skip("needs a pool of scatter_threads workers")
+    calls = []
+
+    def spy(acc, cols, g, r0, r1):
+        calls.append((threading.get_ident(), int(cols.shape[0]), r0, r1))
+        kernels.scatter_lower_rows(acc, cols, g, r0, r1)
+
+    monkeypatch.setattr(trots, "_SCATTER_POOL_MIN_ENTRIES", 1)
+    monkeypatch.setattr(trots, "_compiled_scatter", lambda: spy)
+    a = _random_sparse(600, 50, 0.2, 66)
+    w = np.random.default_rng(67).uniform(0.1, 2.0, a.shape[0])
+    op = _op(
+        a,
+        block_rows=64,
+        threads=1,
+        sparse_tile_flop_ratio=0.0,
+        scatter_threads=scatter_threads,
+    )
+    g = np.asarray(op.gram(w))
+
+    assert _rel(g, _dense_gram(a, w)) < 1e-12
+    main = threading.get_ident()
+    tiles = [t for p in op._plans for t in p.tiles]
+    i = 0
+    for t in tiles:  # single lane: the tiles in order, each one's chunks
+        c = int(t.cols.shape[0])
+        if scatter_threads > 1:
+            want = trots._lower_row_bounds(c, scatter_threads * 4)
+        else:
+            want = [0, c]
+        part = calls[i : i + len(want) - 1]
+        i += len(want) - 1
+        assert sorted((r0, r1) for _t, _c, r0, r1 in part) == list(
+            itertools.pairwise(want)
+        )
+        assert all(cc == c for _t, cc, _r0, _r1 in part)
+        assert all((tid == main) == (scatter_threads == 1) for tid, *_ in part)
+    assert i == len(calls) > 0
+
+
+@pytest.mark.parametrize("compiled", [True, False])
+def test_host_operator_warms_the_kernel_up_at_construction(compiled, monkeypatch):
+    # The Numba import and compilation (or cache load) happen when the
+    # operator is built, not inside the first Gram of a timed iteration.
+    made = []
+    monkeypatch.setattr(trots, "_compiled_scatter", lambda: made.append(1))
+    _op(_random_sparse(600, 50, 0.2, 68), block_rows=64, compiled_scatter=compiled)
+    assert made == ([1] if compiled else [])

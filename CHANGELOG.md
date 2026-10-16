@@ -7,6 +7,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **`LinearOperator.dense_matrix_with_gram(jac, weights)`**, an optional
+  capability of the Hessian operator: the dense condensed route asks `W` for
+  `W + jacᵀ diag(weights) jac` in one call, so a curvature that is a weighted
+  Gram over rows it shares with the inequality Jacobian can multiply those
+  rows once with the summed weights (Breedveld et al. 2017, eq. (48)).
+  `Σ_x` and `δ_w` are added afterwards, out of place; the mixed-precision
+  request applies to the Gram part only. The default raises
+  `NotImplementedError`, and so does an operator that declines a call; the
+  block is then assembled in two passes exactly as before, so every problem
+  that does not implement it (the whole S2MPJ corpus) is unchanged. The
+  `LinearOperator` contract battery checks implementations against
+  `W + Jᵀ diag(w) J`.
+  - The TROTS loader implements it on its exact Hessian
+    (`TiledGramConfig.merge_hessian_gram`, default on): a structure that is
+    both curved and in the linear block is multiplied once per iteration
+    with `h_s + σ_s`, through the core's public Gram chain, on NumPy, CuPy
+    and Torch. Of the default corpus only `Head-and-Neck_01` has such a
+    structure: 21.5 → 19.9 s per iteration on NumPy (medians of three
+    interleaved 10-iteration runs) and 11.7 → 11.1 s on CuPy, with
+    trajectories equal to round-off (≤ 7·10⁻¹³ relative over 10
+    iterations). Every other corpus case declines up front and is
+    unchanged bit for bit.
 - **All options dataclasses are exported from `ipax`**: `BarrierOptions`,
   `BreedveldOptions`, `DenseOptions`, `KrylovOptions`, `LBFGSOptions`,
   `LineSearchOptions`, `RegularizationOptions`, `RestorationOptions` and
@@ -286,6 +308,130 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     reports.
 
 ### Changed
+- **Dense route on NumPy: Cholesky through LAPACK `dpotrf` on one blocked
+  copy** (`ipax.backend.dense.get_dense_cholesky`, NumPy only).
+  `numpy.linalg.cholesky` runs `dpotrf` between two unblocked transposing
+  `n×n` copies (C-ordered input to a Fortran scratch buffer, and back). At
+  `n = 9984` (TROTS `Head-and-Neck_01`) each copy cost about as much as the
+  factorization. The new gap-filler copies only the lower triangle, in
+  cache-sized blocks, into one Fortran-ordered buffer and factors it in
+  place.
+  - It never writes to its input, and it returns a Fortran-ordered, exactly
+    lower factor that `cholesky_solve` back-substitutes without a copy.
+  - A breakdown raises `numpy.linalg.LinAlgError`, as before.
+  - Only float64 2-D input takes the new path; other dtypes and shapes use
+    `numpy.linalg.cholesky`.
+  - `DenseSolver`'s PD guard and its PD-hinted factor reuse go through it.
+    Torch, CuPy, JAX and array-api-strict keep `xp.linalg.cholesky`, and
+    restoration's opt-in dense Cholesky is unchanged.
+
+  Measured: 1.8–2.0× per factorization standalone (`n = 2000`–`9984`), and
+  on `Head-and-Neck_01` 3.19 → 1.80 s per factorization, 25.7 → 24.0 s per
+  iteration (10 iterations, medians of 3). It is the same `dpotrf('L')` on
+  the same data. On the NumPy 2.4.6 / SciPy 1.17.1 wheels both the factor
+  and every back-solve are bit-identical: a bitwise A/B of both dense
+  configs over the S2MPJ corpus (2196 solves, 164 748 iterates) diverged
+  nowhere.
+- **TROTS loader, host tiled Gram and exact Hessian: lower-triangle, threaded
+  compacted scatter** (`benchmarks/corpus/trots.py`, `_scatter_lower`, host
+  NumPy only). Profiling `Head-and-Neck_01` (n = 9984) on NumPy put half of
+  the 42 s iteration in one line: each tile's `c×c` product was added into
+  the `n×n` accumulator by a single-threaded fancy-index scatter of the whole
+  block (`acc[ix_(cols, cols)] += g`), at tile widths up to `c ≈ 9700`. The
+  scatter now adds only the lower triangle (the final mirror overwrites the
+  upper one), in row chunks of equal area, and runs the chunks on a thread
+  pool when the tile runs on a single accumulation lane (NumPy's fancy-index
+  get/set and the addition release the GIL; measured 3.2× on 8 threads
+  standalone). Every lower entry still receives the same single addition, so
+  the Gram and the dense Hessian are **bitwise identical** for any thread
+  count (sha256-checked on `Head-and-Neck_01`, unit-tested against the old
+  scatter on the single-lane, multi-lane and signed paths). New knob
+  `TiledGramConfig.scatter_threads` (default 8; results do not depend on
+  it). `Head-and-Neck_01`, one call each, fresh weights: linear-block Gram
+  20.9 → 13.3 s, dense exact Hessian 11.2 → 6.9 s.
+- **TROTS loader, host tiled Gram and exact Hessian: densify, scaling and
+  mirror on the same thread pool** (`benchmarks/corpus/trots.py`,
+  `_densify`, `_mirror_lower`, `_host_pool`; host NumPy only). A large
+  single-lane tile is densified as zero-copy CSR row windows into one output
+  (`toarray(out=)`) and `√w`-scaled there; the final lower-to-upper mirror
+  runs its independent row panels in parallel. Same values, same products,
+  pure copies: bitwise identical for any `scatter_threads` (unit-tested,
+  including non-canonical CSR input). The pool now starts lazily, once per
+  Gram or dense Hessian, and only when some pass is large enough.
+  `Head-and-Neck_01` per Gram (all 41 dense tiles; medians of 5,
+  interleaved): densify + scale 1.09 → 0.48 s, mirror 0.61 → 0.11 s.
+  `Protons_01`, `Liver_01`, `Prostate_CK_01` Grams and Hessians: unchanged
+  wall, bitwise-identical results.
+- **TROTS loader, host tiled Gram and exact Hessian: compiled compacted
+  scatter** (`benchmarks/corpus/_trots_kernels.py`, `_scatter_lower`; host
+  NumPy only). The per-tile `acc[ix_(cols, cols)] += g` is now a plain loop
+  over the same lower-triangle entries, compiled by Numba
+  (`njit(nogil=True, cache=True)`, no `fastmath`).
+  - It runs in the same row chunks on the same `scatter_threads` pool, and
+    Numba starts no threads of its own.
+  - Each entry receives the same single addition, so the Gram and the dense
+    Hessian are **bitwise identical** (sha256-tested against the NumPy
+    scatter; `Head-and-Neck_01`'s 10-iteration trajectory is bit-identical).
+  - Numba is optional, in the `bench` extra. It is imported lazily and
+    compiled or loaded from its cache when the operator is built, never in
+    a timed iteration.
+  - Without Numba, if compilation fails, or with the new
+    `TiledGramConfig.compiled_scatter=False`, the NumPy scatter runs.
+  - `Head-and-Neck_01`, per iteration on a shared machine: Gram scatter
+    6.33 → 1.46 s, Hessian scatter 2.25 → 0.54 s.
+  - Compiling the product into the accumulator as well (a fused `syrk`) was
+    measured and rejected: 8× slower than OpenBLAS `dsyrk` in IEEE order.
+- **Docs: "Head-and-Neck_01 speed profile (2026-10-02)"**
+  (`docs/benchmarks/trots.md`): per-iteration phase tables on NumPy and
+  CuPy, a ranked lever table (estimate vs measured, with the rejected ones:
+  a 4 GiB lane budget is now slower, BLAS thread count is no lever, host
+  syncs are ~1.4 ms per iteration), and the full re-time after the levers
+  above. NumPy 1786 → 959 s (37.9 → 20.0 s per iteration); CuPy 525 s, and
+  309 s with `--gram-dtype float32`, against the paper's 279 s; all runs
+  46 iterations to the same objective. Also corrects the tiled-Gram
+  section's claim that the compacted scatter holds the GIL.
+- **TROTS runner: `--gram-dtype {auto,native,float32}`**
+  (`benchmarks/runners/trots.py`) sets `DenseOptions.gram_dtype` (default
+  `auto`, the ipax default, so default runs are unchanged). `float32` forces
+  the mixed-precision condensed Gram with float64 iterative refinement on
+  float64 data such as `Head-and-Neck_01`; the loader's pooled densify now
+  also covers a float64 tile under that float32 request (per-window cast
+  into the float32 rows, bitwise the whole-tile `astype`). See
+  `docs/benchmarks/trots.md`, "Head-and-Neck_01 speed profile (2026-10-02)".
+- **TROTS loader, host tiled Gram: width-aware sparse-tile kernel choice on
+  single-lane Grams** (`benchmarks/corpus/trots.py`; new
+  `TiledGramConfig.host_sparse_entry_ratio`, default 4, `None` = off; host
+  NumPy only). The 1% rule (`Σ nnz_row² ≤ 0.01·b·c²` ⇒ SciPy SpGEMM) was
+  fitted on narrow tiles; SpGEMM's cost per product grows with the tile
+  width, so a survey of every sparse-or-near tile of ten TROTS cases put the
+  break-even at ~1.5% for `c ≈ 200` and ~0.2% for `c ≈ 2000`, i.e. about
+  `4/c`. On a single-lane Gram (tiles in sequence with all BLAS threads, the
+  `n ≈ 10⁴` case) a sparse tile is now densified when `Σ nnz_row² > 4·b·c`.
+  Multi-lane Grams keep the 1% rule (their SpGEMMs run in parallel across
+  the lanes; measured: the width rule there cost `Protons_02` 0.88 → 1.07 s
+  per Gram), and the plan's flag, flop counts, gate and device kernels are
+  unchanged. `Head-and-Neck_01` linear-block Gram 13.5 → 12.4 s (its three
+  2048×3609–9684 tiles at 0.4%); a different kernel for those tiles, so the
+  Gram changes by round-off. Every other Gram and dense Hessian of the eleven
+  corpus cases (Protons, Liver, CK, VMAT, BT pairs, `Head-and-Neck_01`'s own
+  Hessian) is sha256-identical. Under a float32 accumulate request a
+  densified tile is rounded like any dense tile (it was float64 by SpGEMM).
+- **TROTS loader, host exact Hessian: keep the tiled plan of a curved
+  structure the gate rejected after planning it** (`benchmarks/corpus/trots.py`,
+  `TROTSExactProblem`, host Hessian: NumPy and adapter-less namespaces; new
+  `TiledGramConfig.host_hessian_flop_ratio`,
+  default 0.9). The linear block's gate (`flop_ratio_threshold = 0.5`) sent
+  such structures to full-width dense row chunks, which cost more `syrk`
+  flops and an `n`-wide scatter than the plan they had just built
+  (`Head-and-Neck_01`'s two PTV structures plan at 0.54 and 0.52). The host
+  Hessian now keeps that plan while its flop ratio is at most the new knob
+  and registers it, so the linear block reuses the tile set (one copy, as
+  on the device). Dense-ish structures the pre-gate rejects are never
+  planned and are unchanged (`Prostate_CK_01`, `Prostate_VMAT_101`).
+  `Head-and-Neck_01` dense Hessian 7.4 → 4.8 s per call; the linear-block
+  Gram is bitwise unchanged. The Hessian changes by round-off only (1.8·10⁻²¹
+  relative on `Head-and-Neck_01`, 7·10⁻²⁴ on `Liver_01`, whose "Liver minus
+  CTV" structure, plan ratio 0.85, is now tiled too).
 - **Dense KKT route: two O(n²)-per-iteration costs removed from the hot path**
   (`ipax/backend/dense/numpy_scipy.py`, `ipax/backend/dense/torch.py`,
   `ipax/backend/dense/__init__.py`, `ipax/ipm/kkt.py`), found profiling TROTS

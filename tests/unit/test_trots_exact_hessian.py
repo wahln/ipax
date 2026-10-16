@@ -176,9 +176,9 @@ def test_negative_merged_weights_take_the_signed_fallback(monkeypatch):
     calls = []
     real = trots._tile_gram_into
 
-    def spy(acc, tile, wp, swp, bad, acc_dtype, syrk):
+    def spy(acc, tile, wp, swp, bad, acc_dtype, syrk, pool=None, **kw):
         calls.append(bad is not None and bool(bad[tile.start : tile.stop].any()))
-        return real(acc, tile, wp, swp, bad, acc_dtype, syrk)
+        return real(acc, tile, wp, swp, bad, acc_dtype, syrk, pool, **kw)
 
     monkeypatch.setattr(trots, "_tile_gram_into", spy)
     grouped, per_term = _problems()
@@ -201,6 +201,109 @@ def test_structures_shared_with_the_linear_block_hold_one_tile_copy():
     oar = next(cs for cs in grouped._curved.values() if cs.mat.name == "oar")
     lin_tiles = [p.tiles for b in lin for p in b._plans]
     assert any(t is oar.tiles for t in lin_tiles)
+
+
+def _full_block_scatter(acc, cols, g, pool=None, kernel=None):
+    # The scatter before 2026-10-02: the whole c×c block at ix_(cols, cols).
+    del pool, kernel
+    acc[np.ix_(cols, cols)] += g
+
+
+@pytest.mark.parametrize("scatter_threads", [1, 4])
+def test_row_chunked_scatter_leaves_the_dense_hessian_bitwise_unchanged(
+    scatter_threads, monkeypatch
+):
+    # The Hessian adds Q (np.add.at) and the gEUD rank-1 part after the tile
+    # scatter, before the mirror: element-wise on the lower triangle in the
+    # same order, so the row-chunked scatter (pooled or not) gives the same
+    # matrix to the bit, tiled and gated-off (full-width chunk) structures
+    # alike.
+    monkeypatch.setattr(trots, "_SCATTER_POOL_MIN_ENTRIES", 1)
+    monkeypatch.setattr(trots, "_SCATTER_CHUNK_MIN_ENTRIES", 1)
+    cfg = trots.TiledGramConfig(
+        block_rows=128,
+        scatter_threads=scatter_threads,
+        compiled_scatter=False,  # the NumPy scatter, Numba installed or not
+    )
+    grouped, _ = _problems(cfg=cfg)
+    z, y = _point(grouped, 14)
+    h = grouped.lagrangian_hessian(z, np.zeros(0), y, 0.9)
+    assert h.quad is not None and h.low_rank is not None
+    new = np.asarray(h.dense_matrix())
+    monkeypatch.setattr(trots, "_scatter_lower", _full_block_scatter)
+    old = np.asarray(grouped.lagrangian_hessian(z, np.zeros(0), y, 0.9).dense_matrix())
+
+    np.testing.assert_array_equal(new, old)
+
+
+@pytest.mark.parametrize("keep", [True, False])
+def test_host_hessian_keeps_plans_the_gate_rejected_after_planning(keep):
+    # A curved structure whose plan exists but fails the linear block's gate
+    # is still cheaper tiled than as full-width chunks: the host Hessian keeps
+    # that plan while its flop ratio is at most host_hessian_flop_ratio
+    # (Head-and-Neck_01's PTVs, 0.54/0.52 against the 0.5 gate). The dense-ish
+    # body is rejected by the pre-gate, never planned, and keeps its chunks.
+    cfg = trots.TiledGramConfig(
+        block_rows=128,
+        flop_ratio_threshold=0.05,  # below the banded plans' ratios
+        host_hessian_flop_ratio=0.9 if keep else 0.0,
+    )
+    grouped, per_term = _problems(cfg=cfg)
+    by_name = {cs.mat.name: cs for cs in grouped._curved.values()}
+    for name in ("ptv", "oar"):
+        cs = by_name[name]
+        assert 0.05 < cs.flop_ratio <= 0.9  # planned, gated off
+        assert (cs.tiles is not None) is keep
+        assert (cs.csr is None) is keep
+    assert by_name["body"].tiles is None
+    z, y = _point(grouped, 15)
+    dense = np.asarray(
+        grouped.lagrangian_hessian(z, np.zeros(0), y, 0.6).dense_matrix()
+    )
+    ref = per_term.lagrangian_hessian(z, np.zeros(0), y, 0.6).dense_matrix()
+    assert _rel(dense, np.asarray(ref)) < 1e-12
+    np.testing.assert_array_equal(dense, dense.T)
+    if keep:
+        oar = by_name["oar"]
+        hit = grouped._plan_registry[grouped._registry_key(oar.mat)]
+        assert hit[2] is oar.tiles  # registered for the linear block to reuse
+
+
+def test_kept_host_plan_is_the_linear_blocks_tile_set_and_its_gram_is_unchanged():
+    # oar's single-structure plan fails a 0.12 gate, but the {oar, ptv}
+    # linear group passes it: the linear block then reuses the tiles the
+    # Hessian kept (one copy), and its Gram is bitwise what it was when the
+    # Hessian dropped the plan (same structure, same config: same plan).
+    import dataclasses
+
+    def build(keep_ratio):
+        inst = _instance()
+        inst.entries.append(
+            dataclasses.replace(inst.entries[-1], name="ptv max", data_id=1, bound=9.0)
+        )
+        cfg = trots.TiledGramConfig(
+            block_rows=128,
+            flop_ratio_threshold=0.12,
+            host_hessian_flop_ratio=keep_ratio,
+        )
+        return trots.TROTSExactProblem(inst, np, tiled_gram=cfg)
+
+    kept, dropped = build(0.9), build(0.0)
+    oar = next(cs for cs in kept._curved.values() if cs.mat.name == "oar")
+    assert oar.tiles is not None and 0.12 < oar.flop_ratio
+    op = kept.linear_ineq()[0]
+    assert isinstance(op, trots.TiledGramCSROperator) and op.tiled
+    assert any(p.tiles is oar.tiles for p in op._plans)
+    w = np.random.default_rng(16).uniform(0.1, 2.0, op.shape[0])
+    np.testing.assert_array_equal(
+        np.asarray(op.gram(w)), np.asarray(dropped.linear_ineq()[0].gram(w))
+    )
+
+
+@pytest.mark.parametrize("bad", [-0.1, float("nan"), float("inf")])
+def test_host_hessian_flop_ratio_is_validated(bad):
+    with pytest.raises(ValueError, match="host_hessian_flop_ratio"):
+        trots.TiledGramConfig(host_hessian_flop_ratio=bad)
 
 
 def test_dense_matrix_is_memoized_per_operator():
@@ -843,3 +946,60 @@ def test_device_hessian_host_bridges_go_through_the_context(namespace, monkeypat
     np.testing.assert_allclose(
         trots._to_numpy_nd(diag), np.diag(ref), rtol=1e-12, atol=1e-12
     )
+
+
+@pytest.mark.parametrize("source", ["python", "numba"])
+@pytest.mark.parametrize("scatter_threads", [1, 4])
+def test_dense_hessian_sha256_is_the_same_with_and_without_the_scatter_kernel(
+    source, scatter_threads, monkeypatch
+):
+    # The compiled compacted scatter (benchmarks/corpus/_trots_kernels.py)
+    # serves the host Hessian's tiles and full-width chunks too; Q and the
+    # rank-1 part are added after it, before the mirror: the same matrix to
+    # the bit. "python" runs the plain kernel (CI has no Numba).
+    import hashlib
+
+    kernels = pytest.importorskip("benchmarks.corpus._trots_kernels")
+    if source == "numba":
+        pytest.importorskip("numba")
+        trots._compiled_scatter.cache_clear()
+        kernel = trots._compiled_scatter()
+    else:
+        kernel = kernels.scatter_lower_rows
+    monkeypatch.setattr(trots, "_SCATTER_POOL_MIN_ENTRIES", 1)
+
+    def digest(compiled):
+        cfg = trots.TiledGramConfig(
+            block_rows=128,
+            scatter_threads=scatter_threads,
+            sparse_tile_flop_ratio=0.0,  # every tile dense: through the scatter
+            compiled_scatter=compiled,
+        )
+        grouped, _ = _problems(cfg=cfg)
+        z, y = _point(grouped, 16)
+        h = grouped.lagrangian_hessian(z, np.zeros(0), y, 0.8)
+        assert h.quad is not None and h.low_rank is not None
+        d = np.ascontiguousarray(np.asarray(h.dense_matrix()))
+        return hashlib.sha256(d.tobytes()).hexdigest()
+
+    widths = set()
+
+    def spy(acc, cols, g, r0, r1):
+        widths.add(int(cols.shape[0]))
+        kernel(acc, cols, g, r0, r1)
+
+    old = digest(False)
+    monkeypatch.setattr(trots, "_compiled_scatter", lambda: spy)
+    assert digest(True) == old
+    # Both kinds of host work item went through the kernel: compacted tiles
+    # (c < N) and the gated-off structure's full-width chunks (c = N).
+    assert N in widths
+    assert any(c < N for c in widths)
+
+
+@pytest.mark.parametrize("compiled", [True, False])
+def test_host_exact_problem_warms_the_scatter_kernel_up(compiled, monkeypatch):
+    made = []
+    monkeypatch.setattr(trots, "_compiled_scatter", lambda: made.append(1))
+    _problems(cfg=trots.TiledGramConfig(block_rows=128, compiled_scatter=compiled))
+    assert bool(made) is compiled

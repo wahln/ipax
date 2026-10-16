@@ -499,12 +499,20 @@ class _CondensedOperator(LinearOperator):
             except NotImplementedError:
                 template = None
 
-        dense = self._W.dense_matrix(template)
+        return self._add_logical_diagonals(self._W.dense_matrix(template))
 
+    def _add_logical_diagonals(self, curvature: Array) -> Array:
+        """``curvature + Sigma_x + delta_w I``, always out of place.
+
+        ``curvature`` is ``W``'s dense form, or the fused ``W + ∇gᵀ Σ_s ∇g``
+        block (:meth:`_fused_curvature_gram`); either may alias a memo of the
+        operator that produced it, so neither is ever written: the ``Sigma_x``
+        term is added out of place, which also makes the result a fresh array.
+        """
         if isinstance(self._sigma_x, (Diagonal, Identity)):
-            dense = _add_dense_diagonal(dense, self._sigma_x.diagonal(dense))
+            dense = _add_dense_diagonal(curvature, self._sigma_x.diagonal(curvature))
         else:
-            dense = dense + self._sigma_x.dense_matrix(dense)
+            dense = curvature + self._sigma_x.dense_matrix(curvature)
 
         if self._delta_w != 0.0:
             dense = _add_dense_diagonal(dense, self._delta_w)
@@ -542,6 +550,10 @@ class _CondensedOperator(LinearOperator):
     def _dense_matrix_impl(
         self, like: Array | None, gram_dtype: str | None, hinted_only: bool
     ) -> Array:
+        fused = self._fused_curvature_gram(gram_dtype, hinted_only)
+        if fused is not None:
+            return self._add_logical_diagonals(fused)
+
         dense = self.logical_dense_block(like)
 
         if self._ineq_jac.shape[0] > 0:
@@ -593,6 +605,43 @@ class _CondensedOperator(LinearOperator):
                     dense = dense + xp.matmul(xp.permute_dims(jac, (1, 0)), sigma_s_jac)
 
         return dense
+
+    def _fused_curvature_gram(
+        self, gram_dtype: str | None, hinted_only: bool
+    ) -> Array | None:
+        """``W + ∇gᵀ Σ_s ∇g`` formed by ``W`` in one pass, or ``None``.
+
+        The optional :meth:`~ipax.backend.operators.LinearOperator.
+        dense_matrix_with_gram` capability of the curvature operator: a ``W``
+        that is itself a weighted Gram over rows it shares with the inequality
+        Jacobian can multiply those rows once with the summed weights
+        (Breedveld 2017, eq. 48, across ``W`` and the Gram term) instead of in
+        two passes. Consulted only when there are inequality rows and Σ_s is
+        a :class:`Diagonal` (the weight vector the hook takes; the
+        :meth:`_sparse_gram` fast path also accepts an ``Identity``, which
+        the driver never passes); ``W`` without the capability, or
+        declining this call, raises ``NotImplementedError`` and the two-pass
+        assembly below runs unchanged. The mixed-precision request is
+        forwarded for the Gram part; ``W``'s own part stays native (the
+        capability's contract), so DenseSolver's refinement against the exact
+        :meth:`matvec` covers the result exactly as it covers the two-pass
+        block (Carson & Higham 2018).
+        """
+        if self._ineq_jac.shape[0] == 0 or not isinstance(self._sigma_s, Diagonal):
+            return None
+        weights = self._sigma_s.diagonal()
+        try:
+            fused = self._W.dense_matrix_with_gram(
+                self._ineq_jac,
+                weights,
+                accumulate_dtype=gram_dtype,
+                hinted_only=hinted_only,
+            )
+        except NotImplementedError:
+            return None
+        # The contract's working dtype (that of the weights); a no-op for a
+        # conforming operator, as the two-pass path's cast of the Gram is.
+        return array_namespace(fused).astype(fused, weights.dtype, copy=False)
 
     def _sparse_gram(
         self,

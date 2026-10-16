@@ -437,7 +437,10 @@ iterations 1 to the last one. Initialization is listed separately.
   not shipped, since it would silently change every existing Gram's last
   bits on a bigger machine. `TiledGramConfig(lane_budget_bytes=4 << 30)` (or
   higher, memory permitting) remains an explicit, opt-in lever for this
-  case. The back-solves are the core's `scipy.linalg.cho_solve` copying
+  case. Since 2026-10-02 it no longer pays: the single lane runs its
+  scatter, densify and mirror on a thread pool, and 5 lanes are slower
+  (Gram 11.9 → 13.3 s, Hessian 4.2 → 5.4 s; see "Head-and-Neck_01 speed
+  profile (2026-10-02)"). The back-solves are the core's `scipy.linalg.cho_solve` copying
   the C-ordered factor to Fortran order on every solve: 0.91 s per solve
   against 0.053 s on an F-ordered factor, measured standalone at
   `n = 9984`.
@@ -689,8 +692,10 @@ backends produce the same trajectory:
 | paper (16-core Xeon) | — | 45 | — | — | 279 s | 7.8 s | 6.2 s |
 
 The GPU run fits the card after the device-memory work above; the NumPy
-per-iteration cost is the single-lane Gram (a 2–4 GiB `lane_budget_bytes`
-brings it to ~24 s, see the profile section).
+per-iteration cost was the single-lane Gram. The 2026-10-02 host levers
+bring the NumPy run to 959 s (20.0 s per iteration) and an opt-in float32
+Gram brings CuPy to 309 s; see "Head-and-Neck_01 speed profile
+(2026-10-02)" below.
 
 **Recommendation: keep both opt-in.** Neither lever becomes a runner
 default. `--common-step` costs iterations on 8 of the other 10 cases (up to
@@ -847,6 +852,380 @@ from 0.09 at iteration 6. The runners report the best iterate, which is why
 the NumPy and CuPy exact rows agree to 10 digits. Reproduce with the
 runner's defaults, `--cases Head-and-Neck_01 --max-iter 15 --max-time 480`,
 adding `--backend cupy` or `--config lbfgs/dense`.
+
+
+### Head-and-Neck_01 speed profile (2026-10-02)
+
+Where the Head-and-Neck_01 iteration goes, what was changed, and what is
+left. The setup is the runner's defaults plus `--common-step` (the
+configuration that converges, see above). The machine is a 13th-gen
+i9-13900HX laptop: 24 cores (8 P + 16 E), 32 threads. NumPy 2.4.6 and
+SciPy 1.17.1 each ship their own OpenBLAS 0.3.31 (`DYNAMIC_ARCH`,
+`MAX_THREADS=24`); no `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` was set,
+so both run 24 threads. The GPU is an RTX 4070 Laptop (8 GB, fp64 at 1/64
+rate). Before every timing run the CPU load was 3–8 % with no other Python
+process, and the GPU had no other compute client. Each run was one process
+of at most ~10 GB. Per-iteration figures cover iterations 1–10 of a
+`--max-iter 10` run; the phases are timed exclusively (a phase's time
+excludes its sub-phases), with the GPU synchronized at every boundary.
+
+**The BLAS on this machine.** SciPy's `dsyrk` reaches 250–320 GFLOP/s on
+these tile shapes (counting `b·c²`). That rate is the same at 8, 24 and 32
+OpenBLAS threads; with 4 threads it drops to 175. So the 16 E-cores add
+almost nothing to fp64 BLAS. `ssyrk` reaches 400–570 GFLOP/s. A Cholesky
+at `n = 9984` took 2.8–3.2 s through `numpy.linalg.cholesky`
+(100–115 GFLOP/s) and 2.2 s through SciPy's `potrf`; most of NumPy's time
+was layout copies, not the factorization (lever 8 below). The paper's
+16-thread machine ran HN in 279 s, 9.8× faster than its own
+single-thread run (2727 s).
+
+**NumPy phase profile** (seconds per iteration and share, three states of
+the loader):
+
+| phase | before (90a1441) | levers 1–4 (2184a55) | + `--gram-dtype float32` |
+| --- | ---: | ---: | ---: |
+| Gram: `syrk` (dense tiles) | 6.46 (15 %) | 9.21 (42 %) | 3.98 (23 %) |
+| Gram: compacted scatter | 12.84 (30 %) | 2.02 (9 %) | 1.74 (10 %) |
+| Gram: densify + `√w` scale | 0.63 (1 %) | 0.35 (2 %) | 1.27 (7 %)¹ |
+| Gram: sparse tiles (SpGEMM + scatter) | 2.70 (6 %) | 0.00 | 0.00 |
+| Gram: mirror | 0.78 (2 %) | 0.10 (0 %) | 0.09 (1 %) |
+| Gram: rest (weights, borders, memo, glue) | 0.41 (1 %) | 0.72 (3 %) | 0.35 (2 %) |
+| Hessian: `syrk`/`gemm` | 4.40 (10 %) | 2.92 (13 %) | 2.81 (16 %) |
+| Hessian: scatter | 7.93 (19 %) | 0.69 (3 %) | 0.67 (4 %) |
+| Hessian: densify, mirror, `Q`, rank-1, rest | 0.70 (2 %) | 0.74 (3 %) | 0.71 (4 %) |
+| other Gram rows (nonlinear constraints) | 0.46 (1 %) | 0.43 (2 %) | 0.42 (2 %) |
+| KKT assembly | 0.33 (1 %) | 0.26 (1 %) | 0.25 (1 %) |
+| Cholesky (`n = 9984`) | 3.97 (9 %) | 3.88 (18 %) | 3.77 (21 %) |
+| back-solves | 0.12 (0 %) | 0.12 (1 %) | 0.22 (1 %) |
+| refinement matvecs | — | — | 0.60 (3 %) |
+| Mehrotra corrector, line search, evaluations, glue | 0.43 (1 %) | 0.43 (2 %) | 0.42 (2 %) |
+| untimed (driver, Python) | 0.30 (1 %) | 0.27 (1 %) | 0.35 (2 %) |
+| **total** | **42.46** | **22.15** | **17.66** |
+
+¹ unpooled in this run: a float64 tile under a float32 request took the
+whole-tile path; d14172b pools it too.
+
+The hypothesis held for the starting point and no longer holds. Before,
+25 s of the 42 s iteration ran on one thread: the compacted
+`acc[ix_(cols, cols)] += g` scatter of every tile (20.8 s, Gram and
+Hessian), SciPy SpGEMM on three wide sparse tiles (2.7 s), the densify and
+the mirror. Only 11 s was BLAS. After the levers, 12.1 s of the 22.2 s is
+`syrk` at the rate above, and 3.9 s is the Cholesky. NumPy fancy-index
+get/set, its ufuncs, and SciPy's `csr_todense` and SpGEMM all release the
+GIL. Measured with 8 threads on independent items: scatter 3.2×, densify
+2.3×, SpGEMM 2.0×. Threads therefore help these passes. The earlier note
+that "the compacted scatter holds the GIL" was wrong.
+
+**CuPy phase profile** (levers 1–4 do not touch the device path):
+
+| phase | s/iter |
+| --- | ---: |
+| Gram: `syrk` (cuBLAS fp64) | 7.27 (63 %) |
+| Gram: densify/scale, scatter, mirror, prepare, SpGEMM tiles | 0.14 (1 %) |
+| Gram: rest (weights, aux borders, memo read) | 0.14 (1 %) |
+| Hessian: `syrk`/`gemm` | 2.32 (20 %) |
+| Hessian: rest | 0.10 (1 %) |
+| other Gram rows, KKT assembly | 0.10 (1 %) |
+| Cholesky | 1.44 (12 %) |
+| back-solves, corrector, line search, evaluations, glue | 0.07 (1 %) |
+| **total** | **11.60** |
+
+The device iteration is fp64-bound: 83 % is `syrk` at the card's
+1/64-rate fp64 ceiling. Host synchronizations are 1096 scalar reads over
+the 11 iterations, about 100 per iteration. At ~14 µs each (see the
+bound-only section) that is about 1.4 ms per iteration. Kernel launches
+are a few per tile, about 500 per Gram, against 9.6 s of `syrk`. Neither
+is a lever on this case.
+
+**Levers.** Estimates were made from the profile above before
+implementing. Measured gains are medians of three interleaved 10-iteration
+runs (end to end, NumPy), or of interleaved microbenchmarks with fresh
+weights (one Gram / one dense Hessian per call):
+
+| # | lever | where | estimate | measured | trajectory | status |
+| ---: | --- | --- | ---: | --- | --- | --- |
+| 1 | lower-triangle, row-chunked, threaded compacted scatter (`TiledGramConfig.scatter_threads`) | loader | −15 s/it | 45.9 → 28.2 s/it (Gram 20.9 → 13.3 s, Hessian 11.2 → 6.9 s per call) | bit-identical | shipped d4ac618 |
+| 2 | host exact Hessian keeps a plan the gate rejected after planning (`host_hessian_flop_ratio`) | loader | −2.5 s/it | 28.2 → 25.1 s/it (Hessian 7.4 → 4.8 s per call) | round-off (≤ 3·10⁻¹³ relative, 10 its) | shipped 585ff80 |
+| 3 | densify + scale and mirror on the same pool | loader | −1.1 s/it | densify 1.09 → 0.48 s, mirror 0.61 → 0.11 s per Gram; end to end within noise (23.50 → 23.35 s/it) | bit-identical | shipped 52765de |
+| 4 | width-aware host sparse-tile kernel on single-lane Grams (`host_sparse_entry_ratio`) | loader | −1.0 s/it | 23.35 → 21.82 s/it (Gram 13.5 → 12.4 s) | round-off (≤ 5·10⁻¹³) | shipped 2184a55 |
+| 5 | float32 Gram with float64 refinement (`--gram-dtype float32`, opt-in) | runner flag over the core's `DenseOptions.gram_dtype` | NumPy −4.5 s/it, GPU −6 s/it | NumPy 22.15 → 17.66 s/it; CuPy 11.60 → 4.52 s/it (10 its) | same 46 iterations and objective (10 digits) | shipped d14172b, opt-in |
+| 6 | `lane_budget_bytes = 4 GiB` (the 2026-09-28 lever) | loader | — | now slower: Gram 11.9 → 13.3 s, Hessian 4.2 → 5.4 s | round-off | rejected: the pooled single lane beats 5 lanes |
+| 7 | `scatter_threads = 16` | loader | −0.3 s/it | Gram 11.9 → 11.7 s per call (noise) | bit-identical | default stays 8 |
+| 8 | SciPy `dpotrf` on one blocked copy instead of `numpy.linalg.cholesky` (`get_dense_cholesky`) | core (dense adapter gap-filler) | −0.7 to −1.5 s/it | Cholesky 3.19 → 1.80 s per call, 25.7 → 24.0 s/it (12 factorizations in 10 its) | bit-identical (factor, back-solves, every iterate; S2MPJ dense A/B too) | shipped 58eea1a |
+| 9 | one product per structure for Hessian **and** Gram (eq. (48) across `W` and `AᵀΣA`: HN's PTV 0–46 Gy is in both) | optional core capability (`dense_matrix_with_gram`) + loader | −1.0 s/it NumPy, −0.6 s/it CuPy | NumPy 21.51 → 19.91 s/it (block 16.88 → 15.11 s per call); CuPy 11.72 → 11.14 s/it (block 9.83 → 8.92 s) | round-off (≤ 7·10⁻¹³ relative, 10 its) | shipped 2026-10-03 (see below), `TiledGramConfig.merge_hessian_gram` |
+| 10 | BLAS thread count (`OPENBLAS_NUM_THREADS` 8 … 32) | environment | — | `dsyrk` 259 / 266 / 261 GFLOP/s at 8 / 24 / 32 | — | no lever: P-core bound |
+| 11 | fewer host syncs / launches on CuPy | loader | < 0.01 s/it | ~100 syncs ≈ 1.4 ms per iteration | — | no lever |
+| 12 | Σ-screening / stale-factor reuse | core | unknown | — | changes the Newton step | not pursued: an inexact-Newton change, needs its own gate |
+
+Levers 1, 3 and 4 run passes that already release the GIL on a thread
+pool, and none of them changes the BLAS products. Lever 2 trades the
+full-width row chunks for the compacted tiles that already exist. Lever
+4's kernel choice comes from a survey of every sparse-or-near tile of ten
+TROTS cases, SciPy SpGEMM against the pooled densify + `syrk` (minimum of
+3 each). The break-even falls with the tile width: about 1.5 % of `b·c²`
+at `c ≈ 200` and 0.2 % at `c ≈ 2000`, i.e. `Σ nnz_row² ≈ 4·b·c`. On
+every surveyed case the rule's kernel choice is within 1.5 % of the
+per-tile oracle's total. Applied to multi-lane Grams it
+cost `Protons_02` 0.88 → 1.07 s per Gram, because there the lanes run
+their SpGEMMs in parallel. So it applies only to single-lane Grams, and
+only `Head-and-Neck_01`'s Gram changes. Every other Gram and dense
+Hessian of the eleven corpus cases, and HN's own Hessian, is
+sha256-identical.
+
+**Final re-time** (full runs to optimality, the runner with
+`--common-step --max-iter 300 --max-time 3600`, after all shipped levers;
+"per iteration" is (wall − initialization) / iterations):
+
+| backend | `--gram-dtype` | status | iterations | KKT | objective | wall | initialization | per iteration |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NumPy (2026-09-29) | auto | optimal | 46 | 1.0e-9 | 3.5422668 | 1786 s | 41 s | 37.9 s |
+| **NumPy** | auto | optimal | 46 | 1.0e-9 | 3.5422668311 | **959 s** | 39 s | **20.0 s** |
+| NumPy | float32 | optimal | 46 | 1.0e-9 | 3.5422668311 | 859 s | 41 s | 17.8 s |
+| CuPy (2026-09-29) | auto | optimal | 46 | 1.0e-9 | 3.5422668 | 526 s | 13 s | 11.1 s |
+| CuPy | auto | optimal | 46 | 1.0e-9 | 3.5422668311 | 525 s | 12 s | 11.2 s |
+| **CuPy** | float32 | optimal | 46 | 1.0e-9 | 3.5422668311 | **309 s** | 13 s | **6.4 s** |
+| paper (16-core Xeon, 2017) | (mixed precision) | — | 45 | — | — | 279 s | 7.8 s | 6.2 s |
+
+All six runs take the same 46 iterations to the same objective, to 10
+digits, and 1.3·10⁻⁶ relative to the published one. The float32 runs end
+on `dense (gram=float32->native)`. Late in the solve, as `N` grows
+ill-conditioned, refinement stops certifying the float32 factor, and the
+route's kill switch returns to native float64 (the route's design: a
+stall falls back to native precision). From the per-iteration averages,
+that happens after roughly 33 of the 46 iterations on CuPy. NumPy's
+default route is 1.9× faster than on 2026-09-29. The CuPy float32 run is
+within 11 % of the paper's wall time.
+
+**What remains, and why.**
+
+- **NumPy, 20 s per iteration (default).** 12 s is `syrk` on 3.0·10¹²
+  `b·c²` of compacted tiles (Gram 2.2·10¹², Hessian 0.8·10¹²) at the
+  250 GFLOP/s this laptop sustains. 3.9 s is the Cholesky. The paper's
+  "make N" took 4.1 s per iteration with mixed-precision tiles on a
+  16-core Xeon. The remaining gap is BLAS throughput and float32, not
+  Python. The next steps would be core ones:
+  - lever 8 (SciPy `dpotrf`) is shipped and saves 1.4 s per
+    factorization; factoring with `uplo='U'` on a plain copy would save
+    another ~0.45 s, but changes the last bits (see below);
+  - lever 9 (Hessian and Gram merged per structure) has since shipped,
+    1.6 s per iteration (see below);
+  - a smaller compacted footprint, i.e. a different tiling than RCM +
+    2048-row tiles. Tile heights of 1024 / 1536 / 4096 were measured at
+    14.1 / 14.1 / 17.4 s per Gram against 12.5 s at 2048.
+
+  **Lever 8 in detail (2026-10-03).** The table's first version
+  expected last-bit changes. Measured, there are none: only factoring
+  the *upper* triangle changes bits (last column below). The 2.2 s
+  quoted above is consistent with `dpotrf` on an `asfortranarray` copy,
+  which pays one of NumPy's two transposing copies.
+  `numpy.linalg.cholesky` is one LAPACK `dpotrf('L')` between two
+  unblocked transposing `n × n` copies (C-ordered in, Fortran scratch,
+  C-ordered out). At `n = 9984` each copy took 0.91 s against 0.87 s for
+  `dpotrf` itself (standalone, 24 threads, quiet machine at 00:00). The
+  NumPy adapter's `cholesky` now copies only the lower triangle, in
+  128 × 128 blocks, into one Fortran-ordered buffer, and runs SciPy's
+  `dpotrf(lower=1, overwrite_a=1, clean=1)` in place on it. That is the
+  same routine on the same data. On the NumPy 2.4.6 / SciPy 1.17.1
+  wheels (OpenBLAS 0.3.31 / 0.3.30) the factor is bit-identical, and so
+  is every back-solve: `cholesky_solve` takes the Fortran-ordered factor
+  through `potrs('L')` without a copy. The 10-iteration HN A/B
+  (`--common-step --max-iter 10`, medians of 3 interleaved runs, one
+  process at a time) gave:
+
+  | arm | Cholesky per call | s/it (solve time / 10) | wall | trajectory |
+  | --- | ---: | ---: | ---: | --- |
+  | `numpy.linalg.cholesky` | 3.19 s | 25.7 | 262 s | — |
+  | `dpotrf` on one blocked copy | 1.80 s | 24.0 | 246 s | bit-identical: objective, KKT at all 11 iterates, final `x` (sha256) |
+
+  The machine ran slower that night than for the profile above (25.7
+  against 22.2 s/it on the same code), so read the difference, not the
+  levels. Standalone, interleaved, medians of 7, 24 OpenBLAS threads,
+  later the same night:
+
+  | `n` | `numpy.linalg.cholesky` | `dpotrf`, one blocked copy | memcpy + `dpotrf('U')` (not shipped) |
+  | ---: | ---: | ---: | ---: |
+  | 2000 | 0.103 s | 0.051 s (2.0×) | 0.044 s (2.4×) |
+  | 5000 | 0.694 s | 0.361 s (1.9×) | 0.269 s (2.6×) |
+  | 9984 | 3.34 s | 1.86 s (1.8×) | 1.38 s (2.4×) |
+
+  The last column is what `cupy.linalg.cholesky` does on the device: a
+  plain C-ordered copy factored as the upper triangle of its Fortran view.
+  It skips the transposing copy and is faster again, but `dpotrf('U')`
+  takes a different blocking path, and its factor differs from NumPy's in
+  the last bits (≤ 3·10⁻¹⁶ relative here). That would change every dense
+  trajectory, so it would need the S2MPJ gate. It is not shipped. Torch
+  (`torch.linalg.cholesky`, 0.87 s at `n = 9984` on CPU with MKL, what
+  `potrf` alone costs) and CuPy had no cheaper call to inject.
+
+  The 2.7 s of remaining scatter was NumPy fancy-index overhead, not
+  memory bandwidth. A compiled scatter kernel now cuts it about 4×; see
+  "Compiled compacted scatter (2026-10-03)" below.
+- **CuPy, 11.2 s per iteration (default).** 83 % is fp64 `syrk` at the
+  card's fp64 ceiling. Only float32 moves it: 4.5 s per iteration while the
+  float32 route holds. The rest is the 1.4 s Cholesky.
+- **Initialization, 39–41 s on NumPy, 12–13 s on CuPy.** LSQR is 30 s of
+  the NumPy figure. The opt-in `--lsqr-iter 5` is bit-identical on every
+  corpus case and saves ~37 s per solve (see "LSQR dual start" above).
+
+Reproduce: the runner with `--cases Head-and-Neck_01 --common-step
+--max-iter 300 --max-time 3600`, adding `--backend cupy` and/or
+`--gram-dtype float32`. The phase profile harness
+(`hn_prof.py`-style exclusive wrappers around the loader and solver
+entry points) is not checked in.
+
+**Compiled compacted scatter (2026-10-03).** Each dense tile's `c×c`
+product `g` is added into the `n×n` accumulator at the tile's columns. With
+NumPy that is `acc[ix_(cols, cols)] += g` per lower-triangle row chunk,
+which builds a gathered temporary, adds `g` to it and scatters it back.
+`benchmarks/corpus/_trots_kernels.py` does the same per-entry addition as a
+plain loop, compiled by Numba:
+
+- It walks 8-row panels so that an F-ordered `syrk` product is read one
+  cache line at a time.
+- It is compiled with `njit(nogil=True, cache=True)` and no `fastmath`.
+- It runs in the same row chunks on the same `scatter_threads` pool.
+
+Every lower-triangle entry receives the same single IEEE addition, so the
+Gram and the exact Hessian are **bitwise unchanged** (sha256, see below).
+The host Hessian's scatter goes through the same function, so it is covered
+too.
+
+- **Install.** Numba is optional and comes with the `bench` extra
+  (`pip install -e ".[bench]"`). It is never imported by `ipax`.
+- **Fallback.** Without Numba, or if it fails to compile (a logged
+  warning), the loader runs the NumPy scatter with the same results.
+  `TiledGramConfig(compiled_scatter=False)` forces the fallback; it exists
+  for A/B runs.
+- **CI.** CI has no Numba. There the uncompiled Python kernel is tested
+  bitwise against the NumPy scatter, and the fallback path is tested too.
+- **Compile time.** The first process on a machine compiles 8
+  specializations in 1.8 s; later processes load them from Numba's cache in
+  0.7 s, plus 0.35–0.5 s for `import numba`. This happens when the host
+  operator or the exact problem is built, so it never falls in a timed
+  iteration.
+
+Design choices, measured standalone (`n = 9984`, random sorted `cols`, an
+F-ordered `syrk` product, medians of interleaved repeats, while other
+agents' work was also running):
+
+| scatter of one tile | 1 thread | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: |
+| NumPy row chunks, `c = 9700` | 603 ms | 247 ms | 187 ms | 104 ms |
+| Numba, 8-row panels, on the pool, `c = 9700` | 183 ms | 70 ms | 45 ms | 33 ms |
+| NumPy row chunks, `c = 7000` | 357 ms | 133 ms | 87 ms | 63 ms |
+| Numba, on the pool, `c = 7000` | 95 ms | 39 ms | 26 ms | 18 ms |
+
+On a quieter run at `c = 9700` and 8 threads, NumPy took 86 ms and the
+kernel 28 ms. At that point the kernel moves about 1.1 GB (read `g`, read
+and write `acc`) at roughly 40 GB/s, close to this laptop's memory
+bandwidth. The table's 1-thread column comes from a separate,
+non-interleaved run. Alternatives that were measured and dropped:
+
+- **A plain row loop instead of 8-row panels:** 34 ms against 28 ms.
+  4-row panels took 36 ms and 16-row panels 27 ms.
+- **Numba's own `parallel=True` / `prange` over the same chunks:** 49 ms
+  against 45 ms on the pool. It also brings in Numba's OpenMP threading
+  layer, whose idle threads slowed the next `dsyrk` by 5–10 %. Running it
+  inside the multi-lane Gram's lane threads would either oversubscribe the
+  cores or need a thread-safe threading layer.
+  - The kernel therefore stays `parallel=False` and `scatter_threads`
+    remains the only thread setting; `numba.set_num_threads` is not
+    involved.
+- **A fused product and accumulate (a hand-written `syrk` straight into
+  `acc`):**
+  - In IEEE order: 31 GFLOP/s against `dsyrk` + scatter's 246 at
+    `c = 1500`, i.e. 8× slower.
+  - With `fastmath`: 79 GFLOP/s.
+  - At `c = 300`, `fastmath` breaks even (84 against 73 GFLOP/s), but
+    neither variant reproduces OpenBLAS's summation order, so neither is
+    bit-identical.
+
+A/B on `Head-and-Neck_01` (runner defaults + `--common-step`, NumPy, phase
+wrappers, 10 iterations, three interleaved rounds per arm,
+`compiled_scatter` false vs true). The machine was heavily shared during
+both measurements: an S2MPJ sweep (4 jobs), another agent's HN and VMAT
+A/B runs, and an unrelated test suite. Iterations ran 4–5× slower than in
+the idle profile above, so only the scatter phase is a clean comparison;
+the totals are within noise.
+
+| per iteration (median of 3) | NumPy scatter | Numba scatter |
+| --- | ---: | ---: |
+| Gram: compacted scatter | 6.33 s (5.66–7.31) | **1.46 s** (1.16–2.31) |
+| Hessian: scatter | 2.25 s (1.91–2.34) | **0.54 s** (0.44–0.77) |
+| Gram + Hessian `syrk` (unchanged) | 53.1 s | 53.6 s |
+| total (shared machine) | 90.4 s (78.2–96.7) | 84.6 s (71.0–121.2) |
+
+A second measurement interleaved 6 rounds of one Gram and one dense
+Hessian per arm in one process, with the same fresh weights per round.
+Gram scatter went from 7.79 to 1.93 s per call and Hessian scatter from
+3.05 to 0.71 s (medians). The Gram and Hessian sha256 were equal in every
+round. All six A/B runs trace a **bit-identical** objective/KKT trajectory.
+
+Peak working set over a 3-iteration run was 12.08 GiB with the NumPy
+scatter and 12.14 GiB with the kernel. The kernel allocates no temporaries
+of its own, so the extra 0.06 GiB is roughly what the Numba/LLVM runtime
+occupies. The peak is reached outside the scatter.
+
+Applied to the idle profile's 2.7 s of scatter, a ~4.2× cut would leave
+about 0.65 s, i.e. roughly 20.0 → 18 s per iteration. That figure is a
+projection and was not measured on an idle machine.
+
+**Lever 9: one product per structure for the Hessian and the Gram
+(2026-10-03).** `Head-and-Neck_01`'s PTV 0–46 Gy (5096 voxels, 9.1 M
+nonzeros) carries curved cost terms and dose constraints. So the loader
+multiplied it twice per iteration: `A_sᵀ diag(h_s) A_s` in the exact
+Hessian and `A_sᵀ diag(σ_s) A_s` in the linear block's Gram. Breedveld
+forms `AᵀDA` once with `D = h + σ` (2017, eq. (48) and §4.2). The core
+forms `W` and the Gram in separate calls, so this needed a hook, and the
+hook had to keep the dose matrices out of the library. The hook is
+`LinearOperator.dense_matrix_with_gram(jac, weights)`, an optional
+capability of the Hessian operator. The condensed dense route asks `W`
+for `W + jacᵀ diag(weights) jac`, then adds `Σ_x` and `δ_w` out of place.
+An operator without the hook, or one that declines, gets the two-pass
+block bit for bit. `ipm/driver.py` is untouched.
+
+The loader's exact Hessian implements it without reading the solver's
+lowered, row-scaled, stacked Jacobian. It offers its dose-space weights,
+keyed by tile set, for the length of one Gram call through the core's
+public Gram chain. The linear block's tiled operator takes the offer for
+each structure whose tile set it shares, and adds `h_s` to `σ_s`. Only a
+float64 accumulation takes it, so the Hessian part is never reduced. The
+Hessian then forms only the structures nobody took, plus `Q` and the
+rank-1 part, and adds the Gram. Of the default corpus only
+`Head-and-Neck_01` has a shared structure. `Protons_01`, `Protons_02`,
+`Prostate_BT_01`, `Prostate_CK_01`, `Prostate_VMAT_101` and `Liver_01`
+have none, so for them the hook declines before any work.
+
+Measured on `Head-and-Neck_01`, `--common-step --max-iter 10`, the
+profile harness in exclusive-phase mode. NumPy: three interleaved rounds
+per arm, `merge_hessian_gram` off/on, the shipped loader otherwise. CuPy:
+one run per arm. "Block" is an in-process microbenchmark: the dense
+`H + ∇gᵀ Σ_s ∇g` at the initial point, six interleaved calls per form
+with fresh weights.
+
+| | off | on | Δ |
+| --- | ---: | ---: | ---: |
+| NumPy s/iter (samples) | 24.47, 21.09, 21.51 | 19.91, 19.59, 20.50 | |
+| NumPy s/iter (median) | 21.51 | 19.91 | −1.60 (−7.4 %) |
+| NumPy Gram + Hessian phases, s/iter (median) | 16.58 | 15.19 | −1.39 |
+| NumPy block, s/call (median of 6) | 16.88 | 15.11 | −1.76 |
+| CuPy s/iter | 11.72 | 11.14 | −0.58 |
+| CuPy Gram + Hessian phases, s/iter | 10.07 | 9.48 | −0.59 |
+| CuPy block, s/call (median of 6) | 9.83 | 8.92 | −0.91 |
+
+The first NumPy "off" round ran while the machine was still loaded by
+other work. The two later pairs agree on −1.0 to −1.5 s per iteration.
+The saving is where the estimate put it. The linear block's tile products
+cost the same with the merged weights (11.7–11.9 s per iteration on
+NumPy), while the Hessian's own tiles drop from 3.8 to 2.4 s, the PTV's
+product. On NumPy the end-to-end gain is larger than the phase gain
+because the Gram is no longer added into the assembled block (0.25 →
+0.16 s). On CuPy the fp64 `syrk` dominates both arms. Trajectories agree
+to round-off: over the 10 iterations the largest relative difference is
+9.4·10⁻¹⁴ in the objective and 6.7·10⁻¹³ in the KKT error on NumPy
+(2.1·10⁻¹⁴ / 5.7·10⁻¹³ on CuPy). The CuPy memory pool stayed at
+7.49 GB. With `--gram-dtype float32` the linear block accumulates in
+float32, takes no offer, and the merge is off, bit for bit as before.
 
 
 ### Breedveld second-order correction (2026-09-29)
@@ -1031,8 +1410,12 @@ row norms) is the plain one: same rows, same order, same bounds.
   last bits do not change with the machine. Only as many lanes are used as
   there is work for, within a 1 GiB accumulator budget, so `n ≈ 10⁴` runs
   sequentially. BLAS keeps its own threads. Setting `OPENBLAS_NUM_THREADS=1`
-  made the pool **slower** (0.45 s vs 0.30 s), because the compacted scatter
-  holds the GIL.
+  made the pool **slower** (0.45 s vs 0.30 s). The reason first given here,
+  that the compacted scatter holds the GIL, was wrong: NumPy's fancy-index
+  get/set and SciPy's `csr_todense` release it (measured 2026-10-02). A
+  single-lane Gram therefore runs its scatter, densify and mirror in row
+  chunks on a thread pool (`scatter_threads`, bitwise the same result; see
+  "Head-and-Neck_01 speed profile (2026-10-02)").
 - **Gate.** A group is tiled only when the plan's arithmetic
   `Σ_r b_r·c_r²` is ≤ 50% of the plain `m·n²`. A lower bound
   (`Σ nnz_row²`) is checked first, which rejects dense groups before any RCM
@@ -1045,8 +1428,9 @@ row norms) is the plain one: same rows, same order, same bounds.
 Use it when a measurement is meant to track the *generic* core Gram on RT
 data, because the default now times this loader kernel.
 `tiled_gram=TiledGramConfig(...)` exposes the knobs (`block_rows`,
-`flop_ratio_threshold`, `sparse_tile_flop_ratio`, `threads`, and the lane
-heuristics).
+`flop_ratio_threshold`, `sparse_tile_flop_ratio`, `threads`, the lane
+heuristics, and since 2026-10-02 `scatter_threads`,
+`host_sparse_entry_ratio` and `host_hessian_flop_ratio`).
 
 **Measured** (2026-09-25, NumPy, 32-thread desktop, threaded OpenBLAS, fresh
 random weights per call because both paths memoize on identical weights; min
@@ -1309,6 +1693,21 @@ variables:
   and for the mixed-precision refinement. `diagonal` serves the Jacobi
   preconditioner. `to_coo` feeds the sparse-direct route through the plain
   SciPy product, grouped per structure.
+- **One product for the Hessian and the Gram** (2026-10-03,
+  `TiledGramConfig.merge_hessian_gram`, default on). The dense route asks the
+  Hessian for `H + ∇gᵀ Σ_s ∇g` through the core's optional
+  `LinearOperator.dense_matrix_with_gram` capability. The operator then
+  multiplies a structure that is both curved and in the linear block once,
+  with `h_s + σ_s`, inside the linear block's tiled Gram, and forms only the
+  rest itself. This is eq. (48) applied across the two terms, as in Breedveld
+  et al. 2017, §4.2. The Hessian never reads the solver's Jacobian layout. It
+  offers its weights, keyed by tile set, for the length of one Gram call
+  through the core's public Gram chain, which translates the solver's weights
+  back to the loader's rows. Only a block accumulated in float64 takes the
+  offer, so the Hessian part is never reduced. Of the default corpus only
+  `Head-and-Neck_01` has such a structure (PTV 0–46 Gy). On the other cases the
+  hook declines before any work, and the block is the two-pass one bit for
+  bit. See lever 9 in the Head-and-Neck_01 speed profile.
 
 **Namespaces.** The `TROTSExactHessian` operator is host-resident, so it is
 returned as-is only on NumPy namespaces. On CuPy and Torch
@@ -1604,7 +2003,9 @@ fluence-map shape in dimensionality, sparsity, and conditioning.
   profile above give 36.8 s (exact) and 27.2 s (L-BFGS) per iteration on
   NumPy, and 25.2 s and 14.0 s on an 8 GB GPU that the case overfilled;
   11.2 s (exact) once it fit the card (provisional), against the paper's
-  6.2 s. RT-specific dose-matrix kernels stay out of the `ipax` core (see
+  6.2 s. As of 2026-10-02: 20.0 s per iteration on NumPy (17.8 s with the
+  opt-in `--gram-dtype float32`) and 6.4 s on CuPy with it (11.2 s without);
+  see "Head-and-Neck_01 speed profile (2026-10-02)". RT-specific dose-matrix kernels stay out of the `ipax` core (see
   `AGENTS.md`). The loader is the RT-specific layer: its tiled Gram above
   (including the float32 `ssyrk` tiles for float32-sourced data) is where that
   structure is exploited, while custom mixed-precision tiled BLAS stays out of

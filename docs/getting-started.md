@@ -5,7 +5,11 @@
 ```bash
 pip install -e ".[numpy]"     # core + NumPy backend
 pip install -e ".[dev]"       # full dev environment
+pip install -e ".[bench]"     # benchmark tools only (asv, plots, Numba for the TROTS loader)
 ```
+
+Numba is used only by the benchmark-side TROTS loader, never by `ipax` itself.
+Without it the loader uses NumPy and gives the same results, only more slowly.
 
 CUDA dependencies are user-managed because the CuPy wheel must match the local
 CUDA toolkit. Install the appropriate CuPy package and cuDSS runtime first, then

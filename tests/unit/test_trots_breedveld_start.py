@@ -1067,6 +1067,28 @@ def test_runner_common_step_sets_the_breedveld_option():
     )
 
 
+def test_runner_gram_dtype_defaults_to_auto_and_sets_the_dense_option():
+    from benchmarks.runners import trots as runner
+
+    default = runner._solve_options(
+        runner._build_parser().parse_args([]), "exact/dense"
+    )
+    assert default.dense.gram_dtype == "auto"
+    assert default.dense == ipax.Options().dense  # the ipax default: a no-op
+    args = runner._parse_args(runner._build_parser(), ["--gram-dtype", "float32"])
+    opts = runner._solve_options(args, "exact/dense")
+    assert opts.dense.gram_dtype == "float32"
+    assert dataclasses.replace(opts, dense=default.dense) == default
+
+
+def test_runner_rejects_an_unknown_gram_dtype(capsys):
+    from benchmarks.runners import trots as runner
+
+    with pytest.raises(SystemExit):
+        runner._parse_args(runner._build_parser(), ["--gram-dtype", "float16"])
+    assert "--gram-dtype" in capsys.readouterr().err
+
+
 def test_runner_breedveld_soc_defaults_off_and_sets_the_option():
     from benchmarks.runners import trots as runner
 

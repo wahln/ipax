@@ -78,8 +78,10 @@ keeps the original per-term SpGEMM path.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
+import itertools
 import logging
 import math
 import os
@@ -101,7 +103,7 @@ _BREEDVELD_LSQR_TOL = 1e-6
 _BREEDVELD_LSQR_ITER = 200
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
     from benchmarks.corpus import BenchmarkProblem
     from ipax.options import ScalingMethod, ScalingOptions
@@ -745,6 +747,30 @@ class TiledGramConfig:
     finite-difference smoothing rows); SciPy's SpGEMM runs ~100× below BLAS
     rate, so the break-even measured on the TROTS tiles sits near 1%.
 
+    That 1% holds for narrow tiles only. On the host, in a Gram that runs
+    on a single lane (tiles in sequence, each with all BLAS threads: the
+    ``n ≈ 10⁴`` accumulator budget, ``threads=1``, one work item, or little
+    work), a sparse tile is also densified once its ``Σ nnz_row²`` exceeds ``host_sparse_entry_ratio``
+    times its dense entries ``b·c``, i.e. once the ratio above exceeds
+    ``host_sparse_entry_ratio / c``: SpGEMM's per-product cost grows with
+    the tile width (its accumulator spills cache), while the densified
+    tile's cost per ``b·c²`` stays at the BLAS rate. Fitted on every
+    sparse-or-near tile of ten TROTS cases (2026-10-02, i9-13900HX,
+    threaded OpenBLAS; docs/benchmarks/trots.md): the break-even falls from
+    ~1.5% at ``c ≈ 200`` to ~0.2% at ``c ≈ 2000``, and ``4/c`` is within
+    1% of picking the faster kernel on every tile set (``Head-and-Neck_01``:
+    its three 2048×3609–9684 tiles at ratio 0.4% take 0.95 s densified
+    against 2.55 s by SpGEMM; of the eleven corpus cases only that Gram
+    changes, bitwise, its exact Hessian included). The plan's ``sparse``
+    flag, its flop count
+    (the gate statistic and the lane deal) and the device kernels are
+    unchanged; ``None`` restores the plain 1% rule on the host. Multi-lane
+    Grams keep the 1% rule: there the SpGEMMs of eight lanes run in
+    parallel (SciPy releases the GIL) while densified tiles would compete
+    for the BLAS threads, and the lanes are dealt by the plan's flop counts
+    (measured: ``Protons_02`` 0.88 → 1.07 s per Gram with the width rule on
+    its lanes).
+
     ``threads`` is the number of accumulation *lanes* (§5.2: one tile per
     worker at a time, private accumulators summed at the end); ``1`` runs the
     tiles sequentially. The lane count — and with it the summation order, so
@@ -753,9 +779,39 @@ class TiledGramConfig:
     the lanes. A Gram uses fewer lanes when there is little work
     (``lane_min_flops`` of BLAS per lane amortizes its private ``n²``
     accumulator) or when the accumulators would exceed ``lane_budget_bytes``
-    (``n ≈ 10⁴`` ⇒ sequential). BLAS keeps its own threading either way
-    (measured: pinning it to one thread makes the pool slower, since the
-    compacted scatter holds the GIL).
+    (``n ≈ 10⁴`` ⇒ sequential). BLAS keeps its own threading either way.
+
+    ``scatter_threads`` is the worker count of a per-call thread pool
+    (started lazily, only when some pass is large enough) for the host
+    passes around the BLAS products, which SciPy's ``csr_todense`` and
+    NumPy's fancy-index get/set and ufuncs run with the GIL released:
+
+    - the compacted scatter of a single-lane tile's ``c×c`` product into
+      the accumulator, in row chunks of its lower triangle (the only part
+      kept; the final mirror overwrites the upper one) — every entry still
+      receives the same single addition;
+    - the densify and ``√w`` scaling of a large single-lane tile, in row
+      windows — the same values and the same products;
+    - the final lower-to-upper mirror, in independent row panels — pure
+      copies.
+
+    So the result is bitwise the same for every value of this knob, ``1``
+    (the calling thread only) included. At ``n ≈ 10⁴`` these passes were
+    more than half of the Head-and-Neck_01 iteration, and the default ``8``
+    was measured there, not on Protons_01 (docs/benchmarks/trots.md,
+    "Head-and-Neck_01 speed profile (2026-10-02)").
+
+    ``compiled_scatter`` runs the compacted scatter through a Numba kernel
+    (:mod:`benchmarks.corpus._trots_kernels`; Numba is in the ``bench``
+    extra) when Numba is importable, and keeps the NumPy
+    ``acc[ix_(cols, cols)] += g`` otherwise or when ``False``. The kernel is
+    a loop over the same entries without the fancy-index temporaries; it
+    releases the GIL and runs in the same row chunks on the same
+    ``scatter_threads`` pool (Numba starts no threads of its own), and each
+    lower-triangle entry receives the same single IEEE addition, so the
+    Gram and the exact Hessian are bitwise the same either way. Measured on
+    Head-and-Neck_01-sized tiles (``c`` up to ~9700, 8 threads): about 3×
+    faster than the NumPy scatter (docs/benchmarks/trots.md).
 
     ``device_sparse_tiles`` (CuPy namespaces) lets exact (float64) Grams
     multiply the plan's sparse tiles by cuSPARSE SpGEMM; ``False`` densifies
@@ -800,19 +856,65 @@ class TiledGramConfig:
     only other device option is a host product crossed per call. The linear
     block keeps the gate. ``tiled_gram=False`` is the only opt-out (the
     grouped Hessian is then crossed as a ``CSCOperator``).
+
+    On the host (NumPy) the exact Hessian keeps a curved structure's plan
+    that the gate rejected *after* planning it (the pre-gate passed) when
+    the plan's flop ratio is at most ``host_hessian_flop_ratio``: the
+    alternative there is the full-width dense row chunks, which cost the
+    whole ratio's complement more ``syrk`` flops and an ``n``-wide scatter.
+    The plan was already paid for; its tile copy replaces the CSR
+    conversion the chunks need (about neutral for the CSC structures the
+    ``.mat`` files load as, about 12 B/nnz extra for a CSR source), and is
+    shared with the linear block when the structure also appears there. ``Head-and-Neck_01``'s two PTV structures sit just above the
+    linear block's gate (0.54 and 0.52): tiled, the dense Hessian drops
+    from 7.4 to 4.8 s per call (and ``Liver_01``'s 0.85 one from 0.109 to 0.100 s).
+    Dense-ish structures that the pre-gate rejects (``Prostate_CK_01``'s and
+    ``Prostate_VMAT_101``'s, 0.97–1.0 when planned anyway) are never
+    planned and keep the chunks.
+
+    ``merge_hessian_gram`` (exact Hessian only) multiplies a structure that
+    is both curved and in the linear block once per iteration, with the
+    summed weights ``h_s + σ_s`` (Breedveld 2017, eq. (48) and §4.2), instead
+    of once in the Hessian and once in the Gram. The core asks for that
+    block through the optional ``LinearOperator.dense_matrix_with_gram``
+    capability of the Hessian operator (see :class:`TROTSExactHessian`); the
+    merge runs only where the linear block's Gram is accumulated exactly
+    (float64), so the Hessian part is never reduced. The summation changes,
+    so the block agrees with the two-pass one to round-off, not bitwise.
+    ``False`` keeps the two passes (the A/B and parity switch); cases where
+    no structure is in both are unaffected either way.
     """
 
     block_rows: int = 2048
     flop_ratio_threshold: float = 0.5
     sparse_tile_flop_ratio: float = 0.01
+    host_sparse_entry_ratio: float | None = 4.0
     threads: int = 8
     lane_min_flops: float = 2.5e8
     lane_budget_bytes: int = 1 << 30
+    scatter_threads: int = 8
     device_sparse_tiles: bool = True
     device_densify_budget_bytes: int = 256 << 20
     device_sparse_tile_flop_ratio: float | None = None
+    host_hessian_flop_ratio: float = 0.9
+    compiled_scatter: bool = True
+    merge_hessian_gram: bool = True
 
     def __post_init__(self) -> None:
+        if int(self.scatter_threads) < 1:
+            raise ValueError(
+                f"scatter_threads must be a positive integer, got {self.scatter_threads!r}"
+            )
+        k = self.host_sparse_entry_ratio
+        if k is not None and not (math.isfinite(k) and k >= 0.0):
+            raise ValueError(
+                f"host_sparse_entry_ratio must be None or a finite number >= 0, got {k!r}"
+            )
+        h = self.host_hessian_flop_ratio
+        if not (math.isfinite(h) and h >= 0.0):
+            raise ValueError(
+                f"host_hessian_flop_ratio must be a finite number >= 0, got {h!r}"
+            )
         r = self.device_sparse_tile_flop_ratio
         if r is not None and not (math.isfinite(r) and r >= 0.0):
             # NaN would silently densify every tile (s <= nan is False).
@@ -850,6 +952,10 @@ class _Tile:
     csr_t: Any = None  # transpose (sparse tiles only)
     row_of_nnz: Any = None  # nnz → tile row (sparse tiles only)
     flops: float = 0.0
+    #: The host kernel's choice (NumPy), None = ``sparse``: a sparse tile
+    #: too wide for SciPy's SpGEMM is densified on the host only (see
+    #: ``TiledGramConfig.host_sparse_entry_ratio``).
+    host_sparse: bool | None = None
 
 
 @dataclass
@@ -941,6 +1047,9 @@ def _plan_structure(
         dense_flops = float(b) * c * c
         sparse = sparse_flops <= cfg.sparse_tile_flop_ratio * dense_flops
         tile = _Tile(start, stop, cols.astype(np.int64), csr, sparse)
+        k = cfg.host_sparse_entry_ratio
+        if sparse and k is not None:
+            tile.host_sparse = sparse_flops <= k * float(b) * c
         if sparse:
             tile.csr_t = csr.T.tocsr()
             tile.row_of_nnz = np.repeat(
@@ -953,18 +1062,237 @@ def _plan_structure(
     return perm, tiles
 
 
-def _tile_gram_into(
-    acc: Any, tile: _Tile, wp: Any, swp: Any, bad: Any, acc_dtype: Any, syrk: Any
-) -> None:
-    """Add ``tileᵀ diag(w) tile`` into ``acc``'s lower triangle (compacted scatter).
+#: Below this many entries (a tile's ``c²`` scatter or ``b·c`` densify,
+#: the mirror's ``n²``) a host pass stays on the calling thread:
+#: dispatching chunks to the pool costs more than it saves.
+_SCATTER_POOL_MIN_ENTRIES = 1 << 20
+#: Row chunks per pool worker (equal lower-triangle area for the scatter,
+#: equal row counts for the densify): more chunks than workers balance the
+#: uneven cost per row.
+_SCATTER_CHUNKS_PER_THREAD = 4
+#: Below this many entries (``c²``) the scatter is the single full-block
+#: add (one chunk): chunking a tiny block costs more call overhead than the
+#: skipped upper triangle saves (measured: c = 60 loses, c ≥ 300 wins).
+_SCATTER_CHUNK_MIN_ENTRIES = 1 << 16
 
-    Only the lower triangle of ``acc`` is meaningful; the caller mirrors once.
+
+class _HostPool:
+    """The thread pool of the host tile passes (compacted scatter, densify,
+    mirror) and its worker count. The executor is created on first use, so
+    a call whose work stays below every pool threshold starts no thread."""
+
+    def __init__(self, workers: int) -> None:
+        self.workers = int(workers)
+        self._executor: Any = None
+
+    @property
+    def executor(self) -> Any:
+        if self._executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._executor = ThreadPoolExecutor(max_workers=self.workers)
+        return self._executor
+
+    def map(self, fn: Callable[[int, int], None], bounds: Sequence[int]) -> None:
+        """``fn(r0, r1)`` over consecutive ``bounds`` on the pool (in any
+        order; the callers' ranges are disjoint), re-raising a failure."""
+        pairs = list(itertools.pairwise(bounds))
+        for _ in self.executor.map(lambda p: fn(*p), pairs):
+            pass
+
+    def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown()
+            self._executor = None
+
+
+@contextlib.contextmanager
+def _host_pool(cfg: TiledGramConfig) -> Iterator[_HostPool | None]:
+    """A :class:`_HostPool` of ``cfg.scatter_threads`` workers (capped by the
+    machine's cores), or None for one worker; shut down on exit."""
+    workers = max(1, min(int(cfg.scatter_threads), os.cpu_count() or 1))
+    if workers == 1:
+        yield None
+        return
+    pool = _HostPool(workers)
+    try:
+        yield pool
+    finally:
+        pool.close()
+
+
+@functools.cache
+def _compiled_scatter() -> Callable[..., None] | None:
+    """The Numba-compiled compacted scatter
+    (:func:`benchmarks.corpus._trots_kernels.compiled_scatter_lower_rows`,
+    compiled or loaded from Numba's on-disk cache and warmed up on the first
+    call), or None when Numba is not importable. Memoized for the process
+    (a pure function of the environment): the Numba import alone costs
+    ~0.5 s, so the host operators call this when they are built, not in
+    their first (timed) product."""
+    from benchmarks.corpus._trots_kernels import compiled_scatter_lower_rows
+
+    return compiled_scatter_lower_rows()
+
+
+def _scatter_kernel(cfg: TiledGramConfig) -> Callable[..., None] | None:
+    """The compacted-scatter kernel ``cfg`` asks for (see
+    ``TiledGramConfig.compiled_scatter``), None for the NumPy scatter."""
+    return _compiled_scatter() if cfg.compiled_scatter else None
+
+
+def _lower_row_bounds(c: int, chunks: int) -> list[int]:
+    """Row bounds splitting the lower triangle of a ``c×c`` block into
+    ``chunks`` row ranges of about equal area (row ``r`` holds ``r + 1``
+    entries, so bound ``i`` sits at ``c·√(i/chunks)``)."""
+    chunks = max(1, min(int(chunks), c))
+    return sorted({round(c * math.sqrt(i / chunks)) for i in range(chunks + 1)})
+
+
+def _scatter_lower(
+    acc: Any,
+    cols: Any,
+    g: Any,
+    pool: _HostPool | None = None,
+    kernel: Callable[..., None] | None = None,
+) -> None:
+    """``acc[ix_(cols, cols)] += g`` on the lower triangle, in row chunks.
+
+    Chunk ``[r0, r1)`` adds ``g[r0:r1, :r1]`` at ``(cols[r0:r1], cols[:r1])``:
+    every lower-triangle entry of the block, once (the diagonal block's upper
+    part rides along and is overwritten by the caller's final mirror, like
+    the zero upper triangle of a ``syrk`` product the full-block scatter
+    used to add). ``cols`` must be strictly increasing (every producer's
+    is: ``np.unique`` in :func:`_plan_structure`, ``arange`` in
+    :func:`_host_chunks`): unique, so no two chunks touch one entry, and
+    sorted, so the block's lower triangle lands in the accumulator's. Each
+    lower entry receives the same single addition as in a full-block
+    scatter: the lower triangle is bitwise the same with or without ``pool``
+    and for any chunking. NumPy's fancy-index get/set and the addition
+    release the GIL, so on ``pool`` the chunks run in parallel. Skipping the
+    strict upper triangle alone halves the work; on Head-and-Neck_01
+    (``n = 9984``, tiles up to ``c ≈ 9700``) the full-block scatter was half
+    of the iteration (docs/benchmarks/trots.md). A block under
+    ``_SCATTER_CHUNK_MIN_ENTRIES`` entries is one chunk: the full-block add.
+
+    ``kernel`` (see :func:`_scatter_kernel`) replaces the NumPy add of a
+    chunk ``[r0, r1)`` by ``kernel(acc, cols, g, r0, r1)``, which adds that
+    chunk's lower-triangle entries only (not the diagonal block's upper
+    part), in place, with the same single addition each and without the
+    gathered temporaries: the lower triangle is bitwise the NumPy
+    scatter's. When the block runs on ``pool`` (``scatter_threads > 1`` and
+    at least ``_SCATTER_POOL_MIN_ENTRIES`` entries) it runs in the same
+    chunks; otherwise it is one call over every row (it never visits the
+    upper triangle, so chunking would save nothing).
+    """
+    import numpy as np
+
+    c = int(cols.shape[0])
+    if c == 0:
+        return
+    workers = 1 if pool is None else pool.workers
+    parallel = pool is not None and workers > 1 and c * c >= _SCATTER_POOL_MIN_ENTRIES
+    if kernel is not None and not parallel:
+        kernel(acc, cols, g, 0, c)
+        return
+    if parallel:
+        chunks = workers * _SCATTER_CHUNKS_PER_THREAD
+    elif c * c >= _SCATTER_CHUNK_MIN_ENTRIES:
+        chunks = _SCATTER_CHUNKS_PER_THREAD
+    else:
+        chunks = 1
+    bounds = _lower_row_bounds(c, chunks)
+
+    def part(r0: int, r1: int) -> None:
+        if kernel is not None:
+            kernel(acc, cols, g, r0, r1)
+        else:
+            acc[np.ix_(cols[r0:r1], cols[:r1])] += g[r0:r1, :r1]
+
+    if parallel:
+        assert pool is not None
+        pool.map(part, bounds)
+    else:
+        for r0, r1 in itertools.pairwise(bounds):
+            part(r0, r1)
+
+
+def _densify(
+    csr: Any, acc_dtype: Any, scale: Any = None, pool: _HostPool | None = None
+) -> Any:
+    """``csr.toarray()`` in ``acc_dtype``, its rows multiplied by ``scale``
+    when given -- on ``pool`` in row chunks for a large tile.
+
+    The chunks are zero-copy CSR windows (as in :func:`_host_chunks`)
+    densified into their rows of one output, then scaled there: the same
+    values and the same elementwise products as the whole-tile
+    ``toarray()`` and ``*=``, so the result is bitwise the same. SciPy's
+    ``csr_todense`` and NumPy's multiply release the GIL. When the stored
+    dtype differs from ``acc_dtype`` (a float64 tile under a float32
+    accumulate request) each window is densified in its own dtype and cast
+    into its rows: the same per-element cast as the whole-tile ``astype``.
     """
     import numpy as np
     import scipy.sparse as sp
 
+    b, c = int(csr.shape[0]), int(csr.shape[1])
+    if pool is None or b * c < _SCATTER_POOL_MIN_ENTRIES:
+        dense = csr.toarray()
+        if dense.dtype != acc_dtype:
+            dense = dense.astype(acc_dtype)
+        if scale is not None:
+            dense *= scale[:, None]
+        return dense
+    dense = np.empty((b, c), dtype=acc_dtype)
+    same_dtype = np.dtype(csr.dtype) == np.dtype(acc_dtype)
+
+    def part(r0: int, r1: int) -> None:
+        lo, hi = int(csr.indptr[r0]), int(csr.indptr[r1])
+        window = sp.csr_matrix((r1 - r0, c), dtype=csr.dtype)
+        window.data = csr.data[lo:hi]
+        window.indices = csr.indices[lo:hi]
+        window.indptr = csr.indptr[r0 : r1 + 1] - lo
+        if same_dtype:
+            window.toarray(out=dense[r0:r1])  # zeroes its rows, then fills them
+        else:
+            dense[r0:r1] = window.toarray()  # the per-element astype cast
+        if scale is not None:
+            dense[r0:r1] *= scale[r0:r1, None]
+
+    chunks = pool.workers * _SCATTER_CHUNKS_PER_THREAD
+    pool.map(part, sorted({b * i // chunks for i in range(chunks + 1)}))
+    return dense
+
+
+def _tile_gram_into(
+    acc: Any,
+    tile: _Tile,
+    wp: Any,
+    swp: Any,
+    bad: Any,
+    acc_dtype: Any,
+    syrk: Any,
+    pool: _HostPool | None = None,
+    single_lane: bool = False,
+    kernel: Callable[..., None] | None = None,
+) -> None:
+    """Add ``tileᵀ diag(w) tile`` into ``acc``'s lower triangle (compacted scatter).
+
+    Only the lower triangle of ``acc`` is meaningful; the caller mirrors once.
+    ``pool`` (optional) runs the dense tile's densify and scaling
+    (:func:`_densify`) and its scatter (:func:`_scatter_lower`) in row
+    chunks; the result does not depend on it. ``single_lane`` (the tiles
+    run in sequence) applies the host width rule to sparse tiles
+    (``_Tile.host_sparse``, see ``TiledGramConfig.host_sparse_entry_ratio``).
+    ``kernel`` is the dense tiles' compiled scatter (see :func:`_scatter_lower`).
+    """
+    import scipy.sparse as sp
+
     w_t = wp[tile.start : tile.stop]
-    if tile.sparse:
+    sparse = tile.sparse
+    if single_lane and tile.host_sparse is not None:
+        sparse = tile.host_sparse
+    if sparse:
         data = tile.csr.data * w_t[tile.row_of_nnz]
         scaled = sp.csr_matrix(
             (data, tile.csr.indices, tile.csr.indptr), shape=tile.csr.shape
@@ -973,18 +1301,16 @@ def _tile_gram_into(
         keep = g.row >= g.col  # the lower triangle suffices (sorted cols)
         acc[tile.cols[g.row[keep]], tile.cols[g.col[keep]]] += g.data[keep]
         return
-    dense = tile.csr.toarray()
-    if dense.dtype != acc_dtype:
-        dense = dense.astype(acc_dtype)
     if bad is None or not bool(bad[tile.start : tile.stop].any()):
         # Σ ≥ 0: symmetric rank-k update on √w-scaled rows, one triangle.
-        dense *= swp[tile.start : tile.stop, None]
+        dense = _densify(tile.csr, acc_dtype, swp[tile.start : tile.stop], pool)
         g = syrk(1.0, dense.T, trans=0, lower=1)
     else:
         # Signed / non-finite weights (exact-Hessian nonconvex case, Breedveld
         # 2017 §5.1.2): no square root — general product for this tile.
+        dense = _densify(tile.csr, acc_dtype, None, pool)
         g = dense.T @ (w_t.astype(acc_dtype)[:, None] * dense)
-    acc[np.ix_(tile.cols, tile.cols)] += g
+    _scatter_lower(acc, tile.cols, g, pool, kernel)
 
 
 #: Row-block size for the host mirror below: bounded temporaries (block²
@@ -1001,7 +1327,7 @@ def _tile_gram_into(
 _HOST_MIRROR_BLOCK = 512
 
 
-def _mirror_lower(out: Any) -> Any:
+def _mirror_lower(out: Any, pool: _HostPool | None = None) -> Any:
     """Copy the lower triangle onto the upper one (bitwise-exact symmetry),
     in ``_HOST_MIRROR_BLOCK`` panels: each diagonal block mirrors internally
     via a block-sized index gather, and the panel right of it is a single
@@ -1009,26 +1335,52 @@ def _mirror_lower(out: Any) -> Any:
     exactly the same array as a per-row copy loop, including ``-0.0`` — see
     ``test_mirror_lower_matches_row_loop_reference`` in
     ``tests/unit/test_trots_tiled_gram.py``.
+
+    A panel writes only upper-triangle entries of its own rows and reads
+    only lower-triangle ones, so the panels are independent: on ``pool``
+    (optional) they run in parallel, with the same result.
     """
     import numpy as np
 
     out = np.ascontiguousarray(out)
     n = out.shape[0]
     block = _HOST_MIRROR_BLOCK
-    tri = None
-    for j0 in range(0, n, block):
-        j1 = min(n, j0 + block)
-        if j1 - j0 == block:
-            if tri is None:
-                tri = np.triu_indices(block, 1)
-            rows, cols = tri
+    full = np.triu_indices(block, 1) if n >= block else None
+
+    def panel(j0: int, j1: int) -> None:
+        if full is not None and j1 - j0 == block:
+            rows, cols = full
         else:
             rows, cols = np.triu_indices(j1 - j0, 1)
         diag = out[j0:j1, j0:j1]
         diag[rows, cols] = diag[cols, rows]
         if j1 < n:
             out[j0:j1, j1:] = out[j1:, j0:j1].T
+
+    bounds = [*range(0, n, block), n]
+    if pool is not None and len(bounds) > 2 and n * n >= _SCATTER_POOL_MIN_ENTRIES:
+        pool.map(panel, bounds)
+    else:
+        for j0, j1 in itertools.pairwise(bounds):
+            panel(j0, j1)
     return out
+
+
+def _add_rows(out: Any, addend: Any, pool: _HostPool | None = None) -> None:
+    """``out += addend`` in place, in row panels on ``pool`` (NumPy's add
+    releases the GIL); elementwise, so the result is the plain add's."""
+    import numpy as np
+
+    n = out.shape[0]
+
+    def part(r0: int, r1: int) -> None:
+        np.add(out[r0:r1], addend[r0:r1], out=out[r0:r1])
+
+    if pool is not None and out.size >= _SCATTER_POOL_MIN_ENTRIES:
+        step = max(1, -(-n // (pool.workers * _SCATTER_CHUNKS_PER_THREAD)))
+        pool.map(part, [*range(0, n, step), n])
+    else:
+        part(0, n)
 
 
 @dataclass
@@ -1047,7 +1399,9 @@ class TiledGramPlan:
     ``gated_structures`` holds the structures of a plan the gate rejected
     after planning them (the pre-gate passed); it is empty for a tiled plan
     and for a pre-gate rejection. The device exact Hessian reuses them
-    instead of planning the structure twice; other callers drop the plan.
+    instead of planning the structure twice, the host one when their flop
+    ratio is at most ``TiledGramConfig.host_hessian_flop_ratio``; other
+    callers drop the plan.
     """
 
     shape: tuple[int, int]
@@ -1075,8 +1429,9 @@ class TiledGramPlan:
         maps ``(segment key, requested tile storage dtype, config)`` to the
         structure's ``(matrix, perm, tiles)``. A hit is reused instead of
         re-planned, and the structures of a plan that passes the gate are
-        registered. The device exact Hessian of :class:`TROTSExactProblem`
-        also registers the structures it plans past the gate (see
+        registered. The exact Hessian of :class:`TROTSExactProblem` also
+        registers the structures it plans past the gate (device), or keeps
+        after the gate rejected them (host, see
         :class:`TiledGramConfig`), under the same key. Either way a structure
         matrix used by both the linear block and the exact Hessian holds one
         tile copy, whichever side plans it first.
@@ -1153,6 +1508,81 @@ class TiledGramPlan:
         )
 
 
+class _GramMerge:
+    """Per-problem rendezvous behind :meth:`TROTSExactHessian.dense_matrix_with_gram`.
+
+    The core hands the Hessian the solver's inequality Jacobian — the
+    lowered, row-scaled, stacked view of the loader's rows — and its weights.
+    The Hessian does not read that layout: it *offers* its per-structure
+    dose-space weights ``h_s`` (keyed by the structure's tile set) and calls
+    the Jacobian's ``gram``, whose ipax wrappers translate the weights down to
+    the loader's own rows. A :class:`TiledGramCSROperator` reached there
+    *takes* the offer for each of its planned structures with the same tile
+    set, adds ``h_s`` to its merged weights ``σ_s`` and multiplies the
+    structure once (Breedveld 2017, eq. (48)); the Hessian then forms only
+    the structures nobody took. Outside an open offer the linear block's
+    Gram is the plain one.
+
+    ``tiles`` records the tile sets of every tiled linear-block operator
+    built for the problem, so a Hessian with no shared structure declines up
+    front (the core's two-pass assembly, bit for bit) without a Gram call.
+    """
+
+    def __init__(self) -> None:
+        #: ``id(tiles)`` → ``(tiles, hint)``: the tile list (held, so its
+        #: id is never reused) and the registering operator's precision hint.
+        self.tiles: dict[int, tuple[Any, str | None]] = {}
+        self._offer: dict[int, tuple[Any, Any]] | None = None
+        self._taken: set[int] = set()
+
+    def register(self, tile_sets: Iterable[Any], hint: str | None) -> None:
+        self.tiles.update((id(t), (t, hint)) for t in tile_sets)
+
+    def mergeable(
+        self, tiles: Any, accumulate_dtype: str | None, hinted_only: bool
+    ) -> bool:
+        """Whether a linear-block operator holding ``tiles`` would take an
+        offer under this Gram request: it must have registered them, and its
+        accumulation must stay exact (the rule of ``TiledGramCSROperator.gram``:
+        under ``hinted_only`` a block whose hint differs from the request
+        accumulates exactly)."""
+        entry = self.tiles.get(id(tiles))
+        if entry is None or entry[0] is not tiles:
+            return False
+        if not _reduced_request(accumulate_dtype):
+            return True
+        return hinted_only and entry[1] != accumulate_dtype
+
+    @contextlib.contextmanager
+    def open(self, offer: dict[int, tuple[Any, Any]]) -> Iterator[set[int]]:
+        """Offer ``{id(tiles): (tiles, h)}`` for the duration of one Gram call;
+        yields the set of tile ids that were taken."""
+        self._offer, self._taken = offer, set()
+        try:
+            yield self._taken
+        finally:
+            self._offer = None
+
+    def take(self, tiles: Any) -> Any:
+        """The offered weights of the structure with tile set ``tiles``, or
+        None (no open offer, not offered, or already taken).
+
+        Taking is final: the taker's product must reach the Gram the Hessian
+        receives, i.e. each operator's ``gram`` runs once per offer and its
+        result is used. The core's Gram wrappers (``VStack``, the row
+        scaling, the lowering's signed row selection) call each block's
+        ``gram`` exactly once; a wrapper that re-requested or discarded a
+        block's Gram inside an offer would drop that structure's ``h_s``."""
+        if self._offer is None:
+            return None
+        key = id(tiles)
+        entry = self._offer.get(key)
+        if entry is None or entry[0] is not tiles or key in self._taken:
+            return None
+        self._taken.add(key)
+        return entry[1]
+
+
 class TiledGramCSROperator(CSROperator):
     """A ``CSROperator`` whose :meth:`gram` is the per-structure tiled product.
 
@@ -1185,6 +1615,11 @@ class TiledGramCSROperator(CSROperator):
     On NumPy a weight vector with at most half of its entries nonzero — the
     restoration phase's active sets — is multiplied from those rows alone
     (:class:`_ActiveRowGram`) instead of through every tile.
+
+    ``merge`` (the exact-Hessian problem's :class:`_GramMerge`) lets a Gram
+    requested by :meth:`TROTSExactHessian.dense_matrix_with_gram` take the
+    Hessian's weights of a shared structure into its own (exact requests
+    only); that merged product bypasses the memo and the active-row path.
     """
 
     def __init__(
@@ -1197,6 +1632,7 @@ class TiledGramCSROperator(CSROperator):
         config: TiledGramConfig | None = None,
         plan: TiledGramPlan | None = None,
         device_cache: dict[Any, Any] | None = None,
+        merge: _GramMerge | None = None,
     ) -> None:
         import numpy as np
         import scipy.sparse as sp
@@ -1259,11 +1695,20 @@ class TiledGramCSROperator(CSROperator):
         self.plan_seconds = plan.seconds
         self._memo: dict[str | None, tuple[Any, Any]] = {}
         self.gram_compute_count = 0  # observability: actual tiled products
+        #: The exact Hessian's merge rendezvous (see _GramMerge), or None.
+        self._merge = merge if self.tiled else None
+        if self._merge is not None:
+            self._merge.register((p.tiles for p in self._plans), values_dtype_hint)
         #: Host restoration Grams from the active rows (see _ActiveRowGram).
         self.active_rows = _ActiveRowGram(csr, self.config)
         #: Device execution context (CuPy / Torch namespaces), else None.
         self._device: _DeviceGramContext | None = None
         kind = None if _is_host_numpy(xp) else _device_kind(xp)
+        if kind is None and self.tiled:
+            # The host tiled Gram's compiled scatter: imported, compiled (or
+            # loaded from Numba's cache) and warmed up now, not in the first
+            # Gram of a timed iteration.
+            _scatter_kernel(self.config)
         if kind is not None:
             self._device = _DeviceGramContext(
                 xp,
@@ -1385,9 +1830,20 @@ class TiledGramCSROperator(CSROperator):
             and self.gram_accumulate_dtype_hint() != accumulate_dtype
         ):
             accumulate_dtype = None  # this block's data does not support it
+        merged = self._take_merge(accumulate_dtype)
         if self._device is not None:
-            return self._device_gram(weights, accumulate_dtype)
+            return self._device_gram(weights, accumulate_dtype, merged)
         w = np.asarray(_to_numpy(weights), dtype=np.float64)
+        if merged is not None:
+            # Merged with the exact Hessian's weights (an open _GramMerge
+            # offer): not this block's Gram, so neither the active-row path
+            # nor the memo. The exact slot is released first, as below (an
+            # n×n array; δ_w retries hit the Hessian's own fused memo).
+            self._memo.pop(None, None)
+            self.gram_compute_count += 1
+            return self._xp_ns.asarray(
+                self._tiled_gram(w, np.dtype(np.float64), merged)
+            )
         # Restoration's active-set Grams (a few nonzero weights): the active
         # rows alone rather than every tile (see _ActiveRowGram).
         compact = self.active_rows.gram(w, accumulate_dtype)
@@ -1412,16 +1868,37 @@ class TiledGramCSROperator(CSROperator):
         self.gram_compute_count += 1
         return self._xp_ns.asarray(out)
 
-    def _tiled_gram(self, w: Any, acc_dtype: Any) -> Any:
+    def _take_merge(self, accumulate_dtype: str | None) -> dict[int, Any] | None:
+        """``{plan index: h_s}`` taken from an open :class:`_GramMerge` offer,
+        or None. A reduced (float32) accumulation never takes one: the
+        Hessian's weights would be rounded with this block's tiles."""
+        merge = self._merge
+        if merge is None or _reduced_request(accumulate_dtype):
+            return None
+        taken: dict[int, Any] = {}
+        for i, plan in enumerate(self._plans):
+            h = merge.take(plan.tiles)
+            if h is not None:
+                taken[i] = h
+        return taken or None
+
+    def _tiled_gram(
+        self, w: Any, acc_dtype: Any, merged: dict[int, Any] | None = None
+    ) -> Any:
         import numpy as np
 
         n = self.shape[1]
         nx = self._nx
         out = np.zeros((n, n), dtype=np.float64)
         work: list[tuple[_Tile, Any, Any, Any]] = []
-        for plan in self._plans:
+        for i, plan in enumerate(self._plans):
             a = plan.structure
             ws = np.zeros((a.shape[0],), dtype=np.float64)
+            if merged is not None and i in merged:
+                # The exact Hessian's dose-space weights of this structure:
+                # A_sᵀ diag(h_s + σ_s) A_s in one product (Breedveld 2017,
+                # eq. (48) across W and the Gram; see _GramMerge).
+                ws += merged[i]
             for seg in plan.uses:
                 w_u = w[seg.start : seg.stop]
                 ws += w_u  # signs square away (eq. 48)
@@ -1433,8 +1910,9 @@ class TiledGramCSROperator(CSROperator):
                     out[k, : a.shape[1]] += (seg.sign * seg.aux_coef) * border
                     out[k, k] += seg.aux_coef**2 * float(np.sum(w_u))
             work.extend(_tile_work(ws, plan.perm, plan.tiles, acc_dtype))
-        _accumulate_tiles(out[:nx, :nx], work, self.config, acc_dtype)
-        return _mirror_lower(out)
+        with _host_pool(self.config) as pool:
+            _accumulate_tiles(out[:nx, :nx], work, self.config, acc_dtype, pool)
+            return _mirror_lower(out, pool)
 
     # -- the device Gram (CuPy / Torch) -----------------------------------------
     def device_structures(self) -> list[_DeviceStructure]:
@@ -1449,8 +1927,17 @@ class TiledGramCSROperator(CSROperator):
             for p in self._plans
         ]
 
-    def _device_gram(self, weights: Array, accumulate_dtype: str | None) -> Array:
-        """The device Gram: one host read per call (see _device_accumulate)."""
+    def _device_gram(
+        self,
+        weights: Array,
+        accumulate_dtype: str | None,
+        merged: dict[int, Any] | None = None,
+    ) -> Array:
+        """The device Gram: one host read per call (see _device_accumulate).
+
+        ``merged`` (device weight vectors by plan index, see
+        :meth:`_take_merge`) adds the exact Hessian's weights of shared
+        structures; that product bypasses the memo."""
         import numpy as np
 
         ctx = self._device
@@ -1465,8 +1952,12 @@ class TiledGramCSROperator(CSROperator):
             w = xp.astype(w, xp.float64)
         items: list[tuple[_DeviceStructure, Any]] = []
         aux: list[GramSegment] = []
-        for plan, ds in zip(self._plans, self.device_structures(), strict=True):
+        for i, (plan, ds) in enumerate(
+            zip(self._plans, self.device_structures(), strict=True)
+        ):
             ws = None
+            if merged is not None and i in merged:
+                ws = merged[i]  # the exact Hessian's h_s (see _tiled_gram)
             for seg in plan.uses:
                 w_u = w[seg.start : seg.stop]
                 ws = w_u if ws is None else ws + w_u  # signs square away (eq. 48)
@@ -1474,6 +1965,17 @@ class TiledGramCSROperator(CSROperator):
                     aux.append(seg)
             items.append((ds, ws))
         prepared, flag_dev = _device_prepare(ctx, items, acc_name)
+        if merged is not None:
+            # Not this block's Gram: bypass the memo, releasing its exact
+            # slot first (see gram).
+            self._memo.pop(key, None)
+            flags = (
+                np.asarray(ctx.to_host(flag_dev), dtype=bool)
+                if flag_dev is not None
+                else np.zeros((0,), dtype=bool)
+            )
+            self.gram_compute_count += 1
+            return self._device_tiled_gram(w, acc_name, prepared, flags, aux)
         # Last-weights memo (δ_w retries). Its comparison is a device
         # reduction read back together with the per-tile weight flags, so a
         # call costs one host read whether it hits or computes (a hit wastes
@@ -1628,6 +2130,19 @@ class _ActiveRowGram:
         return out
 
 
+def _reduced_request(accumulate_dtype: str | None) -> bool:
+    """Whether a Gram request accumulates in float32 (the only reduced dtype
+    the tile kernels run; any other name falls back to float64)."""
+    import numpy as np
+
+    if accumulate_dtype is None:
+        return False
+    try:
+        return bool(np.dtype(accumulate_dtype) == np.float32)
+    except TypeError:
+        return False
+
+
 def _resolve_accumulate(
     op: LinearOperator, accumulate_dtype: str | None, hinted_only: bool
 ) -> str | None:
@@ -1754,6 +2269,7 @@ def _accumulate_tiles(
     work: list[tuple[_Tile, Any, Any, Any]],
     cfg: TiledGramConfig,
     acc_dtype: Any,
+    pool: _HostPool | None = None,
 ) -> None:
     """Add every ``(tile, w_perm, sqrt_w_perm, bad)`` item's weighted Gram into
     the lower triangle of ``acc`` (an ``nx×nx`` view), on the configured lanes.
@@ -1761,12 +2277,15 @@ def _accumulate_tiles(
     Shared by the linear block's :class:`TiledGramCSROperator` and the exact
     Hessian's :class:`TROTSExactHessian`. The lane count is a function of the
     config and the data only (see :class:`TiledGramConfig`), so the round-off
-    does not depend on the machine.
+    does not depend on the machine. ``pool`` (see :func:`_host_pool`) serves
+    the row-chunked host passes of a single-lane run; it never changes the
+    result, nor does the compiled scatter (``TiledGramConfig.compiled_scatter``).
     """
     from scipy.linalg.blas import get_blas_funcs
 
     if not work:
         return
+    kernel = _scatter_kernel(cfg)
     nx = int(acc.shape[0])
     syrk = get_blas_funcs("syrk", dtype=acc_dtype)
     total_flops = sum(item[0].flops for item in work)
@@ -1777,10 +2296,25 @@ def _accumulate_tiles(
         max(1, int(cfg.lane_budget_bytes) // max(1, 8 * nx * nx)),
     )
     if threads == 1:
-        for tile, wp, swp, bad in work:  # scatter straight into the view
-            _tile_gram_into(acc, tile, wp, swp, bad, acc_dtype, syrk)
+        # One lane (small work, or n ≈ 10⁴ by the accumulator budget): the
+        # tiles run in order, scattering straight into the view; the wide
+        # ones densify and scatter in row chunks on the pool (bitwise the
+        # same result, see _densify and _scatter_lower).
+        for tile, wp, swp, bad in work:
+            _tile_gram_into(
+                acc,
+                tile,
+                wp,
+                swp,
+                bad,
+                acc_dtype,
+                syrk,
+                pool,
+                single_lane=True,
+                kernel=kernel,
+            )
     else:
-        acc += _threaded_tiles(work, nx, acc_dtype, syrk, threads)
+        acc += _threaded_tiles(work, nx, acc_dtype, syrk, threads, kernel)
 
 
 def _threaded_tiles(
@@ -1789,9 +2323,12 @@ def _threaded_tiles(
     acc_dtype: Any,
     syrk: Any,
     threads: int,
+    kernel: Callable[..., None] | None = None,
 ) -> Any:
     """One tile per worker at a time (Breedveld 2017 §5.2), private
-    accumulators summed at the end; tiles are dealt to workers by flops."""
+    accumulators summed at the end; tiles are dealt to workers by flops.
+    ``kernel`` (the compiled scatter, or None) runs on each lane's own
+    thread; it releases the GIL, so the lanes scatter in parallel."""
     from concurrent.futures import ThreadPoolExecutor
 
     import numpy as np
@@ -1806,7 +2343,7 @@ def _threaded_tiles(
     def run(items: list[tuple[_Tile, Any, Any, Any]]) -> Any:
         acc = np.zeros((nx, nx))
         for tile, wp, swp, bad in items:
-            _tile_gram_into(acc, tile, wp, swp, bad, acc_dtype, syrk)
+            _tile_gram_into(acc, tile, wp, swp, bad, acc_dtype, syrk, kernel=kernel)
         return acc
 
     workers = max(1, min(threads, os.cpu_count() or 1))
@@ -2864,6 +3401,9 @@ class TROTSProblem(Problem):
         # the L-BFGS problem keeps the linear block's plan scoped to its
         # operator, exactly as before.
         self._plan_registry: dict[Any, Any] | None = None
+        # The exact Hessian's Gram-merge rendezvous (see _GramMerge); only
+        # TROTSExactProblem creates one.
+        self._gram_merge: _GramMerge | None = None
         # Device tiled Gram (CuPy / Torch namespaces): the namespace kind, and
         # the per-problem device tile cache shared by the linear block's
         # operators (rebuilt per linear_ineq() call) and the exact Hessian.
@@ -3477,6 +4017,7 @@ class TROTSProblem(Problem):
                             values_dtype_hint=hint,
                             plan=plan,
                             device_cache=self._device_tiles,
+                            merge=self._gram_merge,
                         )
                     except ValueError as exc:
                         # The segments disagree with the assembled rows (a
@@ -3832,7 +4373,8 @@ class _CurvedStructure:
     """One structure matrix carrying nonlinear (curved) cost terms.
 
     ``perm``/``tiles`` hold its tiled-Gram plan when the per-structure gate
-    passes; otherwise ``csr`` (a CSR view of the matrix, shared with the
+    passes, or (host) when the gate rejected a plan whose flop ratio is at
+    most ``TiledGramConfig.host_hessian_flop_ratio``; otherwise ``csr`` (a CSR view of the matrix, shared with the
     caller when it already is CSR) serves full-width dense row chunks on the
     host. On a device namespace a gated-off structure is planned anyway
     (``device_perm``/``device_tiles``): see :class:`TROTSDeviceExactHessian`.
@@ -3919,7 +4461,8 @@ class TROTSExactHessian(LinearOperator):
     mixed-precision refinement apply); :meth:`dense_matrix` forms the tiled
     products (:class:`TiledGramCSROperator`'s kernels, signed-weight gemm
     where needed; full-width dense row chunks for structures the gate keeps
-    off), is exactly symmetric, and is memoized on the operator (one
+    off whose plan was never made or exceeds
+    ``TiledGramConfig.host_hessian_flop_ratio``), is exactly symmetric, and is memoized on the operator (one
     operator per IPM iteration). :meth:`to_coo` serves the sparse-direct
     route through the plain SciPy product. Host-evaluated (NumPy/SciPy);
     results cross to the solve namespace — which is why
@@ -3929,6 +4472,11 @@ class TROTSExactHessian(LinearOperator):
     ``low_rank_factors`` is ``(U, V)`` (host NumPy, ``nx×r``) or None; the
     operator wraps them in a :class:`~ipax.backend.operators.LowRank`
     (:attr:`low_rank`) and keeps the factors (:attr:`low_rank_factors`).
+
+    :meth:`dense_matrix_with_gram` (the core's optional fused-curvature
+    capability, given a ``merge`` rendezvous) forms ``H + ∇gᵀ Σ_s ∇g`` with
+    every structure that is also in the linear block multiplied once, with
+    ``h_s + σ_s`` (Breedveld 2017, eq. (48) and §4.2); see :class:`_GramMerge`.
     """
 
     def __init__(
@@ -3942,6 +4490,7 @@ class TROTSExactHessian(LinearOperator):
         config: TiledGramConfig,
         stats: dict[str, float] | None = None,
         quad_builder: Callable[[], Any] | None = None,
+        merge: _GramMerge | None = None,
     ) -> None:
         from ipax.backend.operators import LowRank
 
@@ -3965,6 +4514,12 @@ class TROTSExactHessian(LinearOperator):
         self.config = config
         self._stats = stats
         self._dense: Any = None
+        self._merge = merge
+        #: The fused block of the last :meth:`dense_matrix_with_gram`, keyed
+        #: by its request, Jacobian and weights: ``(key, jac, weights, block)``.
+        self._fused: tuple[Any, Any, Any, Any] | None = None
+        #: The curved structures the last fused block multiplied merged.
+        self.fused_structures: list[_CurvedStructure] = []
 
     @property
     def quad(self) -> Any:
@@ -4025,7 +4580,14 @@ class TROTSExactHessian(LinearOperator):
                 self._stats["dense_calls"] += 1
         return self._xp_ns.asarray(self._dense)
 
-    def _dense_host(self) -> Any:
+    def _dense_host(
+        self,
+        terms: list[tuple[_CurvedStructure, Any]] | None = None,
+        addend: Any = None,
+    ) -> Any:
+        """The dense Hessian over ``terms`` (default: all) plus ``Q`` and the
+        rank-1 part, exactly symmetric; ``addend`` (a symmetric host array)
+        is added after the mirror, in row panels on the pool."""
         import numpy as np
         import scipy.sparse as sp
 
@@ -4033,7 +4595,7 @@ class TROTSExactHessian(LinearOperator):
         cfg = self.config
         out = np.zeros((self._n_vars, self._n_vars), dtype=np.float64)
         work: list[tuple[_Tile, Any, Any, Any]] = []
-        for cs, w in self.terms:
+        for cs, w in self.terms if terms is None else terms:
             if cs.tiles is not None:
                 work.extend(_tile_work(w, cs.perm, cs.tiles, np.float64))
                 continue
@@ -4041,13 +4603,128 @@ class TROTSExactHessian(LinearOperator):
             # the plain adapter's product, on the same lanes and kernels.
             work.extend(_tile_work(w, None, _host_chunks(cs, nx, cfg), np.float64))
         acc = out[:nx, :nx]
-        _accumulate_tiles(acc, work, cfg, np.float64)
-        if self.quad is not None:
-            q = sp.coo_matrix(self.quad)
-            np.add.at(acc, (q.row, q.col), q.data)
-        if self.low_rank is not None:
-            acc += np.asarray(self.low_rank.dense_matrix())
-        return _mirror_lower(out)  # lower triangle mirrored: exactly symmetric
+        with _host_pool(cfg) as pool:
+            _accumulate_tiles(acc, work, cfg, np.float64, pool)
+            if self.quad is not None:
+                q = sp.coo_matrix(self.quad)
+                np.add.at(acc, (q.row, q.col), q.data)
+            if self.low_rank is not None:
+                acc += np.asarray(self.low_rank.dense_matrix())
+            # Lower triangle mirrored: exactly symmetric.
+            out = _mirror_lower(out, pool)
+            if addend is not None:
+                _add_rows(out, addend, pool)
+            return out
+
+    # -- the fused block (the core's dense_matrix_with_gram) ---------------
+    def _shared_tiles(self, cs: _CurvedStructure) -> Any:
+        """The tile set the Hessian multiplies ``cs`` with (None: chunks)."""
+        return cs.tiles
+
+    def _merge_offer(
+        self, accumulate_dtype: str | None, hinted_only: bool
+    ) -> dict[int, tuple[Any, Any]]:
+        """``{id(tiles): (tiles, h_s)}`` of the curved structures a linear
+        block operator would take under this request (see _GramMerge)."""
+        merge = self._merge
+        if merge is None:
+            return {}
+        offer: dict[int, tuple[Any, Any]] = {}
+        for cs, w in self.terms:
+            tiles = self._shared_tiles(cs)
+            if tiles and merge.mergeable(tiles, accumulate_dtype, hinted_only):
+                offer[id(tiles)] = (tiles, self._offer_weights(cs, w))
+        return offer
+
+    def _offer_weights(self, cs: _CurvedStructure, w: Any) -> Any:
+        del cs
+        return w
+
+    def _memo_weights(self, weights: Array) -> Any:
+        import numpy as np
+
+        return np.array(_to_numpy_nd(weights), dtype=np.float64, copy=True)
+
+    def _same_weights(self, a: Any, b: Any) -> bool:
+        import numpy as np
+
+        return a.shape == b.shape and bool(np.array_equal(a, b))
+
+    def _fused_block(
+        self, rest: list[tuple[_CurvedStructure, Any]], gram: Array
+    ) -> Array:
+        import numpy as np
+
+        g = np.asarray(_to_numpy_nd(gram), dtype=np.float64)
+        return self._xp_ns.asarray(self._dense_host(rest, addend=g))
+
+    def dense_matrix_with_gram(
+        self,
+        jac: LinearOperator,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        """``H + jacᵀ diag(weights) jac`` with shared structures multiplied once.
+
+        The core's optional fused-curvature capability
+        (``LinearOperator.dense_matrix_with_gram``). ``jac`` is the solver's
+        inequality Jacobian, whose wrappers translate ``weights`` to the
+        loader's rows; its Gram is requested with this Hessian's weights
+        ``h_s`` on offer (:class:`_GramMerge`), so each structure the linear
+        block also holds is multiplied once with ``h_s + σ_s`` (Breedveld
+        2017, eq. (48) and §4.2). The Hessian then forms the structures not
+        taken, ``Q`` and the rank-1 part, and adds the Gram. Declines
+        (``NotImplementedError``: the core's two-pass assembly) when no
+        structure is shared, when the merge is off
+        (``TiledGramConfig.merge_hessian_gram``), or when every shared
+        structure's block would accumulate in float32 — the Hessian part
+        stays float64. Memoized per request and weights (δ_w retries).
+        """
+        import time
+
+        from ipax.backend.operators import forward_gram
+
+        offer = self._merge_offer(accumulate_dtype, hinted_only)
+        if not offer:
+            raise NotImplementedError("no curved structure to merge with the Gram")
+        assert self._merge is not None
+        key = (accumulate_dtype, bool(hinted_only))
+        w_key = self._memo_weights(weights)
+        memo = self._fused
+        if (
+            memo is not None
+            and memo[0] == key
+            and memo[1] is jac
+            and self._same_weights(memo[2], w_key)
+        ):
+            return memo[3]
+        # Superseded: release it before the new block is formed beside it.
+        self._fused = memo = None
+        t0 = time.perf_counter()
+        with self._merge.open(offer) as taken:
+            gram = forward_gram(
+                jac, weights, accumulate_dtype=accumulate_dtype, hinted_only=hinted_only
+            )
+        if not taken:
+            # Offered, but no linear-block operator in ``jac`` took it (an
+            # operator from another linear_ineq() call): the two-pass block.
+            raise NotImplementedError("the linear block took no merged structure")
+        merged = [
+            (cs, w) for cs, w in self.terms if id(self._shared_tiles(cs)) in taken
+        ]
+        rest = [
+            (cs, w) for cs, w in self.terms if id(self._shared_tiles(cs)) not in taken
+        ]
+        out = self._fused_block(rest, gram)
+        del gram
+        self.fused_structures = [cs for cs, _w in merged]
+        self._fused = (key, jac, w_key, out)
+        if self._stats is not None:
+            self._stats["fused_seconds"] += time.perf_counter() - t0
+            self._stats["fused_calls"] += 1
+        return out
 
     def diagonal(self, like: Array | None = None) -> Array:
         """``Σ_k (A_k∘A_k)ᵀ w_k + diag(Q) + rowsum(U∘V)`` — no matrix formed."""
@@ -4348,15 +5025,21 @@ class TROTSDeviceExactHessian(TROTSExactHessian):
                 self._stats["dense_calls"] += 1
         return self._dense
 
-    def _dense_device(self) -> Any:
+    def _dense_device(
+        self, terms: list[tuple[_CurvedStructure, Any]] | None = None
+    ) -> Any:
+        """The dense Hessian on the device over ``terms`` (default: all)."""
         ctx = self._ctx
         xp = ctx.xp
         nx = self._nx
         out = xp.zeros(
             (self._n_vars, self._n_vars), dtype=xp.float64, device=ctx.device
         )
+        keep = None if terms is None else {id(cs) for cs, _w in terms}
         items: list[tuple[_DeviceStructure, Any]] = []
         for (cs, _w), w in zip(self.terms, self._device_weights(), strict=True):
+            if keep is not None and id(cs) not in keep:
+                continue
             if cs.tiles is not None:
                 perm, tiles = cs.perm, cs.tiles
             else:  # gated off: its device plan, made on first use
@@ -4382,6 +5065,34 @@ class TROTSDeviceExactHessian(TROTSExactHessian):
             u, v = low_rank
             out[:nx, :nx] += xp.matmul(u, xp.permute_dims(v, (1, 0)))
         return ctx.mirror_lower(out)
+
+    # -- the fused block on the device ------------------------------------
+    def _shared_tiles(self, cs: _CurvedStructure) -> Any:
+        if cs.tiles is not None:
+            return cs.tiles
+        if self._device_planner is None:
+            return None
+        return self._device_planner(cs)[1]  # gated off: its device plan
+
+    def _offer_weights(self, cs: _CurvedStructure, w: Any) -> Any:
+        del w
+        index = next(i for i, (c, _w) in enumerate(self.terms) if c is cs)
+        return self._device_weights()[index]
+
+    def _memo_weights(self, weights: Array) -> Any:
+        xp = self._ctx.xp
+        return xp.asarray(xp.asarray(weights, device=self._ctx.device), copy=True)
+
+    def _same_weights(self, a: Any, b: Any) -> bool:
+        xp = self._ctx.xp
+        return a.shape == b.shape and bool(xp.all(a == b))
+
+    def _fused_block(
+        self, rest: list[tuple[_CurvedStructure, Any]], gram: Array
+    ) -> Array:
+        out = self._dense_device(rest)
+        out += self._ctx.xp.asarray(gram, device=self._ctx.device)
+        return out
 
     def diagonal(self, like: Array | None = None) -> Array:
         del like
@@ -4475,6 +5186,8 @@ class TROTSExactProblem(TROTSProblem):
             "build_calls": 0,
             "dense_seconds": 0.0,
             "dense_calls": 0,
+            "fused_seconds": 0.0,
+            "fused_calls": 0,
         }
         if not self._grouped_hessian:
             return
@@ -4493,6 +5206,14 @@ class TROTSExactProblem(TROTSProblem):
         self._hess_cfg = (
             self._tiled_cfg if self._tiled_cfg is not None else TiledGramConfig()
         )
+        # One product per structure for the Hessian and the linear block's
+        # Gram (see _GramMerge): host and device tiled Hessians only.
+        if (
+            self._tiled_cfg is not None
+            and self._tiled_cfg.merge_hessian_gram
+            and (self._hess_host or self._hess_device)
+        ):
+            self._gram_merge = _GramMerge()
         # One entry per unique curved structure (insertion order = first use).
         self._curved: dict[int, _CurvedStructure] = {}
         curved_mats = [mat for mat, _c, _t, _p in self._nl_obj] + [
@@ -4526,11 +5247,32 @@ class TROTSExactProblem(TROTSProblem):
                     # rather than planning the structure a second time.
                     gp = plan.gated_structures[0]
                     self._register_device_plan(cs, gp.perm, gp.tiles)
+                elif (
+                    self._hess_host
+                    and plan.gated_structures
+                    and plan.flop_ratio <= self._tiled_cfg.host_hessian_flop_ratio
+                ):
+                    # Gated off after planning, but still cheaper than the
+                    # full-width chunks (see TiledGramConfig): keep the plan
+                    # and register it, so the linear block reuses this tile
+                    # set if it plans the same structure.
+                    gp = plan.gated_structures[0]
+                    cs.perm, cs.tiles = gp.perm, gp.tiles
+                    assert self._plan_registry is not None
+                    self._plan_registry[self._registry_key(mat)] = (
+                        a,
+                        gp.perm,
+                        gp.tiles,
+                    )
             if cs.tiles is None and self._hess_host:
                 # Row slicing needs CSR, not sorted indices: never sort in
                 # place (a CSR source is shared with the instance cache).
                 cs.csr = sp.csr_matrix(a)
             self._curved[id(mat)] = cs
+        if self._hess_host and self._curved:
+            # The host dense Hessian's compiled scatter, warmed up now (see
+            # TiledGramCSROperator.__init__).
+            _scatter_kernel(self._hess_cfg)
         # Beamlet-space quadratic terms: constant symmetric matrices (only
         # their multipliers change per call).
         self._quad_obj_sym = [
@@ -4744,6 +5486,7 @@ class TROTSExactProblem(TROTSProblem):
                 sparse_module=self._cxs if self._eval_device else None,
                 quad_plan=self._quad_device,
                 quad_mults=np.asarray(obj_mults + con_mults, dtype=np.float64),
+                merge=self._gram_merge,
             )
         return TROTSExactHessian(
             self.xp,
@@ -4754,6 +5497,7 @@ class TROTSExactProblem(TROTSProblem):
             low_rank,
             self._hess_cfg,
             stats=self.hessian_stats,
+            merge=self._gram_merge,
         )
 
     def _per_term_lagrangian_hessian(

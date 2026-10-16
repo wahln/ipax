@@ -101,7 +101,12 @@ from benchmarks.corpus.trots import (
 )
 from benchmarks.corpus.trots_reference import breedveld2017_reference
 from benchmarks.harness import capture_environment, run_case
-from ipax.options import BarrierOptions, BreedveldOptions, OptimalityConditionOptions
+from ipax.options import (
+    BarrierOptions,
+    BreedveldOptions,
+    DenseOptions,
+    OptimalityConditionOptions,
+)
 from ipax.testing.backends import import_namespace
 
 if TYPE_CHECKING:
@@ -300,6 +305,7 @@ def _solve_options(args: argparse.Namespace, label: str) -> ipax.Options:
         breedveld=BreedveldOptions(
             common_step=args.common_step, max_soc=args.breedveld_soc
         ),
+        dense=DenseOptions(gram_dtype=args.gram_dtype),
         optimality=OptimalityConditionOptions(
             dual_inf_tol=args.tol,
             constr_viol_tol=args.tol,
@@ -440,6 +446,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "§2.4; an ipax addition, not in Breedveld et al. 2017); default 0 = "
         "off; N > 0 only with --globalization breedveld. Every solve row "
         "counts soc_attempted / soc_accepted",
+    )
+    parser.add_argument(
+        "--gram-dtype",
+        choices=("auto", "native", "float32"),
+        default="auto",
+        help='DenseOptions.gram_dtype (default "auto", the ipax default: '
+        'float32 only where the data is float32). "float32" forces the '
+        "mixed-precision condensed Gram with float64 iterative refinement "
+        "(Carson & Higham 2018) on float64 data too, e.g. Head-and-Neck_01; "
+        '*/dense configs only (docs/benchmarks/trots.md, "Head-and-Neck_01 '
+        'speed profile (2026-10-02)")',
     )
     parser.add_argument(
         "--dual-floor",

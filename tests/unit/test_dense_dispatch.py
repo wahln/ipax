@@ -9,6 +9,7 @@ from importlib.util import find_spec
 import pytest
 
 from ipax.backend.dense import (
+    get_dense_cholesky,
     get_dense_cholesky_solve,
     get_dense_diagonal_adder,
     get_dense_symmetric_indefinite_adapter,
@@ -175,3 +176,34 @@ def test_diagonal_adder_dispatch_degrades_when_torch_unimportable(monkeypatch):
     torch = import_namespace("torch")
     monkeypatch.setitem(sys.modules, "ipax.backend.dense.torch", None)
     assert get_dense_diagonal_adder(torch) is None
+
+
+# --- the Cholesky factorization gap-filler (LAPACK ``potrf``, NumPy only) ----
+# Torch (``torch.linalg.cholesky``: LAPACK/MAGMA ``potrf``) and CuPy
+# (``cupy.linalg.cholesky``: cuSOLVER ``potrf``) already call ``potrf`` without
+# NumPy's two transposing copies, so they keep ``xp.linalg.cholesky``.
+
+
+def test_cholesky_dispatch_numpy_returns_the_potrf_adapter():
+    pytest.importorskip("scipy")
+    numpy = import_namespace("numpy")
+    factorize = get_dense_cholesky(numpy)
+    assert factorize is not None
+    assert factorize.__module__ == "ipax.backend.dense.numpy_scipy"
+    assert factorize.__name__ == "cholesky"
+
+
+def test_cholesky_dispatch_returns_none_for_torch():
+    pytest.importorskip("torch")
+    assert get_dense_cholesky(import_namespace("torch")) is None
+
+
+def test_cholesky_dispatch_returns_none_for_cupy_and_unregistered_namespaces():
+    assert get_dense_cholesky(types.SimpleNamespace(__name__="cupy")) is None
+    assert get_dense_cholesky(import_namespace("array_api_strict")) is None
+
+
+def test_cholesky_dispatch_degrades_when_scipy_unimportable(monkeypatch):
+    numpy = import_namespace("numpy")
+    monkeypatch.setitem(sys.modules, "ipax.backend.dense.numpy_scipy", None)
+    assert get_dense_cholesky(numpy) is None

@@ -85,6 +85,10 @@ bench = [
     "memray>=1.13; sys_platform != 'win32'",
     "matplotlib>=3.8",       # report plots (§9.4); optional, imported lazily
     "osqp>=1.0",             # QP reference baseline (§9.3); optional
+    # TROTS loader's compiled tile scatter; optional, imported lazily (NumPy
+    # fallback, same bits). Numba caps the NumPy/Python versions it supports,
+    # so this extra (and `dev`, which includes it) can lag the newest of both.
+    "numba>=0.60",
 ]
 docs = [
     "mkdocs>=1.6",

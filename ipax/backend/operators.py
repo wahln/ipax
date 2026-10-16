@@ -227,6 +227,44 @@ class LinearOperator(ABC):
         """
         return None
 
+    def dense_matrix_with_gram(
+        self,
+        jac: LinearOperator,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        """Dense ``A + jacᵀ diag(weights) jac`` formed by ``A`` itself, fused.
+
+        Optional capability of a square curvature operator — the Hessian
+        ``W`` of the condensed normal equations, whose dense route otherwise
+        forms ``W.dense_matrix()`` and the inequality Gram
+        ``jac.gram(weights)`` (``∇gᵀ Σ_s ∇g``, Breedveld 2017, eq. 18) in two
+        separate passes. A curvature that is itself a weighted Gram
+        ``Bᵀ diag(h) B`` over rows it shares with ``jac`` can multiply those
+        rows once with the summed weights ``h + w`` (Breedveld 2017, eq. 48,
+        across the two terms), up to halving the dominant product. ``jac`` and
+        ``weights`` are the solver's view of the inequality block — after
+        ``linear_ineq`` lowering, problem scaling and stacking — so an
+        operator that cannot read that layout directly may route through
+        ``jac.gram`` (whose wrappers translate the weights to the source
+        rows) and cooperate with its own source operators there.
+
+        Contract: the result equals ``self.dense_matrix() + jacᵀ diag(weights)
+        jac`` up to round-off, is symmetric, lives in the namespace and on the
+        device of ``weights`` in their (working) dtype, and is treated as
+        **read-only**
+        (it may alias a memo, as :meth:`dense_matrix` may). ``accumulate_dtype``
+        and ``hinted_only`` are :meth:`gram`'s mixed-precision request and
+        apply to the Gram part only; ``self``'s own part must stay in native
+        precision. Declining is always valid: raise ``NotImplementedError``
+        (the default) and the caller forms the two terms separately, bit for
+        bit as without this hook.
+        """
+        del jac, weights, accumulate_dtype, hinted_only
+        raise NotImplementedError("operator does not fuse an inequality Gram")
+
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         """``Aᵀ diag(weights) A`` as *sparse* COO triplets (invariant #4).
 

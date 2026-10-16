@@ -25,9 +25,13 @@ escalation — the dense analog of the sparse route's inertia check. Both
 stays pure Array API. Target ≤ ~1e4 variables; the reference implementation every
 other solver is checked against.
 
-When the probed block spans the whole system (the condensed route), the probe's
-Cholesky factor is kept and every solve back-substitutes it through the
-``get_dense_cholesky_solve`` backend gap-filler (the Array-API ``linalg``
+The probe factors through the ``get_dense_cholesky`` backend gap-filler where
+one is registered (NumPy: LAPACK ``potrf`` on a single cache-blocked copy,
+instead of ``numpy.linalg.cholesky``'s two transposing copies around it) and
+through ``xp.linalg.cholesky`` everywhere else. When the probed block spans the
+whole system (the condensed route), the probe's Cholesky factor is kept and
+every solve back-substitutes it through the ``get_dense_cholesky_solve`` backend
+gap-filler (the Array-API ``linalg``
 extension has no triangular solve), replacing the redundant O(n³) LU refactor
 with an O(n²) solve — this also makes corrector/SOC back-solves against the
 same factorization cheap. Backends without the gap-filler (array-api-strict,
@@ -152,6 +156,12 @@ class DenseSolver:
         self._cholesky_factor: Array | None = None
         self._cholesky_solve: Callable[[Array, Array], Array] | None = None
         self._cholesky_solve_checked = False
+        # The backend's own Cholesky factorization (``get_dense_cholesky``:
+        # LAPACK ``potrf`` without NumPy's layout round trip), looked up once
+        # per instance like the back-substitution above; ``None`` ⇒
+        # ``xp.linalg.cholesky``.
+        self._cholesky: Callable[[Array], Array] | None = None
+        self._cholesky_checked = False
         # Whether the backend's ``cholesky`` reports a breakdown silently (a
         # broken factor instead of an exception), probed once per instance
         # like the lookup above; ``None`` until the first PD probe.
@@ -495,6 +505,14 @@ class DenseSolver:
         except numerical_failure_types() as exc:
             raise LinearSolveError("dense linear solve failed") from exc
 
+    def _lookup_cholesky(self, xp: Any) -> Callable[[Array], Array] | None:
+        if not self._cholesky_checked:
+            from ipax.backend.dense import get_dense_cholesky
+
+            self._cholesky = get_dense_cholesky(xp)
+            self._cholesky_checked = True
+        return self._cholesky
+
     def _lookup_cholesky_solve(self, xp: Any) -> Callable[[Array, Array], Array] | None:
         if not self._cholesky_solve_checked:
             from ipax.backend.dense import get_dense_cholesky_solve
@@ -662,15 +680,23 @@ class DenseSolver:
         cholesky = getattr(xp.linalg, "cholesky", None)
         if cholesky is None:
             return
-        # A backend that returns a broken factor instead of raising (CuPy,
-        # JAX) must fail this probe too, or an indefinite N would pass the
-        # guard: there the factor's pivots are checked (``checked_cholesky``,
-        # one host sync). Where the backend raises, the check could never
-        # trip, so the plain call stays — no sync added, results unchanged.
-        if self._silent_cholesky is None:
-            self._silent_cholesky = cholesky_breakdown_is_silent(xp, matrix)
-        if self._silent_cholesky:
-            cholesky = functools.partial(checked_cholesky, xp)
+        injected = self._lookup_cholesky(xp)
+        if injected is not None:
+            # The backend gap-filler (LAPACK ``potrf`` on one blocked copy on
+            # NumPy) raises the backend's numerical failure on a breakdown by
+            # contract, so it needs no pivot check.
+            cholesky = injected
+        else:
+            # A backend that returns a broken factor instead of raising (CuPy,
+            # JAX) must fail this probe too, or an indefinite N would pass the
+            # guard: there the factor's pivots are checked
+            # (``checked_cholesky``, one host sync). Where the backend raises,
+            # the check could never trip, so the plain call stays — no sync
+            # added, results unchanged.
+            if self._silent_cholesky is None:
+                self._silent_cholesky = cholesky_breakdown_is_silent(xp, matrix)
+            if self._silent_cholesky:
+                cholesky = functools.partial(checked_cholesky, xp)
         primal_block = getattr(self._operator, "primal_block", None)
         block = primal_block() if primal_block is not None else None
         if block is None:
@@ -711,8 +737,9 @@ class DenseSolver:
         JAX return a broken factor instead. On such a backend the
         ``cholesky`` handed in is the pivot-checked one from
         :meth:`_guard_positive_definite`
-        (:func:`~ipax.linalg.solver.checked_cholesky`), so a breakdown raises
-        on every backend.
+        (:func:`~ipax.linalg.solver.checked_cholesky`), and a registered
+        backend gap-filler (``get_dense_cholesky``) raises by contract, so a
+        breakdown raises on every backend.
 
         A breakdown is not free — the attempted factorization is wasted work
         — so ``DenseOptions.pd_hint_failure_limit`` *consecutive* breakdowns

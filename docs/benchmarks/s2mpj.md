@@ -1403,6 +1403,32 @@ reproducible run to run, add `--backends cupy --cupy-certificates
 probes and the logs are in the session scratchpad (`repro_sparse/`, local,
 not committed).
 
+### Dense Cholesky through `dpotrf` (2026-10-03)
+
+The NumPy dense route now factors `N` with SciPy's `dpotrf` on a single
+cache-blocked copy instead of `numpy.linalg.cholesky`; see the
+[TROTS Head-and-Neck_01 profile](trots.md#head-and-neck_01-speed-profile-2026-10-02),
+lever 8. Both run `dpotrf('L')` on the same data. The change is expected
+to be bit-identical, so it was checked with a bitwise A/B instead of the
+gate sweep. Both dense configs (`lbfgs/dense`, `exact/dense`) ran over the
+whole corpus (`--all --include-objective-free`), one arm with
+`numpy.linalg.cholesky` and one with `dpotrf`. The budget was `--max-iter
+500` with a 30–60 s cap, one BLAS thread per process, 8 processes. Every
+solve's per-iteration objective and KKT error and its final `x` were
+recorded:
+
+| rows | iterations compared | identical, final `x` included | identical up to a `max_time` stop at a different iteration | diverged |
+| ---: | ---: | ---: | ---: | ---: |
+| 2196 | 164 748 | 2132 | 64 | **0** |
+
+The 64 rows hit the time cap at different iterations, because the two
+arms ran at different times on a shared machine. Their common prefixes are
+identical. Because the trajectory does not change, verdicts do not
+either, so the v33 baseline stands. The HN A/B (24 threads) was
+bit-identical as well. The harness (`s2mpj_arm.py`,
+`compare_bitwise.py`) and the reports are in the session scratchpad
+(`sweep_potrf/`, local, not committed).
+
 ## Reproducing
 
 From a checkout with `IPAX_S2MPJ_DIR` pointing at an
