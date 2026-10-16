@@ -189,3 +189,55 @@ class TestCSCOperator(LinearOperatorContract):
             array(namespace, self._data),
             (2, 3),
         )
+
+
+# Signed row selection S·A (the lowered-``linear_ineq`` wrapper): lower rows
+# {0, 2} negated, then upper rows {0, 1} — row 0 is a range row, so it appears
+# twice. Wraps a Dense so the full capability surface is exercised.
+_SELECTION_SOURCE = [[2.0, -1.0, 0.5], [0.0, 3.0, 4.0], [1.0, 0.0, -2.0]]
+_SELECTION_DENSE = [
+    [-2.0, 1.0, -0.5],
+    [-1.0, 0.0, 2.0],
+    [2.0, -1.0, 0.5],
+    [0.0, 3.0, 4.0],
+]
+
+
+class TestSignedRowSelection(LinearOperatorContract):
+    def make_dense(self, namespace):
+        return array(namespace, _SELECTION_DENSE)
+
+    def make_operator(self, namespace):
+        from ipax.backend.operators import _SignedRowSelection
+
+        return _SignedRowSelection(
+            Dense(array(namespace, _SELECTION_SOURCE)),
+            namespace.asarray([True, False, True]),
+            namespace.asarray([True, True, False]),
+        )
+
+
+@pytest.mark.sparse
+class TestLoweredSparseLinearIneqBlock(LinearOperatorContract):
+    # The same lowering rewritten at the triplet level from a CSR operator.
+    def make_dense(self, namespace):
+        return array(namespace, _SELECTION_DENSE)
+
+    def make_operator(self, namespace):
+        from ipax.problem.linear_ineq import _lower_two_sided
+
+        _require_adapter(namespace)
+        inf = float("inf")
+        op, _ = _lower_two_sided(
+            CSROperator(
+                namespace.asarray([0, 3, 5, 7]),
+                namespace.asarray([0, 1, 2, 1, 2, 0, 2]),
+                array(namespace, [2.0, -1.0, 0.5, 3.0, 4.0, 1.0, -2.0]),
+                (3, 3),
+                pattern_key="contract",
+            ),
+            array(namespace, [0.0, -inf, 1.0]),
+            array(namespace, [5.0, 2.0, inf]),
+            namespace,
+        )
+        return op

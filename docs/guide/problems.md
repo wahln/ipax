@@ -209,7 +209,36 @@ def linear_ineq(self):
 ```
 
 `A` may be a dense array **or** a [`LinearOperator`](../reference.md#ipax.backend.operators.LinearOperator),
-so a large structured constraint matrix never has to be materialized.
+so a large structured constraint matrix never has to be materialized. The
+solver lowers the two-sided block once into one-sided rows (`l − A x ≤ 0` for
+each finite lower bound, `A x − u ≤ 0` for each finite upper bound; a range row
+contributes both) and keeps it in the operator's own form:
+
+- a `COOOperator` / `CSROperator` / `CSCOperator` is rewritten at the triplet
+  level into an operator of the same family, so the dense route forms the small
+  `n×n` Gram by sparse arithmetic and the sparse route factors true sparsity —
+  the natural choice for tall sparse sets (`m ≫ n`);
+- a `VStack` of blocks is lowered block by block, so e.g. a float32-sourced
+  block keeps its `values_dtype_hint` for `DenseOptions(gram_dtype="auto")`;
+- any other operator (matrix-free included; it must provide `rmatvec`) is
+  wrapped in a signed row selection that forwards the Gram capabilities.
+
+A source operator constructed with a `pattern_key` yields a lowered block with a
+derived key, so the sparse route keeps its symbolic-analysis reuse.
+
+The lowered rows follow any nonlinear inequalities, so their multipliers come
+last in `Result.y_ineq`: all finite-lower rows (source order), then all
+finite-upper rows (source order). A `VStack` is laid out block by block instead
+(each block's lower rows, then its upper rows).
+
+```python
+from ipax.backend.operators import CSROperator
+
+
+def linear_ineq(self):
+    A = CSROperator(indptr, indices, data, (m, n), pattern_key="dose")
+    return (A, lower, upper)  # never densified
+```
 
 ## Returning operators instead of matrices
 
@@ -233,6 +262,43 @@ For sparse-direct factorization the operator additionally exposes COO structure;
 the built-in `Dense`, `Diagonal`, and `Identity` operators already do, and the
 `SparseOperator` adapter wraps a backend sparse matrix. See
 [The linear-algebra layer](../concepts/linalg.md).
+
+### Fusing the Hessian with the inequality Gram (optional)
+
+On the dense route the solver forms the condensed block
+`N = W + ∇gᵀ Σ_s ∇g + Σ_x` in two passes: `W.dense_matrix()` and the
+Jacobian's `gram(σ_s)`. When your Hessian is itself a weighted Gram over rows
+it shares with the inequality Jacobian (`W = Bᵀ diag(h) B + …`, with `B`'s rows
+also among the inequality rows), the shared rows can be multiplied once with
+the summed weights `h + σ_s` instead of twice (Breedveld et al. 2017, eq. (48)).
+The Hessian operator opts in by overriding
+`LinearOperator.dense_matrix_with_gram(jac, weights, *, accumulate_dtype=None,
+hinted_only=False)`:
+
+```python
+class MyHessian(LinearOperator):
+    def dense_matrix_with_gram(
+        self, jac, weights, *, accumulate_dtype=None, hinted_only=False
+    ):
+        # Return dense  W + jacᵀ diag(weights) jac,  or decline:
+        raise NotImplementedError
+```
+
+- `jac` and `weights` are the solver's view of the inequality block: nonlinear
+  rows first, then the lowered `linear_ineq` rows, after problem scaling. An
+  operator that cannot read that layout can call `jac.gram(weights)` itself —
+  the wrappers translate the weights back to your rows — and cooperate with its
+  own Jacobian operator there (this is how the TROTS loader does it, see
+  [the TROTS page](../benchmarks/trots.md)).
+- The result must equal `W.dense_matrix() + jacᵀ diag(weights) jac` up to
+  round-off, be symmetric, live in the namespace, device and dtype of
+  `weights`, and is treated as read-only (it may be a memo).
+- `accumulate_dtype`/`hinted_only` are the mixed-precision request of
+  `DenseOptions.gram_dtype` and apply to the Gram part only; `W`'s own part
+  must stay in the working precision.
+- Raising `NotImplementedError` (the default) is always valid: the solver then
+  forms the two terms separately, exactly as without the method. Problems that
+  do not override it are unaffected; the Krylov and sparse routes never ask.
 
 ## Quadratic and linear programs
 

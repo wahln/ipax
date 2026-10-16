@@ -20,7 +20,7 @@ from ipax.linalg.dense import DenseSolver
 from ipax.linalg.regularize import RegularizationState
 from ipax.linalg.solver import LinearSolveError
 from ipax.options import DenseOptions, LBFGSOptions
-from tests._helpers import array, assert_allclose, transpose
+from tests._helpers import array, assert_allclose, backend_linalg_error, transpose
 
 
 def _spd_matrix(namespace):
@@ -83,6 +83,46 @@ def test_cholesky_solve_gap_filler_accepts_matrix_rhs(namespace, tol):
 
     assert x.shape == rhs.shape
     assert_allclose(namespace, namespace.matmul(a, x), rhs, **tol)
+
+
+@pytest.mark.parametrize("order", ["C", "F"])
+@pytest.mark.parametrize("n_rhs", [None, 3])
+def test_cupy_cholesky_solve_reads_the_factor_in_place(
+    backend_name, namespace, order, n_rhs
+):
+    # Regression (TROTS Head-and-Neck_01, n = 9984): cupyx's
+    # ``solve_triangular`` copied the C-ordered Cholesky factor to Fortran
+    # order on each of the two triangular solves, an n×n transient (0.76 GB
+    # there, at the dense route's memory peak) per right-hand side. The
+    # factor's transpose is a Fortran-ordered view, so the adapter now solves
+    # with it (flipping the triangle and the transpose flag) and never copies.
+    if backend_name != "cupy":
+        pytest.skip("the CuPy adapter's triangular solves")
+    import cupy
+    import numpy as np
+
+    xp = namespace
+    n = 192
+    rng = np.random.default_rng(5)
+    b = rng.standard_normal((n, n))
+    a = b @ b.T + n * np.eye(n)
+    factor = xp.linalg.cholesky(xp.asarray(a))
+    factor = cupy.asfortranarray(factor) if order == "F" else factor
+    shape = (n,) if n_rhs is None else (n, n_rhs)
+    rhs = rng.standard_normal(shape)
+    solve_fn = _require_gap_filler(namespace)
+    pool = cupy.get_default_memory_pool()
+    sizes: list[int] = []
+
+    def allocator(size: int):
+        sizes.append(size)
+        return pool.malloc(size)
+
+    with cupy.cuda.using_allocator(allocator):
+        x = solve_fn(factor, xp.asarray(rhs))
+
+    assert max(sizes, default=0) < n * n * 8  # nothing factor-sized
+    np.testing.assert_allclose(a @ cupy.asnumpy(x), rhs, rtol=1e-10, atol=1e-10)
 
 
 def test_cholesky_solve_gap_filler_availability(backend_name, namespace):
@@ -177,17 +217,18 @@ def test_dense_solver_saddle_route_keeps_lu(namespace, tol, monkeypatch):
 
 
 def test_dense_solver_falls_back_to_lu_when_backsub_fails(namespace, tol, monkeypatch):
-    # The reuse is purely an optimization: an unexpected back-substitution
+    # The reuse is purely an optimization: a numerical back-substitution
     # failure must not escalate delta_w — the materialized matrix is still in
     # hand, so the solver falls back to LU and drops the factor so later
     # solves skip the retry.
     import ipax.backend.dense as dense_backend
 
     calls = {"boom": 0}
+    failure = backend_linalg_error(namespace)
 
     def boom(factor, rhs):
         calls["boom"] += 1
-        raise RuntimeError("backend blew up")
+        raise failure
 
     monkeypatch.setattr(dense_backend, "get_dense_cholesky_solve", lambda xp: boom)
     op = _condensed_with_inequalities(namespace)
@@ -202,6 +243,26 @@ def test_dense_solver_falls_back_to_lu_when_backsub_fails(namespace, tol, monkey
     dense = op.matmat(namespace.eye(2, dtype=rhs.dtype))
     assert_allclose(namespace, namespace.matmul(dense, x1), rhs, **tol)
     assert_allclose(namespace, namespace.matmul(dense, x2), rhs, **tol)
+
+
+def test_dense_solver_backsub_bug_propagates_unchanged(namespace, monkeypatch):
+    # ...but a non-numerical failure of the gap-filler (a shape/dtype bug in
+    # the adapter) is not something LU "recovers" from: silently paying the
+    # O(n³) fallback would hide it, so it propagates.
+    import ipax.backend.dense as dense_backend
+
+    bug = RuntimeError("Expected b and A to have the same dtype")
+
+    def buggy(factor, rhs):
+        raise bug
+
+    monkeypatch.setattr(dense_backend, "get_dense_cholesky_solve", lambda xp: buggy)
+    solver = DenseSolver()
+    solver.factor(_condensed_with_inequalities(namespace))
+
+    with pytest.raises(RuntimeError) as info:
+        solver.solve(array(namespace, [1.0, -2.0]))
+    assert info.value is bug
 
 
 def test_dense_solver_still_rejects_indefinite_block_before_reuse(namespace):
@@ -239,6 +300,155 @@ def test_dense_solver_factor_resets_cached_cholesky(namespace, tol):
     dense2 = op2.matmat(namespace.eye(2, dtype=rhs.dtype))
     assert_allclose(namespace, namespace.matmul(dense1, x1), rhs, **tol)
     assert_allclose(namespace, namespace.matmul(dense2, x2), rhs, **tol)
+
+
+# --- the injected factorization (``get_dense_cholesky``) ---------------------
+
+
+def _counting_factorization(namespace, calls):
+    def factorize(matrix):
+        calls.append(matrix)
+        return namespace.linalg.cholesky(matrix)
+
+    return factorize
+
+
+def test_dense_solver_guard_factors_through_the_injected_cholesky(
+    namespace, tol, monkeypatch
+):
+    # ``ipax.linalg`` never calls a concrete LAPACK: the PD probe uses the
+    # backend gap-filler when one is registered, and the factor it returns is
+    # the one kept for back-substitution.
+    import ipax.backend.dense as dense_backend
+
+    _require_gap_filler(namespace)
+    calls: list = []
+    factorize = _counting_factorization(namespace, calls)
+    monkeypatch.setattr(dense_backend, "get_dense_cholesky", lambda xp: factorize)
+    monkeypatch.setattr(
+        DenseSolver,
+        "_solve_lu",
+        lambda self, matrix, rhs, xp: pytest.fail("LU reached"),
+    )
+    op = _condensed_with_inequalities(namespace)
+    solver = DenseSolver()
+    solver.factor(op)
+    rhs = array(namespace, [1.0, -2.0])
+    x = solver.solve(rhs)
+    solver.solve(rhs)
+
+    assert len(calls) == 1  # one factorization per factor(), reused per solve
+    dense = op.matmat(namespace.eye(2, dtype=rhs.dtype))
+    assert_allclose(namespace, namespace.matmul(dense, x), rhs, **tol)
+
+
+def test_dense_solver_pd_hinted_block_factors_through_the_injected_cholesky(
+    namespace, tol, monkeypatch
+):
+    import ipax.backend.dense as dense_backend
+
+    _require_gap_filler(namespace)
+    calls: list = []
+    factorize = _counting_factorization(namespace, calls)
+    monkeypatch.setattr(dense_backend, "get_dense_cholesky", lambda xp: factorize)
+    op = _lbfgs_condensed_with_inequalities(namespace)
+    solver = DenseSolver()
+    solver.factor(op)
+    rhs = array(namespace, [1.0, -2.0])
+    x = solver.solve(rhs)
+
+    assert len(calls) == 1
+    assert solver._cholesky_factor is not None
+    dense = op.matmat(namespace.eye(2, dtype=rhs.dtype))
+    assert_allclose(namespace, namespace.matmul(dense, x), rhs, **tol)
+
+
+def test_dense_solver_injected_cholesky_breakdown_escalates(namespace, monkeypatch):
+    # The gap-filler's contract is to *raise* the backend's numerical failure
+    # on a breakdown (as ``numpy.linalg.cholesky`` does); the guard classifies
+    # it exactly as before, so the IPM still escalates delta_w.
+    import ipax.backend.dense as dense_backend
+
+    error = backend_linalg_error(namespace)
+
+    def raising(matrix):
+        raise error
+
+    monkeypatch.setattr(dense_backend, "get_dense_cholesky", lambda xp: raising)
+    solver = DenseSolver()
+    solver.factor(_condensed_with_inequalities(namespace))
+    with pytest.raises(LinearSolveError, match="not positive definite") as info:
+        solver.solve(array(namespace, [1.0, -2.0]))
+    assert info.value.__cause__ is error
+
+
+def test_dense_solver_without_injected_cholesky_uses_the_namespace(
+    namespace, tol, monkeypatch
+):
+    import ipax.backend.dense as dense_backend
+
+    monkeypatch.setattr(dense_backend, "get_dense_cholesky", lambda xp: None)
+    op = _condensed_with_inequalities(namespace)
+    solver = DenseSolver()
+    solver.factor(op)
+    rhs = array(namespace, [1.0, -2.0])
+    x = solver.solve(rhs)
+    dense = op.matmat(namespace.eye(2, dtype=rhs.dtype))
+    assert_allclose(namespace, namespace.matmul(dense, x), rhs, **tol)
+
+
+def test_dense_solver_injected_cholesky_skips_the_silent_breakdown_probe(
+    namespace, monkeypatch
+):
+    # A registered gap-filler raises on a breakdown by contract, so the
+    # one-off "does xp.linalg.cholesky fail silently?" probe is not needed.
+    import ipax.backend.dense as dense_backend
+    import ipax.linalg.dense as dense_module
+
+    _require_gap_filler(namespace)
+    calls: list = []
+    factorize = _counting_factorization(namespace, calls)
+    monkeypatch.setattr(dense_backend, "get_dense_cholesky", lambda xp: factorize)
+    monkeypatch.setattr(
+        dense_module,
+        "cholesky_breakdown_is_silent",
+        lambda xp, like: pytest.fail("silent-breakdown probe ran"),
+    )
+    solver = DenseSolver()
+    solver.factor(_condensed_with_inequalities(namespace))
+    solver.solve(array(namespace, [1.0, -2.0]))
+    assert len(calls) == 1
+
+
+def test_dense_solver_numpy_potrf_matches_the_namespace_cholesky(monkeypatch):
+    # End to end on NumPy: the potrf gap-filler and numpy.linalg.cholesky give
+    # the same solve to round-off (bitwise where NumPy and SciPy share an
+    # OpenBLAS; not asserted, it is a build fact).
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("scipy")
+    import ipax.backend.dense as dense_backend
+
+    rng = np.random.default_rng(7)
+    n, m = 150, 90
+    w = rng.standard_normal((n, n))
+    op = build_condensed_operator(
+        Dense(w @ w.T / n),
+        Diagonal(rng.uniform(0.1, 1.0, n)),
+        Diagonal(rng.uniform(0.1, 10.0, m)),
+        Dense(rng.standard_normal((m, n))),
+        RegularizationState(delta_w=1e-8),
+    )
+    rhs = rng.standard_normal(n)
+    solver = DenseSolver()
+    solver.factor(op)
+    x_potrf = solver.solve(rhs)
+    assert dense_backend.get_dense_cholesky(np) is not None
+
+    monkeypatch.setattr(dense_backend, "get_dense_cholesky", lambda xp: None)
+    reference = DenseSolver()
+    reference.factor(op)
+    x_numpy = reference.solve(rhs)
+    np.testing.assert_allclose(x_potrf, x_numpy, rtol=1e-11, atol=0)
 
 
 # --- PD-by-construction (L-BFGS) blocks ---------------------------------------
@@ -588,3 +798,29 @@ def test_dense_solver_describe_composes_retired_mixed_and_pd_hint_markers():
     solver._mixed_label = "float32"
     solver._pd_hint_ever_failed = True
     assert solver.describe() == "dense (gram=float32->native, pd-hint->lu)"
+
+
+def test_dense_solver_checks_the_pivots_where_the_backend_breakdown_is_silent(
+    namespace, monkeypatch
+):
+    # No gap-filler and a backend whose ``cholesky`` does not raise on a
+    # breakdown (CuPy, JAX): the PD probe must go through ``checked_cholesky``.
+    import ipax.backend.dense as dense_backend
+    import ipax.linalg.dense as dense_module
+
+    calls: list = []
+    monkeypatch.setattr(dense_backend, "get_dense_cholesky", lambda xp: None)
+    monkeypatch.setattr(
+        dense_module, "cholesky_breakdown_is_silent", lambda xp, like: True
+    )
+    real = dense_module.checked_cholesky
+
+    def forward(xp, matrix):
+        calls.append(1)
+        return real(xp, matrix)
+
+    monkeypatch.setattr(dense_module, "checked_cholesky", forward)
+    solver = DenseSolver()
+    solver.factor(_condensed_with_inequalities(namespace))
+    solver.solve(array(namespace, [1.0, -2.0]))
+    assert calls

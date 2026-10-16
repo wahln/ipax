@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from ipax.linalg.solver import LinearSolveError
 from tests._helpers import array, assert_allclose, implemented
 
 pytestmark = pytest.mark.sparse
@@ -44,6 +45,49 @@ class SparseDirectSolverContract:
 
         assert_allclose(namespace, actual, array(namespace, [1.0, 2.0, 2.0]), **tol)
 
+    @pytest.mark.parametrize("refinement_steps", [0, 10])
+    def test_optional_perturbed_pivot_hook_keeps_solves_exact(
+        self, namespace, tol, refinement_steps
+    ):
+        # ``configure_perturbed_pivots`` is optional (adapters that never
+        # perturb pivots omit it and the facade skips them). Where present,
+        # any valid policy must leave a well-posed factor/solve exact.
+        with implemented(self.implementation_reason):
+            adapter = self.make_adapter(namespace)
+            configure = getattr(adapter, "configure_perturbed_pivots", None)
+            if configure is None:
+                pytest.skip("adapter has no perturbed-pivot hook")
+            configure(refinement_steps=refinement_steps, max_residual=1e-2)
+            rows = namespace.asarray([0, 1, 1, 2])
+            cols = namespace.asarray([0, 0, 1, 2])
+            values = array(namespace, [2.0, 1.0, 3.0, 4.0])
+            K = adapter.from_coo(rows, cols, values, shape=(3, 3))
+            solver = adapter.solver()
+            solver.factor(K)
+            actual = solver.solve(array(namespace, [2.0, 7.0, 8.0]))
+
+        assert_allclose(namespace, actual, array(namespace, [1.0, 2.0, 2.0]), **tol)
+
+    def test_optional_determinism_hook_keeps_solves_exact(self, namespace, tol):
+        # ``configure_deterministic`` is optional (adapters without a
+        # reproducible mode omit it and the facade skips them). Where present,
+        # switching it on must leave a well-posed factor/solve exact.
+        with implemented(self.implementation_reason):
+            adapter = self.make_adapter(namespace)
+            configure = getattr(adapter, "configure_deterministic", None)
+            if configure is None:
+                pytest.skip("adapter has no determinism hook")
+            configure(enabled=True)
+            rows = namespace.asarray([0, 1, 1, 2])
+            cols = namespace.asarray([0, 0, 1, 2])
+            values = array(namespace, [2.0, 1.0, 3.0, 4.0])
+            K = adapter.from_coo(rows, cols, values, shape=(3, 3))
+            solver = adapter.solver()
+            solver.factor(K)
+            actual = solver.solve(array(namespace, [2.0, 7.0, 8.0]))
+
+        assert_allclose(namespace, actual, array(namespace, [1.0, 2.0, 2.0]), **tol)
+
     def test_reports_inertia_when_available(self, namespace):
         with implemented("inertia reporting"):
             adapter = self.make_adapter(namespace)
@@ -55,3 +99,52 @@ class SparseDirectSolverContract:
             solver.factor(K)
 
         assert solver.inertia == (1, 1, 0)
+
+    # -- failure contract: numerical failures are signalled, not raised raw --
+    #
+    # The IPM escalates δ_w on ``LinearSolveError``, on a non-finite solution,
+    # or on a reported inertia that misses its target (a zero eigenvalue
+    # always does); a backend-native exception escaping the adapter would
+    # abort the run instead (Wächter & Biegler 2006, §3.1). Adapters translate
+    # their backend's failures at this boundary.
+
+    @pytest.mark.parametrize("symmetric", [True, None], ids=["symmetric", "general"])
+    def test_singular_matrix_is_classified(self, namespace, symmetric):
+        with implemented(self.implementation_reason):
+            adapter = self.make_adapter(namespace)
+            K = adapter.from_coo(
+                namespace.asarray([0, 0, 1, 1]),
+                namespace.asarray([0, 1, 0, 1]),
+                array(namespace, [1.0, 1.0, 1.0, 1.0]),
+                shape=(2, 2),
+                symmetric=symmetric,
+            )
+            solver = adapter.solver()
+            try:
+                solver.factor(K)
+                x = solver.solve(array(namespace, [1.0, 2.0]))
+            except LinearSolveError:
+                return
+
+        inertia_fn = getattr(solver, "inertia_or_none", None)
+        inertia = inertia_fn() if inertia_fn is not None else None
+        # An LDLᵀ may complete a singular factorization (Feral does, with a
+        # finite but meaningless solution); then its inertia must say so.
+        singular_inertia = inertia is not None and inertia[2] > 0
+        assert singular_inertia or not bool(namespace.all(namespace.isfinite(x)))
+
+    @pytest.mark.parametrize("symmetric", [True, None], ids=["symmetric", "general"])
+    def test_non_finite_matrix_raises_linear_solve_error(self, namespace, symmetric):
+        with implemented(self.implementation_reason):
+            adapter = self.make_adapter(namespace)
+            K = adapter.from_coo(
+                namespace.asarray([0, 1]),
+                namespace.asarray([0, 1]),
+                array(namespace, [float("nan"), 1.0]),
+                shape=(2, 2),
+                symmetric=symmetric,
+            )
+            solver = adapter.solver()
+            with pytest.raises(LinearSolveError):
+                solver.factor(K)
+                solver.solve(array(namespace, [1.0, 2.0]))

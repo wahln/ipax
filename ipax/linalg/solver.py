@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from ipax.backend.namespace import Capabilities
     from ipax.backend.operators import LinearOperator
     from ipax.options import Options
-    from ipax.typing import Array
+    from ipax.typing import Array, Namespace
 
 # Auto-selection thresholds. Below ``_DENSE_AUTO_MAX_VARS`` the dense route is
 # the reference choice regardless of constraint shape. Between that and
@@ -74,9 +74,112 @@ class LinearSolveError(RuntimeError):
         self.iterate = iterate
 
 
+def numerical_failure_types() -> tuple[type[BaseException], ...]:
+    """Exception types that signal a *numerical* failure of a KKT solve.
+
+    The only exceptions a solve site may translate into
+    :class:`LinearSolveError` — and so hand to the IPM's δ_w regularization
+    ladder and, once that is exhausted, to feasibility restoration (Wächter &
+    Biegler 2006, §3.1 → §3.3):
+
+    * :class:`LinearSolveError` itself (already classified, e.g. by a sparse
+      or dense LDLᵀ adapter at its backend boundary);
+    * the backends' own linear-algebra failure types — NumPy/SciPy/CuPy
+      ``LinAlgError``, Torch ``torch.linalg.LinAlgError`` — which the core may
+      not name (invariant #1), so they come from
+      :func:`ipax.backend.errors.backend_linalg_error_types`;
+    * Python's ``ArithmeticError`` family (``FloatingPointError`` under an
+      ``errstate(... "raise")``, ``ZeroDivisionError``, ``OverflowError``) —
+      overflow/underflow at a bad trial iterate.
+
+    Everything else — a ``TypeError``/``AttributeError``/``ValueError`` from a
+    user operator or callback, ``NotImplementedError`` (capability absent, the
+    solvers' fallback signal), ``MemoryError`` — is not numerical trouble a
+    larger δ_w could cure and must propagate unchanged. Use it in the clause
+    itself (``except numerical_failure_types() as exc:``): the expression is
+    evaluated only when an exception is already propagating, so the lookup
+    costs nothing on a successful solve.
+    """
+    from ipax.backend.errors import backend_linalg_error_types
+
+    return (LinearSolveError, ArithmeticError, *backend_linalg_error_types())
+
+
+def cholesky_factor_ok(xp: Namespace, factor: Array) -> Array:
+    """Device-side verdict (0-d bool array): did this Cholesky factorization succeed?
+
+    Gap-filler for a missing Array-API guarantee: the ``linalg`` extension does
+    not say how ``cholesky`` reports a matrix that is not positive definite,
+    and not every backend raises (:mod:`ipax.backend.errors`) — CuPy under its
+    default ``errstate`` and JAX return a factor instead. LAPACK ``potrf``
+    fails exactly when a pivot ``l_kk² = a_kk − Σ_j l_kj²`` is not positive
+    (its ``INFO > 0``; Golub & Van Loan 2013, §4.2), and every entry of a
+    row feeds that row's pivot, so a NaN/inf anywhere in the factor surfaces
+    on the diagonal too. Hence the classification: the factor is valid iff
+    every diagonal entry is finite and strictly positive. That covers the
+    silent breakdown modes observed on CuPy — a NaN pivot for a negative
+    one, and a *finite* factor with an exact zero pivot for a singular PSD
+    matrix, which a plain ``isfinite`` test would accept.
+
+    Returned on device so a caller can fold it into another check and pay a
+    single host synchronization; an O(n) reduction beside the O(n³)
+    factorization it validates.
+    """
+    pivots = xp.linalg.diagonal(factor)
+    return xp.all(xp.isfinite(pivots) & (pivots > 0))
+
+
+def checked_cholesky(xp: Namespace, matrix: Array) -> Array:
+    """``xp.linalg.cholesky(matrix)``, raising on a breakdown on *every* backend.
+
+    A backend that raises keeps raising its own numerical failure type (a
+    member of :func:`numerical_failure_types`); a backend that returns a
+    broken factor silently now raises :class:`LinearSolveError` instead
+    (:func:`cholesky_factor_ok`), so callers classify both identically. One
+    host synchronization per factorization.
+    """
+    factor = xp.linalg.cholesky(matrix)
+    if not bool(cholesky_factor_ok(xp, factor)):
+        raise LinearSolveError(
+            "Cholesky factorization broke down (a non-positive or non-finite pivot)"
+        )
+    return factor
+
+
+def cholesky_breakdown_is_silent(xp: Namespace, like: Array) -> bool:
+    """Whether ``xp.linalg.cholesky`` *returns* a factor for a non-PD matrix.
+
+    A one-off capability probe (a 1×1 negative-definite matrix on ``like``'s
+    device and dtype) for callers that factor repeatedly: where the backend
+    raises (NumPy, array-api-strict, Torch) :func:`checked_cholesky`'s pivot
+    check can never trip on a non-PD input, so they keep the plain
+    ``xp.linalg.cholesky`` — no extra host sync per factorization, results
+    unchanged — and pay the check only where the breakdown is silent (CuPy
+    under its default ``errstate``, JAX). Cache the answer per solver
+    instance, which stays on one backend.
+    """
+    # ``device()``, not ``like.device``: the attribute is missing on NumPy < 2.
+    from ipax.backend.namespace import device
+
+    probe = xp.full((1, 1), -1.0, dtype=like.dtype, device=device(like))
+    try:
+        xp.linalg.cholesky(probe)
+    except numerical_failure_types():
+        return False
+    return True
+
+
 @runtime_checkable
 class LinearSolver(Protocol):
-    """Solve ``K x = rhs`` for a KKT or condensed operator ``K``."""
+    """Solve ``K x = rhs`` for a KKT or condensed operator ``K``.
+
+    Failure contract: a *numerical* failure of ``factor``/``solve`` (a
+    singular or, where the solver checks it, indefinite system) raises
+    :class:`LinearSolveError` — or returns a non-finite solution, which the
+    driver treats the same way — so the IPM escalates δ_w. Any other exception
+    (in particular one raised by the operator's own callbacks) must propagate
+    unchanged; :func:`numerical_failure_types` is the dividing line.
+    """
 
     def factor(self, K: LinearOperator) -> None:
         """Prepare/factor the operator."""
@@ -131,6 +234,23 @@ class SolverKind(Protocol):
         ...
 
 
+def _sparse_direct_solver(form: str, options: Options) -> LinearSolver:
+    """A ``SparseDirectSolver`` carrying ``Options.sparse``' adapter policies.
+
+    The perturbed-pivot solve policy and the reproducible-factorization
+    request, both forwarded to the adapter through optional hooks.
+    """
+    from ipax.linalg.sparse import SparseDirectSolver
+
+    sparse = options.sparse
+    return SparseDirectSolver(
+        form=form,
+        perturbed_pivot_refinement_steps=sparse.perturbed_pivot_refinement_steps,
+        perturbed_pivot_max_residual=sparse.perturbed_pivot_max_residual,
+        deterministic=sparse.deterministic,
+    )
+
+
 def select_solver(
     *,
     n_vars: int,
@@ -172,8 +292,6 @@ def select_solver(
     if mode == "sparse":
         if not capabilities.has_sparse_adapter:
             raise RuntimeError("sparse linear solving is unavailable for this backend")
-        from ipax.linalg.sparse import SparseDirectSolver
-
         form = options.sparse.kkt_route
         if form == "auto":
             # Same tall gate and measured thresholds as the linsolve="auto"
@@ -199,7 +317,7 @@ def select_solver(
                     density = ineq_density() if ineq_density is not None else None
                     if density is not None and density >= _TALL_DENSE_MIN_DENSITY:
                         form = "normal_equations"
-        return SparseDirectSolver(form=form)
+        return _sparse_direct_solver(form, options)
 
     dense_viable = has_dense_solve() and (
         not has_equalities or "cholesky" in capabilities.linalg_functions
@@ -231,9 +349,7 @@ def select_solver(
         if density is None or density < _TALL_DENSE_MIN_DENSITY:
             fill = ineq_gram_fill()
             if fill is not None and fill <= _TALL_SPARSE_NE_MAX_FILL:
-                from ipax.linalg.sparse import SparseDirectSolver
-
-                return SparseDirectSolver(form="normal_equations")
+                return _sparse_direct_solver("normal_equations", options)
 
     if n_vars < _DENSE_AUTO_MAX_VARS and dense_viable:
         return DenseSolver(options.dense)
@@ -284,6 +400,10 @@ __all__ = [
     "LinearSolveError",
     "LinearSolver",
     "SolverKind",
+    "checked_cholesky",
+    "cholesky_breakdown_is_silent",
+    "cholesky_factor_ok",
+    "numerical_failure_types",
     "select_restoration_solver",
     "select_solver",
 ]

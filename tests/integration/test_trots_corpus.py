@@ -102,7 +102,9 @@ def test_exact_hessian_matches_finite_differences():
         d = mat.matrix @ x
         z[instance.n + k] = np.max(d) if mini else np.min(d)
 
-    n_ineq = problem._n_nl_ineq + problem._n_lin_ineq
+    # The solver slices the (curvature-free) lowered linear_ineq multipliers
+    # off, so lagrangian_hessian receives the nonlinear rows' multipliers only.
+    n_ineq = problem._n_nl_ineq
     H = problem.lagrangian_hessian(z, np.zeros(0), np.zeros(n_ineq), 1.0)
     Hd = np.asarray(H.dense_matrix())
     eps = 1e-6
@@ -120,7 +122,13 @@ def test_reference_solution_is_feasible():
     instance = trots.load_trots_file(f"{_ROOT}/Liver_01.mat")
     problem = trots.TROTSExactProblem(instance, np, sparse=True)
     z = _padded_solution(problem, instance)
-    g = np.asarray(problem.ineq_constraints(z))
+    # Evaluate as the solver does: the nonlinear rows plus the lowered
+    # linear_ineq block (dose constraints and minimax links).
+    from ipax.problem.linear_ineq import lower_linear_inequalities
+
+    lowered = lower_linear_inequalities(problem, z, np)
+    g = np.asarray(lowered.ineq_constraints(z))
+    assert g.shape[0] > problem._n_nl_ineq
     # The reference plan satisfies every constraint up to the DVH smoothing slack.
     assert float(np.max(g)) <= 1e-3
 
@@ -180,7 +188,7 @@ def test_linear_block_declares_float32_source():
     # route's gram_dtype="auto" default engages the reduced accumulate.
     instance = trots.load_trots_file(f"{_ROOT}/Prostate_BT_01.mat")
     problem = trots.TROTSProblem(instance, np, sparse=True)
-    op = problem._linear_ineq_operator()
+    op = problem.linear_ineq()[0]
     assert op.gram_accumulate_dtype_hint() == "float32"
 
 
@@ -251,6 +259,20 @@ def test_device_evaluation_matches_host():
         atol=1e-9,
     )
 
+    # The linear_ineq block is declared in the solve namespace (device-resident
+    # operator and bounds) and agrees with the host declaration.
+    A_host, lo_host, hi_host = host.linear_ineq()
+    A_dev, lo_dev, hi_dev = dev.linear_ineq()
+    assert hasattr(lo_dev, "__cuda_array_interface__")
+    np.testing.assert_array_equal(cupy.asnumpy(lo_dev), np.asarray(lo_host))
+    np.testing.assert_array_equal(cupy.asnumpy(hi_dev), np.asarray(hi_host))
+    np.testing.assert_allclose(
+        cupy.asnumpy(A_dev.matvec(xp.asarray(z))),
+        np.asarray(A_host.matvec(z)),
+        rtol=1e-9,
+        atol=1e-9,
+    )
+
 
 def test_list_and_reference_parsing():
     cases = trots.list_trots_cases()
@@ -287,3 +309,467 @@ def test_all_zero_sparse_matrix_case_loads_and_validates():
         rel_tol = 10.0 ** (-(ref.significant_figures - 1))
         rel_err = abs(obj - ref.objective) / max(1.0, abs(ref.objective))
         assert rel_err <= rel_tol
+
+
+# --------------------------------------------------------------------------- #
+# Tiled per-structure Gram (TiledGramCSROperator) vs the plain CSR block
+# --------------------------------------------------------------------------- #
+def _lowered_linear_jacobian(problem):
+    from ipax.problem.linear_ineq import lower_linear_inequalities
+
+    return lower_linear_inequalities(problem, np.zeros(problem.n_vars), np)._jac
+
+
+def _linear_blocks(problem):
+    op = problem.linear_ineq()[0]
+    return op.blocks if hasattr(op, "blocks") else (op,)
+
+
+def test_tiled_gram_gate_keeps_prostate_bt02_plain():
+    # The dense 70-beamlet brachytherapy block cannot compact: the gate keeps
+    # every group on the plain operator (so its solves are the plain ones).
+    case = "Prostate_BT_02"
+    if case not in trots.list_trots_cases():
+        pytest.skip(f"{case} not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/{case}.mat")
+    problem = trots.TROTSProblem(instance, np)
+    assert not any(
+        isinstance(b, trots.TiledGramCSROperator) for b in _linear_blocks(problem)
+    )
+
+
+def test_tiled_gram_is_solve_neutral_on_liver01():
+    # A case whose float64 group really tiles (Gram 0.74 -> 0.20 s): a short
+    # solve on the RT recipe takes the same path with and without the kernel.
+    from ipax.options import BarrierOptions
+
+    case = "Liver_01"
+    if case not in trots.list_trots_cases():
+        pytest.skip(f"{case} not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/{case}.mat")
+    opts = Options(
+        hessian="lbfgs",
+        linsolve="dense",
+        max_iter=10,
+        barrier=BarrierOptions(slack_init_scale=0.1),
+    )
+    results = []
+    for tiled in (True, False):
+        problem = trots.TROTSProblem(instance, np, tiled_gram=tiled)
+        kinds = [
+            isinstance(b, trots.TiledGramCSROperator) for b in _linear_blocks(problem)
+        ]
+        assert any(kinds) is tiled
+        results.append(solve(problem, problem.initial_point(), options=opts))
+    r_t, r_p = results
+    assert r_t.status == r_p.status
+    assert r_t.n_iter == r_p.n_iter
+    assert r_t.routes == r_p.routes
+    assert abs(r_t.objective - r_p.objective) <= 1e-8 * max(1.0, abs(r_p.objective))
+
+
+def test_tiled_gram_matches_plain_on_protons01_lowered_block():
+    if "Protons_01" not in trots.list_trots_cases():
+        pytest.skip("Protons_01 not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/Protons_01.mat")
+    tiled = trots.TROTSProblem(instance, np)
+    plain = trots.TROTSProblem(instance, np, tiled_gram=False)
+    blocks = _linear_blocks(tiled)  # a VStack of groups, or one group's operator
+    assert any(isinstance(b, trots.TiledGramCSROperator) for b in blocks)
+
+    j_t, j_p = _lowered_linear_jacobian(tiled), _lowered_linear_jacobian(plain)
+    assert j_t.shape == j_p.shape
+    rng = np.random.default_rng(2026)
+    for _ in range(2):  # fresh weights each time (both paths memoize)
+        w = rng.uniform(1e-3, 1e3, j_t.shape[0])
+        g_t, g_p = np.asarray(j_t.gram(w)), np.asarray(j_p.gram(w))
+        assert np.max(np.abs(g_t - g_p)) <= 1e-12 * np.max(np.abs(g_p))
+        np.testing.assert_array_equal(g_t, g_t.T)
+
+
+# --------------------------------------------------------------------------- #
+# Grouped exact Hessian (TROTSExactHessian) vs the per-term SpGEMM path
+# --------------------------------------------------------------------------- #
+def _exact_pair(case):
+    if case not in trots.list_trots_cases():
+        pytest.skip(f"{case} not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/{case}.mat")
+    return (
+        trots.TROTSExactProblem(instance, np),
+        trots.TROTSExactProblem(instance, np, grouped_hessian=False),
+    )
+
+
+def test_grouped_exact_hessian_solves_like_per_term_on_prostate_bt02():
+    # LTCP + DVH objectives and DVH constraints on shared structures, some of
+    # them also linear-block structures.
+    grouped, per_term = _exact_pair("Prostate_BT_02")
+    opts = Options(hessian="exact", linsolve="dense")
+    r_g, r_p = (solve(p, p.initial_point(), options=opts) for p in (grouped, per_term))
+    assert r_g.status == r_p.status
+    assert r_g.routes == r_p.routes
+    assert abs(r_g.n_iter - r_p.n_iter) <= 2, (r_g.n_iter, r_p.n_iter)
+    assert abs(r_g.objective - r_p.objective) <= 1e-8 * max(1.0, abs(r_p.objective))
+
+
+@pytest.mark.parametrize("case", ["Protons_01", "Liver_01", "Prostate_CK_01"])
+def test_grouped_exact_hessian_matches_per_term_at_the_initial_point(case):
+    # Protons_01 has no curved term at all (linear dose block + minimax only):
+    # its exact Hessian is identically zero on both paths. Liver_01 (DVH
+    # constraints + smoothing quadratics) and Prostate_CK_01 (LTCP on a
+    # dense-ish PTV shared by two terms) carry the real curvature.
+    grouped, per_term = _exact_pair(case)
+    z = np.asarray(grouped.initial_point())
+    rng = np.random.default_rng(2026)
+    y = rng.uniform(0.0, 2.0, grouped._n_nl_ineq)
+    h_g = grouped.lagrangian_hessian(z, np.zeros(0), y, 1.0).dense_matrix()
+    h_p = per_term.lagrangian_hessian(z, np.zeros(0), y, 1.0).dense_matrix()
+    h_g, h_p = np.asarray(h_g), np.asarray(h_p)
+    np.testing.assert_array_equal(h_g, h_g.T)
+    scale = float(np.max(np.abs(h_p)))
+    if scale == 0.0:
+        assert case == "Protons_01"
+        assert not np.any(h_g)
+        return
+    assert float(np.max(np.abs(h_g - h_p))) <= 1e-10 * scale
+
+
+# --------------------------------------------------------------------------- #
+# Device tiled Gram (CuPy): the NumPy plan run on the GPU
+# --------------------------------------------------------------------------- #
+def _cupy_namespace():
+    pytest.importorskip("cupy")
+    import cupy
+
+    try:
+        cupy.cuda.runtime.getDeviceCount()
+        cupy.asarray(0.0)
+    except Exception:
+        pytest.skip("no usable CUDA device")
+    from ipax.testing.backends import import_namespace
+
+    return import_namespace("cupy")
+
+
+def _lowered_on(problem, xp):
+    from ipax.problem.linear_ineq import lower_linear_inequalities
+
+    z0 = xp.zeros(problem.n_vars, dtype=xp.float64)
+    return lower_linear_inequalities(problem, z0, xp)._jac
+
+
+def test_device_tiled_gram_matches_plain_on_protons01_cupy():
+    xp = _cupy_namespace()
+    if "Protons_01" not in trots.list_trots_cases():
+        pytest.skip("Protons_01 not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/Protons_01.mat")
+    tiled = trots.TROTSProblem(instance, xp)
+    plain = trots.TROTSProblem(instance, xp, tiled_gram=False)
+    assert any(isinstance(b, trots.TiledGramCSROperator) for b in _linear_blocks(tiled))
+    j_t, j_p = _lowered_on(tiled, xp), _lowered_on(plain, xp)
+    assert j_t.shape == j_p.shape
+    rng = np.random.default_rng(2026)
+    for _ in range(2):  # fresh weights each time (both paths memoize)
+        w = xp.asarray(rng.uniform(1e-3, 1e3, j_t.shape[0]))
+        g_t = trots._to_numpy_nd(j_t.gram(w))
+        g_p = trots._to_numpy_nd(j_p.gram(w))
+        assert np.max(np.abs(g_t - g_p)) <= 1e-10 * np.max(np.abs(g_p))
+        np.testing.assert_array_equal(g_t, g_t.T)
+
+
+def test_device_tiled_gram_accepts_raw_cupy_namespace():
+    # Regression: the device kernels use ``device=`` keywords that the raw
+    # ``cupy`` module (as opposed to the Array API compat wrapper the fixtures
+    # hand out) does not accept, so a problem built on plain ``cupy`` failed at
+    # its first lowered-block Gram with ``asarray() got an unexpected keyword
+    # argument 'device'`` -- in the solver only once restoration asked for it.
+    xp = _cupy_namespace()
+    import cupy
+
+    if "Protons_01" not in trots.list_trots_cases():
+        pytest.skip("Protons_01 not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/Protons_01.mat")
+    raw = trots.TROTSProblem(instance, cupy)
+    ref = trots.TROTSProblem(instance, xp)
+    assert any(isinstance(b, trots.TiledGramCSROperator) for b in _linear_blocks(raw))
+    j_raw, j_ref = _lowered_on(raw, cupy), _lowered_on(ref, xp)
+    w = np.random.default_rng(11).uniform(1e-3, 1e3, j_raw.shape[0])
+    g_raw = trots._to_numpy_nd(j_raw.gram(cupy.asarray(w)))
+    g_ref = trots._to_numpy_nd(j_ref.gram(xp.asarray(w)))
+    # Two device problems scatter their tiles in their own order, so the two
+    # Grams agree to reduction-order round-off rather than bit-for-bit.
+    np.testing.assert_allclose(g_raw, g_ref, rtol=1e-12, atol=0.0)
+
+
+def test_device_tiled_gram_is_solve_neutral_on_protons01_cupy():
+    from ipax.options import BarrierOptions
+
+    xp = _cupy_namespace()
+    if "Protons_01" not in trots.list_trots_cases():
+        pytest.skip("Protons_01 not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/Protons_01.mat")
+    opts = Options(
+        hessian="lbfgs",
+        linsolve="dense",
+        max_iter=10,
+        barrier=BarrierOptions(slack_init_scale=0.1),
+    )
+    results = []
+    for tiled in (True, False):
+        problem = trots.TROTSProblem(instance, xp, tiled_gram=tiled)
+        results.append(solve(problem, problem.initial_point(), options=opts))
+    r_t, r_p = results
+    assert r_t.status == r_p.status
+    assert r_t.n_iter == r_p.n_iter
+    assert r_t.routes == r_p.routes
+    assert abs(r_t.objective - r_p.objective) <= 1e-8 * max(1.0, abs(r_p.objective))
+
+
+def test_device_exact_hessian_solves_like_numpy_on_liver01_cupy(monkeypatch):
+    # The device exact Hessian through ipax.solve: Liver_01's curved
+    # structures (DVH constraints) tile, so CuPy gets a TROTSDeviceExactHessian
+    # whose dense_matrix (device tiled kernel) and matvec (device products)
+    # the solve drives. Parity with the NumPy exact run over 10 iterations.
+    from ipax.options import BarrierOptions
+
+    xp = _cupy_namespace()
+    if "Liver_01" not in trots.list_trots_cases():
+        pytest.skip("Liver_01 not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/Liver_01.mat")
+    calls = {"dense_matrix": 0, "matvec": 0}
+    for name in calls:
+        real = getattr(trots.TROTSDeviceExactHessian, name)
+
+        def spy(self, *args, _real=real, _name=name, **kwargs):
+            calls[_name] += 1
+            return _real(self, *args, **kwargs)
+
+        monkeypatch.setattr(trots.TROTSDeviceExactHessian, name, spy)
+    opts = Options(
+        hessian="exact",
+        linsolve="dense",
+        max_iter=10,
+        barrier=BarrierOptions(slack_init_scale=0.1),
+    )
+    results = []
+    for ns in (np, xp):
+        problem = trots.TROTSExactProblem(instance, ns)
+        results.append(solve(problem, problem.initial_point(), options=opts))
+    r_np, r_cp = results
+    assert calls["dense_matrix"] > 0
+    assert calls["matvec"] > 0
+    assert r_cp.status == r_np.status
+    assert r_cp.n_iter == r_np.n_iter
+    assert r_cp.routes == r_np.routes
+    assert abs(r_cp.objective - r_np.objective) <= 1e-8 * max(1.0, abs(r_np.objective))
+
+
+def test_device_exact_hessian_keeps_gated_off_structures_on_the_gpu_ck01(
+    monkeypatch,
+):
+    # Regression (2026-09-27): Prostate_CK_01's curved structures (PTV 3 mm,
+    # PZ: 87-90% dense) fail the tile gate, so on CuPy no curved structure
+    # was tiled and the grouped Hessian crossed through the host on every
+    # call -- TROTSExactHessian.host_sparse, one SciPy SpGEMM per structure
+    # (36 s), then a CSCOperator upload: 33 s/iter vs 2.2 s on NumPy. The
+    # device operator now plans them past the gate and forms the 25
+    # smoothing quadratics on the device; a steady-state call uploads only
+    # weight vectors and the quadratic multipliers.
+    xp = _cupy_namespace()
+    if "Prostate_CK_01" not in trots.list_trots_cases():
+        pytest.skip("Prostate_CK_01 not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/Prostate_CK_01.mat")
+    host = trots.TROTSExactProblem(instance, np)
+    dev = trots.TROTSExactProblem(instance, xp)
+    assert all(cs.tiles is None for cs in dev._curved.values())  # gated off
+    assert len(dev._quad_con) == 25
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("the device Hessian crossed through the host")
+
+    monkeypatch.setattr(trots.TROTSExactHessian, "host_sparse", boom)
+    uploads = []
+    real_put = trots._DeviceGramContext.put
+
+    def put(self, arr, dtype=None):
+        host = np.asarray(arr)
+        uploads.append((int(host.nbytes), np.dtype(dtype or host.dtype)))
+        return real_put(self, arr, dtype)
+
+    monkeypatch.setattr(trots._DeviceGramContext, "put", put)
+    z = np.asarray(host.initial_point())
+    rng = np.random.default_rng(2027)
+    zero = xp.asarray(np.zeros(0))
+    rows = max(cs.mat.matrix.shape[0] for cs in dev._curved.values())
+    for sigma, y in (
+        (1.0, np.zeros(host._n_nl_ineq)),  # the LTCP structures alone
+        (0.9, rng.uniform(0.0, 2.0, host._n_nl_ineq)),  # plus the quadratics
+    ):
+        uploads.clear()
+        h = dev.lagrangian_hessian(xp.asarray(z), zero, xp.asarray(y), sigma)
+        assert isinstance(h, trots.TROTSDeviceExactHessian)
+        d = trots._to_numpy_nd(h.dense_matrix())
+        ref = np.asarray(
+            host.lagrangian_hessian(z, np.zeros(0), y, sigma).dense_matrix()
+        )
+        np.testing.assert_array_equal(d, d.T)
+        assert np.max(np.abs(d - ref)) <= 1e-12 * np.max(np.abs(ref))
+        v = rng.standard_normal(host.n_vars)
+        hv = trots._to_numpy_nd(h.matvec(xp.asarray(v)))
+        assert np.max(np.abs(hv - ref @ v)) <= 1e-12 * np.max(np.abs(ref @ v))
+    # Second call (tiles cached): per structure its weights, plus the
+    # multipliers -- nothing of the size of a tile, a product or n x n, and
+    # no index array (the fingerprint of a COO / CSC crossing).
+    assert max(nbytes for nbytes, _dt in uploads) <= 8 * rows
+    assert len(uploads) <= len(dev._curved) + 1
+    assert all(dt.kind == "f" for _nb, dt in uploads), uploads
+
+
+def test_device_breedveld_start_matches_the_host_start_on_protons01_cupy():
+    # On CuPy the Breedveld et al. 2017 §3.1 start runs LSQR (eq. (26)) on the
+    # GPU against the problem's own lowered operator; it must give the host
+    # SciPy start to round-off and return device arrays.
+    import scipy.sparse.linalg as spla
+
+    xp = _cupy_namespace()
+    import cupy
+
+    if "Protons_01" not in trots.list_trots_cases():
+        pytest.skip("Protons_01 not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/Protons_01.mat")
+    problem = trots.TROTSProblem(instance, xp)
+    x0 = problem.initial_point(strategy="breedveld")
+
+    dev = problem._breedveld_least_squares(x0, "auto")
+    host = problem._breedveld_least_squares(x0, "host")
+    assert dev.on_device and not host.on_device
+    assert isinstance(dev.y, cupy.ndarray)
+    np.testing.assert_allclose(cupy.asnumpy(dev.grad), host.grad, rtol=1e-12)
+    np.testing.assert_allclose(
+        cupy.asnumpy(dev.g), host.g, rtol=0, atol=1e-12 * np.max(np.abs(host.g))
+    )
+
+    # Unfloored LSQR solution. Over a short horizon the device iteration
+    # tracks SciPy's to round-off; afterwards Golub–Kahan's loss of
+    # orthogonality amplifies it (a 1e-16 relative perturbation of SciPy's own
+    # matvec moves its final iterate by ~1e-4), so the full runs are compared
+    # as least-squares solutions: both stop on the atol/btol test at a
+    # residual of the same size, and the multipliers agree far below the
+    # floor of 5 that every one of them is raised to.
+    m, n = int(host.g.shape[0]), int(host.x.shape[0])
+    jt = spla.LinearOperator(
+        (n, m),
+        matvec=lambda v: np.asarray(host.jac.rmatvec(np.ravel(v))),
+        rmatvec=lambda u: np.asarray(host.jac.matvec(np.ravel(u))),
+        dtype=np.float64,
+    )
+    y_short = spla.lsqr(jt, -host.grad, atol=0.0, btol=0.0, conlim=0.0, iter_lim=10)[0]
+    y_short_dev = trots._lsqr(
+        dev.jac.rmatvec, dev.jac.matvec, -dev.grad, m, xp,
+        atol=0.0, btol=0.0, conlim=0.0, iter_lim=10,
+    )[0]  # fmt: skip
+    np.testing.assert_allclose(
+        cupy.asnumpy(y_short_dev), y_short, rtol=0, atol=1e-10 * np.max(np.abs(y_short))
+    )
+    y_dev = cupy.asnumpy(dev.y)
+    assert np.linalg.norm(y_dev - host.y) <= 1e-2 * np.linalg.norm(host.y)
+    assert np.max(np.abs(y_dev - host.y)) <= 1e-4
+    r_host = np.linalg.norm(jt.matvec(host.y) + host.grad)
+    r_dev = float(xp.linalg.vector_norm(dev.jac.rmatvec(dev.y) + dev.grad))
+    assert r_dev == pytest.approx(r_host, rel=0.05)
+    assert r_host <= 1e-3 * np.linalg.norm(host.grad)
+
+    # The start itself (after the floors) and μ0: round-off, on the device.
+    wd, mu_dev = problem.breedveld_warm_start(x0)
+    wh, mu_host = problem.breedveld_warm_start(x0, lsqr="host")
+    for a, b in ((wd.s, wh.s), (wd.y_ineq, wh.y_ineq), (wd.z_lower, wh.z_lower)):
+        assert isinstance(a, cupy.ndarray) and a.device == x0.device
+        np.testing.assert_allclose(cupy.asnumpy(a), cupy.asnumpy(b), rtol=1e-8)
+    assert mu_dev == pytest.approx(mu_host, rel=1e-8)
+    assert bool(cupy.all(wd.y_ineq == 5.0))  # every multiplier on the floor
+
+
+# --------------------------------------------------------------------------- #
+# Restoration's dense route on a tall linear block: Gram, not densification
+# --------------------------------------------------------------------------- #
+def test_restoration_forms_the_tall_linear_block_by_gram_on_liver01(monkeypatch):
+    # TROTS 2026-09: the dense restoration route densified the whole lowered
+    # dose block (Protons_01: 369 445 x 1101, 3.2 GB per restoration
+    # iteration). Liver_01's block (121 975 x 1124, 1.1 GB) is above the
+    # default RestorationOptions.dense_materialize_max_elements, so restore()
+    # must form J^T diag(g > 0) J through the operators' Gram instead.
+    import ipax.ipm.restoration as restoration_mod
+    from ipax.backend.operators import _SparseStructured
+    from ipax.options import RestorationOptions
+    from ipax.problem.linear_ineq import lower_linear_inequalities
+
+    case = "Liver_01"
+    if case not in trots.list_trots_cases():
+        pytest.skip(f"{case} not present in this TROTS copy")
+    instance = trots.load_trots_file(f"{_ROOT}/{case}.mat")
+    problem = trots.TROTSProblem(instance, np)
+    z0 = np.asarray(problem.initial_point())
+    lowered = lower_linear_inequalities(problem, z0, np)
+    jac = lowered.ineq_jacobian(z0)
+    m, n = jac.shape
+    assert m * n > RestorationOptions().dense_materialize_max_elements
+    g0 = np.asarray(lowered.ineq_constraints(z0))
+    assert float(np.max(g0)) > 1.0  # the RT start is well outside the dose limits
+
+    # Two outer iterations bound the test's wall; each is one Gram.
+    monkeypatch.setattr(restoration_mod, "_MAX_ITER", 2)
+    events: list[str] = []
+    real_dense = restoration_mod._dense
+
+    def spy_dense(op, xp, dtype):
+        events.append(f"dense{op.shape}")
+        return real_dense(op, xp, dtype)
+
+    monkeypatch.setattr(restoration_mod, "_dense", spy_dense)
+    for cls in (_SparseStructured, trots.TiledGramCSROperator):
+        real_gram = cls.gram
+
+        def spy_gram(self, *args, _real=real_gram, **kwargs):
+            events.append("gram")
+            return _real(self, *args, **kwargs)
+
+        monkeypatch.setattr(cls, "gram", spy_gram)
+    real_matmat = _SparseStructured.matmat
+
+    def spy_matmat(self, V):
+        if tuple(V.shape) == (n, n):
+            events.append("identity_matmat")
+        return real_matmat(self, V)
+
+    monkeypatch.setattr(_SparseStructured, "matmat", spy_matmat)
+
+    lower, upper = problem.bounds()
+    lower = np.full(n, -np.inf) if lower is None else np.asarray(lower)
+    upper = np.full(n, np.inf) if upper is None else np.asarray(upper)
+    mask_l, mask_u = np.isfinite(lower), np.isfinite(upper)
+    x, s, _exit = restoration_mod.restore(
+        xp=np,
+        x=z0,
+        s=np.ones(m),
+        m=m,
+        m_eq=0,
+        eq_fn=lambda z: np.zeros(0),
+        eq_jac_fn=lambda z: None,
+        ineq_fn=lowered.ineq_constraints,
+        ineq_jac_fn=lowered.ineq_jacobian,
+        mask_l=mask_l,
+        mask_u=mask_u,
+        lower_safe=np.where(mask_l, lower, 0.0),
+        upper_safe=np.where(mask_u, upper, 0.0),
+        tol=1e-8,
+    )
+
+    assert "gram" in events
+    assert not any(e.startswith("dense") for e in events), events
+    assert "identity_matmat" not in events
+    # ...and the Gram-formed Gauss-Newton step made progress on the violation.
+    g1 = np.asarray(lowered.ineq_constraints(x))
+    assert float(np.sum(np.maximum(g1, 0.0) ** 2)) < float(
+        np.sum(np.maximum(g0, 0.0) ** 2)
+    )
+    assert s.shape == (m,)

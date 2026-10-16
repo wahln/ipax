@@ -21,7 +21,7 @@ from collections.abc import Callable
 from itertools import pairwise
 from typing import TYPE_CHECKING, Literal
 
-from ipax.backend.namespace import array_namespace
+from ipax.backend.namespace import array_namespace, device
 
 if TYPE_CHECKING:
     from ipax.typing import Array
@@ -180,7 +180,8 @@ class LinearOperator(ABC):
         operator's native result dtype regardless. Best-effort: implementations
         may ignore the request (returning the exact Gram is always valid), and
         wrappers forwarding :meth:`gram` must forward it. Callers tolerate
-        pre-keyword implementations (``TypeError``) by retrying without it —
+        pre-keyword implementations (the ``TypeError`` naming the keyword —
+        any other ``TypeError`` propagates) by retrying without it —
         a wrapper is also a caller, so it owes the same retry:
         :func:`forward_gram` is that call, ready-made.
 
@@ -225,6 +226,45 @@ class LinearOperator(ABC):
         the reduction where its data justifies it.
         """
         return None
+
+    def dense_matrix_with_gram(
+        self,
+        jac: LinearOperator,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        """Dense ``A + jacᵀ diag(weights) jac`` formed by ``A`` itself, fused.
+
+        Optional capability of a square curvature operator — the Hessian
+        ``W`` of the condensed normal equations, whose dense route otherwise
+        forms ``W.dense_matrix()`` and the inequality Gram
+        ``jac.gram(weights)`` (``∇gᵀ Σ_s ∇g``, Breedveld 2017, eq. 18) in two
+        separate passes. A curvature that is itself a weighted Gram
+        ``Bᵀ diag(h) B`` over rows it shares with ``jac`` can multiply those
+        rows once with the summed weights ``h + w`` (Breedveld 2017, eq. 48,
+        across the two terms), up to halving the dominant product. ``jac`` and
+        ``weights`` are the solver's view of the inequality block — after
+        ``linear_ineq`` lowering, problem scaling and stacking — so an
+        operator that cannot read that layout directly may route through
+        ``jac.gram`` (whose wrappers translate the weights to the source
+        rows) and cooperate with its own source operators there.
+
+        Contract: the result equals ``self.dense_matrix() + jacᵀ diag(weights)
+        jac`` up to round-off, is symmetric, lives in the namespace and on the
+        device of ``weights`` in their (working) dtype, and is treated as
+        **read-only**
+        (it may alias a memo, as :meth:`dense_matrix` may). ``accumulate_dtype``
+        and ``hinted_only`` are :meth:`gram`'s mixed-precision request and
+        apply to the Gram part only; ``self``'s own part must stay in native
+        precision. Declining is always valid: raise ``NotImplementedError``
+        (the default) and the caller forms the two terms separately, bit for
+        bit as without this hook — but decide *before* forming anything, as
+        the caller pays for the two-pass assembly in full after a decline.
+        """
+        del jac, weights, accumulate_dtype, hinted_only
+        raise NotImplementedError("operator does not fuse an inequality Gram")
 
     def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
         """``Aᵀ diag(weights) A`` as *sparse* COO triplets (invariant #4).
@@ -729,6 +769,36 @@ class Composite(LinearOperator):
         return result
 
 
+# The accumulation keywords a pre-0.10 ``gram(weights)`` signature rejects.
+_GRAM_KEYWORDS = ("accumulate_dtype", "hinted_only")
+
+
+def _gram_rejects_keywords(exc: TypeError) -> bool:
+    """Whether ``exc`` is a pre-keyword ``gram(weights)`` refusing the keywords.
+
+    The compatibility retry (:meth:`LinearOperator.gram`) exists for exactly
+    one ``TypeError``: Python's "got an unexpected keyword argument
+    'accumulate_dtype'" (or ``'hinted_only'``) from an operator written against
+    the old signature. Any other ``TypeError`` raised *inside* a Gram that
+    accepted the keywords is a bug in that operator; retrying without the
+    keywords would silently degrade to the exact Gram and hide it (or run the
+    same failing Gram twice), so it must propagate.
+
+    Two recognizers, either suffices: (1) the error was raised at the call
+    boundary — argument binding fails before the callee's frame exists, so the
+    traceback (caught in the caller) has no deeper frame; this also covers a
+    compiled ``gram`` (a builtin's "takes no keyword arguments", pybind11's
+    "incompatible function arguments"), whose wording names no keyword. (2)
+    the message names a keyword — for a ``*args, **kwargs`` wrapper that
+    forwards to an old signature one frame down.
+    """
+    traceback = exc.__traceback__
+    if traceback is not None and traceback.tb_next is None:
+        return True
+    message = str(exc)
+    return any(f"'{name}'" in message for name in _GRAM_KEYWORDS)
+
+
 def forward_gram(
     op: LinearOperator,
     weights: Array,
@@ -752,7 +822,9 @@ def forward_gram(
         return op.gram(
             weights, accumulate_dtype=accumulate_dtype, hinted_only=hinted_only
         )
-    except TypeError:
+    except TypeError as exc:
+        if not _gram_rejects_keywords(exc):
+            raise
         return op.gram(weights)
 
 
@@ -778,6 +850,11 @@ class VStack(LinearOperator):
     @property
     def shape(self) -> tuple[int, int]:
         return sum(self._rows), self._n
+
+    @property
+    def blocks(self) -> tuple[LinearOperator, ...]:
+        """The stacked operators, top to bottom (read-only view of the stack)."""
+        return self._ops
 
     def matvec(self, v: Array) -> Array:
         xp = array_namespace(v)
@@ -1179,11 +1256,33 @@ class COOOperator(_SparseStructured):
 def _expand_indptr(xp: object, indptr: Array, nnz: int) -> Array:
     """Compressed ``indptr`` → the major-axis index of each stored entry.
 
-    Entry ``e`` belongs to major index ``i`` where ``indptr[i] ≤ e < indptr[i+1]``;
-    ``searchsorted(..., 'right') − 1`` recovers it in one pure Array-API pass (no
-    scatter primitive, which the standard lacks).
+    Entry ``e`` belongs to major index ``i`` where ``indptr[i] ≤ e < indptr[i+1]``,
+    so the map is ``repeat(arange(len(indptr) − 1), diff(indptr))``: one O(nnz)
+    pass with no ``arange(nnz)`` temporary. ``repeat`` with array-valued counts is
+    standard since the 2023.12 revision, but it is a data-dependent-shape
+    primitive not every namespace provides (CuPy < 14 rejects array counts;
+    ``array-api-strict`` rejects them with ``data_dependent_shapes`` disabled; a
+    pre-2023.12 namespace lacks ``repeat``). Those fall back to the equivalent
+    ``searchsorted(indptr, arange(nnz), 'right') − 1`` (O(nnz log m)). Both forms
+    agree exactly — values and dtype — on a valid ``indptr``.
     """
-    arange = xp.arange(nnz)  # type: ignore[attr-defined]
+    dev = device(indptr)
+    repeat = getattr(xp, "repeat", None)
+    if repeat is not None:
+        counts = indptr[1:] - indptr[:-1]
+        major = xp.arange(int(indptr.shape[0]) - 1, device=dev)  # type: ignore[attr-defined]
+        try:
+            expanded = repeat(major, counts)
+        except (TypeError, ValueError, RuntimeError, NotImplementedError):
+            expanded = None  # array-valued ``repeat`` unsupported → searchsorted
+        if expanded is not None:
+            if int(expanded.shape[0]) != nnz:
+                raise ValueError(
+                    "compressed indptr does not span the stored entries: "
+                    f"indptr[-1] - indptr[0] = {int(expanded.shape[0])}, nnz = {nnz}"
+                )
+            return expanded
+    arange = xp.arange(nnz, device=dev)  # type: ignore[attr-defined]
     return xp.searchsorted(indptr, arange, side="right") - 1  # type: ignore[attr-defined]
 
 
@@ -1261,6 +1360,267 @@ class CSCOperator(_SparseStructured):
             pattern_key=pattern_key,
             values_dtype_hint=values_dtype_hint,
         )
+
+
+def _signed_row_select_plan(
+    rows: Array, sel_lower: Array, sel_upper: Array
+) -> tuple[Array, Array, Array, int]:
+    """Structure of ``S A`` for a signed row selection ``S`` (invariant #4).
+
+    ``S`` stacks ``−e_iᵀ`` for every source row with ``sel_lower[i]`` (in source
+    order) on top of ``+e_iᵀ`` for every row with ``sel_upper[i]``; a row
+    selected by both appears twice. This is the Jacobian of the two-sided
+    linear-inequality lowering (``l − A x ≤ 0`` over ``A x − u ≤ 0``, see
+    :mod:`ipax.problem.linear_ineq`), derived from the COO row vector alone:
+    rows are renumbered through a rank-1 map (``cumulative_sum`` of the mask)
+    and entries are filtered through ``nonzero``/``take`` — no scatter, no
+    integer ``__setitem__``, no backend sparse type. Entries keep their source
+    order within each half, so row-sorted (CSR-ordered) input yields row-sorted
+    output.
+
+    Returns ``(keep_lower, keep_upper, new_rows, n_lowered_rows)``: the source
+    entry indices feeding the lower and upper halves, and the lowered row of
+    each kept entry (lower half first). The plan depends on the row vector and
+    the masks only, so it can be computed once and reused for every value
+    refresh (:func:`_signed_row_select_values`).
+    """
+    xp = array_namespace(rows)
+    lower_int = xp.astype(sel_lower, xp.int64)
+    upper_int = xp.astype(sel_upper, xp.int64)
+    lower_rank = xp.cumulative_sum(lower_int)
+    upper_rank = xp.cumulative_sum(upper_int)
+    k_lower = int(lower_rank[-1]) if int(lower_rank.shape[0]) else 0
+    k_upper = int(upper_rank[-1]) if int(upper_rank.shape[0]) else 0
+    # Rank-1 row maps: the lowered position of each selected source row (the
+    # value at an unselected row is never read — its entries are filtered out).
+    map_lower = lower_rank - 1
+    map_upper = upper_rank + (k_lower - 1)
+
+    keep_lower = xp.nonzero(xp.take(sel_lower, rows))[0]
+    keep_upper = xp.nonzero(xp.take(sel_upper, rows))[0]
+    new_rows = xp.concat(
+        (
+            xp.take(map_lower, xp.take(rows, keep_lower)),
+            xp.take(map_upper, xp.take(rows, keep_upper)),
+        )
+    )
+    return keep_lower, keep_upper, new_rows, k_lower + k_upper
+
+
+def _signed_row_select_values(
+    values: Array, keep_lower: Array, keep_upper: Array
+) -> Array:
+    """The values of ``S A`` in the plan's entry order (lower half negated)."""
+    xp = array_namespace(values)
+    return xp.concat((-xp.take(values, keep_lower), xp.take(values, keep_upper)))
+
+
+def _signed_row_select_triplets(
+    rows: Array,
+    cols: Array,
+    values: Array,
+    sel_lower: Array,
+    sel_upper: Array,
+) -> tuple[Array, Array, Array, int]:
+    """COO triplets ``(rows, cols, values, n_lowered_rows)`` of ``S A``.
+
+    See :func:`_signed_row_select_plan` for the selection ``S``.
+    """
+    xp = array_namespace(values)
+    keep_lower, keep_upper, new_rows, k = _signed_row_select_plan(
+        rows, sel_lower, sel_upper
+    )
+    new_cols = xp.concat((xp.take(cols, keep_lower), xp.take(cols, keep_upper)))
+    return (
+        new_rows,
+        new_cols,
+        _signed_row_select_values(values, keep_lower, keep_upper),
+        k,
+    )
+
+
+class _SignedRowSelection(LinearOperator):
+    """``S A`` — a signed selection (with repetition) of the rows of ``A``.
+
+    ``S`` stacks ``−e_iᵀ`` for each source row ``i`` with ``sel_lower[i]`` on
+    top of ``+e_iᵀ`` for each row with ``sel_upper[i]`` (a row selected by both
+    appears twice). It is the lowered Jacobian of a two-sided linear
+    inequality ``l ≤ A x ≤ u`` whose ``A`` is an operator the lowering cannot
+    rewrite at the triplet level (matrix-free, or a user subclass whose
+    overrides must survive): the finite-lower rows become ``l − A x ≤ 0`` and
+    the finite-upper rows ``A x − u ≤ 0`` (see :mod:`ipax.problem.linear_ineq`).
+
+    Nothing is densified. The matvec family gathers/expands around ``A``'s
+    own products, and every Gram capability folds the selection into the
+    weights exactly as :class:`~ipax.problem.scaling._RowScaled` folds its row
+    scaling: ``(SA)ᵀ W (SA) = Aᵀ (Sᵀ W S) A``, where ``Sᵀ W S`` is diagonal
+    with, on each source row, the sum of the weights of the lowered rows drawn
+    from it (the signs square away). The expansion ``v ↦ Sᵀ v`` is scatter-free:
+    each selected source row reads its lowered entry through a precomputed
+    ``cumulative_sum`` rank map from a zero-padded copy of ``v``, so unselected
+    rows read the pad. Capability probes forward to ``A``, so the wrapper never
+    advertises a route ``A`` cannot serve.
+    """
+
+    def __init__(self, op: LinearOperator, sel_lower: Array, sel_upper: Array) -> None:
+        xp = array_namespace(sel_lower, sel_upper)
+        m = op.shape[0]
+        if int(sel_lower.shape[0]) != m or int(sel_upper.shape[0]) != m:
+            raise ValueError("row-selection masks must match the operator row count")
+        self._op = op
+        self._sel_lower = sel_lower
+        self._sel_upper = sel_upper
+        lower_idx = xp.nonzero(sel_lower)[0]
+        upper_idx = xp.nonzero(sel_upper)[0]
+        self._k_lower = int(lower_idx.shape[0])
+        self._k = self._k_lower + int(upper_idx.shape[0])
+        # Source row of each lowered row, in lowered order (lower half first).
+        self._gather = xp.concat((lower_idx, upper_idx))
+        # Sᵀ expansion maps into the zero-padded lowered vector [0, v]: a
+        # selected lower row i reads entry rank_lower(i), a selected upper row
+        # reads k_lower + rank_upper(i) (ranks 1-based, the pad sits at 0), and
+        # an unselected row reads the pad.
+        lower_int = xp.astype(sel_lower, xp.int64)
+        upper_int = xp.astype(sel_upper, xp.int64)
+        self._expand_lower = xp.cumulative_sum(lower_int) * lower_int
+        upper_rank = xp.cumulative_sum(upper_int) + self._k_lower
+        self._expand_upper = upper_rank * upper_int
+        # Identity token for the pattern signature: the selection is fixed for
+        # this operator's lifetime, but two selections of the same ``A`` differ.
+        self._token = object()
+        # COO plan of S·A, cached on the first ``to_coo`` when A's pattern is
+        # structural, so the per-iteration value refresh is two gathers.
+        self._coo_plan: tuple[Array, Array, Array, Array] | None = None
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self._k, self._op.shape[1]
+
+    # -- S and Sᵀ -------------------------------------------------------------
+    def _signed_gather(self, y: Array) -> Array:
+        """``S y`` for a rank-1 or rank-2 (row-major) ``y`` of length ``m``."""
+        xp = array_namespace(y)
+        picked = xp.take(y, self._gather, axis=0)
+        k = self._k_lower
+        return xp.concat((-picked[:k, ...], picked[k:, ...]), axis=0)
+
+    def _expand(self, v: Array, *, signed: bool) -> Array:
+        """``Sᵀ v`` (``signed``) or ``|S|ᵀ v`` (weights), rank-1 or rank-2 ``v``."""
+        xp = array_namespace(v)
+        if self._k == 0:
+            zeros = xp.zeros_like(self._expand_lower, dtype=v.dtype)
+            if len(v.shape) == 1:
+                return zeros
+            return xp.broadcast_to(
+                xp.expand_dims(zeros, axis=1), (int(zeros.shape[0]), int(v.shape[1]))
+            )
+        padded = xp.concat((xp.zeros_like(v[:1, ...]), v), axis=0)
+        lower = xp.take(padded, self._expand_lower, axis=0)
+        upper = xp.take(padded, self._expand_upper, axis=0)
+        return upper - lower if signed else upper + lower
+
+    # -- matvec family --------------------------------------------------------
+    def matvec(self, v: Array) -> Array:
+        return self._signed_gather(self._op.matvec(v))
+
+    def rmatvec(self, v: Array) -> Array:
+        return self._op.rmatvec(self._expand(v, signed=True))
+
+    def matmat(self, V: Array) -> Array:
+        return self._signed_gather(self._op.matmat(V))
+
+    def rmatmat(self, V: Array) -> Array:
+        return self._op.rmatmat(self._expand(V, signed=True))
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        # Densifies exactly when A does; a matrix-free A keeps raising.
+        return self._signed_gather(self._op.dense_matrix(like))
+
+    def row_inf_norms(self, like: Array | None = None) -> Array:
+        xp = array_namespace(self._gather)
+        return xp.take(self._op.row_inf_norms(like), self._gather)
+
+    # -- Gram capabilities: fold S into the weights ---------------------------
+    def gram_diagonal(self, weights: Array) -> Array:
+        return self._op.gram_diagonal(self._expand(weights, signed=False))
+
+    def gram(
+        self,
+        weights: Array,
+        *,
+        accumulate_dtype: str | None = None,
+        hinted_only: bool = False,
+    ) -> Array:
+        # (SA)ᵀ diag(w) (SA) = Aᵀ diag(|S|ᵀ w) A (Breedveld 2017, eq. 18's
+        # ∇gᵀ Σ_s ∇g for the lowered rows), formed by A's own Gram.
+        return forward_gram(
+            self._op,
+            self._expand(weights, signed=False),
+            accumulate_dtype=accumulate_dtype,
+            hinted_only=hinted_only,
+        )
+
+    def gram_capable(self) -> bool:
+        return self._op.gram_capable()
+
+    def gram_accumulate_dtype_hint(self) -> str | None:
+        # ±1 selection is exact in any precision: the data hint is A's.
+        return self._op.gram_accumulate_dtype_hint()
+
+    def gram_coo(self, weights: Array) -> tuple[Array, Array, Array, tuple[int, int]]:
+        # Same folding; A's Gram pattern is weight-independent, so the pattern
+        # stays stable (zero-weight source rows keep their structural entries).
+        return self._op.gram_coo(self._expand(weights, signed=False))
+
+    def gram_coo_capable(self) -> bool:
+        return self._op.gram_coo_capable()
+
+    def gram_fill_estimate(self) -> float | None:
+        # pattern((SA)ᵀ(SA)) ⊆ pattern(AᵀA): A's estimate is a safe upper bound.
+        return self._op.gram_fill_estimate()
+
+    def row_gram_diagonal(self, weights: Array) -> Array:
+        xp = array_namespace(self._gather)
+        return xp.take(self._op.row_gram_diagonal(weights), self._gather)
+
+    # -- structure ------------------------------------------------------------
+    def to_coo(
+        self, like: Array | None = None
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        # Remap A's triplets when A exposes them; a matrix-free A propagates
+        # NotImplementedError (the sparse-direct route is then unavailable).
+        if self._coo_plan is not None:
+            _, _, rows, cols = self._coo_plan
+            return rows, cols, self.coo_values(like), self.shape
+        rows, cols, values, _ = self._op.to_coo(like)
+        keep_lower, keep_upper, new_rows, _ = _signed_row_select_plan(
+            rows, self._sel_lower, self._sel_upper
+        )
+        xp = array_namespace(values)
+        new_cols = xp.concat((xp.take(cols, keep_lower), xp.take(cols, keep_upper)))
+        if self._op.coo_pattern_signature() is not None:
+            # A's pattern is structural, so the plan holds for every later
+            # call and only the values need re-reading (see coo_values).
+            self._coo_plan = (keep_lower, keep_upper, new_rows, new_cols)
+        values = _signed_row_select_values(values, keep_lower, keep_upper)
+        return new_rows, new_cols, values, self.shape
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        # Values-only refresh (the sparse route calls this every iteration):
+        # reuse the cached plan rather than re-derive the selection, which
+        # would cost cumulative sums and data-dependent ``nonzero`` syncs.
+        if self._coo_plan is None:
+            return self.to_coo(like)[2]
+        keep_lower, keep_upper, _, _ = self._coo_plan
+        return _signed_row_select_values(
+            self._op.coo_values(like), keep_lower, keep_upper
+        )
+
+    def coo_pattern_signature(self) -> object | None:
+        inner = self._op.coo_pattern_signature()
+        if inner is None:
+            return None
+        return ("signed_row_selection", self.shape, inner, self._token)
 
 
 def as_operator(obj: Array | LinearOperator) -> LinearOperator:

@@ -68,10 +68,35 @@ class SparseDirectSolver:
     is selectable explicitly (``SparseOptions(kkt_route=...)``) and picked by
     ``select_solver`` only when the ``gram_fill_estimate`` probe (sampled
     column overlap of ``∇g``) certifies a sparse Gram pattern.
+
+    ``perturbed_pivot_refinement_steps`` / ``perturbed_pivot_max_residual``
+    carry :class:`~ipax.options.SparseOptions`' perturbed-pivot solve policy
+    to the backend adapter. They are handed over through the adapter's
+    *optional* ``configure_perturbed_pivots(refinement_steps=...,
+    max_residual=...)`` hook, called once right after the adapter is created
+    (before it builds a matrix or a solver), and looked up by duck typing:
+    an adapter whose factorization never perturbs pivots does not implement
+    it and the policy is ignored — the adapter protocol itself is unchanged.
+    Both ``None`` (the default) leaves the hook uncalled, so the adapter keeps
+    its own defaults; ``select_solver`` always passes ``Options.sparse``'s
+    values. Validation is the adapter's (and ``SparseOptions``') concern.
+
+    ``deterministic=True`` (``SparseOptions.deterministic``) reaches the
+    adapter the same way, through its optional
+    ``configure_deterministic(enabled=True)`` hook, called once right after
+    the adapter is created: an adapter whose backend offers run-to-run
+    reproducible factorizations switches that mode on, any other adapter has
+    no hook and ignores it. ``False`` (the default) never calls the hook.
     """
 
     def __init__(
-        self, *, require_inertia: bool = False, form: str = "augmented"
+        self,
+        *,
+        require_inertia: bool = False,
+        form: str = "augmented",
+        perturbed_pivot_refinement_steps: int | None = None,
+        perturbed_pivot_max_residual: float | None = None,
+        deterministic: bool = False,
     ) -> None:
         if form not in ("augmented", "normal_equations"):
             raise ValueError(
@@ -79,6 +104,17 @@ class SparseDirectSolver:
             )
         self._require_inertia = require_inertia
         self._form = form
+        self._perturbed_pivot_policy: tuple[int | None, float | None] | None = (
+            None
+            if perturbed_pivot_refinement_steps is None
+            and perturbed_pivot_max_residual is None
+            else (perturbed_pivot_refinement_steps, perturbed_pivot_max_residual)
+        )
+        # Typed ``object``: a truthy non-bool ("no") must not switch it on.
+        flag: object = deterministic
+        if not isinstance(flag, bool):
+            raise ValueError("SparseDirectSolver deterministic must be a bool")
+        self._deterministic = flag
         self._adapter: Any = None
         self._adapter_key: tuple[str, int | None] | None = None
         self._inner: Any = None
@@ -198,6 +234,16 @@ class SparseDirectSolver:
                     "linsolve mode"
                 )
             self._adapter_key = adapter_key
+            # Optional adapter hook (see the class docstring): only adapters
+            # whose factorization can perturb pivots implement it.
+            configure = getattr(self._adapter, "configure_perturbed_pivots", None)
+            if self._perturbed_pivot_policy is not None and configure is not None:
+                steps, max_residual = self._perturbed_pivot_policy
+                configure(refinement_steps=steps, max_residual=max_residual)
+            # Optional hook too: only adapters with a reproducible mode have it.
+            make_deterministic = getattr(self._adapter, "configure_deterministic", None)
+            if self._deterministic and make_deterministic is not None:
+                make_deterministic(enabled=True)
         elif adapter_key != self._adapter_key:
             raise RuntimeError(
                 "SparseDirectSolver cannot reuse a cached sparse adapter across "

@@ -52,6 +52,8 @@ validated on construction.
 
 ::: ipax.options.RestorationOptions
 
+::: ipax.options.SparseOptions
+
 ::: ipax.options.BreedveldOptions
 
 ## Results and diagnostics
@@ -91,6 +93,8 @@ strategies. The core only ever sees these protocol types — see
 ::: ipax.linalg.solver.LinearSolver
 
 ::: ipax.linalg.solver.LinearSolveError
+
+::: ipax.linalg.solver.numerical_failure_types
 
 ::: ipax.linalg.solver.select_solver
 

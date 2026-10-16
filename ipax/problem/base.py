@@ -101,7 +101,27 @@ class Problem(ABC):
     def linear_ineq(
         self,
     ) -> tuple[Array | LinearOperator, Array, Array] | None:
-        """``(A_ineq, l, u)`` for ``l ≤ A_ineq x ≤ u`` (l/u may be ∓inf)."""
+        """``(A_ineq, l, u)`` for ``l ≤ A_ineq x ≤ u`` (l/u may be ∓inf).
+
+        ``A_ineq`` may be a rank-2 array or any
+        :class:`~ipax.backend.operators.LinearOperator`. The solver lowers the
+        block once into one-sided rows (a row finite on both sides becomes two
+        rows; a row infinite on both sides is dropped) without densifying an
+        operator: ``COOOperator``/``CSROperator``/``CSCOperator`` are rewritten
+        at the triplet level (same family, precision hint kept, pattern key
+        derived from the source's), a ``VStack`` block by block (so each block
+        keeps its own ``gram_accumulate_dtype_hint``), and any other operator
+        through a signed row-selection wrapper whose Gram capabilities fold
+        into the weights. A matrix-free ``A_ineq`` needs ``rmatvec``. The
+        lowered rows follow any nonlinear inequalities, and their multipliers
+        are sliced off before :meth:`lagrangian_hessian` is called.
+
+        Layout of the lowered rows (and so of their entries in
+        ``Result.y_ineq``, after the nonlinear ones): all finite-lower rows in
+        source order, then all finite-upper rows in source order — except for
+        a ``VStack``, which is laid out block by block (each block's lower
+        rows, then its upper rows).
+        """
         return None
 
     # ---- Hessian of the Lagrangian (optional → autodiff-HVP → L-BFGS) ----

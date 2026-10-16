@@ -21,6 +21,8 @@ needs lives here so the algorithm code stays declarative.
 from __future__ import annotations
 
 import math
+import numbers
+import operator
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -29,14 +31,17 @@ LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
 Globalization = Literal["filter", "breedveld"]
 MuSchedule = Literal["monotone", "adaptive", "breedveld", "probing", "quality"]
 MuFallback = Literal["kkt-error", "never"]
+ProbingSigma = Literal["nww", "mehrotra"]
 FreeModeAcceptance = Literal["obj-constr-filter", "rigorous"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
 RestorationLinearSolver = Literal["auto", "dense", "krylov"]
+RestorationDenseFactorization = Literal["lu", "cholesky"]
 DenseKKTRoute = Literal["condensed", "augmented"]
 SparseKKTRoute = Literal["auto", "augmented", "normal_equations"]
 ScalingMethod = Literal["none", "gradient-based"]
 CorrectionsMethod = Literal["none", "mehrotra", "gondzio"]
+GondzioVariant = Literal["ipax", "breedveld"]
 
 
 def _validate_optional_positive(
@@ -96,8 +101,33 @@ class BarrierOptions:
     # constraint scale on RT-scale problems (Protons_01: feasibility at iter ~17 vs
     # ~42 with the flat floor). OPT-IN pending a full-corpus sweep of the default.
     slack_init_scale: float = 0.0
+    # Centering rule of the ``mu_schedule="probing"`` oracle (the affine-probe
+    # Mehrotra σ). Only applies with ``Options.mu_schedule="probing"``: every
+    # other schedule ignores it, including ``"quality"``, whose fallback always
+    # uses the NWW rule. ``"nww"`` (default) is Nocedal, Wächter & Waltz 2009,
+    # eqs. (3.2)–(3.5): σ = (μ_aff/μ_gap)³ against the current average
+    # complementarity μ_gap, maximal (τ = 1) probe step, σ clipped at 1 so
+    # probing never raises μ above the current gap. ``"mehrotra"`` is the
+    # textbook unclipped rule as Breedveld et al. 2017 run it (Mehrotra 1992;
+    # Breedveld 2017 supplement eqs. (4)–(7), with the supplement's μ_prev
+    # read as the eq. (10) gap measured at the current iterate): the same σ
+    # against the same μ_gap, but the probe step cut back by the
+    # fraction-to-boundary τ of ``BreedveldOptions.tau`` (his §2.1, 0.995) and
+    # σ **unclipped** (σ > 1 raises μ above the current gap). The remaining
+    # safeguards still apply to both: the ``max(mu_min, tol/10)`` floor, the
+    # El-Bakry centrality floor (``kappa_centrality=0.0`` opts out) and the
+    # KKT-error fallback (``fallback="never"`` opts out). OPT-IN: the
+    # unclipped σ is the rule the NWW default clips *because* a quasi-Newton
+    # probe can inflate the products (tests/regression/
+    # test_mu_oracle_inflation.py) — pair it with the exact Hessian. (Reading
+    # μ_prev as the previous barrier *target* instead was tested and diverges:
+    # μ_{k+1} = μ_aff³/μ_k².) If the unclipped σ overflows (σ·μ_gap not
+    # finite) the rule holds μ at μ_gap.
+    probing_sigma: ProbingSigma = "nww"
 
     def __post_init__(self) -> None:
+        if self.probing_sigma not in ("nww", "mehrotra"):
+            raise ValueError("probing_sigma must be 'nww' or 'mehrotra'")
         if not 0.0 < self.fallback_kappa < 1.0:
             raise ValueError("fallback_kappa must lie in (0, 1)")
         if self.fallback_window < 0:
@@ -372,13 +402,82 @@ class RegularizationOptions:
 
 @dataclass(frozen=True, slots=True)
 class BreedveldOptions:
-    """Alternative step controller (Breedveld 2017 §2, eqs. 34–36)."""
+    """Alternative step controller (Breedveld 2017 §2, eqs. 34–36).
+
+    ``tau`` is also the probe's fraction-to-boundary scaling of the
+    ``BarrierOptions.probing_sigma="mehrotra"`` μ oracle — under *any*
+    ``globalization``, including the default filter line search.
+
+    ``common_step`` (default ``False``; only read with
+    ``globalization="breedveld"``) moves the primal and the dual variables by
+    **one** step length, as Breedveld's own solver does on every problem with
+    a nonlinear term (Breedveld 2017 §2.1: ``α = min(α_z, α_w, α_x, α_y)``;
+    for *purely linear* problems the paper pairs ``α_x = α_w`` and
+    ``α_y = α_z`` separately, which this option does not reproduce):
+    ``α = min(α_p, α_d)`` of the fraction-to-boundary rule at
+    ``tau``, which the ratio control / Markov backtracking then shrinks as a
+    single length for ``(x, s, y_eq)`` and ``(y_ineq, z_L, z_U)`` together.
+    Only the step taken is coupled: the predictor–corrector's step-length
+    probes (the Mehrotra probe and keep-fraction test, the Gondzio
+    acceptance tests, the ``"quality"`` oracle) keep separate primal and
+    dual lengths — coupling them too re-targets μ and was measured worse on
+    the diagnosis case below. By default ipax takes separate
+    primal and dual lengths — the IPOPT filter line-search convention
+    (Wächter & Biegler 2006, eq. (15)), which lets the multipliers advance by
+    their own boundary length; the filter line search ignores this option.
+    Diagnosed on a convex radiotherapy benchmark (TROTS Head-and-Neck_01,
+    2026-09-28): separate first-step lengths ``α_p = 0.84``, ``α_d = 0.27``
+    from a start with every inequality multiplier at a large floor took the
+    objective from 4.6 to 7.9e8 without the ratio control (eq. (36))
+    rejecting the step; see ``docs/benchmarks/trots.md`` for the trajectory
+    and the measured effect of this option.
+
+    ``max_soc`` (default ``0`` = off; only read with
+    ``globalization="breedveld"``) adds a second-order correction (SOC) to
+    the Markov acceptance, following Wächter & Biegler 2006, §2.4 /
+    Algorithm A-5.5–A-5.8: when the *first* trial (the full
+    fraction-to-boundary step) is rejected by eqs. (34)–(35), did not
+    reduce the constraint violation (``θ_t ≥ θ0``) and is not itself feasible
+    to ``max(kkt_tol, 1e-8)`` (a deviation: a round-off residual has nothing
+    to correct), the filter line search's correction closure runs
+    ``max_soc`` accumulated rounds — each re-solves the step's KKT system
+    with the constraint residual at the corrected point as right-hand side,
+    under the same factorization-reuse policy — and the final corrected point
+    is judged once by the same Markov test at the full step length (a fixed
+    round count in place of A-5.9's κ_soc-guarded loop). An accepted
+    correction is taken at that length (so with ``common_step`` it also sets
+    the dual step); a rejected one falls back to the usual ``0.9``
+    backtracking, whose budget it does not consume. The ratio-control
+    iterations (eq. (36)) are unaffected. This is an ipax addition:
+    Breedveld's own solver has no second-order correction — the paper's
+    controller (§2) only backtracks. Try it when a Breedveld run with
+    *nonlinear* constraints backtracks heavily on steps that worsen
+    feasibility (the Maratos effect SOC exists to repair); on problems whose
+    constraints are all linear the Newton step keeps the linearized residual
+    exact up to round-off, which the feasibility gate above screens out.
+    Must be a non-negative integer; ``LineSearchOptions.max_soc`` governs the
+    filter line search only.
+    """
 
     tau: float = 0.995  # fraction-to-boundary scaling
     backtrack: float = 0.9  # multiplicative backtracking factor
     max_backtrack: int = 20
     armijo_c: float = 1e-4  # Markov-filter sufficient-decrease constant
     ratio_limit: float = 20.0  # eq. (36): f⁺γ_y⁺ / fγ_y ratio-control bound
+    # §2.1 / Algorithm 1: one step length for primal and dual (see docstring).
+    common_step: bool = False
+    # W&B 2006 §2.4 second-order corrections on a rejected full step (see
+    # docstring); 0 keeps Breedveld's backtracking-only controller.
+    max_soc: int = 0
+
+    def __post_init__(self) -> None:
+        count = self.max_soc
+        try:
+            valid = not isinstance(count, bool) and operator.index(count) >= 0
+        except TypeError:
+            valid = False
+        if not valid:
+            raise ValueError("max_soc must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -512,6 +611,47 @@ class RestorationOptions:
     budget call after call with slowly shrinking infeasibility, raise
     ``krylov.max_iter`` — neither the tolerance nor the damping policy is
     the lever there.
+
+    ``dense_materialize_max_elements`` bounds what the *dense* route may
+    densify. It forms ``Jᵀ Σ J`` block by block (equality rows, inequality
+    rows); a block whose ``m_b · n`` exceeds this bound and whose operator is
+    Gram-capable (:meth:`~ipax.backend.operators.LinearOperator.gram_capable`)
+    contributes ``J_bᵀ Σ_b J_b`` through its own ``gram`` and ``J_bᵀ r_b``
+    through ``rmatvec`` instead of through an ``m_b × n`` dense copy.
+    Mathematically identical; the round-off differs (the Gram is accumulated
+    by the operator's kernel, not by a dense GEMM). Blocks at or below the
+    bound, and blocks without a Gram, keep the verbatim densified arithmetic.
+    Motivation (TROTS 2026-09): ``Protons_01``'s inequality block is
+    369 445 × 1101, i.e. 3.2 GB of float64 per restoration iteration; on an
+    8 GB GPU one restoration spent 1127 s inside ``restore()``; from the
+    initial point, ``restore()`` took 560 s densified vs 9.7 s through the
+    Gram (CuPy, same 40 outer iterations to feasibility). The default
+    of 10⁷ elements (80 MB of float64) lies above every block of the S2MPJ
+    corpus the dense route was tuned on (largest ``m · n`` ≈ 3.9·10⁶,
+    TWIRIBG1, ≈ 7.7·10⁶ even if every row were two-sided), so that corpus
+    stays on the identical arithmetic.
+
+    ``dense_factorization`` selects how the *dense* route solves each
+    Levenberg–Marquardt trial ``(Jᵀ Σ J + λ I) Δx = −∇F`` (Nocedal & Wright
+    2006, §10.3). ``"lu"`` (the default) is the established
+    ``xp.linalg.solve`` (LU with partial pivoting), so the S2MPJ corpus
+    arithmetic is untouched. ``"cholesky"`` exploits that the matrix is
+    symmetric positive definite for ``λ > 0`` (a Gauss–Newton Gram plus a
+    positive shift): ``xp.linalg.cholesky`` plus two triangular solves
+    through the per-backend ``get_dense_cholesky_solve`` gap-filler — about
+    half the LU's flops (``n³/3`` vs ``2n³/3``; Golub & Van Loan 2013, §§3.2,
+    4.2). Use it when restoration's dense solves dominate the wall time at a
+    few thousand variables (TROTS ``Prostate_VMAT_101``, n = 1976, 2026-09:
+    the LU was ~60 % of restoration time, 157–200 LM trials per call; its
+    first 25 restoration iterations spent 17 s in LU solves vs 8 s in
+    Cholesky ones, NumPy). The gain shrinks with ``n`` on OpenBLAS — about
+    even at ``n = 5000``. The iterate agrees with the LU one to round-off,
+    not bit for bit. A Cholesky breakdown — the backend raising a numerical
+    failure, a non-finite factor or a non-finite solution (an extreme-scale,
+    numerically indefinite matrix) — falls back to the LU solve for that
+    trial. On a backend without a triangular-solve adapter (JAX,
+    array-api-strict) ``"cholesky"`` behaves exactly like ``"lu"``. The
+    iterative route (``linear_solver="krylov"``) ignores this option.
     """
 
     linear_solver: RestorationLinearSolver = "auto"
@@ -523,11 +663,20 @@ class RestorationOptions:
             adaptive_tol=False,
         )
     )
+    dense_materialize_max_elements: int = 10_000_000
+    dense_factorization: RestorationDenseFactorization = "lu"
 
     def __post_init__(self) -> None:
         if self.linear_solver not in ("auto", "dense", "krylov"):
             raise ValueError(
                 "restoration linear solver must be 'auto', 'dense' or 'krylov'"
+            )
+        if self.dense_factorization not in ("lu", "cholesky"):
+            raise ValueError("dense_factorization must be 'lu' or 'cholesky'")
+        limit = self.dense_materialize_max_elements
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError(
+                "dense_materialize_max_elements must be a positive integer"
             )
 
 
@@ -670,15 +819,86 @@ class SparseOptions:
     end-to-end. Whenever the NE prerequisites are unmet, or the problem is
     not tall, auto stays on ``"augmented"`` — so non-tall problems are
     untouched by construction.
+
+    **Perturbed-pivot solves.** A sparse factorization that uses *static
+    pivoting* does not reorder around a pivot that is too small; it replaces
+    it by a tiny ``±ε`` and so factors ``A + E`` instead of ``A`` (the GESP
+    strategy; Li & Demmel 2003). An adapter doing so pairs the factorization
+    with iterative refinement against the unperturbed ``A``,
+    ``x ← x + (A+E)⁻¹ (b − A x)`` (Higham 2002, ch. 12), and then certifies
+    the solve: a right-hand-side column whose relative residual
+    ``‖b − A x‖∞ / ‖b‖∞`` still exceeds a threshold raises
+    :class:`~ipax.linalg.solver.LinearSolveError`, so the IPM regularizes the
+    system on its δ_w ladder (Wächter & Biegler 2006, §3.1) instead of taking
+    a step from a solve that does not solve it — the inexact-Newton condition
+    ``‖b − A x‖ ≤ η ‖b‖`` (Dembo, Eisenstat & Steihaug 1982). Only solves on
+    a factorization that actually perturbed a pivot pay for either.
+
+    ``perturbed_pivot_refinement_steps`` (default ``10``, IPOPT's
+    ``max_refinement_steps``) caps the refinement steps per solve; ``0``
+    disables refinement, leaving the bare certificate. The loop stops earlier
+    once the residual reaches working accuracy or a step stops reducing it
+    (IPOPT's ``PDFullSpaceSolver`` stopping rules).
+    ``perturbed_pivot_max_residual`` (default ``1e-2``) is the certificate's
+    threshold ``η`` on the refined residual: lower it to reject inexact
+    solves sooner (more δ_w escalations), raise it to accept them. It must be
+    finite and positive — an infinite threshold would silently switch the
+    certificate off. Adapters whose factorizations never perturb a pivot
+    (threshold-pivoting LDLᵀ, LU) ignore both fields; the backends guide says
+    which adapters read them. The defaults are those adapters' own defaults,
+    so leaving the fields alone changes nothing.
+
+    **Reproducibility.** ``deterministic=True`` asks the sparse-direct adapter
+    for run-to-run reproducible factorizations where the backend offers them,
+    at a factorization-time cost; adapters without such a mode ignore it. A
+    parallel factorization may reduce in a different order on every run, so
+    two solves of the same problem can then differ in the last bits, and an
+    interior-point trajectory amplifies such differences. On the CUDA route
+    the factorization is the last such source: the adapter's own sparse
+    products and COO builds are reproducible in every mode (bar the
+    transposed products of an operator too large to cache its transpose),
+    so with ``deterministic=True`` a CuPy sparse solve repeats bit for bit on
+    the same machine and software stack, within the limits the backends
+    guide lists (a ``max_time`` stop, cuBLAS and cuDSS versions). The default (``False``) keeps the
+    backend's own, fastest mode; the backends guide says which adapters read
+    the field and what it costs.
     """
 
     kkt_route: SparseKKTRoute = "auto"
+    # Perturbed-pivot solve policy (see docstring); read only by adapters whose
+    # factorization uses static pivoting.
+    perturbed_pivot_refinement_steps: int = 10
+    perturbed_pivot_max_residual: float = 1e-2
+    # Reproducible factorizations (see docstring); read only by adapters whose
+    # backend offers such a mode.
+    deterministic: bool = False
 
     def __post_init__(self) -> None:
         if self.kkt_route not in ("auto", "augmented", "normal_equations"):
             raise ValueError(
                 "sparse kkt_route must be 'auto', 'augmented' or 'normal_equations'"
             )
+        steps = self.perturbed_pivot_refinement_steps
+        try:
+            valid = not isinstance(steps, bool) and operator.index(steps) >= 0
+        except TypeError:
+            valid = False
+        if not valid:
+            raise ValueError(
+                "perturbed_pivot_refinement_steps must be a non-negative integer"
+            )
+        # Typed ``object``: user code may pass anything (a bool, a string).
+        threshold: object = self.perturbed_pivot_max_residual
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, numbers.Real)
+            or not 0.0 < float(threshold) < math.inf
+        ):
+            raise ValueError("perturbed_pivot_max_residual must be finite and positive")
+        # Typed ``object``: a truthy non-bool (1, "yes") is a likely typo.
+        deterministic: object = self.deterministic
+        if not isinstance(deterministic, bool):
+            raise ValueError("deterministic must be a bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -722,17 +942,41 @@ class CorrectionsOptions:
 
     ``gondzio_gamma`` sets the centrality neighborhood and
     ``gondzio_max_corrections`` caps its extra solves per outer iteration.
+
+    ``gondzio_variant`` picks the Gondzio correction loop and only applies
+    with ``method="gondzio"`` (ignored otherwise). ``"ipax"``
+    (default) probes trial step lengths enlarged by ``+0.1``, projects the
+    trial products into the symmetric box ``[γμ, μ/γ]`` and keeps a
+    correction that grows the summed step length by ``0.02``.
+    ``"breedveld"`` is Breedveld et al. 2017's variant (supplement A.2,
+    eqs. (10)–(15)), run after the full Mehrotra corrector: trial step
+    ``α̌ = min(1.1·α, 1)``; each trial product ``t`` below ``0.2·μ`` is
+    corrected by ``0.2·μ − t``, each above ``8·μ`` by
+    ``max(8·μ − t, −5·8·μ)`` (eqs. (13)–(14) in the *capped* reading: the
+    literal reading of the ``5·β_max`` assignment as a second target tier is
+    non-monotone in ``t``, so ipax caps the downward correction of large
+    outliers as Gondzio 1996 does — see
+    ``ipax.ipm.corrections._breedveld_correction``); a correction kept only
+    when the step length grows to at least ``1.07·α``. Both stop at the first
+    rejected correction or after ``gondzio_max_corrections``. Under both
+    variants the Mehrotra corrector that precedes the loop still clips its
+    second-order targets into ``[γμ, μ/γ]`` with ``γ = gondzio_gamma``
+    (Colombo & Gondzio 2008) — ``gondzio_gamma`` is *not* inert under
+    ``"breedveld"``. OPT-IN.
     """
 
     method: CorrectionsMethod = "none"
     gondzio_max_corrections: int = 2  # Gondzio K_max (extra corrector solves)
     gondzio_gamma: float = 0.1  # centrality-box fraction γ ∈ (0, 1)
+    gondzio_variant: GondzioVariant = "ipax"
 
     def __post_init__(self) -> None:
         if self.method not in ("none", "mehrotra", "gondzio"):
             raise ValueError(
                 "corrections method must be 'none', 'mehrotra', or 'gondzio'"
             )
+        if self.gondzio_variant not in ("ipax", "breedveld"):
+            raise ValueError("gondzio_variant must be 'ipax' or 'breedveld'")
         if self.gondzio_max_corrections < 0:
             raise ValueError("gondzio_max_corrections must be non-negative")
         if not 0.0 < self.gondzio_gamma < 1.0:
@@ -1000,6 +1244,7 @@ __all__ = [
     "DenseOptions",
     "FreeModeAcceptance",
     "Globalization",
+    "GondzioVariant",
     "HessianMode",
     "KrylovMethod",
     "KrylovOptions",
@@ -1011,7 +1256,9 @@ __all__ = [
     "MuSchedule",
     "OptimalityConditionOptions",
     "Options",
+    "ProbingSigma",
     "RegularizationOptions",
+    "RestorationDenseFactorization",
     "RestorationLinearSolver",
     "RestorationOptions",
     "ScalingMethod",

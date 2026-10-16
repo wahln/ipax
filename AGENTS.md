@@ -205,6 +205,17 @@ kernels*, chained dose-influence products; hard-coded RT cost-functions
 dimensionality & sparsity in mind, but the RT-specific kernels belong in a
 separate downstream layer.
 
+**Where the guardrails apply.** The scope above governs the library, i.e. the
+`ipax/` package. `benchmarks/` (corpus loaders, generators, runners) and
+`examples/` are application-edge demonstrators and *may* implement
+out-of-scope, domain-specific machinery on top of the public `Problem` /
+`LinearOperator` protocols — e.g. the TROTS loader's per-structure tiled
+dose-matrix Gram and grouped exact Hessian (Breedveld 2017; van Haveren &
+Breedveld 2019). Such code must reach the solver only through those
+protocols (an operator supplying its own `gram`, a `Problem` supplying its
+own Hessian), never through changes to `ipax/`; it is the reference for what a
+downstream RT layer would look like, not part of the solver's API.
+
 ---
 
 ## Direction
@@ -302,6 +313,12 @@ Steps:
   implementation developed and tuned for radiation therapy treatment planning."
   *Computational Optimization and Applications* 68(2), 209–242.
   <https://doi.org/10.1007/s10589-017-9919-4>. TROTS dataset <http://www.trots.eu>.
+- van Haveren, R. & Breedveld, S. (2019). "Fast and exact Hessian computation for
+  a class of nonlinear functions used in radiation therapy treatment planning."
+  *Physics in Medicine & Biology* 64, 16NT01.
+  <https://doi.org/10.1088/1361-6560/ab1e17>; corrigendum *Phys. Med. Biol.* 65
+  (2020) 079501 <https://doi.org/10.1088/1361-6560/ab7ac0> (the TROTS loader's
+  grouped exact Hessian, eqs. (8)–(9))
 - Array API `linalg` extension:
   <https://data-apis.org/array-api/latest/extensions/linear_algebra_functions.html>
 - `array-api-compat` / `array-api-extra`:
@@ -318,6 +335,15 @@ Steps:
   programming." *Journal of Optimization Theory and Applications* 89(3), 507–541.
   <https://doi.org/10.1007/BF02275347> (centrality condition behind the
   free-mode μ floor)
+- Mehrotra, S. (1992). "On the implementation of a primal–dual interior point
+  method." *SIAM Journal on Optimization* 2(4), 575–601.
+  <https://doi.org/10.1137/0802028> (Mehrotra predictor–corrector and σ rule;
+  `BarrierOptions.probing_sigma="mehrotra"`)
+- Gondzio, J. (1996). "Multiple centrality corrections in a primal–dual method
+  for linear programming." *Computational Optimization and Applications* 6,
+  137–156. <https://doi.org/10.1007/BF00249643> (multiple centrality
+  corrections; the outlier cap behind the capped reading of the Breedveld
+  Gondzio variant, `gondzio_variant="breedveld"`)
 - Colombo, M. & Gondzio, J. (2008). "Further development of multiple centrality
   correctors for interior point methods." *Computational Optimization and
   Applications* 41(3), 277–305. <https://doi.org/10.1007/s10589-007-9106-0>
@@ -326,3 +352,36 @@ Steps:
   by iterative refinement in three precisions." *SIAM Journal on Scientific
   Computing* 40(2), A817–A847. <https://doi.org/10.1137/17M1140819>
   (mixed-precision Gram accumulation + refinement in the dense condensed route)
+- Golub, G. H. & Van Loan, C. F. (2013). *Matrix Computations*, 4th ed. Johns
+  Hopkins University Press. (Cholesky vs LU operation counts, §§3.2, 4.2, and
+  the `potrf` success criterion behind `checked_cholesky` and the restoration
+  `dense_factorization="cholesky"` option)
+- Li, X. S. & Demmel, J. W. (2003). "SuperLU_DIST: A scalable distributed-memory
+  sparse direct solver for unsymmetric linear systems." *ACM Transactions on
+  Mathematical Software* 29(2), 110–140. <https://doi.org/10.1145/779359.779361>
+  (static pivoting paired with iterative refinement; why a cuDSS factorization
+  with perturbed pivots is refined and then certified by its residual in the
+  CuPy sparse adapter)
+- Higham, N. J. (2002). *Accuracy and Stability of Numerical Algorithms*, 2nd
+  ed. SIAM. <https://doi.org/10.1137/1.9780898718027> (ch. 12, iterative
+  refinement: the contraction ≈ ‖(A+E)⁻¹E‖ behind the cuDSS perturbed-pivot
+  refinement)
+- IPOPT's iterative-refinement rules: `PDFullSpaceSolver::Solve` and the
+  options `max_refinement_steps = 10`, `residual_ratio_max = 1e-10`,
+  `residual_improvement_factor = 1`, `residual_ratio_singular = 1e-5`
+  (<https://coin-or.github.io/Ipopt/OPTIONS.html>, IPOPT 3.14; the stopping
+  rules of the cuDSS perturbed-pivot refinement)
+- Duff, I. S. & Koster, J. (2001). "On algorithms for permuting large entries to
+  the diagonal of a sparse matrix." *SIAM Journal on Matrix Analysis and
+  Applications* 22(4), 973–996. <https://doi.org/10.1137/S0895479899358443>
+  (maximum weighted matching with scaling — cuDSS's `USE_MATCHING`; measured
+  and not adopted, docs/benchmarks/s2mpj.md "cuDSS matching and pivot options")
+- Duff, I. S. & Pralet, S. (2005). "Strategies for scaling and pivoting for
+  sparse symmetric indefinite problems." *SIAM Journal on Matrix Analysis and
+  Applications* 27(2), 313–340. <https://doi.org/10.1137/04061043X>
+  (symmetric matching into 2×2 pivots, which preserves the LDLᵀ inertia — the
+  option cuDSS 0.7 lacks)
+- Dembo, R. S., Eisenstat, S. C. & Steihaug, T. (1982). "Inexact Newton methods."
+  *SIAM Journal on Numerical Analysis* 19(2), 400–408.
+  <https://doi.org/10.1137/0719025> (the inexact-Newton forcing of the Krylov
+  route)

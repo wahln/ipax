@@ -50,3 +50,11 @@ Thumbs.db
 # Datasets (TROTS etc. are downloaded, never committed)
 data/
 *.mat
+# ...except the small, licensed reference tables that ship with the benchmarks
+# (see benchmarks/corpus/data/breedveld2017/README.md). Un-ignore the directory
+# itself (``data/`` above excludes it, and git cannot re-include a file inside
+# an excluded directory), ignore everything in it, then re-include only that
+# one subdirectory.
+!benchmarks/corpus/data/
+benchmarks/corpus/data/*
+!benchmarks/corpus/data/breedveld2017/

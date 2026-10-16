@@ -156,6 +156,64 @@ in [`KrylovOptions`](../reference.md#ipax.options.KrylovOptions).
     for **moderate `n` with a genuinely sparse Jacobian**, and even there its
     edge over the dense route is small once BLAS is threaded.
 
+### Sparse-direct solves on perturbed pivots
+
+Some sparse factorizations use *static pivoting*: instead of reordering around
+a pivot that is too small, they replace it by a tiny `±ε` and factor a slightly
+perturbed matrix. An adapter that does this refines each solve on such a
+factorization against the unperturbed matrix. It then rejects a solve whose
+relative residual is still too large, which sends the step to the
+regularization ladder. Two fields of
+[`SparseOptions`](../reference.md#ipax.options.SparseOptions) set this policy:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `perturbed_pivot_refinement_steps` | `10` | Maximum refinement steps per solve (IPOPT's `max_refinement_steps`); `0` turns refinement off. |
+| `perturbed_pivot_max_residual` | `1e-2` | Reject a solve whose refined relative residual `‖b − A x‖∞ / ‖b‖∞` exceeds this. Finite and positive. |
+
+```python
+from ipax.options import SparseOptions
+
+opts = ipax.Options(
+    linsolve="sparse",
+    sparse=SparseOptions(perturbed_pivot_refinement_steps=0),  # unrefined
+)
+```
+
+Today the CUDA sparse route (cuDSS, reached from CuPy, Torch-CUDA and JAX-GPU
+arrays) is the only one that perturbs pivots; see
+[Backends & hardware](backends.md#gpu). The CPU route (Feral `LDLᵀ`, SuperLU)
+ignores both fields. The defaults are the ones the CUDA adapter has always
+used, so leaving them alone changes nothing.
+
+### Reproducible sparse factorizations
+
+A parallel sparse factorization may sum in a different order on every run, so
+two factorizations of the same matrix can differ in the last bits, and an
+interior-point trajectory amplifies such differences into different
+iteration counts. Another field of `SparseOptions` asks for the reproducible
+mode where the backend has one:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `deterministic` | `False` | Ask the sparse-direct adapter for run-to-run reproducible factorizations where the backend offers them, at a factorization-time cost. Adapters without such a mode ignore it. Must be a `bool`. |
+
+```python
+opts = ipax.Options(linsolve="sparse", sparse=SparseOptions(deterministic=True))
+```
+
+Today the CUDA sparse route reads it: it switches cuDSS to
+`DETERMINISTIC_MODE`, which makes repeated factorizations bitwise identical.
+The CuPy adapter's own sparse products and COO→CSR builds are
+reproducible whatever this option says, except the transposed products of
+an operator whose transpose would exceed a 512 MiB cache cap. So the
+factorization was the last run-dependent step: with `deterministic=True` a
+CuPy sparse solve repeats bit for bit on the same machine and software
+stack, within the limits listed under
+[Reproducibility on CUDA](backends.md#reproducibility-on-cuda). The CPU route (Feral `LDLᵀ`, SuperLU)
+is reproducible already and ignores the option. The same section gives the
+measured cost.
+
 ## Problem scaling
 
 Badly scaled problems converge faster with gradient-based auto-scaling (IPOPT's
@@ -194,6 +252,24 @@ ipax.Options(corrections="mehrotra")
 Corrections degenerate to the plain step on problems with no inequalities or
 bounds, so they never hurt there. Tune Gondzio via
 [`CorrectionsOptions`](../reference.md#ipax.options.CorrectionsOptions).
+`CorrectionsOptions(method="gondzio", gondzio_variant="breedveld")`
+*(opt-in)* runs Breedveld et al. 2017's Gondzio loop instead (supplement A.2):
+after the full Mehrotra corrector (whose second-order targets are still
+clipped into [γμ, μ/γ] with `gondzio_gamma`), the trial step
+α̌ = min(1.1·α, 1), a centrality correction of each trial product t —
+0.2·μ − t below 0.2·μ, max(8·μ − t, −5·8·μ) above 8·μ, zero in between —
+and a correction kept only when the step length grows to at least 1.07·α.
+`gondzio_variant` only applies with `method="gondzio"`.
+
+!!! note "Capped reading of eqs. (13)–(14)"
+    The supplement's eqs. (13)–(14) assign `5 β_max μ − t` to products above
+    `5 β_max μ` *after* assigning `β_max μ − t` to those above `β_max μ`.
+    Read literally as a second target tier, the correction is non-monotone in
+    t (μ = 1: t = 39 → −31, t = 41 → −1, t = 1000 → −960). ipax instead
+    caps the downward correction of large outliers at `5 β_max μ` in
+    magnitude, which is monotone in t and matches Gondzio (1996)'s outlier
+    cap. This is ipax's interpretation of the supplement, not a verbatim
+    transcription.
 
 ## Globalization
 
@@ -204,6 +280,56 @@ bounds, so they never hurt there. Tune Gondzio via
   restoration phase. Robust on nonconvex problems.
 - `"breedveld"` — a lighter Markov-filter + ratio-control step controller tuned
   for convex/RT-like problems ([`BreedveldOptions`](../reference.md#ipax.options.BreedveldOptions)).
+
+Both strategies move the primal and the dual variables by separate
+fraction-to-boundary step lengths (the IPOPT convention, Wächter & Biegler
+2006, eq. (15)). `BreedveldOptions(common_step=True)` makes the `"breedveld"`
+controller take one step length for both, `α = min(α_p, α_d)`, as Breedveld's
+own solver does (Breedveld et al. 2017, §2.1): the ratio control and the
+Markov backtracking then shrink that single α (the predictor–corrector's
+step-length probes keep separate lengths). It is opt-in (the filter line search
+ignores it). On TROTS `Head-and-Neck_01` the separate lengths of the first
+step (`α_p = 0.84`, `α_d = 0.27`) send the objective from 4.6 to 7.9·10⁸,
+which the ratio control does not reject; see the
+[TROTS benchmark page](../benchmarks/trots.md) for the diagnosis.
+
+```python
+from ipax import Options
+from ipax.options import BreedveldOptions
+
+opts = Options(globalization="breedveld", breedveld=BreedveldOptions(common_step=True))
+```
+
+`BreedveldOptions(max_soc=N)` *(opt-in, default `0` = off)* adds a
+second-order correction to the `"breedveld"` controller — the Maratos-effect
+repair the filter line search already has (Wächter & Biegler 2006, §2.4).
+Breedveld's own solver has no second-order correction: the paper's controller
+(Breedveld et al. 2017, §2) only backtracks, so this is an ipax addition. When
+the *first* trial — the full fraction-to-boundary step — fails the Markov test
+(eqs. (34)–(35)) without reducing the constraint violation, and is not itself
+feasible to `max(kkt_tol, 1e-8)`, the filter's correction runs `N` accumulated
+rounds, each re-solving the step's KKT system with the constraint residual at
+the corrected point as the right-hand side (the same factorization-reuse
+policy), and the final corrected point is judged once by the same Markov test
+at the full step length. An accepted correction is taken at that length — with
+`common_step=True` it also moves the duals — and a rejected one falls back to
+the usual `0.9` backtracking without shortening its budget. The ratio-control
+iterations (eq. (36)) are unchanged. `LineSearchOptions.max_soc` governs the
+filter line search only; the two counts are independent.
+
+The correction only has something to do on problems with *nonlinear*
+constraints — with linear constraints the Newton step satisfies the
+linearization exactly, so a trial worsens feasibility only at round-off, which
+the feasibility gate screens out — so try it when a `"breedveld"` run with
+nonlinear constraints backtracks heavily on steps that increase the constraint
+violation. On the TROTS corpus it fires on one of six cases
+(Liver_01: one accepted correction, 57 → 51 iterations) and is inert on the
+rest, so it stays off by default — see the
+[Breedveld SOC A/B](../benchmarks/trots.md#breedveld-second-order-correction-2026-09-29).
+
+```python
+opts = Options(globalization="breedveld", breedveld=BreedveldOptions(max_soc=1))
+```
 
 ### Restoration linear solver
 
@@ -248,6 +374,56 @@ dense random Jacobians of condition 10³ and 10⁶ from `n = 100` to `4 000`,
 both routes reaching the same feasibility. What the dense reference buys
 below the cutoff is robustness on Jacobians so ill-conditioned that CG
 truncates (see the work-cap note below), which does not depend on `n`.
+
+The dense route never densifies a *tall* Jacobian it does not have to.
+It assembles `Jᵀ Σ J` block by block (equality rows, inequality rows). A block
+with more than `RestorationOptions.dense_materialize_max_elements` entries
+(`m_b · n`, default 10⁷ = 80 MB of float64) whose operator can form its own
+weighted Gram (`gram_capable()`, e.g. the SciPy/CuPy sparse adapters and the
+TROTS loader's tiled operator) contributes `J_bᵀ Σ_b J_b` through `gram` and
+`J_bᵀ r_b` through `rmatvec` instead of an `m_b × n` dense copy. The matrices
+are the same; only the round-off differs. Smaller blocks, and operators
+without a Gram, keep the densified reference arithmetic: every block in the
+S2MPJ corpus is below the default (largest `m · n` ≈ 3.9·10⁶), so those
+results do not change. The motivating case is TROTS `Protons_01`, whose
+lowered dose block is 369 445 × 1101: densifying it cost 3.2 GB per restoration
+iteration, and on an 8 GB GPU a single restoration phase ran for 1127 s.
+Measured from its initial point on CuPy, `restore()` takes 560 s with the
+block densified and 9.7 s through the Gram, with the same 40 outer iterations
+to feasibility.
+
+```python
+options = Options(
+    restoration=RestorationOptions(dense_materialize_max_elements=2_000_000),
+)
+```
+
+Each damping trial of the dense route solves `(Jᵀ Σ J + λ I) Δx = −∇F`, by
+default with `xp.linalg.solve` (an LU with partial pivoting).
+`RestorationOptions.dense_factorization="cholesky"` uses the fact that this
+matrix is symmetric positive definite for `λ > 0`: it factors it with
+`xp.linalg.cholesky` and back-substitutes through the per-backend triangular
+solve (SciPy `cho_solve` on NumPy, `torch.cholesky_solve`, CuPy
+`solve_triangular`), about half the LU's flops. The iterate agrees with
+the LU one to round-off, not bit for bit. If the Cholesky breaks down (the
+backend raises, or the factor or the solution is non-finite — an extreme-scale
+Gram can be numerically indefinite), that trial is solved by LU instead. On
+backends without a triangular-solve adapter (JAX, array-api-strict) the option
+behaves exactly like `"lu"`, and the iterative route ignores it. The default
+stays `"lu"`, so S2MPJ results do not change. Consider it when dense
+restoration solves dominate the wall time at a few thousand variables: on TROTS
+`Prostate_VMAT_101` (n = 1976) the LU was about 60 % of restoration time. In the
+first 25 restoration iterations from its initial point (54 trials, NumPy,
+provisional timings on a shared machine) the solves took 8 s instead of 17 s,
+`restore()` took 20 s instead of 28 s, and both options reached the same point
+to a relative 6·10⁻¹⁴. The speedup shrinks with `n` on OpenBLAS: at `n = 5000`
+the Cholesky and LU solves measured about even.
+
+```python
+options = Options(
+    restoration=RestorationOptions(dense_factorization="cholesky"),
+)
+```
 
 The one knob to know is the work cap, `RestorationOptions.krylov.max_iter`
 (default 200). Conjugate gradients on the Gauss-Newton normal operator sees
@@ -319,6 +495,19 @@ opt-in.
   corrector this costs one extra KKT solve per iteration; with corrections
   active the affine solve is shared. Rescues 12–18 problems per config that
   monotone misses — worth trying when monotone stalls.
+  `BarrierOptions(probing_sigma="mehrotra")` *(opt-in)* is the textbook
+  unclipped rule as Breedveld et al. 2017 run it (Mehrotra 1992; supplement
+  A.1, eqs. (4)–(7)): the same σ = (μ_aff/μ)³ against the current average
+  complementarity, but σ is **not clipped** at 1 (μ may rise above the current
+  gap) and the affine probe is cut back by `BreedveldOptions.tau` (0.995)
+  instead of taking the maximal step — under either `globalization`, not only
+  `"breedveld"`. `probing_sigma` only applies with `mu_schedule="probing"`;
+  should the unclipped σ overflow, μ is held at the current gap. The default
+  `"nww"` clips σ because a
+  quasi-Newton probe can inflate the complementarity products — use the
+  unclipped rule with `hessian="exact"`. The μ floor, the centrality floor and
+  the KKT-error fallback below still apply (`kappa_centrality=0.0` /
+  `fallback="never"` opt out of them).
 - `"adaptive"` — LOQO centrality rule: μ = σ·(average complementarity), where σ
   grows with the deviation of the smallest complementarity product from the
   average (Nocedal, Wächter & Waltz 2009, eq. (3.6)). Re-targeted every

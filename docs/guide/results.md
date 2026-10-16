@@ -115,8 +115,11 @@ print(res.derivative_sources)
 `res.history` is a tuple of
 [`IterationRecord`](../reference.md#ipax.result.IterationRecord)s, one per
 iteration, holding the objective, `mu`, `theta` (constraint violation), the KKT
-error and its components, step lengths, applied regularization, and per-row
-timing splits. Use it to plot convergence or diagnose a slow solve:
+error and its components, step lengths, applied regularization, per-row
+timing splits, and whether the row was a restoration jump (`restored`) or a
+second-order-corrected point (`used_soc`; `soc_attempted` marks that a
+correction was tried this iteration, accepted or not). Use it to plot
+convergence or diagnose a slow solve:
 
 ```python
 import matplotlib.pyplot as plt

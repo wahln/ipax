@@ -70,6 +70,14 @@ class CaseResult:
     gradient_source: str
     hessian_source: str
     error: str | None  # exception text when the solve raised, else None
+    # Seconds spent in the case's ``prepare_solve`` hook; already included in
+    # ``solve_time`` (paper accounting), reported separately for attribution.
+    prepare_time: float = 0.0
+    # Second-order-correction counts summed from ``result.history`` (either
+    # globalization's correction — see ``IterationRecord.used_soc`` /
+    # ``.soc_attempted``); 0 for both when the case never attempts one.
+    soc_attempted: int = 0
+    soc_accepted: int = 0
 
 
 def capture_environment() -> dict[str, object]:
@@ -121,7 +129,9 @@ def run_case(
     aborts the sweep.
     """
 
-    def _fail(status: str, error: str) -> CaseResult:
+    def _fail(status: str, error: str, prepare_seconds: float = 0.0) -> CaseResult:
+        # A failed row keeps the time the ``prepare_solve`` hook already spent
+        # (same paper accounting as a successful row: it is part of solve_time).
         return CaseResult(
             problem=case.name,
             kind=case.kind,
@@ -142,7 +152,8 @@ def run_case(
             expected_objective=None,
             expected_infeasible=False,
             pbclass=None,
-            solve_time=0.0,
+            solve_time=prepare_seconds,
+            prepare_time=prepare_seconds,
             linear_solver="",
             gradient_source="n/a",
             hessian_source="n/a",
@@ -154,10 +165,32 @@ def run_case(
     except Exception:  # report build failures as a row
         return _fail("build_error", traceback.format_exc(limit=2).strip())
 
+    prepare_seconds = 0.0
+    if case.prepare_solve is not None:
+        start = perf_counter()
+        try:
+            x0, warm_start, prepared = case.prepare_solve(problem, x0, options)
+        except Exception:  # report initialisation failures as a row
+            return _fail(
+                "prepare_error",
+                traceback.format_exc(limit=2).strip(),
+                perf_counter() - start,
+            )
+        # Counted in the row's solve_time: the initialisation — the starting
+        # point as well as any multiplier solve — is part of the method
+        # (Breedveld et al. 2017 report runtimes including it), which is why
+        # the hook, not the untimed ``build``, produces the solve's ``x0``.
+        prepare_seconds = perf_counter() - start
+
     try:
-        result = ipax.solve(problem, x0, options=options)
+        if case.prepare_solve is None:
+            result = ipax.solve(problem, x0, options=options)
+        else:
+            result = ipax.solve(problem, x0, options=prepared, warm_start=warm_start)
     except Exception:  # report solve failures as a row
-        return _fail("solve_error", traceback.format_exc(limit=2).strip())
+        return _fail(
+            "solve_error", traceback.format_exc(limit=2).strip(), prepare_seconds
+        )
 
     optimum = case.optimum(problem)
     error_vs_optimum = None if optimum is None else _inf_norm(xp, result.x, optimum)
@@ -212,11 +245,14 @@ def run_case(
         expected_objective=expected_objective,
         expected_infeasible=expected_infeasible,
         pbclass=pbclass,
-        solve_time=result.solve_time,
+        solve_time=result.solve_time + prepare_seconds,
+        prepare_time=prepare_seconds,
         linear_solver=result.linear_solver,
         gradient_source=sources.gradient,
         hessian_source=sources.hessian,
         error=None,
+        soc_attempted=sum(1 for r in result.history if r.soc_attempted),
+        soc_accepted=sum(1 for r in result.history if r.used_soc),
     )
 
 

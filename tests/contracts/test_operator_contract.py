@@ -88,6 +88,34 @@ class LinearOperatorContract:
             factor = namespace.linalg.cholesky(dense)
         assert bool(namespace.all(namespace.isfinite(factor)))
 
+    def test_dense_matrix_with_gram_is_honest_when_offered(self, namespace, tol):
+        # ``dense_matrix_with_gram`` declines by default; an operator that
+        # fuses must return ``A + Jᵀ diag(w) J`` for *any* Jacobian it is
+        # handed (or decline it), symmetric to round-off.
+        from ipax.backend.operators import Dense
+
+        with implemented(self.implementation_reason):
+            op = self.make_operator(namespace)
+            dense = self.make_dense(namespace)
+        n_rows, n_cols = op.shape
+        if n_rows != n_cols:
+            return
+        J = array(
+            namespace,
+            [
+                [((-1.0) ** (i + k)) * (1.0 + i + 0.5 * k) for k in range(n_cols)]
+                for i in range(3)
+            ],
+        )
+        w = array(namespace, [0.5, 1.0, 2.0])
+        try:
+            fused = op.dense_matrix_with_gram(Dense(J), w)
+        except NotImplementedError:
+            return
+        expected = dense + namespace.matmul(transpose(namespace, J), w[:, None] * J)
+        assert_allclose(namespace, fused, expected, **tol)
+        assert_allclose(namespace, fused, transpose(namespace, fused), **tol)
+
     def test_exact_lbfgs_inverse_claim_is_honest(self, namespace, tol):
         # ``lbfgs_inverse_is_exact`` defaults to False; an operator that claims
         # exactness must back it with an apply that inverts it to round-off.

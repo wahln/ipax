@@ -26,6 +26,8 @@ These tests stub the corpus, so they run without an S2MPJ checkout.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from benchmarks.runners import s2mpj as runner
@@ -101,3 +103,142 @@ def test_no_prefix_means_no_marker(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "s2mpj_problems", lambda *a, **k: [_StubCase()])
     runner._run_problem_cases(*_args())
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("backend", "policy", "applied"),
+    [
+        ("cupy", (0, 1e-5), [(0, 1e-5, False)]),
+        ("cupy", (None, None), []),
+        ("numpy", (3, None), []),
+        ("cupy", (None, None, False), []),
+        ("cupy", (None, None, True), [(None, None, True)]),
+        ("numpy", (None, None, True), []),
+    ],
+)
+def test_cudss_policy_override_reaches_only_cupy_workers(
+    monkeypatch, backend, policy, applied
+):
+    # The A/B lever for the cuDSS perturbed-pivot policy is applied per worker
+    # to the configs' options, only on the backend it concerns, and only when
+    # asked for.
+    seen: list[tuple[object, object, object]] = []
+
+    def _record(configs, steps, res, deterministic=False):
+        seen.append((steps, res, deterministic))
+        return configs
+
+    monkeypatch.setattr(runner, "import_namespace", lambda name: None)
+    monkeypatch.setattr(runner, "_with_cudss_policy", _record)
+    monkeypatch.setattr(runner, "s2mpj_problems", lambda *a, **k: [_StubCase()])
+    runner._run_problem_cases(*_args(backend=backend), cudss_policy=policy)
+    assert seen == applied
+
+
+def test_cudss_policy_is_set_through_sparse_options():
+    # The flags reach the adapter as SparseOptions fields (the public path),
+    # not by patching adapter module state; None keeps the option default.
+    from ipax.options import SparseOptions
+
+    configs = runner.default_configs(10, 5.0)
+    both = runner._with_cudss_policy(configs, 0, 1e-5)
+    assert [label for label, _, _ in both] == [label for label, _, _ in configs]
+    for (_, before, cap_before), (_, after, cap_after) in zip(
+        configs, both, strict=True
+    ):
+        assert after.sparse.perturbed_pivot_refinement_steps == 0
+        assert after.sparse.perturbed_pivot_max_residual == 1e-5
+        assert after.sparse.kkt_route == before.sparse.kkt_route
+        assert after.hessian == before.hessian and cap_after == cap_before
+
+    (_, steps_only, _), *_ = runner._with_cudss_policy(configs, 3, None)
+    assert steps_only.sparse.perturbed_pivot_refinement_steps == 3
+    default = SparseOptions().perturbed_pivot_max_residual
+    assert steps_only.sparse.perturbed_pivot_max_residual == default
+
+    assert runner._with_cudss_policy(configs, None, None) is configs
+    assert runner._with_cudss_policy(configs, None, None, False) is configs
+    with pytest.raises(ValueError, match="perturbed_pivot_refinement_steps"):
+        runner._with_cudss_policy(configs, -1, None)
+
+    deterministic = runner._with_cudss_policy(configs, None, None, True)
+    for (_, before, _), (_, after, _) in zip(configs, deterministic, strict=True):
+        assert after.sparse.deterministic is True
+        assert (
+            after.sparse.perturbed_pivot_refinement_steps
+            == before.sparse.perturbed_pivot_refinement_steps
+        )
+
+
+def _fake_checkout(tmp_path):
+    root = tmp_path / "s2mpj"
+    (root / "python_problems").mkdir(parents=True)
+    (root / "s2mpjlib.py").write_text("", encoding="utf-8")
+    return str(root)
+
+
+@pytest.mark.parametrize(
+    "flag", [["--cudss-refinement-steps", "-1"], ["--cudss-max-residual", "inf"]]
+)
+def test_invalid_cudss_policy_flags_fail_the_parse(tmp_path, capsys, flag):
+    # Rejected up front, not by the first worker after the sweep started.
+    argv = ["--dir", _fake_checkout(tmp_path), "--names", "X", "--backends", "cupy"]
+    with pytest.raises(SystemExit):
+        runner.main([*argv, *flag, "--out", str(tmp_path / "r")])
+    assert flag[0] in capsys.readouterr().err
+
+
+def test_resume_refuses_to_mix_cudss_policies(tmp_path, capsys):
+    # A report records the policy its CuPy rows ran with; resuming it under a
+    # different one would silently mix two arms of an A/B.
+    out = tmp_path / "r"
+    env = {"cudss_policy": {"max_refinement_steps": 0, "perturbed_max_residual": None}}
+    out.with_suffix(".json").write_text(
+        json.dumps({"environment": env, "results": []}), encoding="utf-8"
+    )
+    argv = ["--dir", _fake_checkout(tmp_path), "--names", "X", "--backends", "cupy"]
+    with pytest.raises(SystemExit):
+        runner.main([*argv, "--resume", "--out", str(out)])
+    assert "would mix cuDSS policies" in capsys.readouterr().err
+
+
+def _resume_argv(tmp_path, policy):
+    out = tmp_path / "r"
+    env = {"cudss_policy": policy}
+    out.with_suffix(".json").write_text(
+        json.dumps({"environment": env, "results": []}), encoding="utf-8"
+    )
+    argv = ["--dir", _fake_checkout(tmp_path), "--names", "X", "--backends", "cupy"]
+    return [*argv, "--resume", "--out", str(out)]
+
+
+def test_resume_refuses_to_mix_cudss_determinism(tmp_path, capsys):
+    argv = _resume_argv(
+        tmp_path,
+        {
+            "max_refinement_steps": None,
+            "perturbed_max_residual": None,
+            "deterministic": True,
+        },
+    )
+    with pytest.raises(SystemExit):
+        runner.main(argv)  # this run asks for the default (non-deterministic) mode
+    assert "would mix cuDSS policies" in capsys.readouterr().err
+
+
+def test_resume_of_a_report_without_the_determinism_key(tmp_path, monkeypatch):
+    # Reports written before --cudss-deterministic existed ran in the default
+    # mode: they still resume without the flag (and record the new key).
+    argv = _resume_argv(
+        tmp_path, {"max_refinement_steps": None, "perturbed_max_residual": None}
+    )
+    monkeypatch.setattr(runner, "import_namespace", _no_backend)
+    assert runner.main(argv) == 0
+    env = json.loads((tmp_path / "r.json").read_text())["environment"]
+    assert env["cudss_policy"]["deterministic"] is False
+    with pytest.raises(SystemExit):
+        runner.main([*argv, "--cudss-deterministic"])
+
+
+def _no_backend(name):
+    raise ImportError(name)

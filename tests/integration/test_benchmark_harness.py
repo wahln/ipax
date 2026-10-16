@@ -88,6 +88,51 @@ def test_run_case_records_failures_without_raising(namespace):
     assert result.error is not None  # captured, not raised
 
 
+def test_run_case_reports_soc_attempted_and_accepted(namespace):
+    # ``CaseResult.soc_attempted``/``.soc_accepted`` are sums of the public
+    # ``IterationRecord.soc_attempted``/``.used_soc`` off ``Result.history``
+    # (see AGENTS.md; ipax/result.py) — not a re-implementation of the
+    # controller's bookkeeping. Reuses the textbook Maratos-effect setup
+    # (tests/integration/test_breedveld_soc.py) whose far-start Newton steps
+    # trigger a Breedveld second-order correction.
+    import math
+
+    from benchmarks.corpus import BenchmarkProblem
+    from ipax.options import BreedveldOptions
+    from ipax.testing.problems import Maratos
+    from tests._helpers import array
+
+    start = [0.5 * math.cos(2.5), 0.5 * math.sin(2.5)]
+    case = BenchmarkProblem(
+        name="maratos",
+        kind="NLP",
+        tags=(),
+        build=lambda xp: (Maratos(namespace), array(namespace, start)),
+    )
+
+    def _run(max_soc: int):
+        return run_case(
+            case,
+            config="exact/dense",
+            options=ipax.Options(
+                hessian="exact",
+                linsolve="dense",
+                globalization="breedveld",
+                breedveld=BreedveldOptions(max_soc=max_soc),
+            ),
+            xp=namespace,
+            backend="test",
+        )
+
+    off = _run(0)
+    assert off.soc_attempted == 0
+    assert off.soc_accepted == 0
+
+    on = _run(1)
+    assert on.soc_accepted >= 1
+    assert on.soc_attempted >= on.soc_accepted
+
+
 def test_run_case_converged_but_not_correct_when_objective_differs(namespace):
     # A solve that reaches a valid KKT point but a *different* objective than the
     # dataset-documented one is `converged` but not `correct` — the tier that
@@ -140,3 +185,140 @@ def test_report_round_trips_json_and_markdown(namespace):
     assert "# ipax quality-control benchmark" in markdown
     assert "bound_qp" in markdown
     assert "converged" in markdown  # the KKT-convergence tier is reported
+
+
+def test_run_case_applies_prepare_solve(namespace, monkeypatch):
+    # A case's ``prepare_solve`` hook runs after ``build`` and its start,
+    # warm start and options are what ``ipax.solve`` receives; its wall time
+    # counts toward the row's solve_time (the TROTS Breedveld initialisation).
+    import time
+    from dataclasses import replace
+
+    from ipax.result import WarmStart
+
+    seen: dict[str, object] = {}
+    warm = WarmStart()
+    tuned = ipax.Options(hessian="exact", linsolve="dense", max_iter=50)
+
+    def prepare(problem, x0, options):
+        seen["prepare"] = (problem, x0, options)
+        time.sleep(0.05)
+        started = x0 * 1.0  # a fresh array: the hook's start, not build's
+        seen["start"] = started
+        return started, warm, tuned
+
+    real_solve = ipax.solve
+
+    def spy_solve(problem, x0, **kwargs):
+        seen["solve"] = (problem, x0, kwargs)
+        return real_solve(problem, x0, **kwargs)
+
+    monkeypatch.setattr(ipax, "solve", spy_solve)
+    base = ipax.Options(hessian="exact", linsolve="dense")
+    result = run_case(
+        replace(_bound_qp_case(), prepare_solve=prepare),
+        config="exact/dense",
+        options=base,
+        xp=namespace,
+        backend="test",
+    )
+
+    problem, _x0, given = seen["prepare"]
+    assert given is base
+    solved_problem, solved_x0, kwargs = seen["solve"]
+    assert solved_problem is problem
+    assert solved_x0 is seen["start"]  # the solve starts from the hook's x0
+    assert kwargs["options"] is tuned
+    assert kwargs["warm_start"] is warm
+    assert result.error is None and result.correct
+    # prepare_time attributes the hook's share; solve_time is the combined
+    # (paper-accounting) figure.
+    assert result.prepare_time >= 0.04  # sleep(0.05), Windows timer jitter
+    assert result.solve_time >= result.prepare_time
+    row = json.loads(json.dumps(to_payload([result], capture_environment())))
+    assert row["results"][0]["prepare_time"] == result.prepare_time
+
+
+def test_run_case_without_prepare_solve_passes_no_warm_start(namespace, monkeypatch):
+    seen: dict[str, object] = {}
+    real_solve = ipax.solve
+
+    def spy_solve(problem, x0, **kwargs):
+        seen.update(kwargs)
+        return real_solve(problem, x0, **kwargs)
+
+    monkeypatch.setattr(ipax, "solve", spy_solve)
+    options = ipax.Options(hessian="exact", linsolve="dense")
+    result = run_case(
+        _bound_qp_case(),
+        config="exact/dense",
+        options=options,
+        xp=namespace,
+        backend="test",
+    )
+    assert seen == {"options": options}
+    assert result.prepare_time == 0.0
+
+
+def test_run_case_records_a_failing_prepare_solve(namespace):
+    from dataclasses import replace
+
+    def boom(problem, x0, options):
+        raise RuntimeError("init failed")
+
+    result = run_case(
+        replace(_bound_qp_case(), prepare_solve=boom),
+        config="exact/dense",
+        options=ipax.Options(hessian="exact", linsolve="dense"),
+        xp=namespace,
+        backend="test",
+    )
+    assert result.status == "prepare_error"
+    assert "init failed" in (result.error or "")
+
+
+def test_run_case_keeps_prepare_time_when_the_solve_raises(namespace, monkeypatch):
+    # Regression: a failed solve row dropped the (possibly expensive) prepare_solve
+    # time, so failures looked cheaper than they were under paper accounting.
+    import time
+    from dataclasses import replace
+
+    from ipax.result import WarmStart
+
+    def prepare(problem, x0, options):
+        time.sleep(0.05)
+        return x0, WarmStart(), options
+
+    def failing_solve(problem, x0, **kwargs):
+        raise RuntimeError("solve failed")
+
+    monkeypatch.setattr(ipax, "solve", failing_solve)
+    result = run_case(
+        replace(_bound_qp_case(), prepare_solve=prepare),
+        config="exact/dense",
+        options=ipax.Options(hessian="exact", linsolve="dense"),
+        xp=namespace,
+        backend="test",
+    )
+    assert result.status == "solve_error"
+    assert result.prepare_time >= 0.04  # sleep(0.05), Windows timer jitter
+    assert result.solve_time == result.prepare_time
+
+
+def test_run_case_keeps_elapsed_time_when_prepare_solve_raises(namespace):
+    import time
+    from dataclasses import replace
+
+    def boom(problem, x0, options):
+        time.sleep(0.05)
+        raise RuntimeError("init failed")
+
+    result = run_case(
+        replace(_bound_qp_case(), prepare_solve=boom),
+        config="exact/dense",
+        options=ipax.Options(hessian="exact", linsolve="dense"),
+        xp=namespace,
+        backend="test",
+    )
+    assert result.status == "prepare_error"
+    assert result.prepare_time >= 0.04  # sleep(0.05), Windows timer jitter

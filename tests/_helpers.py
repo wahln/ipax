@@ -18,6 +18,40 @@ def implemented(reason: str) -> Iterator[None]:
         pytest.xfail(f"{reason}: {exc}")
 
 
+def backend_linalg_error(xp: Any) -> BaseException:
+    """The exception ``xp`` itself raises on an exactly singular ``linalg.solve``.
+
+    A genuine backend numerical failure (``numpy.linalg.LinAlgError`` on
+    NumPy/array-api-strict, ``torch.linalg.LinAlgError`` on Torch) to inject
+    where a test needs one, without naming a concrete library. Skips on a
+    backend that returns non-finite values instead of raising (JAX).
+    """
+    singular = array(xp, [[1.0, 1.0], [1.0, 1.0]])
+    try:
+        xp.linalg.solve(singular, array(xp, [1.0, 2.0]))
+    except Exception as exc:  # whatever the backend raises
+        return exc
+    pytest.skip(f"{xp.__name__} returns non-finite values instead of raising")
+
+
+def to_numpy(value: Any) -> Any:
+    """A host NumPy array holding ``value`` (a backend array, or anything
+    ``numpy.asarray`` accepts).
+
+    ``numpy.asarray`` on a CuPy array raises ("Implicit conversion to a NumPy
+    array is not allowed") — the device-to-host copy must be explicit — so
+    tests that compare against a NumPy reference go through this instead.
+    Everything else keeps the plain ``numpy.asarray`` conversion.
+    """
+    import numpy as np
+
+    if hasattr(value, "__cuda_array_interface__") and hasattr(value, "get"):
+        return np.asarray(value.get())  # CuPy: explicit device→host copy
+    if hasattr(value, "detach") and hasattr(value, "cpu"):
+        return np.asarray(value.detach().cpu())  # Torch, possibly on CUDA
+    return np.asarray(value)
+
+
 def float_dtype(xp: Any) -> Any:
     return getattr(xp, "float64", getattr(xp, "float32", None))
 

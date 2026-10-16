@@ -28,10 +28,19 @@ from ipax.backend.operators import (
 )
 from ipax.options import (
     AcceptableStoppingOptions,
+    BarrierOptions,
+    BreedveldOptions,
     CorrectionsOptions,
+    DenseOptions,
+    KrylovOptions,
+    LBFGSOptions,
+    LineSearchOptions,
     OptimalityConditionOptions,
     Options,
+    RegularizationOptions,
+    RestorationOptions,
     ScalingOptions,
+    SparseOptions,
 )
 from ipax.problem.base import Problem
 from ipax.problem.function import FunctionProblem, LinearProblem, QuadraticProblem
@@ -50,27 +59,36 @@ from ipax.solve import solve
 
 __all__ = [
     "AcceptableStoppingOptions",
+    "BarrierOptions",
+    "BreedveldOptions",
     "COOOperator",
     "CSCOperator",
     "CSROperator",
     "CorrectionsOptions",
+    "DenseOptions",
     "DerivativeSources",
     "FunctionProblem",
     "IterationCallback",
     "IterationInfo",
     "IterationRecord",
     "KKTResiduals",
+    "KrylovOptions",
+    "LBFGSOptions",
+    "LineSearchOptions",
     "LinearProblem",
     "OptimalityConditionOptions",
     "Options",
     "Problem",
     "QuadraticProblem",
+    "RegularizationOptions",
+    "RestorationOptions",
     "Result",
     "Routes",
     "ScalingOptions",
+    "SparseOptions",
     "Status",
     "WarmStart",
     "solve",
 ]
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"

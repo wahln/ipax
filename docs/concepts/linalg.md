@@ -98,6 +98,23 @@ inequalities) broke down in its reuse-only Cholesky at least once and fell back
 to LU; `DenseOptions.pd_hint_failure_limit` consecutive breakdowns on the exact
 matrix retire that reuse for the rest of the solve.
 
+### Fused curvature and Gram (optional operator capability)
+
+The dense condensed block is `W + Σ_x + δ_w I + ∇gᵀ Σ_s ∇g`. By default `W`
+and the Gram term are formed separately. A Hessian operator that implements
+`LinearOperator.dense_matrix_with_gram(jac, weights)` is asked for
+`W + jacᵀ diag(weights) jac` in one call instead, whenever the block has
+inequality rows and `Σ_s` is diagonal. `Σ_x` and `δ_w` are added afterwards,
+out of place, so the regularization ladder works unchanged. This lets a
+curvature that is a weighted Gram over rows shared with the Jacobian multiply
+those rows once with the summed weights (Breedveld 2017, eq. (48)). The
+capability is generic: the core passes only the Jacobian operator and the
+weight vector and knows nothing about what the rows mean. The mixed-precision
+request (`gram_dtype`) is forwarded for the Gram part only, and refinement
+runs against the exact `matvec` as before. An operator without the method, or
+one that raises `NotImplementedError` for a call, gets the two-pass assembly
+bit for bit. See the [problem guide](../guide/problems.md) for the contract.
+
 !!! warning "Known limitation: matrix-free Krylov on equality saddles"
 
     On **equality-constrained** problems the matrix-free `KrylovSolver` borders

@@ -38,6 +38,63 @@ def _condensed_with_inequalities_system(namespace):
     return op, rhs, x_exact
 
 
+def _singular_dense_system(namespace):
+    # Exactly singular with an inconsistent right-hand side.
+    return Dense(array(namespace, [[1.0, 1.0], [1.0, 1.0]])), array(
+        namespace, [1.0, 2.0]
+    )
+
+
+def _singular_condensed_system(namespace):
+    # W = 0, Σ_x = 0, δ_w = 0 and no inequality border: N = 0.
+    dtype = array(namespace, [0.0]).dtype
+    op = build_condensed_operator(
+        Dense(namespace.zeros((2, 2), dtype=dtype)),
+        Diagonal(array(namespace, [0.0, 0.0])),
+        Diagonal(array(namespace, [])),
+        Dense(namespace.zeros((0, 2), dtype=dtype)),
+        RegularizationState(delta_w=0.0),
+    )
+    return op, array(namespace, [1.0, 2.0])
+
+
+def _singular_krylov_system(namespace):
+    # Rank-deficient SPD-semidefinite: CG meets zero curvature on the null
+    # space, MINRES cannot reach an inconsistent right-hand side.
+    return Dense(array(namespace, [[1.0, 0.0], [0.0, 0.0]])), array(
+        namespace, [1.0, 1.0]
+    )
+
+
+def _singular_sparse_ne_system(namespace):
+    # N = ∇gᵀ Σ_s ∇g = [[1, 1], [1, 1]] (one row, two variables), W = 0, δ_w = 0.
+    if get_sparse_adapter(namespace) is None:
+        pytest.skip(f"no sparse adapter for backend {namespace.__name__!r}")
+    W = COOOperator(
+        namespace.asarray([0, 1]),
+        namespace.asarray([0, 1]),
+        array(namespace, [0.0, 0.0]),
+        (2, 2),
+        symmetric=True,
+        pattern_key="W0",
+    )
+    jac = COOOperator(
+        namespace.asarray([0, 0]),
+        namespace.asarray([0, 1]),
+        array(namespace, [1.0, 1.0]),
+        (1, 2),
+        pattern_key="G0",
+    )
+    op = build_condensed_operator(
+        W,
+        Diagonal(array(namespace, [0.0, 0.0])),
+        Diagonal(array(namespace, [1.0])),
+        jac,
+        RegularizationState(delta_w=0.0),
+    )
+    return op, array(namespace, [1.0, 2.0])
+
+
 class TestDenseSolver(LinearSolverContract):
     implementation_reason = "DenseSolver"
 
@@ -46,6 +103,9 @@ class TestDenseSolver(LinearSolverContract):
 
     def make_system(self, namespace):
         return _spd_system(namespace)
+
+    def make_singular_system(self, namespace):
+        return _singular_dense_system(namespace)
 
 
 class TestDenseSolverAugmented(LinearSolverContract):
@@ -56,6 +116,9 @@ class TestDenseSolverAugmented(LinearSolverContract):
 
     def make_system(self, namespace):
         return _condensed_with_inequalities_system(namespace)
+
+    def make_singular_system(self, namespace):
+        return _singular_condensed_system(namespace)
 
 
 class TestKrylovSolver(LinearSolverContract):
@@ -68,6 +131,9 @@ class TestKrylovSolver(LinearSolverContract):
 
     def make_system(self, namespace):
         return _spd_system(namespace)
+
+    def make_singular_system(self, namespace):
+        return _singular_krylov_system(namespace)
 
 
 def _condensed_sparse_ne_system(namespace):
@@ -109,3 +175,6 @@ class TestSparseDirectSolverNormalEquations(LinearSolverContract):
 
     def make_system(self, namespace):
         return _condensed_sparse_ne_system(namespace)
+
+    def make_singular_system(self, namespace):
+        return _singular_sparse_ne_system(namespace)

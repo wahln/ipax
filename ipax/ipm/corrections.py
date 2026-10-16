@@ -33,9 +33,12 @@ Wächter & Waltz 2009: "the corrector is not part of the selection of the
 barrier parameter"). The driver's μ oracle (``Options.mu_schedule``) picks the
 target; :func:`probing_mu` is the Mehrotra σ-rule oracle
 (``σ = (μ_aff/μ)³``, NWW 2009 eqs. (3.2)–(3.5)), which lives here because it
-probes the affine direction. :class:`CenteringOnly` backs the standalone
-``mu_schedule="probing"`` mode: the affine solve is only a probe and the
-returned direction is the plain centered Newton step.
+probes the affine direction; :func:`mehrotra_probing_mu` is its unclipped
+textbook form with a τ-scaled probe (Mehrotra 1992; Breedveld 2017 supplement
+eqs. (4)–(7); ``BarrierOptions.probing_sigma="mehrotra"``).
+:class:`CenteringOnly` backs the standalone ``mu_schedule="probing"`` mode:
+the affine solve is only a probe and the returned direction is the plain
+centered Newton step.
 
 Both use :attr:`CorrectionContext.solve` so the injected-linear-algebra
 invariant (#3) holds — a corrector never sees the solver, only a callback that
@@ -56,7 +59,7 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from ipax.backend.namespace import array_namespace
+from ipax.backend.namespace import array_namespace, device
 from ipax.ipm.step import NewtonStep
 
 if TYPE_CHECKING:
@@ -82,6 +85,17 @@ _TAU_BOUNDARY = 1.0
 # threshold the corrector degrades to the plain centered Newton step at the
 # same μ target — the direction ``corrections="none"`` would compute.
 _MEHROTRA_KEEP_FRACTION = 0.5
+# Breedveld 2017 supplement A.2 ("novel Gondzio", eqs. (10)–(15)): the trial
+# step is α̌ = min(_BV_TRIAL·α, 1); trial products below β_min·μ are moved up
+# to β_min·μ, those above β_max·μ down toward β_max·μ, the downward correction
+# capped at _BV_CAP·β_max·μ (eqs. (13)–(14) in the capped reading, see
+# _breedveld_correction); a correction is kept only if the step length
+# reaches _BV_ACCEPT·α.
+_BV_TRIAL = 1.1
+_BV_BETA_MIN = 0.2
+_BV_BETA_MAX = 8.0
+_BV_CAP = 5.0
+_BV_ACCEPT = 1.07
 # Quality-function oracle (NWW 2009, §3.3/§4): σ search bounds and budget.
 # σ_max > 1 admits genuine μ *raises* — the closed-loop answer to a decentered
 # iterate whose complementarity has collapsed below the true KKT residual
@@ -215,14 +229,16 @@ def _second_order_targets(
     ctx: CorrectionContext,
     xp: Namespace,
     step: NewtonStep,
-    target_s: Array,
-    target_l: Array,
-    target_u: Array,
+    target_s: Array | float,
+    target_l: Array | float,
+    target_u: Array | float,
 ) -> tuple[Array, Array, Array]:
     """Add the second-order term ``−ΔΔ`` to per-component centering targets.
 
     The slack/lower products gain ``−Δ·Δ``; the upper block's slack is
     ``x_U − x`` with increment ``−Δx``, so its cross term flips sign (``+ΔxΔz_U``).
+    A scalar target broadcasts: bitwise the same as passing ``τ·e`` (``τ·1 = τ``
+    exactly), without materializing the constant vector.
     """
     zero_l = xp.zeros_like(ctx.x_minus_l)
     zero_u = xp.zeros_like(ctx.u_minus_x)
@@ -254,9 +270,67 @@ def probing_mu(ctx: CorrectionContext) -> float:
     # can inflate the dual products instead (μ_aff ≫ μ), and an unguarded
     # σ = (μ_aff/μ)³ then explodes μ within a few iterations (regression:
     # tests/regression/test_mu_oracle_inflation.py). Probing may hold μ at the
-    # current gap, never raise it.
-    sigma = min((mu_aff / mu) ** 3, 1.0) if mu > 0.0 else 0.0
+    # current gap, never raise it. The cube is ``r*r*r``, not ``r**3``: a
+    # Python-float ``**`` raises OverflowError past r ≈ 5.6e102, whereas the
+    # product saturates to IEEE inf (then clipped to 1).
+    if mu > 0.0:
+        ratio = mu_aff / mu
+        sigma = min(ratio * ratio * ratio, 1.0)
+    else:
+        sigma = 0.0
     return max(sigma * mu, ctx.mu_min)
+
+
+def mehrotra_probing_mu(ctx: CorrectionContext, tau: float) -> float:
+    """Unclipped Mehrotra σ-rule with a τ-scaled probe (Breedveld 2017's rule).
+
+    Mehrotra (1992); Breedveld et al. 2017, supplement eqs. (4)–(7), with the
+    supplement's ``μ_prev`` read as the eq. (10) duality gap measured at the
+    current iterate (before the predictor): the affine (μ = 0) direction is
+    probed with the fraction-to-boundary step at ``tau`` (his §2.1,
+    τ = 0.995), ``μ_aff`` is the average complementarity at that trial point
+    (eq. (5)), ``σ = (μ_aff/μ_gap)³`` with ``μ_gap`` the current average
+    complementarity (eq. (6)), and the corrector aims at ``σ·μ_gap``
+    (eq. (7)). Unlike :func:`probing_mu` (NWW 2009) σ is **not clipped** at
+    1 — an affine probe whose products end above the current gap raises μ —
+    and the probe uses ``tau`` instead of the maximal τ = 1 step. Primal and
+    dual probe steps are taken separately, as ipax's own step is. Floored at
+    ``ctx.mu_min``; ``0.0`` without complementarity pairs.
+
+    Overflow guard: σ is cubed as ``r*r*r`` (IEEE ``inf`` past the float
+    range, where a Python-float ``r**3`` raises ``OverflowError`` for
+    ``r ≳ 5.6e102``), and when the target ``σ·μ_gap`` is non-finite the rule
+    falls back to ``μ_gap`` — hold μ at the measured gap rather than hand an
+    infinite barrier target to the corrector.
+
+    The alternative reading of ``μ_prev`` as the previous iteration's barrier
+    *target* was tested on TROTS (2026-09-27) and diverges: it gives
+    ``μ_{k+1} = μ_aff³/μ_k²``, which amplifies any target/complementarity
+    mismatch by −2 per iteration in log space (μ cycling between the floor and
+    1e10–1e24 on Protons_01/Liver_01).
+    """
+    xp = array_namespace(ctx.affine.dx)
+    count = _counts(ctx, xp)
+    if count == 0:
+        return 0.0
+    # Breedveld 2017 supplement, eq. (6) with eq. (10): μ is the measured gap.
+    mu_gap = _average(*_products(ctx, xp, None, 0.0, 0.0), count, xp)
+    if mu_gap <= 0.0:
+        return ctx.mu_min
+    # Breedveld 2017 supplement, eqs. (4)–(5): trial point at the τ-scaled
+    # maximal affine step and its average complementarity.
+    alpha_p = ctx.alpha_primal(ctx.affine, tau=tau)
+    alpha_d = ctx.alpha_dual(ctx.affine, tau=tau)
+    mu_aff = _average(*_products(ctx, xp, ctx.affine, alpha_p, alpha_d), count, xp)
+    # Mehrotra 1992; Breedveld 2017 supplement, eqs. (6)–(7): unclipped σ,
+    # cubed as r*r*r so an overflow saturates to inf instead of raising.
+    ratio = mu_aff / mu_gap
+    sigma = ratio * ratio * ratio
+    target = sigma * mu_gap
+    if not math.isfinite(target):
+        # Non-finite target (overflowed σ, or a nan probe): hold μ at the gap.
+        target = mu_gap
+    return max(target, ctx.mu_min)
 
 
 def _step_axpy(base: NewtonStep, sigma: float, direction: NewtonStep) -> NewtonStep:
@@ -375,10 +449,8 @@ def _mehrotra_step(
     dual state by orders of magnitude in one accepted step (regression:
     tests/regression/test_mu_oracle_inflation.py).
     """
-    ones_s = xp.ones_like(ctx.s)
-    ones_x = xp.ones_like(ctx.x_minus_l)
     comp_s, comp_l, comp_u = _second_order_targets(
-        ctx, xp, ctx.affine, mu_target * ones_s, mu_target * ones_x, mu_target * ones_x
+        ctx, xp, ctx.affine, mu_target, mu_target, mu_target
     )
     if mu_target > 0.0:
         lo, hi = gamma * mu_target, mu_target / gamma
@@ -498,6 +570,15 @@ class GondzioCorrector:
             return base
 
         comp_s, comp_l, comp_u = state.comp_s, state.comp_l, state.comp_u
+        if self._options.gondzio_variant == "breedveld":
+            return _breedveld_gondzio(
+                context,
+                xp,
+                step,
+                mu_target,
+                (comp_s, comp_l, comp_u),
+                self._options.gondzio_max_corrections,
+            )
         gamma = self._options.gondzio_gamma
         lo = gamma * mu_target
         hi = mu_target / gamma
@@ -535,6 +616,109 @@ class GondzioCorrector:
         return CorrectionResult(step, mu_target)
 
 
+def _breedveld_correction(xp: Namespace, v: Array, mu: float) -> Array:
+    """Centrality correction of the trial products ``v`` (Breedveld 2017, A.2).
+
+    Breedveld et al. 2017, supplement A.2, eqs. (13)–(14), verbatim (with
+    ``β_min = 0.2``, ``β_max = 8``; eq. (14) is the same for ``c_w`` with
+    ``W̌ Y̌ e`` and ``c_w = W̌⁻¹ c_w``)::
+
+        c_z = 0
+        t = X̌ Ž e
+        c_z(t < β_min μ̌) = β_min μ̌ − t(t < β_min μ̌)
+        c_z(t > β_max μ̌) = β_max μ̌ − t(t > β_max μ̌)
+        c_z(t > 5 β_max μ̌) = 5 β_max μ̌ − t(t > 5 β_max μ̌)
+        c_z = −Ž⁻¹ c_z
+
+    Two readings of the third assignment are possible:
+
+    - *literal* (a two-tier target ``5 β_max μ̌`` for far outliers): the
+      correction is **non-monotone** in ``t`` — with ``μ̌ = 1``, ``t = 39``
+      gets ``−31`` but ``t = 41`` only ``−1`` and ``t = 1000`` ``−960`` — so
+      a product just above ``5 β_max μ̌`` is corrected *less* than one just
+      below it. That cannot be the intent.
+    - *capped* (used here): the downward correction of a large outlier is
+      capped at ``5 β_max μ̌`` in magnitude, i.e. ``max(β_max μ̌ − t,
+      −5 β_max μ̌)`` for ``t > β_max μ̌``. This is monotone (non-increasing)
+      in ``t`` and matches the outlier cap of Gondzio (1996), who bounds the
+      downward correction of large complementarity products so a single
+      outlier cannot dominate the corrector right-hand side — the ``5`` sets
+      that cap's width.
+
+    So: ``β_min μ̌ − t`` for ``t < β_min μ̌``; ``max(β_max μ̌ − t,
+    −5 β_max μ̌)`` for ``t > β_max μ̌``; ``0`` inside the box. The fill values
+    are 0-d arrays broadcast by ``where`` (as
+    :func:`~ipax.ipm.barrier.boundary_ratio` does), not materialized
+    full-length vectors.
+    """
+    lo = _BV_BETA_MIN * mu
+    hi = _BV_BETA_MAX * mu
+    zero = xp.full((), 0.0, dtype=v.dtype, device=device(v))
+    cap = xp.full((), -_BV_CAP * hi, dtype=v.dtype, device=device(v))
+    above = hi - v
+    # Gondzio 1996 outlier cap on the downward correction (capped reading).
+    above = xp.where(above < cap, cap, above)
+    return xp.where(v < lo, lo - v, xp.where(v > hi, above, zero))
+
+
+def _breedveld_gondzio(
+    ctx: CorrectionContext,
+    xp: Namespace,
+    step: NewtonStep,
+    mu_target: float,
+    targets: tuple[Array, Array, Array],
+    max_corrections: int,
+) -> CorrectionResult:
+    """Breedveld 2017's Gondzio variant on top of the full Mehrotra step.
+
+    Breedveld et al. 2017, supplement A.2, eqs. (10)–(15): at the enlarged
+    trial step ``α̌ = min(1.1·α, 1)`` each complementarity product ``t`` gets
+    the centrality correction of eqs. (13)–(14) (``β_min = 0.2``,
+    ``β_max = 8``) in the *capped* reading — ``β_min·μ − t`` below the box,
+    ``max(β_max·μ − t, −5·β_max·μ)`` above it, zero inside; see
+    :func:`_breedveld_correction` for the verbatim equations and why the
+    literal two-tier reading is rejected (it is non-monotone in ``t``). The
+    correction is added to the current targets and re-solved against the
+    same operator; it is kept while the step length grows to at least
+    ``1.07·α``. ``μ`` is the corrector's barrier target. Primal and dual step
+    lengths are tracked separately (as ipax's own step is), both at the
+    maximal τ = 1 boundary step, and the acceptance compares their sum.
+    """
+    comp_s, comp_l, comp_u = targets
+    zero_l = xp.zeros_like(ctx.x_minus_l)
+    zero_u = xp.zeros_like(ctx.u_minus_x)
+
+    for _ in range(max_corrections):
+        alpha_p = ctx.alpha_primal(step, tau=_TAU_BOUNDARY)
+        alpha_d = ctx.alpha_dual(step, tau=_TAU_BOUNDARY)
+        if alpha_p >= 1.0 and alpha_d >= 1.0:
+            break  # a full step cannot grow: nothing to gain
+        # Breedveld 2017 supplement A.2: trial step α̌ = min(1.1·α, 1).
+        trial_p = min(_BV_TRIAL * alpha_p, 1.0)
+        trial_d = min(_BV_TRIAL * alpha_d, 1.0)
+        v_s, v_l, v_u = _products(ctx, xp, step, trial_p, trial_d)
+        # Breedveld 2017 supplement A.2, eqs. (13)–(15): corrected targets.
+        candidate_s = comp_s + _breedveld_correction(xp, v_s, mu_target)
+        candidate_l = comp_l + xp.where(
+            ctx.mask_l, _breedveld_correction(xp, v_l, mu_target), zero_l
+        )
+        candidate_u = comp_u + xp.where(
+            ctx.mask_u, _breedveld_correction(xp, v_u, mu_target), zero_u
+        )
+        candidate = ctx.solve(candidate_s, candidate_l, candidate_u)
+        if candidate is None:
+            break
+        new_p = ctx.alpha_primal(candidate, tau=_TAU_BOUNDARY)
+        new_d = ctx.alpha_dual(candidate, tau=_TAU_BOUNDARY)
+        # Breedveld 2017 supplement A.2: keep only a ≥ 7 % step-length increase.
+        if new_p + new_d >= _BV_ACCEPT * (alpha_p + alpha_d):
+            step = candidate
+            comp_s, comp_l, comp_u = candidate_s, candidate_l, candidate_u
+        else:
+            break
+    return CorrectionResult(step, mu_target)
+
+
 def select_corrector(options: CorrectionsOptions) -> HigherOrderCorrection:
     """Construct the corrector named by ``options.method`` (default no-op)."""
     method = options.method
@@ -555,6 +739,7 @@ __all__ = [
     "HigherOrderCorrection",
     "MehrotraCorrector",
     "NoCorrection",
+    "mehrotra_probing_mu",
     "probing_mu",
     "quality_mu",
     "select_corrector",

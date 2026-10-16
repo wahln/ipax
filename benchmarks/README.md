@@ -17,6 +17,9 @@ benchmarks/
 
 ```bash
 pip install -e ".[bench,numpy,torch,sparse-cpu]"
+# The bench extra includes Numba, which the TROTS loader uses for its
+# compiled tile scatter; without it the loader falls back to NumPy and gets
+# bitwise-identical results, only slower (docs/benchmarks/trots.md).
 
 # Quality-control sweep (correctness / robustness / accuracy regression gate).
 # Runs the curated corpus across a config matrix (hessian x linsolve x
@@ -46,6 +49,43 @@ config)` cell into a `CaseResult` (status, iterations, scaled-KKT components,
 constraint violation, accuracy vs `x*`, solve time, solver used), and
 `runners/qc.py` drives the matrix and renders the report. A fast smoke test
 (`tests/integration/test_benchmark_harness.py`) keeps it from bit-rotting.
+
+## Tall linear-inequality suite (asv)
+
+`runners/bench_tall_linear_ineq.py` tracks the tall condensed path
+(`m ≫ n`, `N = W + AᵀΣA + Σ_x`) that large sparse `linear_ineq` sets land on.
+It solves `TallSparseQP` (`generators/`) with `linsolve="auto"` and
+`hessian="lbfgs"` (the generator's analytic Hessian would keep the sparse
+normal-equations route out of auto-selection), 10% range rows, and both
+declarations of the same rows: `"linear_ineq"` (public API, lowered by the
+core) and `"operator"` (hand-lowered `ineq_constraints` with a `CSROperator`
+Jacobian). `TallLinearIneq` times one solve per cell (`time_solve`,
+`peakmem_solve`); `TallLinearIneqTrack` shares one solve per cell through
+`setup_cache` for `track_success`, `track_iterations`, `track_kkt_residual`
+and `track_route`.
+
+| cell (`n`, `m/n`, density, bandwidth) | expected route | what it pins |
+|---|---|---|
+| 500, 10, 0.01, random | 1 dense | fill probe runs, Gram fills, small-n dense rule |
+| 500, 10, 0.2, random | 1 dense | density ≥ 5% skips the fill probe |
+| 2000, 10, 0.01, random | 1 dense | fill-gate straddle (filled side) |
+| 2000, 10, 0.01, banded 0.002 | 5 sparse-NE | fill-gate straddle (fill ≈ 0.4%) |
+| 2000, 100, 0.01, banded 0.002 | 5 sparse-NE | 200 000 rows |
+| 10000, 10, 0.01, banded 0.002 | 5 sparse-NE | only the fill gate keeps it off Krylov (3) |
+
+`track_route` codes (append-only; from `Result.routes.linear_solver`'s leading
+token and `Result.routes.kkt_form`): **1** dense/condensed, **2**
+dense/augmented, **3** krylov/condensed, **4** sparse/augmented, **5**
+sparse-NE/normal_equations. An unmapped route raises, and
+`tests/integration/test_tall_linear_ineq_benchmark.py` fails when a solver
+can emit a route the mapping lacks. asv needs `runners/` to be a package
+(`runners/__init__.py`). No Krylov cell is tracked: a tall
+random-row solve at `n = 10 000` (where auto picks Krylov) runs for minutes.
+
+```bash
+cd benchmarks
+asv run --python=same --bench bench_tall_linear_ineq   # a few minutes on a laptop CPU
+```
 
 ## What is measured
 

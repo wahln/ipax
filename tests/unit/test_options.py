@@ -14,6 +14,7 @@ from ipax.options import (
     OptimalityConditionOptions,
     Options,
     RestorationOptions,
+    SparseOptions,
 )
 
 
@@ -285,3 +286,51 @@ def test_line_search_accepts_the_documented_shrink_bounds():
     assert options.backtrack_shrink_min == options.backtrack_shrink_max == 0.25
     assert LineSearchOptions().backtrack_shrink_min == 0.1
     assert LineSearchOptions().backtrack_shrink_max == 0.5
+
+
+def test_sparse_perturbed_pivot_policy_defaults():
+    # The adapter defaults (IPOPT's max_refinement_steps; the 1e-2 residual
+    # certificate), pinned against the adapter constants in
+    # tests/unit/test_cupy_sparse_adapter.py.
+    options = SparseOptions()
+    assert options.perturbed_pivot_refinement_steps == 10
+    assert options.perturbed_pivot_max_residual == 1e-2
+
+
+def test_sparse_perturbed_pivot_policy_accepts_valid_values():
+    options = SparseOptions(
+        perturbed_pivot_refinement_steps=0, perturbed_pivot_max_residual=0.5
+    )
+    assert options.perturbed_pivot_refinement_steps == 0
+    assert options.perturbed_pivot_max_residual == 0.5
+    # An integral float threshold and a large finite one are fine.
+    SparseOptions(perturbed_pivot_max_residual=1)
+    SparseOptions(perturbed_pivot_max_residual=1e300)
+
+
+@pytest.mark.parametrize("steps", [-1, 1.5, True, False, "3", None])
+def test_sparse_rejects_invalid_perturbed_pivot_refinement_steps(steps):
+    with pytest.raises(ValueError, match="perturbed_pivot_refinement_steps"):
+        SparseOptions(perturbed_pivot_refinement_steps=steps)
+
+
+@pytest.mark.parametrize(
+    "threshold",
+    [0.0, -1e-3, float("nan"), float("inf"), -float("inf"), True, "0.01", None],
+)
+def test_sparse_rejects_invalid_perturbed_pivot_max_residual(threshold):
+    with pytest.raises(ValueError, match="perturbed_pivot_max_residual"):
+        SparseOptions(perturbed_pivot_max_residual=threshold)
+
+
+def test_sparse_deterministic_is_off_by_default():
+    # Opt-in: reproducible factorizations cost factorization time where an
+    # adapter offers them, so the default leaves the backend's fastest mode.
+    assert SparseOptions().deterministic is False
+    assert SparseOptions(deterministic=True).deterministic is True
+
+
+@pytest.mark.parametrize("value", [1, 0, 1.0, "yes", None])
+def test_sparse_rejects_a_non_bool_deterministic(value):
+    with pytest.raises(ValueError, match="deterministic"):
+        SparseOptions(deterministic=value)

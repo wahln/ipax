@@ -171,10 +171,11 @@ def format_record(record: IterationRecord, *, acceptable: bool = False) -> str:
 
     ``ls`` is the number of backtracking trial step sizes the line search (or
     Breedveld controller) evaluated to reach this row. A trailing ``R`` marks
-    an iterate produced by a feasibility-restoration jump, and a trailing ``*``
-    marks one that already satisfies every enabled acceptable-stopping
+    an iterate produced by a feasibility-restoration jump, a trailing ``C``
+    marks one produced by an accepted second-order correction, and a trailing
+    ``*`` marks one that already satisfies every enabled acceptable-stopping
     criterion even though the required consecutive-iteration count has not yet
-    been reached; both tags may appear together.
+    been reached; any of these tags may appear together.
     """
     row = (
         f"{record.iteration:>4d} {record.objective:>15.7e} "
@@ -186,6 +187,8 @@ def format_record(record: IterationRecord, *, acceptable: bool = False) -> str:
     tags = []
     if record.restored:
         tags.append("R")
+    if record.used_soc:
+        tags.append("C")
     if acceptable:
         tags.append("*")
     return f"{row} {' '.join(tags)}" if tags else row

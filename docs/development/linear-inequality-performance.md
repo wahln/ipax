@@ -36,14 +36,25 @@ pattern reuse; those are existing capabilities, not new proposals.
 
 Two representation details matter before tuning kernels:
 
-- `linear_ineq=(A, lower, upper)` currently accepts concrete dense arrays only.
-  The lowering rejects `LinearOperator` inputs, despite the broader annotation.
-  Sparse or matrix-free affine inequalities can currently be expressed through
-  `ineq_constraints(x)=A.matvec(x)-b` and a constant `ineq_jacobian` callback.
+- `linear_ineq=(A, lower, upper)` accepts a concrete array or any
+  `LinearOperator`. Since 2026-09 the lowering no longer rejects operators:
+  sparse operators are rewritten at the triplet level (same family, no
+  densification), a `VStack` block by block, and other operators are wrapped
+  in a signed row selection that folds into the Gram weights. The workaround
+  this bullet used to recommend (`ineq_constraints(x)=A.matvec(x)-b` with a
+  constant `ineq_jacobian` callback) is no longer needed.
 - Two finite row bounds produce separate signed rows when dense inequalities
   are lowered. Choosing `linsolve="sparse"` does not make a dense `A` sparse:
   `Dense.to_coo()` emits all entries, including numerical zeros. Use a structural
-  sparse operator through the callbacks when its sparsity is important.
+  sparse operator (e.g. a `CSROperator` in `linear_ineq`) when its sparsity is important.
+- A `CSROperator` *subclass* (or any other operator) declared through
+  `linear_ineq` is wrapped rather than rewritten, so its own `gram` override
+  survives the lowering and receives per-source-row summed weights. The TROTS
+  loader relies on this for its per-structure tiled Gram
+  (`TiledGramCSROperator`, Breedveld 2017 eq. 48), which forms the Gram 7× faster
+  on `Protons_01`. It lives at the application edge, so problem-specific Gram
+  kernels need no core change; see
+  [the TROTS page](../benchmarks/trots.md#tiled-per-structure-gram-loader-side-default).
 
 Auto-selection also uses size, aspect ratio, and available Gram/fill metadata.
 The measurements below do not establish new crossover thresholds.
@@ -289,6 +300,29 @@ The same-iteration-count wall-time ratio was 0.97 corpus-wide and 0.88 on
 `lbfgs/dense`, but the untouched sparse configurations spread 1.05–1.10 on the
 same machine, so the sweep is consistent with the microbenchmark, not a
 measurement of it.
+
+**Tracked tall suite (asv).** `benchmarks/runners/bench_tall_linear_ineq.py`
+tracks the tall condensed path over commits. It solves the seeded
+`TallSparseQP` generator (\(\min\tfrac12\|x-t\|^2\) s.t. \(l\le Ax\le b\),
+\(x\ge0\), 10% range rows) with `linsolve="auto"` and `hessian="lbfgs"`. The
+generator's analytic Hessian would keep the sparse normal-equations route out
+of auto-selection, because that route folds only a diagonal-plus-low-rank \(W\).
+Every cell runs under both declarations of the same rows: the public
+`linear_ineq` path and a hand-lowered `ineq_constraints` path with a
+`CSROperator` Jacobian. A gap between the two exposes a lowering regression.
+The six cells are \((n, m/n, \text{density}, \text{rows})\) =
+(500, 10, 1%, random), (500, 10, 20%, random), (2000, 10, 1%, random),
+(2000, 10, 1%, banded), (2000, 100, 1%, banded), and (10 000, 10, 1%, banded).
+They cover the small-n dense rule, the density-gated fill-probe skip, the
+Gram-fill gate at a fixed shape (Gram fill ≈ 0.85 against ≈ 0.4%), and the
+sparse normal-equations route beyond the small-n dense cutoff. `track_route`
+reports a stable code (1 dense/condensed, 2 dense/augmented, 3
+krylov/condensed, 4 sparse/augmented, 5 sparse-NE/normal_equations), so a
+change at a routing boundary appears as a change in a tracked value. No
+Krylov cell is tracked, because a tall random-row solve at \(n=10\,000\)
+takes minutes. The sparse normal-equations cell at that size would flip to
+code 3 if the fill gate regressed. With the full grid, one `time_solve` per
+cell took 0.6–15 s on a laptop CPU.
 
 Full IPM speedups, peak allocator measurements, cold compilation, and profiled
 kernel/synchronization counts remain separate measurements. Apply the

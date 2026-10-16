@@ -341,11 +341,26 @@ def cholesky_solve(factor: Any, rhs: Any) -> Any:
     factor cannot be back-substituted portably. Two cuSOLVER ``trsm``
     triangular solves via ``cupyx.scipy.linalg.solve_triangular`` (CuPy has no
     ``cho_solve``), O(n²) per right-hand side.
+
+    ``solve_triangular`` hands cuBLAS a Fortran-ordered matrix and copies any
+    other layout first, once per call. The factor from ``cupy.linalg.
+    cholesky`` is C-ordered, so that was an n×n copy on each of the two
+    solves — at TROTS Head-and-Neck_01 (n = 9984) a 0.76 GB transient per
+    solve at the dense route's memory peak, and most of the solve's time. Its
+    transpose ``Lᵀ`` is a Fortran-ordered *view*: ``L y = b`` is solved as
+    ``(Lᵀ)ᵀ y = b`` (upper triangle, transposed) and ``Lᵀ x = y`` directly,
+    with no copy. Same triangular systems, a different cuBLAS kernel: the
+    results agree to round-off (bit-identical for matrix right-hand sides,
+    last-bit differences for vectors on the RTX 4070 Laptop).
     """
     from cupyx.scipy.linalg import solve_triangular as _solve_triangular
 
     ell = _to_cupy(factor)
     b = _to_cupy(rhs)
+    if ell.flags.c_contiguous and not ell.flags.f_contiguous:
+        upper = ell.T  # Fortran-ordered view of Lᵀ: no copy
+        y = _solve_triangular(upper, b, lower=False, trans="T")
+        return _solve_triangular(upper, y, lower=False, trans="N")
     y = _solve_triangular(ell, b, lower=True)
     x = _solve_triangular(ell, y, lower=True, trans="T")
     return x

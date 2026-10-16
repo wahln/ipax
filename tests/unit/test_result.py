@@ -95,3 +95,23 @@ def test_iteration_history_and_derivative_sources_are_explicit(namespace):
     assert history[0].dual_infeasibility == 8e-3
     assert history[0].primal_infeasibility == 9e-4
     assert history[0].complementarity == 1e-5
+    assert history[0].used_soc is False
+    assert history[0].soc_attempted is False
+
+
+def test_iteration_record_soc_fields_default_false():
+    # A row that never went through a step search (e.g. constructed directly,
+    # as ``_record_transform`` hooks or tests may do) reports no correction.
+    record = IterationRecord(
+        iteration=0,
+        objective=1.0,
+        mu=0.1,
+        theta=0.0,
+        kkt_error=1e-2,
+        alpha_primal=1.0,
+        alpha_dual=1.0,
+        regularization=0.0,
+    )
+
+    assert record.used_soc is False
+    assert record.soc_attempted is False
