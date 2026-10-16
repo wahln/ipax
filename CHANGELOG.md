@@ -7,338 +7,70 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
-- **`LinearOperator.dense_matrix_with_gram(jac, weights)`**, an optional
-  capability of the Hessian operator: the dense condensed route asks `W` for
-  `W + jacᵀ diag(weights) jac` in one call, so a curvature that is a weighted
-  Gram over rows it shares with the inequality Jacobian can multiply those
-  rows once with the summed weights (Breedveld et al. 2017, eq. (48)).
-  `Σ_x` and `δ_w` are added afterwards, out of place; the mixed-precision
-  request applies to the Gram part only. The default raises
-  `NotImplementedError`, and so does an operator that declines a call; the
-  block is then assembled in two passes exactly as before, so every problem
-  that does not implement it (the whole S2MPJ corpus) is unchanged. The
-  `LinearOperator` contract battery checks implementations against
-  `W + Jᵀ diag(w) J`.
-  - The TROTS loader implements it on its exact Hessian
-    (`TiledGramConfig.merge_hessian_gram`, default on): a structure that is
-    both curved and in the linear block is multiplied once per iteration
-    with `h_s + σ_s`, through the core's public Gram chain, on NumPy, CuPy
-    and Torch. Of the default corpus only `Head-and-Neck_01` has such a
-    structure: 21.5 → 19.9 s per iteration on NumPy (medians of three
-    interleaved 10-iteration runs) and 11.7 → 11.1 s on CuPy, with
-    trajectories equal to round-off (≤ 7·10⁻¹³ relative over 10
-    iterations). Every other corpus case declines up front and is
-    unchanged bit for bit.
-- **All options dataclasses are exported from `ipax`**: `BarrierOptions`,
-  `BreedveldOptions`, `DenseOptions`, `KrylovOptions`, `LBFGSOptions`,
-  `LineSearchOptions`, `RegularizationOptions`, `RestorationOptions` and
-  `SparseOptions` join the top-level namespace next to `Options`; importing
-  them from `ipax.options` keeps working.
-- **`ipax.testing.problems.Maratos`**: the Maratos-effect problem (Nocedal &
-  Wright 2006, Example 15.4) joins the analytic test problems; the sparse-direct
-  contract battery now also runs against the CuPy/cuDSS adapter when a CUDA
-  device is present.
-- **`SparseOptions.deterministic`** (default `False`): asks the sparse-direct
-  adapter for run-to-run reproducible factorizations where the backend offers
-  them, at a factorization-time cost; adapters without such a mode ignore it.
-  The CUDA route (cuDSS) reads it and sets `DETERMINISTIC_MODE`, which makes
-  repeated factorizations bitwise identical. Six default-mode solvers on one
-  captured `ROTDISC` KKT system had given six different solutions. The mode
-  costs 1.2–3× per cuDSS factorization phase in isolation and 2–3 % per
-  factorization call on whole S2MPJ solves.
-  - The flag reaches the adapter through a second optional, duck-typed hook,
-    `configure_deterministic(enabled=)`, which the `SparseDirectSolver`
-    facade calls once, and only when the option is on. The CuPy adapter
-    implements it and the device-routing adapter (Torch/JAX) forwards it.
-    The SciPy adapter has no hook. The default calls nothing, so default
-    behaviour is unchanged.
-  - With it, the CuPy sparse route as a whole is bitwise reproducible
-    run to run on one machine: the adapter's own products and COO builds
-    are reproducible in every mode (see Fixed below). Three processes per
-    problem on `AGG`, `ROTDISC`, `ACOPR14`, `YORKNET` and `COSHFUN`
-    (`exact/sparse`) traced identical trajectories.
-  - The S2MPJ runner gains `--cudss-deterministic`. It is recorded in
-    `environment.cudss_policy`, and `--resume` refuses to mix it with the
-    default mode; older reports resume as non-deterministic.
-- **`SparseOptions.perturbed_pivot_refinement_steps`** (default `10`) and
-  **`SparseOptions.perturbed_pivot_max_residual`** (default `1e-2`): the
-  perturbed-pivot solve policy of static-pivoting sparse factorizations (today
-  the CUDA/cuDSS route; see Fixed below) is now a public option, settable from
-  `ipax.solve(...)`. Previously only the adapter constructors could set it.
-  - The policy reaches the adapter through an optional, duck-typed
-    `configure_perturbed_pivots(refinement_steps=, max_residual=)` hook that
-    the `SparseDirectSolver` facade calls once when it creates the adapter.
-    The CuPy adapter implements the hook and the device-routing adapter
-    (Torch/JAX) forwards it. Adapters that never perturb pivots (SciPy/Feral)
-    do not implement it and ignore the fields, so the adapter protocol is
-    unchanged.
-  - Both fields are validated on construction: a non-negative integer and a
-    finite positive float, with `bool` rejected. The defaults equal the
-    adapter's constants (a unit test pins them), so default behaviour is
-    unchanged.
-  - The S2MPJ runner's `--cudss-refinement-steps` / `--cudss-max-residual` now
-    set these options on the CuPy configs instead of patching the adapter's
-    module constants in each worker.
-- **`IterationRecord.used_soc` / `.soc_attempted`**: each row of `Result.history`
-  now reports whether it is a second-order-corrected point (W&B 2006 §2.4 filter
-  correction, or the opt-in `BreedveldOptions.max_soc` Markov correction) and
-  whether a correction was tried this iteration, accepted or not. The console table gains a
-  trailing `C` tag alongside the existing `R`/`*`. `benchmarks/harness.CaseResult`
-  gains matching `soc_attempted`/`soc_accepted` counts (summed off the new
-  fields), and the TROTS runner's `soc_attempted`/`soc_accepted` counters are now
-  read from `Result.history` for *either* globalization instead of a
-  `BreedveldController.search` monkeypatch that only covered the Breedveld
-  controller.
-- **`BreedveldOptions.max_soc`** (`0` default = off): opt-in second-order
-  correction for the `globalization="breedveld"` controller (Wächter &
-  Biegler 2006, §2.4 / A-5.5–A-5.8, adapted to the Markov acceptance of
-  Breedveld 2017, eqs. (34)–(35)). When the first, full-length trial is
-  rejected without reducing the constraint violation (and is not itself
-  feasible to `max(kkt_tol, 1e-8)`), the filter SOC's closure runs `max_soc`
-  accumulated correction rounds (same factorization-reuse policy; its round
-  count is now taken from the active controller's option) and the corrected
-  point is judged once by the Markov test at the full step; a rejected
-  correction falls back to backtracking. The
-  ratio-control iterations are untouched, and `common_step` moves the duals by
-  the accepted length. Breedveld's own solver has no SOC — this is an ipax
-  addition; the default path is bit-identical. The TROTS runner gains
-  `--breedveld-soc N` (only with `--globalization breedveld`) and every solve
-  row counts `soc_attempted` / `soc_accepted` (see the
-  `IterationRecord.used_soc` entry above). TROTS A/B (NumPy, six cases): only
-  Liver_01 triggers it (one accepted correction, 57 → 51 iterations, same
-  objective); Protons, CyberKnife, both VMAT cases and 20 Head-and-Neck
-  iterations make no attempt and are identical — it stays opt-in.
-- **`TROTSProblem.breedveld_warm_start(lsqr_iter=, lsqr_tol=)`** (`benchmarks/corpus/trots.py`):
-  opt-in overrides for the eq. (26) LSQR dual solve's iteration cap and
-  `atol = btol` (default `None`: the module constants, 200 / `1e-6`,
-  unchanged). On the measured TROTS corpus 7 of 11 cases hit the 200-iteration
-  cap and every LSQR multiplier still ends up floored to 5, so `lsqr_iter=5`
-  reproduces the full run's `WarmStart` and `μ0` bit-for-bit there while
-  cutting the LSQR wall from 46.6 s to 7.2 s on `Head-and-Neck_01` and 25.3 s
-  to 3.7 s on `Prostate_CK_01` (NumPy, provisional, shared machine). This is
-  not provable in general (an early exit can change the floored start on a
-  differently-conditioned instance — see
-  `test_truncating_lsqr_is_not_safe_in_general`), so the default stays 200.
-  The TROTS runner gains matching `--lsqr-iter`/`--lsqr-tol` flags, accepted
-  only with `--init breedveld`.
-- **`BreedveldOptions.common_step`** (`False` default): opt-in single step
-  length for the `globalization="breedveld"` controller, as Breedveld et al.
-  2017 run it (§2.1, Algorithm 1): `α = min(α_p, α_d)` of the
-  fraction-to-boundary rule moves the primal and the dual variables, and the
-  ratio control / Markov backtracking shrinks that one α (the
-  predictor–corrector's step-length probes keep separate lengths). ipax's separate primal and dual lengths
-  (the IPOPT convention) stay the default and the filter line search ignores
-  the option; the default path is bit-identical. Diagnosed on TROTS
-  `Head-and-Neck_01`, where the separate first-step lengths (0.84 / 0.27)
-  send the objective from 4.6 to 7.9·10⁸.
-- **TROTS loader/runner: units-aware dual floor and common-step lever.**
-  `TROTSProblem.breedveld_warm_start(..., dual_floor=5.0)` sets the floor of
-  the §3.1 multipliers `y0`, `z0` (eqs. (26)–(27); the slacks keep the
-  paper's 5); the runner gains `--dual-floor` (default 5, only with
-  `--init breedveld`) and `--common-step` (only with `--globalization
-  breedveld`). On `Head-and-Neck_01` every LSQR multiplier is below 2·10⁻⁵,
-  so the floor of 5 sets `μ0 = 665`; `--dual-floor 1e-6` gives `μ0 = 1.8·10⁻⁴`.
-  Runner defaults unchanged.
-- **`RestorationOptions.dense_factorization`** (`"lu"` default | `"cholesky"`):
-  opt-in Cholesky solve for the dense feasibility-restoration route. Each
-  Levenberg–Marquardt trial matrix `Jᵀ Σ J + λ I` is symmetric positive
-  definite for `λ > 0`, so `"cholesky"` factors it with `xp.linalg.cholesky`
-  and back-substitutes through the existing `get_dense_cholesky_solve` backend
-  gap-filler, at about half the LU's flops. A Cholesky breakdown (the
-  backend raises, or the factor or solution is non-finite) solves that trial
-  by LU. Backends without a triangular-solve adapter (JAX, array-api-strict)
-  keep the LU path. TROTS `Prostate_VMAT_101`, first 25 restoration
-  iterations (NumPy, provisional timings): solves 17 s → 8 s, `restore()`
-  28 s → 20 s, same point to 6·10⁻¹⁴ relative. The default is unchanged, and
-  so is the S2MPJ arithmetic.
-- **`BarrierOptions.probing_sigma`** (`"nww"` default | `"mehrotra"`): opt-in
-  unclipped Mehrotra σ-rule for `mu_schedule="probing"`, as Breedveld et al.
-  2017 run it (Mehrotra 1992; Breedveld 2017 supplement eqs. (4)–(7)):
-  σ = (μ_aff/μ)³ against the current average complementarity, without the
-  NWW clip at σ ≤ 1, the affine probe cut back by `BreedveldOptions.tau`. The
-  μ floor, the centrality floor and the KKT-error fallback still apply. On
-  TROTS it is a no-op (σ > 1 on 1 of ~250 oracle calls); the previous-target
-  reading of the supplement's μ_prev was tested and diverges as μ_aff³/μ².
-- **`CorrectionsOptions.gondzio_variant`** (`"ipax"` default | `"breedveld"`):
-  opt-in Breedveld et al. 2017 Gondzio loop (supplement A.2) after the full
-  Mehrotra corrector: trial step min(1.1α, 1), the asymmetric target box
+- **`LinearOperator.dense_matrix_with_gram(jac, weights)`**, an optional capability of the Hessian operator: the dense condensed route asks `W` for `W + jacᵀ diag(weights) jac` in one call, so a curvature that is a weighted Gram over rows it shares with the inequality Jacobian can multiply those rows once with the summed weights (Breedveld et al. 2017, eq. (48)). `Σ_x` and `δ_w` are added afterwards, out of place; the mixed-precision request applies to the Gram part only. The default raises `NotImplementedError`, and so does an operator that declines a call; the block is then assembled in two passes exactly as before, so every problem that does not implement it (the whole S2MPJ corpus) is unchanged. The `LinearOperator` contract battery checks implementations against `W + Jᵀ diag(w) J`.
+  - The TROTS loader implements it on its exact Hessian (`TiledGramConfig.merge_hessian_gram`, default on): a structure that is both curved and in the linear block is multiplied once per iteration with `h_s + σ_s`, through the core's public Gram chain, on NumPy, CuPy and Torch. Of the default corpus only `Head-and-Neck_01` has such a structure: 21.5 → 19.9 s per iteration on NumPy (medians of three interleaved 10-iteration runs) and 11.7 → 11.1 s on CuPy, with trajectories equal to round-off (≤ 7·10⁻¹³ relative over 10 iterations). Every other corpus case declines up front and is unchanged bit for bit.
+- **All options dataclasses are exported from `ipax`**: `BarrierOptions`, `BreedveldOptions`, `DenseOptions`, `KrylovOptions`, `LBFGSOptions`, `LineSearchOptions`, `RegularizationOptions`, `RestorationOptions` and `SparseOptions` join the top-level namespace next to `Options`; importing them from `ipax.options` keeps working.
+- **`ipax.testing.problems.Maratos`**: the Maratos-effect problem (Nocedal & Wright 2006, Example 15.4) joins the analytic test problems; the sparse-direct contract battery now also runs against the CuPy/cuDSS adapter when a CUDA device is present.
+- **`SparseOptions.deterministic`** (default `False`): asks the sparse-direct adapter for run-to-run reproducible factorizations where the backend offers them, at a factorization-time cost; adapters without such a mode ignore it. The CUDA route (cuDSS) reads it and sets `DETERMINISTIC_MODE`, which makes repeated factorizations bitwise identical. Six default-mode solvers on one captured `ROTDISC` KKT system had given six different solutions. The mode costs 1.2–3× per cuDSS factorization phase in isolation and 2–3 % per factorization call on whole S2MPJ solves.
+  - The flag reaches the adapter through a second optional, duck-typed hook, `configure_deterministic(enabled=)`, which the `SparseDirectSolver` facade calls once, and only when the option is on. The CuPy adapter implements it and the device-routing adapter (Torch/JAX) forwards it. The SciPy adapter has no hook. The default calls nothing, so default behaviour is unchanged.
+  - With it, the CuPy sparse route as a whole is bitwise reproducible run to run on one machine: the adapter's own products and COO builds are reproducible in every mode (see Fixed below). Three processes per problem on `AGG`, `ROTDISC`, `ACOPR14`, `YORKNET` and `COSHFUN` (`exact/sparse`) traced identical trajectories.
+  - The S2MPJ runner gains `--cudss-deterministic`. It is recorded in `environment.cudss_policy`, and `--resume` refuses to mix it with the default mode; older reports resume as non-deterministic.
+- **`SparseOptions.perturbed_pivot_refinement_steps`** (default `10`) and **`SparseOptions.perturbed_pivot_max_residual`** (default `1e-2`): the perturbed-pivot solve policy of static-pivoting sparse factorizations (today the CUDA/cuDSS route; see Fixed below) is now a public option, settable from `ipax.solve(...)`. Previously only the adapter constructors could set it.
+  - The policy reaches the adapter through an optional, duck-typed `configure_perturbed_pivots(refinement_steps=, max_residual=)` hook that the `SparseDirectSolver` facade calls once when it creates the adapter. The CuPy adapter implements the hook and the device-routing adapter (Torch/JAX) forwards it. Adapters that never perturb pivots (SciPy/Feral) do not implement it and ignore the fields, so the adapter protocol is unchanged.
+  - Both fields are validated on construction: a non-negative integer and a finite positive float, with `bool` rejected. The defaults equal the adapter's constants (a unit test pins them), so default behaviour is unchanged.
+  - The S2MPJ runner's `--cudss-refinement-steps` / `--cudss-max-residual` now set these options on the CuPy configs instead of patching the adapter's module constants in each worker.
+- **`IterationRecord.used_soc` / `.soc_attempted`**: each row of `Result.history` now reports whether it is a second-order-corrected point (W&B 2006 §2.4 filter correction, or the opt-in `BreedveldOptions.max_soc` Markov correction) and whether a correction was tried this iteration, accepted or not. The console table gains a trailing `C` tag alongside the existing `R`/`*`. `benchmarks/harness.CaseResult` gains matching `soc_attempted`/`soc_accepted` counts (summed off the new fields), and the TROTS runner's `soc_attempted`/`soc_accepted` counters are now read from `Result.history` for *either* globalization instead of a `BreedveldController.search` monkeypatch that only covered the Breedveld controller.
+- **`BreedveldOptions.max_soc`** (`0` default = off): opt-in second-order correction for the `globalization="breedveld"` controller (Wächter & Biegler 2006, §2.4 / A-5.5–A-5.8, adapted to the Markov acceptance of Breedveld 2017, eqs. (34)–(35)). When the first, full-length trial is rejected without reducing the constraint violation (and is not itself feasible to `max(kkt_tol, 1e-8)`), the filter SOC's closure runs `max_soc` accumulated correction rounds (same factorization-reuse policy; its round count is now taken from the active controller's option) and the corrected point is judged once by the Markov test at the full step; a rejected correction falls back to backtracking. The ratio-control iterations are untouched, and `common_step` moves the duals by the accepted length. Breedveld's own solver has no SOC — this is an ipax addition; the default path is bit-identical. The TROTS runner gains `--breedveld-soc N` (only with `--globalization breedveld`) and every solve row counts `soc_attempted` / `soc_accepted` (see the `IterationRecord.used_soc` entry above). TROTS A/B (NumPy, six cases): only Liver_01 triggers it (one accepted correction, 57 → 51 iterations, same objective); Protons, CyberKnife, both VMAT cases and 20 Head-and-Neck iterations make no attempt and are identical — it stays opt-in.
+- **`TROTSProblem.breedveld_warm_start(lsqr_iter=, lsqr_tol=)`** (`benchmarks/corpus/trots.py`): opt-in overrides for the eq. (26) LSQR dual solve's iteration cap and `atol = btol` (default `None`: the module constants, 200 / `1e-6`, unchanged). On the measured TROTS corpus 7 of 11 cases hit the 200-iteration cap and every LSQR multiplier still ends up floored to 5, so `lsqr_iter=5` reproduces the full run's `WarmStart` and `μ0` bit-for-bit there while cutting the LSQR wall from 46.6 s to 7.2 s on `Head-and-Neck_01` and 25.3 s to 3.7 s on `Prostate_CK_01` (NumPy, provisional, shared machine). This is not provable in general (an early exit can change the floored start on a differently-conditioned instance — see `test_truncating_lsqr_is_not_safe_in_general`), so the default stays 200. The TROTS runner gains matching `--lsqr-iter`/`--lsqr-tol` flags, accepted only with `--init breedveld`.
+- **`BreedveldOptions.common_step`** (`False` default): opt-in single step length for the `globalization="breedveld"` controller, as Breedveld et al. 2017 run it (§2.1, Algorithm 1): `α = min(α_p, α_d)` of the fraction-to-boundary rule moves the primal and the dual variables, and the ratio control / Markov backtracking shrinks that one α (the predictor–corrector's step-length probes keep separate lengths). ipax's separate primal and dual lengths (the IPOPT convention) stay the default and the filter line search ignores the option; the default path is bit-identical. Diagnosed on TROTS `Head-and-Neck_01`, where the separate first-step lengths (0.84 / 0.27) send the objective from 4.6 to 7.9·10⁸.
+- **TROTS loader/runner: units-aware dual floor and common-step lever.** `TROTSProblem.breedveld_warm_start(..., dual_floor=5.0)` sets the floor of the §3.1 multipliers `y0`, `z0` (eqs. (26)–(27); the slacks keep the paper's 5); the runner gains `--dual-floor` (default 5, only with `--init breedveld`) and `--common-step` (only with `--globalization breedveld`). On `Head-and-Neck_01` every LSQR multiplier is below 2·10⁻⁵, so the floor of 5 sets `μ0 = 665`; `--dual-floor 1e-6` gives `μ0 = 1.8·10⁻⁴`. Runner defaults unchanged.
+- **`RestorationOptions.dense_factorization`** (`"lu"` default | `"cholesky"`): opt-in Cholesky solve for the dense feasibility-restoration route. Each Levenberg–Marquardt trial matrix `Jᵀ Σ J + λ I` is symmetric positive definite for `λ > 0`, so `"cholesky"` factors it with `xp.linalg.cholesky` and back-substitutes through the existing `get_dense_cholesky_solve` backend gap-filler, at about half the LU's flops. A Cholesky breakdown (the backend raises, or the factor or solution is non-finite) solves that trial by LU. Backends without a triangular-solve adapter (JAX, array-api-strict) keep the LU path. TROTS `Prostate_VMAT_101`, first 25 restoration iterations (NumPy, provisional timings): solves 17 s → 8 s, `restore()` 28 s → 20 s, same point to 6·10⁻¹⁴ relative. The default is unchanged, and so is the S2MPJ arithmetic.
+- **`BarrierOptions.probing_sigma`** (`"nww"` default | `"mehrotra"`): opt-in unclipped Mehrotra σ-rule for `mu_schedule="probing"`, as Breedveld et al. 2017 run it (Mehrotra 1992; Breedveld 2017 supplement eqs. (4)–(7)): σ = (μ_aff/μ)³ against the current average complementarity, without the NWW clip at σ ≤ 1, the affine probe cut back by `BreedveldOptions.tau`. The μ floor, the centrality floor and the KKT-error fallback still apply. On TROTS it is a no-op (σ > 1 on 1 of ~250 oracle calls); the previous-target reading of the supplement's μ_prev was tested and diverges as μ_aff³/μ².
+- **`CorrectionsOptions.gondzio_variant`** (`"ipax"` default | `"breedveld"`): opt-in Breedveld et al. 2017 Gondzio loop (supplement A.2) after the full Mehrotra corrector: trial step min(1.1α, 1), the asymmetric target box
   [0.2μ, 8μ] with the downward correction of large outliers capped at
   5·8·μ (Gondzio 1996's cap; the supplement's eqs. (13)–(14) read literally
   give a non-monotone correction, so the capped reading is used and both
   are documented), kept only when the step grows to at least 1.07α.
   Neutral on TROTS `Protons_01` (101–103 vs 104 iterations).
-- **Breedveld 2017 reference timings as benchmark data** (CC BY 4.0;
-  `benchmarks/corpus/data/breedveld2017/`). Electronic supplementary material 2
-  of Breedveld, van den Berg & Heijmen (2017), doi:10.1007/s10589-017-9919-4,
-  converted to `trots_reference.json` by
-  `benchmarks/tools/convert_breedveld2017_esm.py` with the values unchanged:
-  per-problem sizes, Default/Mehrotra/Gondzio iterations and seconds, the
-  tiling/permutation/multiple-precision and thread-scaling variants, module
-  breakdowns and per-site module timings. Read by
-  `benchmarks.corpus.trots_reference.breedveld2017_reference()` /
-  `breedveld2017_site_timings()`; the TROTS runner reports the paper's
-  Mehrotra iterations and seconds next to each solve (`ref_iters`,
-  `ref_time_s`). All 120 dataset `Results/*_result.txt` files match the
-  supplement's Mehrotra runs. The directory carries its own LICENSE and
-  attribution README; it ships in the sdist only (README/NOTICE updated).
-- **Device LSQR for the Breedveld dual start on CuPy**
-  (`TROTSProblem.breedveld_warm_start(lsqr="auto")`): SciPy's LSQR ported to
-  the array namespace runs the eq. (26) least-squares solve on the problem's
-  own lowered operator, with no host twin. Same start as the host path to
-  round-off; `Protons_01` initialization 14–17 s → 3.5–4 s under CPU load,
-  0.8 s once the tile plans exist. `lsqr="host"` keeps the SciPy path.
-- **TROTS runner `--corrections` lever** (`benchmarks/runners/trots.py`):
-  overrides `Options.corrections` (`none`/`mehrotra`/`gondzio`) like the
-  existing `--mu-schedule`/`--globalization` levers. The TROTS docs record
-  the `Protons_01` convergence study it reproduces: with the tiled Gram,
-  `hessian="exact"` + `corrections="mehrotra"` certifies below the
-  published reference in 181 iterations where plain L-BFGS stalls.
-- **Operator-valued `linear_ineq` matrices, lowered without densifying.**
-  `Problem.linear_ineq()` now accepts any `LinearOperator`, not only a rank-2
-  array (an operator previously raised `NotImplementedError`). The two-sided
-  block is lowered by the kind of matrix: `COOOperator`/`CSROperator`/
-  `CSCOperator` are rewritten at the triplet level into an operator of the
-  same family (Array-API index/value arithmetic only; the data-precision hint
-  is kept and a pattern key is derived from the source's, so symbolic reuse
-  survives); a `VStack` is lowered block by block so each block keeps its own
-  `gram_accumulate_dtype_hint` for `DenseOptions(gram_dtype="auto")`; any
-  other operator (matrix-free included) is wrapped in a signed row selection
-  whose `gram`/`gram_diagonal`/`gram_coo` fold the selection into the weights.
-  Tall sparse inequality sets (`m ≫ n`) declared through `linear_ineq` now
-  stay on the condensed routes' sparse-Gram fast path. Arrays lower exactly
-  as before, and a `Dense` operator lowers bit-for-bit like its array.
-  Lowered rows are laid out lower-rows-then-upper-rows (block by block for a
-  `VStack`), after any nonlinear inequalities in `Result.y_ineq`.
-  `VStack.blocks` exposes the stacked operators.
-- **Tracked tall linear-inequality benchmark** (`benchmarks/runners/bench_tall_linear_ineq.py`,
-  asv). It tracks time, peak memory, iterations, KKT residual, success, and a
-  stable route code over six tall cells. The cells straddle the dense and
-  sparse normal-equations boundary. Each cell runs with the rows declared
-  through `linear_ineq` and through a hand-lowered operator Jacobian.
-  `TallSparseQP` gains `declaration=` and `two_sided=` (range rows) parameters.
-- **Tiled per-structure Gram in the TROTS loader** (`benchmarks/corpus/trots.py`,
-  default on). Each precision group of the linear block is now declared as a
-  `TiledGramCSROperator`: a `CSROperator` subclass whose `gram` follows
-  Breedveld et al. 2017, §4.2 eq. (48) and §5.2. It plans each structure once
-  with RCM row ordering and 2048-row tiles compacted to their active columns.
-  Row sets sharing a structure matrix are merged into a single weight vector,
-  and the minimax columns add rank-1 borders. Dense tiles use `syrk` on
-  `√w`-scaled data (`gemm` for signed weights); nearly empty tiles use a sparse
-  product. Tiles run on a thread pool, and the result is mirrored once so it is
-  exactly symmetric.
-  A flop-ratio gate (with a cheap pre-gate) keeps dense groups on the plain
-  operator (non-NumPy namespaces: see the device entry below). Results agree with the plain Gram
-  to ~1e-15 relative.
-  - `Protons_01`: lowered-block Gram 2.32 s → 0.33 s; 35 L-BFGS/dense iterations
-    2.8–3.2 → 0.66–0.70 s per iteration.
+- **Breedveld 2017 reference timings as benchmark data** (CC BY 4.0; `benchmarks/corpus/data/breedveld2017/`). Electronic supplementary material 2 of Breedveld, van den Berg & Heijmen (2017), doi:10.1007/s10589-017-9919-4, converted to `trots_reference.json` by `benchmarks/tools/convert_breedveld2017_esm.py` with the values unchanged: per-problem sizes, Default/Mehrotra/Gondzio iterations and seconds, the tiling/permutation/multiple-precision and thread-scaling variants, module breakdowns and per-site module timings. Read by `benchmarks.corpus.trots_reference.breedveld2017_reference()` / `breedveld2017_site_timings()`; the TROTS runner reports the paper's Mehrotra iterations and seconds next to each solve (`ref_iters`, `ref_time_s`). All 120 dataset `Results/*_result.txt` files match the supplement's Mehrotra runs. The directory carries its own LICENSE and attribution README; it ships in the sdist only (README/NOTICE updated).
+- **Device LSQR for the Breedveld dual start on CuPy** (`TROTSProblem.breedveld_warm_start(lsqr="auto")`): SciPy's LSQR ported to the array namespace runs the eq. (26) least-squares solve on the problem's own lowered operator, with no host twin. Same start as the host path to round-off; `Protons_01` initialization 14–17 s → 3.5–4 s under CPU load, 0.8 s once the tile plans exist. `lsqr="host"` keeps the SciPy path.
+- **TROTS runner `--corrections` lever** (`benchmarks/runners/trots.py`): overrides `Options.corrections` (`none`/`mehrotra`/`gondzio`) like the existing `--mu-schedule`/`--globalization` levers. The TROTS docs record the `Protons_01` convergence study it reproduces: with the tiled Gram, `hessian="exact"` + `corrections="mehrotra"` certifies below the published reference in 181 iterations where plain L-BFGS stalls.
+- **Operator-valued `linear_ineq` matrices, lowered without densifying.** `Problem.linear_ineq()` now accepts any `LinearOperator`, not only a rank-2 array (an operator previously raised `NotImplementedError`). The two-sided block is lowered by the kind of matrix: `COOOperator`/`CSROperator`/ `CSCOperator` are rewritten at the triplet level into an operator of the same family (Array-API index/value arithmetic only; the data-precision hint is kept and a pattern key is derived from the source's, so symbolic reuse survives); a `VStack` is lowered block by block so each block keeps its own `gram_accumulate_dtype_hint` for `DenseOptions(gram_dtype="auto")`; any other operator (matrix-free included) is wrapped in a signed row selection whose `gram`/`gram_diagonal`/`gram_coo` fold the selection into the weights. Tall sparse inequality sets (`m ≫ n`) declared through `linear_ineq` now stay on the condensed routes' sparse-Gram fast path. Arrays lower exactly as before, and a `Dense` operator lowers bit-for-bit like its array. Lowered rows are laid out lower-rows-then-upper-rows (block by block for a `VStack`), after any nonlinear inequalities in `Result.y_ineq`. `VStack.blocks` exposes the stacked operators.
+- **Tracked tall linear-inequality benchmark** (`benchmarks/runners/bench_tall_linear_ineq.py`, asv). It tracks time, peak memory, iterations, KKT residual, success, and a stable route code over six tall cells. The cells straddle the dense and sparse normal-equations boundary. Each cell runs with the rows declared through `linear_ineq` and through a hand-lowered operator Jacobian. `TallSparseQP` gains `declaration=` and `two_sided=` (range rows) parameters.
+- **Tiled per-structure Gram in the TROTS loader** (`benchmarks/corpus/trots.py`, default on). Each precision group of the linear block is now declared as a `TiledGramCSROperator`: a `CSROperator` subclass whose `gram` follows Breedveld et al. 2017, §4.2 eq. (48) and §5.2. It plans each structure once with RCM row ordering and 2048-row tiles compacted to their active columns. Row sets sharing a structure matrix are merged into a single weight vector, and the minimax columns add rank-1 borders. Dense tiles use `syrk` on `√w`-scaled data (`gemm` for signed weights); nearly empty tiles use a sparse product. Tiles run on a thread pool, and the result is mirrored once so it is exactly symmetric. A flop-ratio gate (with a cheap pre-gate) keeps dense groups on the plain operator (non-NumPy namespaces: see the device entry below). Results agree with the plain Gram to ~1e-15 relative.
+  - `Protons_01`: lowered-block Gram 2.32 s → 0.33 s; 35 L-BFGS/dense iterations 2.8–3.2 → 0.66–0.70 s per iteration.
   - `Prostate_VMAT_101`: unchanged.
-  - `TROTSProblem(..., tiled_gram=False)` restores the plain block;
-    `TiledGramConfig` exposes the knobs.
+  - `TROTSProblem(..., tiled_gram=False)` restores the plain block; `TiledGramConfig` exposes the knobs.
   - No change under `ipax/`.
-- **Grouped exact Hessian in the TROTS loader** (`benchmarks/corpus/trots.py`,
-  default for `TROTSExactProblem`). `lagrangian_hessian` now returns a
-  `TROTSExactHessian`: one tiled product `A_kᵀ diag(w_k) A_k` per unique curved
-  structure, with the dose-space diagonals of all its terms summed (van Haveren
-  & Breedveld 2019, eqs. (8)–(9); Breedveld et al. 2017, eq. (48)). The gEUD
-  rank-1 terms are a `LowRank` factor and the quadratic terms a re-weighted
-  constant sum. It reuses the linear block's tiled kernels (signed-weight
-  `gemm` fallback; dense row chunks for gated-off structures) and shares tile
-  plans with the linear block through a per-problem registry. The exact
-  `matvec`, `diagonal` and a SciPy `to_coo` are also provided.
-  - `Prostate_CK_01` Hessian: 287–300 s → 1.3–1.5 s per call. `Liver_01`:
-    6.5 s → 0.52 s. The Hessian is now ~11% of an `exact/dense` iteration.
-  - Agrees with the per-term Hessian to ≤ 1e-10 relative. `Protons_01` has no
-    curved term, so its exact Hessian is zero on both paths.
+- **Grouped exact Hessian in the TROTS loader** (`benchmarks/corpus/trots.py`, default for `TROTSExactProblem`). `lagrangian_hessian` now returns a `TROTSExactHessian`: one tiled product `A_kᵀ diag(w_k) A_k` per unique curved structure, with the dose-space diagonals of all its terms summed (van Haveren & Breedveld 2019, eqs. (8)–(9); Breedveld et al. 2017, eq. (48)). The gEUD rank-1 terms are a `LowRank` factor and the quadratic terms a re-weighted constant sum. It reuses the linear block's tiled kernels (signed-weight `gemm` fallback; dense row chunks for gated-off structures) and shares tile plans with the linear block through a per-problem registry. The exact `matvec`, `diagonal` and a SciPy `to_coo` are also provided.
+  - `Prostate_CK_01` Hessian: 287–300 s → 1.3–1.5 s per call. `Liver_01`: 6.5 s → 0.52 s. The Hessian is now ~11% of an `exact/dense` iteration.
+  - Agrees with the per-term Hessian to ≤ 1e-10 relative. `Protons_01` has no curved term, so its exact Hessian is zero on both paths.
   - `TROTSExactProblem(..., grouped_hessian=False)` keeps the per-term path.
-- **TROTS runner A/B flags**: `--plain-gram` (`tiled_gram=False`) and
-  `--per-term-hessian` (`grouped_hessian=False` on the `exact/*` configs).
-- **Device tiled Gram in the TROTS loader** (`benchmarks/corpus/trots.py`,
-  CuPy and Torch namespaces). The tiled plan now also drives a kernel in the
-  solve namespace instead of falling back to the plain `CSROperator`.
-  - Tiles are materialized once on the operator's device as a flat
-    dense-scatter index plus values (~12 B/nnz, 195 MiB on `Protons_01`),
-    shared per problem.
-  - Each tile is multiplied on the device (cuBLAS `syrk` on CuPy; `matmul` on
-    Torch), scatter-added, and the result is mirrored once so it is exactly
-    symmetric.
+- **TROTS runner A/B flags**: `--plain-gram` (`tiled_gram=False`) and `--per-term-hessian` (`grouped_hessian=False` on the `exact/*` configs).
+- **Device tiled Gram in the TROTS loader** (`benchmarks/corpus/trots.py`, CuPy and Torch namespaces). The tiled plan now also drives a kernel in the solve namespace instead of falling back to the plain `CSROperator`.
+  - Tiles are materialized once on the operator's device as a flat dense-scatter index plus values (~12 B/nnz, 195 MiB on `Protons_01`), shared per problem.
+  - Each tile is multiplied on the device (cuBLAS `syrk` on CuPy; `matmul` on Torch), scatter-added, and the result is mirrored once so it is exactly symmetric.
   - Sparse tiles use cuSPARSE on CuPy for exact Grams.
-  - `TROTSExactProblem` on those namespaces returns a
-    `TROTSDeviceExactHessian` that runs its tiled structures through the same
-    device tiles. It keeps the `CSCOperator` crossing when no structure is
-    tiled.
+  - `TROTSExactProblem` on those namespaces returns a `TROTSDeviceExactHessian` that runs its tiled structures through the same device tiles. It keeps the `CSCOperator` crossing when no structure is tiled.
   - The gate, `tiled_gram=False` and the NumPy path are unchanged.
-  - `Protons_01` on an RTX 4070 Laptop (CuPy): lowered-block Gram
-    2.91 s → 0.22 s in float64 and 0.19 s → 0.057 s in float32; 36 L-BFGS/dense
-    iterations 2.87 → 0.29 s per iteration on the same trajectory.
+  - `Protons_01` on an RTX 4070 Laptop (CuPy): lowered-block Gram 2.91 s → 0.22 s in float64 and 0.19 s → 0.057 s in float32; 36 L-BFGS/dense iterations 2.87 → 0.29 s per iteration on the same trajectory.
   - Torch-CUDA is untested; Torch is validated on CPU tensors.
-- **The S2MPJ sweep runs on CuPy** (`benchmarks/runners/s2mpj.py`,
-  `benchmarks/corpus/s2mpj.py`, new `benchmarks/runners/_cupy_certificates.py`).
-  - Fixed: the S2MPJ host bridge could not run on CuPy before. It relied on an
-    implicit `np.asarray`, which CuPy refuses, and it always built the SciPy
-    sparse operator, which cuDSS cannot factor. The bridge now copies device
-    arrays with `get()` and uploads each Jacobian and Hessian once into the
-    CuPy adapter's `SparseOperator`. `--backends cupy` therefore runs every
-    config, with cuDSS on the sparse ones. NumPy and Torch are unchanged.
-  - `--cupy-certificates` counts, per solve, the cuDSS perturbed-pivot residual
-    certificate and the dense pivot-checked Cholesky. It bins every certified
-    relative residual by decade and writes the counts to
-    `<out>.certs.<pid>.jsonl`. It wraps the adapter from the benchmark side and
-    leaves `ipax/` untouched.
-  - First corpus run of the certificate (docs/benchmarks/s2mpj.md, "CuPy
-    sparse-direct route"). `db75a27`, four configs, CuPy against NumPy at the
-    gate budget: correct changed by +2 (`lbfgs/dense`), −9 (`exact/dense`), −21
-    (`lbfgs/sparse`) and −18 (`exact/sparse`).
-  - On `lbfgs/sparse`, 893 of 1100 problems factor with perturbed pivots.
-    99 784 of 695 428 certified solves are rejected, and the residuals are
-    continuous across the `1e-2` threshold.
-  - Re-running each flip with the certificate relaxed or off gives 5 true
-    positives (off fails) and 3 false positives. The larger CuPy-vs-NumPy gap
-    comes from accepted perturbed-pivot solves with residuals of 1e-5–1e-2:
-    a strict `1e-6` fixes 8 of 17 such stalls.
-  - The threshold stays at `1e-2`. Iterative refinement on perturbed-pivot
-    factorizations is the recommended follow-up (since done; see Fixed).
-    factorizations is the recommended follow-up.
-  - Documented that the CuPy sparse-direct route (cuDSS) and the CuPy
-    device-tiled Gram assembly are not run-to-run deterministic — identical
-    re-runs of the corpus sweep moved `ACOPR14` `exact/sparse` from 25 to 38
-    iterations, `YORKNET` from 2055 to 120, and flipped `COSHFUN` from
-    `max_time` to `optimal` — while the CuPy dense route reproduced that sweep exactly and the
-    NumPy/Torch-CPU routes are deterministic. New "Reproducibility on CUDA" subsection in
-    `docs/guide/backends.md`, cross-linked from the S2MPJ and TROTS benchmark
-    reports.
+- **The S2MPJ sweep runs on CuPy** (`benchmarks/runners/s2mpj.py`, `benchmarks/corpus/s2mpj.py`, new `benchmarks/runners/_cupy_certificates.py`).
+  - Fixed: the S2MPJ host bridge could not run on CuPy before. It relied on an implicit `np.asarray`, which CuPy refuses, and it always built the SciPy sparse operator, which cuDSS cannot factor. The bridge now copies device arrays with `get()` and uploads each Jacobian and Hessian once into the CuPy adapter's `SparseOperator`. `--backends cupy` therefore runs every config, with cuDSS on the sparse ones. NumPy and Torch are unchanged.
+  - `--cupy-certificates` counts, per solve, the cuDSS perturbed-pivot residual certificate and the dense pivot-checked Cholesky. It bins every certified relative residual by decade and writes the counts to `<out>.certs.<pid>.jsonl`. It wraps the adapter from the benchmark side and leaves `ipax/` untouched.
+  - First corpus run of the certificate (docs/benchmarks/s2mpj.md, "CuPy sparse-direct route"). `db75a27`, four configs, CuPy against NumPy at the gate budget: correct changed by +2 (`lbfgs/dense`), −9 (`exact/dense`), −21 (`lbfgs/sparse`) and −18 (`exact/sparse`).
+  - On `lbfgs/sparse`, 893 of 1100 problems factor with perturbed pivots. 99 784 of 695 428 certified solves are rejected, and the residuals are continuous across the `1e-2` threshold.
+  - Re-running each flip with the certificate relaxed or off gives 5 true positives (off fails) and 3 false positives. The larger CuPy-vs-NumPy gap comes from accepted perturbed-pivot solves with residuals of 1e-5–1e-2: a strict `1e-6` fixes 8 of 17 such stalls.
+  - The threshold stays at `1e-2`. Iterative refinement on perturbed-pivot factorizations is the recommended follow-up (since done; see Fixed). factorizations is the recommended follow-up.
+  - Documented that the CuPy sparse-direct route (cuDSS) and the CuPy device-tiled Gram assembly are not run-to-run deterministic — identical re-runs of the corpus sweep moved `ACOPR14` `exact/sparse` from 25 to 38 iterations, `YORKNET` from 2055 to 120, and flipped `COSHFUN` from `max_time` to `optimal` — while the CuPy dense route reproduced that sweep exactly and the NumPy/Torch-CPU routes are deterministic. New "Reproducibility on CUDA" subsection in `docs/guide/backends.md`, cross-linked from the S2MPJ and TROTS benchmark reports.
 
 ### Changed
-- **Highlights of this release.** The Breedveld 2017 parity campaign on
-  the TROTS radiotherapy corpus: Head-and-Neck_01, the one site that did not
-  converge, reaches the paper's optimum in 46 iterations (paper: 45) with the
-  opt-in common step, and runs in 749 s on NumPy (was 1786 s) and 283 s on
-  CuPy with the opt-in float32 Gram (paper: 279 s on 16 cores) after a
-  profiling-driven set of loader and dense-route levers (threaded and
-  compiled tile scatter, LAPACK `dpotrf` on one blocked copy, one product per
-  structure through the new optional `LinearOperator.dense_matrix_with_gram`
-  hook). The CuPy sparse route refines cuDSS perturbed-pivot solves before
-  certifying them (sparse-config gap to NumPy −39 → −17 rows), is bitwise
-  reproducible run to run, and exposes its policy through `SparseOptions`.
-  Overflowing bound diagonals can no longer pass as finite steps. Every
-  options dataclass is importable from `ipax`. All behaviour-changing
-  defaults were gated by full-corpus sweeps (S2MPJ v36 NumPy +1/−0 vs v31,
-  v37 CuPy); every other lever is opt-in.
-- **Dense route on NumPy: Cholesky through LAPACK `dpotrf` on one blocked
-  copy** (`ipax.backend.dense.get_dense_cholesky`, NumPy only).
-  `numpy.linalg.cholesky` runs `dpotrf` between two unblocked transposing
-  `n×n` copies (C-ordered input to a Fortran scratch buffer, and back). At
-  `n = 9984` (TROTS `Head-and-Neck_01`) each copy cost about as much as the
-  factorization. The new gap-filler copies only the lower triangle, in
-  cache-sized blocks, into one Fortran-ordered buffer and factors it in
-  place.
-  - It never writes to its input, and it returns a Fortran-ordered, exactly
-    lower factor that `cholesky_solve` back-substitutes without a copy.
+- **Highlights of this release.** The Breedveld 2017 parity campaign on the TROTS radiotherapy corpus: Head-and-Neck_01, the one site that did not converge, reaches the paper's optimum in 46 iterations (paper: 45) with the opt-in common step, and runs in 749 s on NumPy (was 1786 s) and 283 s on CuPy with the opt-in float32 Gram (paper: 279 s on 16 cores) after a profiling-driven set of loader and dense-route levers (threaded and compiled tile scatter, LAPACK `dpotrf` on one blocked copy, one product per structure through the new optional `LinearOperator.dense_matrix_with_gram` hook). The CuPy sparse route refines cuDSS perturbed-pivot solves before certifying them (sparse-config gap to NumPy −39 → −17 rows), is bitwise reproducible run to run, and exposes its policy through `SparseOptions`. Overflowing bound diagonals can no longer pass as finite steps. Every options dataclass is importable from `ipax`. All behaviour-changing defaults were gated by full-corpus sweeps (S2MPJ v36 NumPy +1/−0 vs v31, v37 CuPy); every other lever is opt-in.
+- **Dense route on NumPy: Cholesky through LAPACK `dpotrf` on one blocked copy** (`ipax.backend.dense.get_dense_cholesky`, NumPy only). `numpy.linalg.cholesky` runs `dpotrf` between two unblocked transposing `n×n` copies (C-ordered input to a Fortran scratch buffer, and back). At `n = 9984` (TROTS `Head-and-Neck_01`) each copy cost about as much as the factorization. The new gap-filler copies only the lower triangle, in cache-sized blocks, into one Fortran-ordered buffer and factors it in place.
+  - It never writes to its input, and it returns a Fortran-ordered, exactly lower factor that `cholesky_solve` back-substitutes without a copy.
   - A breakdown raises `numpy.linalg.LinAlgError`, as before.
-  - Only float64 2-D input takes the new path; other dtypes and shapes use
-    `numpy.linalg.cholesky`.
-  - `DenseSolver`'s PD guard and its PD-hinted factor reuse go through it.
-    Torch, CuPy, JAX and array-api-strict keep `xp.linalg.cholesky`, and
-    restoration's opt-in dense Cholesky is unchanged.
+  - Only float64 2-D input takes the new path; other dtypes and shapes use `numpy.linalg.cholesky`.
+  - `DenseSolver`'s PD guard and its PD-hinted factor reuse go through it. Torch, CuPy, JAX and array-api-strict keep `xp.linalg.cholesky`, and restoration's opt-in dense Cholesky is unchanged.
 
   Measured: 1.8–2.0× per factorization standalone (`n = 2000`–`9984`), and
   on `Head-and-Neck_01` 3.19 → 1.80 s per factorization, 25.7 → 24.0 s per
@@ -347,986 +79,142 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   and every back-solve are bit-identical: a bitwise A/B of both dense
   configs over the S2MPJ corpus (2196 solves, 164 748 iterates) diverged
   nowhere.
-- **TROTS loader, host tiled Gram and exact Hessian: lower-triangle, threaded
-  compacted scatter** (`benchmarks/corpus/trots.py`, `_scatter_lower`, host
-  NumPy only). Profiling `Head-and-Neck_01` (n = 9984) on NumPy put half of
-  the 42 s iteration in one line: each tile's `c×c` product was added into
-  the `n×n` accumulator by a single-threaded fancy-index scatter of the whole
-  block (`acc[ix_(cols, cols)] += g`), at tile widths up to `c ≈ 9700`. The
-  scatter now adds only the lower triangle (the final mirror overwrites the
-  upper one), in row chunks of equal area, and runs the chunks on a thread
-  pool when the tile runs on a single accumulation lane (NumPy's fancy-index
-  get/set and the addition release the GIL; measured 3.2× on 8 threads
-  standalone). Every lower entry still receives the same single addition, so
-  the Gram and the dense Hessian are **bitwise identical** for any thread
-  count (sha256-checked on `Head-and-Neck_01`, unit-tested against the old
-  scatter on the single-lane, multi-lane and signed paths). New knob
-  `TiledGramConfig.scatter_threads` (default 8; results do not depend on
-  it). `Head-and-Neck_01`, one call each, fresh weights: linear-block Gram
-  20.9 → 13.3 s, dense exact Hessian 11.2 → 6.9 s.
-- **TROTS loader, host tiled Gram and exact Hessian: densify, scaling and
-  mirror on the same thread pool** (`benchmarks/corpus/trots.py`,
-  `_densify`, `_mirror_lower`, `_host_pool`; host NumPy only). A large
-  single-lane tile is densified as zero-copy CSR row windows into one output
-  (`toarray(out=)`) and `√w`-scaled there; the final lower-to-upper mirror
-  runs its independent row panels in parallel. Same values, same products,
-  pure copies: bitwise identical for any `scatter_threads` (unit-tested,
-  including non-canonical CSR input). The pool now starts lazily, once per
-  Gram or dense Hessian, and only when some pass is large enough.
-  `Head-and-Neck_01` per Gram (all 41 dense tiles; medians of 5,
-  interleaved): densify + scale 1.09 → 0.48 s, mirror 0.61 → 0.11 s.
-  `Protons_01`, `Liver_01`, `Prostate_CK_01` Grams and Hessians: unchanged
-  wall, bitwise-identical results.
-- **TROTS loader, host tiled Gram and exact Hessian: compiled compacted
-  scatter** (`benchmarks/corpus/_trots_kernels.py`, `_scatter_lower`; host
-  NumPy only). The per-tile `acc[ix_(cols, cols)] += g` is now a plain loop
-  over the same lower-triangle entries, compiled by Numba
-  (`njit(nogil=True, cache=True)`, no `fastmath`).
-  - It runs in the same row chunks on the same `scatter_threads` pool, and
-    Numba starts no threads of its own.
-  - Each entry receives the same single addition, so the Gram and the dense
-    Hessian are **bitwise identical** (sha256-tested against the NumPy
-    scatter; `Head-and-Neck_01`'s 10-iteration trajectory is bit-identical).
-  - Numba is optional, in its own `trots` extra (not part of `dev` or
-    `bench`: Numba lags new Python/NumPy releases). It is imported lazily and
-    compiled or loaded from its cache when the operator is built, never in
-    a timed iteration.
-  - Without Numba, if compilation fails, or with the new
-    `TiledGramConfig.compiled_scatter=False`, the NumPy scatter runs.
-  - `Head-and-Neck_01`, per iteration on a shared machine: Gram scatter
-    6.33 → 1.46 s, Hessian scatter 2.25 → 0.54 s.
-  - Compiling the product into the accumulator as well (a fused `syrk`) was
-    measured and rejected: 8× slower than OpenBLAS `dsyrk` in IEEE order.
-- **Docs: "Head-and-Neck_01 speed profile (2026-10-02)"**
-  (`docs/benchmarks/trots.md`): per-iteration phase tables on NumPy and
-  CuPy, a ranked lever table (estimate vs measured, with the rejected ones:
-  a 4 GiB lane budget is now slower, BLAS thread count is no lever, host
-  syncs are ~1.4 ms per iteration), and the full re-time after the levers
-  above. NumPy 1786 → 959 s (37.9 → 20.0 s per iteration); CuPy 525 s, and
-  309 s with `--gram-dtype float32`, against the paper's 279 s; all runs
-  46 iterations to the same objective. Also corrects the tiled-Gram
-  section's claim that the compacted scatter holds the GIL.
-- **TROTS runner: `--gram-dtype {auto,native,float32}`**
-  (`benchmarks/runners/trots.py`) sets `DenseOptions.gram_dtype` (default
-  `auto`, the ipax default, so default runs are unchanged). `float32` forces
-  the mixed-precision condensed Gram with float64 iterative refinement on
-  float64 data such as `Head-and-Neck_01`; the loader's pooled densify now
-  also covers a float64 tile under that float32 request (per-window cast
-  into the float32 rows, bitwise the whole-tile `astype`). See
-  `docs/benchmarks/trots.md`, "Head-and-Neck_01 speed profile (2026-10-02)".
-- **TROTS loader, host tiled Gram: width-aware sparse-tile kernel choice on
-  single-lane Grams** (`benchmarks/corpus/trots.py`; new
-  `TiledGramConfig.host_sparse_entry_ratio`, default 4, `None` = off; host
-  NumPy only). The 1% rule (`Σ nnz_row² ≤ 0.01·b·c²` ⇒ SciPy SpGEMM) was
-  fitted on narrow tiles; SpGEMM's cost per product grows with the tile
-  width, so a survey of every sparse-or-near tile of ten TROTS cases put the
-  break-even at ~1.5% for `c ≈ 200` and ~0.2% for `c ≈ 2000`, i.e. about
-  `4/c`. On a single-lane Gram (tiles in sequence with all BLAS threads, the
-  `n ≈ 10⁴` case) a sparse tile is now densified when `Σ nnz_row² > 4·b·c`.
-  Multi-lane Grams keep the 1% rule (their SpGEMMs run in parallel across
-  the lanes; measured: the width rule there cost `Protons_02` 0.88 → 1.07 s
-  per Gram), and the plan's flag, flop counts, gate and device kernels are
-  unchanged. `Head-and-Neck_01` linear-block Gram 13.5 → 12.4 s (its three
-  2048×3609–9684 tiles at 0.4%); a different kernel for those tiles, so the
-  Gram changes by round-off. Every other Gram and dense Hessian of the eleven
-  corpus cases (Protons, Liver, CK, VMAT, BT pairs, `Head-and-Neck_01`'s own
-  Hessian) is sha256-identical. Under a float32 accumulate request a
-  densified tile is rounded like any dense tile (it was float64 by SpGEMM).
-- **TROTS loader, host exact Hessian: keep the tiled plan of a curved
-  structure the gate rejected after planning it** (`benchmarks/corpus/trots.py`,
-  `TROTSExactProblem`, host Hessian: NumPy and adapter-less namespaces; new
-  `TiledGramConfig.host_hessian_flop_ratio`,
-  default 0.9). The linear block's gate (`flop_ratio_threshold = 0.5`) sent
-  such structures to full-width dense row chunks, which cost more `syrk`
-  flops and an `n`-wide scatter than the plan they had just built
-  (`Head-and-Neck_01`'s two PTV structures plan at 0.54 and 0.52). The host
-  Hessian now keeps that plan while its flop ratio is at most the new knob
-  and registers it, so the linear block reuses the tile set (one copy, as
-  on the device). Dense-ish structures the pre-gate rejects are never
-  planned and are unchanged (`Prostate_CK_01`, `Prostate_VMAT_101`).
-  `Head-and-Neck_01` dense Hessian 7.4 → 4.8 s per call; the linear-block
-  Gram is bitwise unchanged. The Hessian changes by round-off only (1.8·10⁻²¹
-  relative on `Head-and-Neck_01`, 7·10⁻²⁴ on `Liver_01`, whose "Liver minus
-  CTV" structure, plan ratio 0.85, is now tiled too).
-- **Dense KKT route: two O(n²)-per-iteration costs removed from the hot path**
-  (`ipax/backend/dense/numpy_scipy.py`, `ipax/backend/dense/torch.py`,
-  `ipax/backend/dense/__init__.py`, `ipax/ipm/kkt.py`), found profiling TROTS
-  `Head-and-Neck_01` (n=9984) on NumPy:
-  - **Cholesky back-solve layout.** `get_dense_cholesky_solve`'s NumPy/SciPy
-    adapter passed the C-ordered lower factor from `np.linalg.cholesky`
-    straight into `scipy.linalg.cho_solve`; SciPy's f2py wrapper bridges the
-    C→Fortran mismatch with a full O(n²) copy on *every* back-solve. The
-    factor's transpose view `Lᵀ` is Fortran-contiguous over the same memory
-    at zero cost and is exactly the upper factor `U` (`A = Uᵀ U`), so
-    `(U, lower=False)` runs the same LAPACK `potrs` without the copy.
-    Verified bitwise identical on the tested NumPy/OpenBLAS build across
-    n ∈ {10, 100, 500, 2000, 5000}, float32/float64, 1- and multi-column
-    right-hand sides, and well-/ill-conditioned SPD matrices (40/40
-    configurations, see `tests/unit/test_dense_numpy_scipy_cholesky.py`);
-    LAPACK's `uplo='U'` and `'L'` `potrs` paths are not guaranteed bit-for-bit
-    identical in general (different trsm kernels internally), so a different
-    BLAS build is only guaranteed numerically equivalent, not bitwise.
-    Provisional NumPy timings (interleaved medians of 7 samples, shared CPU): a single
-    back-solve at n=2000 23 ms → 3.0 ms, n=5000 334 ms → 31 ms, n=10000
-    1010 ms → 79 ms. Torch's `cholesky_solve` was already unaffected
-    (`torch.linalg.cholesky` returns its factor Fortran-ordered, so the
-    existing call already avoided the copy — confirmed on CPU, measured
-    faster than either C- or F-ordered SciPy path at the same sizes). CuPy's
-    `cholesky_solve` (`cupyx.scipy.linalg.solve_triangular` ×2) was found by
-    reading to have the same C→F copy on both triangular solves (CuPy's own
-    `cholesky` also returns a C-ordered factor); that copy is removed by the
-    `Head-and-Neck_01` GPU-memory entry below, verified on CUDA hardware.
-  - **`_add_dense_diagonal`.** Built `diag(diagonal)` via `xp.eye(n) *
-    diagonal` — an extra O(n²) identity allocation and elementwise multiply
-    on top of the O(n²) copy already unavoidable to return a new matrix
-    (about 0.5 s/iteration at n≈10⁴ in the profile). New
-    `get_dense_diagonal_adder` backend gap-filler (NumPy, Torch) copies the
-    matrix once and updates only the diagonal in O(n) through a writable
-    view (`numpy.einsum("ii->i", a)`; `torch.Tensor.diagonal()` +
-    `add_()`), also applied to the adjacent `delta_w * I` regularization term
-    in the same function. Bitwise identical to the `eye`-based formula for
-    finite inputs, at the promoted dtype: NEP 50 / Torch's own type-promotion
-    rules keep `matrix.dtype` for a Python-scalar `diagonal` (a "weak" type)
-    but promote to `diagonal`'s dtype for a same-valued array (a "strong"
-    type, e.g. a float64 vector against a float32 `matrix`) —
-    `numpy.result_type`/`torch.result_type` reproduce that exact promotion
-    decision. No adapter for CuPy/JAX/array-api-strict — the `eye`-based
-    fallback is unchanged there,
-    so only correctness, not speed, is guaranteed. Provisional NumPy timings
-    (interleaved medians of 7 samples): n=2000 32 ms → 7.2 ms, n=5000
-    179 ms → 47 ms, n=10000 682 ms → 173 ms (the remaining cost is the
-    unavoidable O(n²) copy). Bitwise identical ⇒ no S2MPJ round-off change;
-    the corpus sweep is not required for this change.
-- **TROTS `Head-and-Neck_01` fits the 8 GB GPU** (CuPy, runner default:
-  exact Hessian, Mehrotra, Breedveld start). Duplicate device copies were
-  removed without changing the arithmetic: peak pool use 11.2 → 6.5 GB, pool
-  size 13.6 → 7.3 GB, and 7 iterations run under a 7.5 GB pool limit;
-  per iteration 18.6–39.5 s → 11.2 s, initialization 54 → 19.5 s (RTX 4070
-  Laptop under CPU load, provisional). The trajectory agrees to 1.2·10⁻¹³
-  relative, within CuPy's run-to-run spread. `Protons_01` and `Liver_01`
-  keep their iteration counts (93, 57) and statuses; their final objectives
-  move by 2.8·10⁻⁹ and 2·10⁻¹⁶ relative, where two runs of the old code
-  already differ by 2.3·10⁻⁹ on `Protons_01`. In detail:
-  - *Loader* (`benchmarks/corpus/trots.py`): on CuPy the tiled
-    linear-block operator (`TiledGramCSROperator`) holds the block once, as
-    the sparse adapter's device CSR (12 B/nnz), instead of COO triplets
-    beside that CSR (36 B/nnz). The canonical host CSR is uploaded as
-    that CSR, so the device COO→CSR conversion is gone; it peaked at 8.8 GB
-    on this case and was where a 7.6 GB limit failed. `to_coo()` rebuilds
-    the triplets on demand. Products are bit-identical except the
-    atomics-accumulated transpose products. The tiled Gram's
-    last-weights memo is now released before the next Gram is accumulated
-    beside it (NumPy and CuPy).
-  - *Dense assembly* (`ipax/ipm/kkt.py`): the condensed matrix adds the
-    Gram term into the assembly's own fresh block in place
-    (`dense += gram`), which saves an `n×n` temporary at the route's memory
-    peak. Bit-identical on every backend; immutable-array namespaces rebind
-    as before.
-  - *CuPy dense adapter* (`ipax/backend/dense/cupy.py`, `cholesky_solve`):
-    the back-substitution solves with the C-ordered factor's transpose view,
-    which is Fortran-ordered, so `cupyx`'s `solve_triangular` no longer
-    copies the factor on each of its two calls (an `n×n` copy each, 0.76 GB
-    here). Same triangular systems, different cuBLAS kernel: bit-identical
-    for matrix right-hand sides, last-bit differences for vectors
-    (≤ 5·10⁻¹⁵ relative at `n = 9984`). CuPy only.
+- **TROTS loader, host tiled Gram and exact Hessian: lower-triangle, threaded compacted scatter** (`benchmarks/corpus/trots.py`, `_scatter_lower`, host NumPy only). Profiling `Head-and-Neck_01` (n = 9984) on NumPy put half of the 42 s iteration in one line: each tile's `c×c` product was added into the `n×n` accumulator by a single-threaded fancy-index scatter of the whole block (`acc[ix_(cols, cols)] += g`), at tile widths up to `c ≈ 9700`. The scatter now adds only the lower triangle (the final mirror overwrites the upper one), in row chunks of equal area, and runs the chunks on a thread pool when the tile runs on a single accumulation lane (NumPy's fancy-index get/set and the addition release the GIL; measured 3.2× on 8 threads standalone). Every lower entry still receives the same single addition, so the Gram and the dense Hessian are **bitwise identical** for any thread count (sha256-checked on `Head-and-Neck_01`, unit-tested against the old scatter on the single-lane, multi-lane and signed paths). New knob `TiledGramConfig.scatter_threads` (default 8; results do not depend on it). `Head-and-Neck_01`, one call each, fresh weights: linear-block Gram 20.9 → 13.3 s, dense exact Hessian 11.2 → 6.9 s.
+- **TROTS loader, host tiled Gram and exact Hessian: densify, scaling and mirror on the same thread pool** (`benchmarks/corpus/trots.py`, `_densify`, `_mirror_lower`, `_host_pool`; host NumPy only). A large single-lane tile is densified as zero-copy CSR row windows into one output (`toarray(out=)`) and `√w`-scaled there; the final lower-to-upper mirror runs its independent row panels in parallel. Same values, same products, pure copies: bitwise identical for any `scatter_threads` (unit-tested, including non-canonical CSR input). The pool now starts lazily, once per Gram or dense Hessian, and only when some pass is large enough. `Head-and-Neck_01` per Gram (all 41 dense tiles; medians of 5, interleaved): densify + scale 1.09 → 0.48 s, mirror 0.61 → 0.11 s. `Protons_01`, `Liver_01`, `Prostate_CK_01` Grams and Hessians: unchanged wall, bitwise-identical results.
+- **TROTS loader, host tiled Gram and exact Hessian: compiled compacted scatter** (`benchmarks/corpus/_trots_kernels.py`, `_scatter_lower`; host NumPy only). The per-tile `acc[ix_(cols, cols)] += g` is now a plain loop over the same lower-triangle entries, compiled by Numba (`njit(nogil=True, cache=True)`, no `fastmath`).
+  - It runs in the same row chunks on the same `scatter_threads` pool, and Numba starts no threads of its own.
+  - Each entry receives the same single addition, so the Gram and the dense Hessian are **bitwise identical** (sha256-tested against the NumPy scatter; `Head-and-Neck_01`'s 10-iteration trajectory is bit-identical).
+  - Numba is optional, in its own `trots` extra (not part of `dev` or `bench`: Numba lags new Python/NumPy releases). It is imported lazily and compiled or loaded from its cache when the operator is built, never in a timed iteration.
+  - Without Numba, if compilation fails, or with the new `TiledGramConfig.compiled_scatter=False`, the NumPy scatter runs.
+  - `Head-and-Neck_01`, per iteration on a shared machine: Gram scatter 6.33 → 1.46 s, Hessian scatter 2.25 → 0.54 s.
+  - Compiling the product into the accumulator as well (a fused `syrk`) was measured and rejected: 8× slower than OpenBLAS `dsyrk` in IEEE order.
+- **Docs: "Head-and-Neck_01 speed profile (2026-10-02)"** (`docs/benchmarks/trots.md`): per-iteration phase tables on NumPy and CuPy, a ranked lever table (estimate vs measured, with the rejected ones: a 4 GiB lane budget is now slower, BLAS thread count is no lever, host syncs are ~1.4 ms per iteration), and the full re-time after the levers above. NumPy 1786 → 959 s (37.9 → 20.0 s per iteration); CuPy 525 s, and 309 s with `--gram-dtype float32`, against the paper's 279 s; all runs 46 iterations to the same objective. Also corrects the tiled-Gram section's claim that the compacted scatter holds the GIL.
+- **TROTS runner: `--gram-dtype {auto,native,float32}`** (`benchmarks/runners/trots.py`) sets `DenseOptions.gram_dtype` (default `auto`, the ipax default, so default runs are unchanged). `float32` forces the mixed-precision condensed Gram with float64 iterative refinement on float64 data such as `Head-and-Neck_01`; the loader's pooled densify now also covers a float64 tile under that float32 request (per-window cast into the float32 rows, bitwise the whole-tile `astype`). See `docs/benchmarks/trots.md`, "Head-and-Neck_01 speed profile (2026-10-02)".
+- **TROTS loader, host tiled Gram: width-aware sparse-tile kernel choice on single-lane Grams** (`benchmarks/corpus/trots.py`; new `TiledGramConfig.host_sparse_entry_ratio`, default 4, `None` = off; host NumPy only). The 1% rule (`Σ nnz_row² ≤ 0.01·b·c²` ⇒ SciPy SpGEMM) was fitted on narrow tiles; SpGEMM's cost per product grows with the tile width, so a survey of every sparse-or-near tile of ten TROTS cases put the break-even at ~1.5% for `c ≈ 200` and ~0.2% for `c ≈ 2000`, i.e. about `4/c`. On a single-lane Gram (tiles in sequence with all BLAS threads, the `n ≈ 10⁴` case) a sparse tile is now densified when `Σ nnz_row² > 4·b·c`. Multi-lane Grams keep the 1% rule (their SpGEMMs run in parallel across the lanes; measured: the width rule there cost `Protons_02` 0.88 → 1.07 s per Gram), and the plan's flag, flop counts, gate and device kernels are unchanged. `Head-and-Neck_01` linear-block Gram 13.5 → 12.4 s (its three 2048×3609–9684 tiles at 0.4%); a different kernel for those tiles, so the Gram changes by round-off. Every other Gram and dense Hessian of the eleven corpus cases (Protons, Liver, CK, VMAT, BT pairs, `Head-and-Neck_01`'s own Hessian) is sha256-identical. Under a float32 accumulate request a densified tile is rounded like any dense tile (it was float64 by SpGEMM).
+- **TROTS loader, host exact Hessian: keep the tiled plan of a curved structure the gate rejected after planning it** (`benchmarks/corpus/trots.py`, `TROTSExactProblem`, host Hessian: NumPy and adapter-less namespaces; new `TiledGramConfig.host_hessian_flop_ratio`, default 0.9). The linear block's gate (`flop_ratio_threshold = 0.5`) sent such structures to full-width dense row chunks, which cost more `syrk` flops and an `n`-wide scatter than the plan they had just built (`Head-and-Neck_01`'s two PTV structures plan at 0.54 and 0.52). The host Hessian now keeps that plan while its flop ratio is at most the new knob and registers it, so the linear block reuses the tile set (one copy, as on the device). Dense-ish structures the pre-gate rejects are never planned and are unchanged (`Prostate_CK_01`, `Prostate_VMAT_101`). `Head-and-Neck_01` dense Hessian 7.4 → 4.8 s per call; the linear-block Gram is bitwise unchanged. The Hessian changes by round-off only (1.8·10⁻²¹ relative on `Head-and-Neck_01`, 7·10⁻²⁴ on `Liver_01`, whose "Liver minus CTV" structure, plan ratio 0.85, is now tiled too).
+- **Dense KKT route: two O(n²)-per-iteration costs removed from the hot path** (`ipax/backend/dense/numpy_scipy.py`, `ipax/backend/dense/torch.py`, `ipax/backend/dense/__init__.py`, `ipax/ipm/kkt.py`), found profiling TROTS `Head-and-Neck_01` (n=9984) on NumPy:
+  - **Cholesky back-solve layout.** `get_dense_cholesky_solve`'s NumPy/SciPy adapter passed the C-ordered lower factor from `np.linalg.cholesky` straight into `scipy.linalg.cho_solve`; SciPy's f2py wrapper bridges the C→Fortran mismatch with a full O(n²) copy on *every* back-solve. The factor's transpose view `Lᵀ` is Fortran-contiguous over the same memory at zero cost and is exactly the upper factor `U` (`A = Uᵀ U`), so `(U, lower=False)` runs the same LAPACK `potrs` without the copy. Verified bitwise identical on the tested NumPy/OpenBLAS build across n ∈ {10, 100, 500, 2000, 5000}, float32/float64, 1- and multi-column right-hand sides, and well-/ill-conditioned SPD matrices (40/40 configurations, see `tests/unit/test_dense_numpy_scipy_cholesky.py`); LAPACK's `uplo='U'` and `'L'` `potrs` paths are not guaranteed bit-for-bit identical in general (different trsm kernels internally), so a different BLAS build is only guaranteed numerically equivalent, not bitwise. Provisional NumPy timings (interleaved medians of 7 samples, shared CPU): a single back-solve at n=2000 23 ms → 3.0 ms, n=5000 334 ms → 31 ms, n=10000 1010 ms → 79 ms. Torch's `cholesky_solve` was already unaffected (`torch.linalg.cholesky` returns its factor Fortran-ordered, so the existing call already avoided the copy — confirmed on CPU, measured faster than either C- or F-ordered SciPy path at the same sizes). CuPy's `cholesky_solve` (`cupyx.scipy.linalg.solve_triangular` ×2) was found by reading to have the same C→F copy on both triangular solves (CuPy's own `cholesky` also returns a C-ordered factor); that copy is removed by the `Head-and-Neck_01` GPU-memory entry below, verified on CUDA hardware.
+  - **`_add_dense_diagonal`.** Built `diag(diagonal)` via `xp.eye(n) * diagonal` — an extra O(n²) identity allocation and elementwise multiply on top of the O(n²) copy already unavoidable to return a new matrix (about 0.5 s/iteration at n≈10⁴ in the profile). New `get_dense_diagonal_adder` backend gap-filler (NumPy, Torch) copies the matrix once and updates only the diagonal in O(n) through a writable view (`numpy.einsum("ii->i", a)`; `torch.Tensor.diagonal()` + `add_()`), also applied to the adjacent `delta_w * I` regularization term in the same function. Bitwise identical to the `eye`-based formula for finite inputs, at the promoted dtype: NEP 50 / Torch's own type-promotion rules keep `matrix.dtype` for a Python-scalar `diagonal` (a "weak" type) but promote to `diagonal`'s dtype for a same-valued array (a "strong" type, e.g. a float64 vector against a float32 `matrix`) — `numpy.result_type`/`torch.result_type` reproduce that exact promotion decision. No adapter for CuPy/JAX/array-api-strict — the `eye`-based fallback is unchanged there, so only correctness, not speed, is guaranteed. Provisional NumPy timings (interleaved medians of 7 samples): n=2000 32 ms → 7.2 ms, n=5000 179 ms → 47 ms, n=10000 682 ms → 173 ms (the remaining cost is the unavoidable O(n²) copy). Bitwise identical ⇒ no S2MPJ round-off change; the corpus sweep is not required for this change.
+- **TROTS `Head-and-Neck_01` fits the 8 GB GPU** (CuPy, runner default: exact Hessian, Mehrotra, Breedveld start). Duplicate device copies were removed without changing the arithmetic: peak pool use 11.2 → 6.5 GB, pool size 13.6 → 7.3 GB, and 7 iterations run under a 7.5 GB pool limit; per iteration 18.6–39.5 s → 11.2 s, initialization 54 → 19.5 s (RTX 4070 Laptop under CPU load, provisional). The trajectory agrees to 1.2·10⁻¹³ relative, within CuPy's run-to-run spread. `Protons_01` and `Liver_01` keep their iteration counts (93, 57) and statuses; their final objectives move by 2.8·10⁻⁹ and 2·10⁻¹⁶ relative, where two runs of the old code already differ by 2.3·10⁻⁹ on `Protons_01`. In detail:
+  - *Loader* (`benchmarks/corpus/trots.py`): on CuPy the tiled linear-block operator (`TiledGramCSROperator`) holds the block once, as the sparse adapter's device CSR (12 B/nnz), instead of COO triplets beside that CSR (36 B/nnz). The canonical host CSR is uploaded as that CSR, so the device COO→CSR conversion is gone; it peaked at 8.8 GB on this case and was where a 7.6 GB limit failed. `to_coo()` rebuilds the triplets on demand. Products are bit-identical except the atomics-accumulated transpose products. The tiled Gram's last-weights memo is now released before the next Gram is accumulated beside it (NumPy and CuPy).
+  - *Dense assembly* (`ipax/ipm/kkt.py`): the condensed matrix adds the Gram term into the assembly's own fresh block in place (`dense += gram`), which saves an `n×n` temporary at the route's memory peak. Bit-identical on every backend; immutable-array namespaces rebind as before.
+  - *CuPy dense adapter* (`ipax/backend/dense/cupy.py`, `cholesky_solve`): the back-substitution solves with the C-ordered factor's transpose view, which is Fortran-ordered, so `cupyx`'s `solve_triangular` no longer copies the factor on each of its two calls (an `n×n` copy each, 0.76 GB here). Same triangular systems, different cuBLAS kernel: bit-identical for matrix right-hand sides, last-bit differences for vectors (≤ 5·10⁻¹⁵ relative at `n = 9984`). CuPy only.
 
   `docs/benchmarks/trots.md` (Head-and-Neck profile) has the per-component
   attribution before and after.
-- **TROTS loader, host tiled Gram: blocked lower-to-upper mirror**
-  (`benchmarks/corpus/trots.py`, `_mirror_lower`, host NumPy only; the
-  already-blocked CuPy/Torch device mirror in `_DeviceGramContext` and the
-  core's `ipax.backend.sparse.cupy._mirror_lower_to_upper` were unaffected).
-  The per-row Python copy loop cost 0.35 s per call at `n ≈ 10⁴` on
-  `Head-and-Neck_01` (2026-09-28 profile). Replaced with the same
-  cache-blocked panel scheme as the device mirror (`_HOST_MIRROR_BLOCK = 512`
-  rows: a `triu_indices` gather on each diagonal block, a transposed-slice
-  copy for the panel right of it) — a pure data copy, so the result is
-  bitwise identical to the old loop's, including `-0.0`, for every matrix
-  size relative to the block (below, at, and straddling it); see
-  `test_mirror_lower_matches_row_loop_reference` in
-  `tests/unit/test_trots_tiled_gram.py`. Re-timed on an idle machine at
-  n = 9984 (medians of 5, interleaved): 2.5 → 0.36 s on the Fortran-ordered
-  accumulator of the dense-chunk path; unchanged on the C-ordered buffers of
-  the tiled Gram and the grouped exact Hessian, where both forms take
-  0.3–2.4 s depending on page-fault state.
-- **TROTS loader, device tiled Gram: size-aware sparse-tile choice and
-  shared tile buffers** (`benchmarks/corpus/trots.py`, CuPy only; the NumPy
-  kernels are unchanged). A plan's sparse tile now keeps cuSPARSE SpGEMM only
-  when its `Σ nnz_row²` is at most `r·b·c²`. The device break-even `r` is
-  the throughput ratio of the two kernels, measured once per problem and
-  device on the plan's cheapest sparse tile and shared by the linear block
-  and the exact Hessian. The host's 1% rule was far off on a consumer GPU:
-  on `Head-and-Neck_01` three tiles at `4·10⁻³` took 37.7 s by SpGEMM
-  against 3.1 s densified, and the measured `r` is 1.8·10⁻⁴ (logged at
-  INFO; a single probe is good to about 2×, and the TROTS tiles measured so
-  far lie at least 10× from the break-even).
-  `TiledGramConfig(device_sparse_tile_flop_ratio=...)` pins `r`: `1.0` is
-  the previous choice, `0.0` densifies every tile under the densify budget.
-  A measured `r` can flip a tile near the break-even between processes, and
-  with it the Gram's last bits. The densified tiles of one call now share a
-  `b×c` buffer and a C-ordered `c×c` `syrk` result, and their lower
-  triangles are scattered by one elementwise kernel instead of
-  `cupy.add.at` with broadcast indices. The old scatter built a 715 MiB
-  index at the widest tile and ran about 6× slower. The Gram's lower
-  triangle is bitwise unchanged on the tested CuPy 14 / cuBLAS build.
-  `TiledGramConfig` now rejects a NaN or negative device ratio.
-  `Head-and-Neck_01`, RTX 4070
-  Laptop, provisional: linear-block Gram 44 s (sum of tiles) → 7.5 s, and
-  per iteration 83.8 → 25.2 s (exact Hessian) and 75.5 → 14.0 s (L-BFGS),
-  identical trajectory. The case still overfills the 8 GB card, which now
-  bounds the Cholesky and the back-solves (see
-  `docs/benchmarks/trots.md`, Head-and-Neck profile). On `Protons_01` the
-  calibration keeps all 17 sparse tiles sparse, and the Gram time is
-  unchanged (0.21 s).
-- **CSR/CSC index expansion by `repeat`** (`ipax/backend/operators.py`,
-  `_expand_indptr`, used by `CSROperator`/`CSCOperator`). The per-entry
-  major index is now `repeat(arange(len(indptr) − 1), diff(indptr))` — O(nnz),
-  no `arange(nnz)` temporary — instead of `searchsorted(indptr, arange(nnz),
-  'right') − 1` (O(nnz log m)). Namespaces without a usable array-valued
-  `repeat` (CuPy < 14, `array-api-strict` with `data_dependent_shapes`
-  disabled, pre-2023.12 namespaces) keep the `searchsorted` form. Results are
-  identical (values and dtype, tested on NumPy/Torch/array-api-strict incl.
-  empty rows/matrices); an `indptr` whose span disagrees with `nnz` now raises
-  `ValueError` instead of producing out-of-range indices. Micro-benchmark
-  (m = 80k rows, nnz = 1e7, shared CPU, provisional): NumPy 0.45–1.35 s →
-  0.02–0.11 s, Torch 0.08–0.09 s → 0.016–0.028 s (medians of two runs).
-- **SciPy adapter: dense-Gram row windows densified into a reused chunk
-  buffer** (`ipax/backend/sparse/numpy_scipy.py`, `_gram_dense_accumulate`).
-  Each chunk is written by SciPy's own `csr_todense` kernel (what `toarray`
-  runs; public `toarray(out=…)` fallback) straight from views of the CSR
-  arrays into one buffer per call, instead of a `csr_matrix` + fresh
-  `toarray()` (+ a dtype-promoting copy for float32 data) per chunk. The
-  window constructor itself was already zero-copy for int32 indices on SciPy
-  1.17 (it copies only int64 windows, which it re-canonicalizes to int32).
-  Gram results are bitwise identical (byte-compared against the previous
-  routine: duplicates, unsorted indices, `-0.0` data, float32 data, zero /
-  negative / non-finite weights, int64 indices, 1–N chunks). On a 1e7-nnz,
-  n = 2000 block (shared CPU, provisional): the densify step 126 → 100 ms
-  (m = 40k, 2 chunks) and 263 → 163 ms (m = 100k, 4 chunks) for float64
-  data, 197 → 154 / 536 → 306 ms for float32; whole Gram 639 → 606 ms and
-  1439 → 1348 ms (float64) — the syrk dominates.
-- **TROTS least-squares start without SpGEMM** (`benchmarks/corpus/trots.py`,
-  `TROTSProblem.least_squares_fluence`, Breedveld et al. 2017 eq. (23)): the
-  normal matrix `A_initᵀA_init` is accumulated per initialization matrix
-  through the SciPy adapter's `gram` (chunked dense-BLAS `syrk` on the
-  dense-ish tumour matrices) instead of a SpGEMM of the stacked blocks plus
-  `todense`; the regularization matrix is added from its sparse entries, the
-  ridge in place on the diagonal, and the system is solved by Cholesky (LU if
-  it fails). Signature and return contract unchanged. Measured best-of-two
-  on a shared machine (provisional), old → new: `Protons_01` 1.3 → 0.3 s,
-  `Liver_01` 5.6 → 0.1 s, `Prostate_VMAT_101` 19 → 0.2 s, `Prostate_CK_01`
-  35 → 0.3 s, `Head-and-Neck_01` 22 → 3.5 s. The start is the same to
-  round-off: ≤ 3.3e-11 relative difference in `x` on those five cases, no
-  change of the clipped set. The runner counts this solve as initialization,
-  so the reported TROTS solve times drop by the same amounts.
-- **TROTS loader: restoration Grams from the active rows; host Hessian
-  chunks cut once** (`benchmarks/corpus/trots.py`). On NumPy, a linear-block
-  group the tiled-Gram gate keeps off is now an `ActiveRowGramCSROperator`:
-  interior-point Grams are the adapter's, unchanged, while the restoration
-  phase's active-set Grams `Jᵀ diag(1[g>0]) J` (Wächter & Biegler 2006, §3.3)
-  and gradient `Jᵀ max(g, 0)` are formed from the ~100 active rows instead of
-  all 81,279 (`Prostate_VMAT_101`); `TiledGramCSROperator` does the same for
-  sparse weight vectors on the host. VMAT_101, monotone-μ arm: restoration
-  calls 148–277 s → 109–139 s, 31 iterations 946 → 631 s, same trajectory;
-  the gated-off group is lowered as a signed row selection (solve setup
-  10.3 → 5.1 s, Breedveld start 31.9 → 27.0 s). The exact Hessian's
-  gated-off structures cut zero-copy row windows once instead of slicing
-  per call (0.34 → 0.24 s per Hessian, bit-identical). VMAT_101/102 and CK_01
-  trajectories are bit-identical; Liver_01 differs by round-off only. The
-  50 s/iteration seen for VMAT_101 in the 2026-09-27 sweep was restoration in
-  the monotone arm, not Hessian cost (~2 s/iteration); the default probing
-  arm converges VMAT_101 in 60 iterations / 197 s and VMAT_102 in 74.
-- **The TROTS runner's default μ schedule is `probing` with the centrality
-  floor off** (`--mu-schedule probing --kappa-centrality 0`;
-  `benchmarks/runners/trots.py`). A sweep over all seven TROTS sites
-  (2026-09-27, docs/benchmarks/trots.md) located the barrier-dominated
-  excursions of the nonconvex cases in ipax's El-Bakry centrality floor,
-  not in the oracle: with the floor off, Mehrotra's predictor-based μ beats
-  the monotone reduction on every measured case (Protons_01 93 vs 214
-  iterations, Liver_01 57 vs 74, Prostate_CK_01 39 vs 87, VMAT_101 404 vs
-  635 under L-BFGS; the BT pair certifies its −0.78/−0.75 optima where the
-  monotone arm stops at objective 0). `--mu-schedule monotone
-  --kappa-centrality 1e-2` reproduces the previous default. The runner also
-  gained `--backend` (numpy/cupy/torch) for the solves.
-- **Fewer tall-Jacobian and O(m) passes per iteration** (`ipax/ipm/driver.py`,
-  `barrier.py`, `corrections.py`). The monotone μ-reduction's KKT tests reuse
-  the iteration's ∇L instead of re-forming ∇gᵀλ (one Jᵀ pass per test, on
-  every path), and the Mehrotra/probing corrector pass no longer re-measures
-  a direction's fraction-to-boundary length or re-evaluates the barrier
-  directional derivative for the same step; the fraction-to-boundary rule
-  stops allocating fill vectors. Results are bit-identical (854-run
-  fingerprint A/B over 7 corrector/μ configurations: 0 differences). Stage
-  timing on TROTS `Protons_01` showed the corrector itself already at its
-  minimum: one Jᵀ·v, one J·v (~14 ms each over 369k rows) and a back-solve
-  of the kept factor, ~76 ms per iteration under monotone μ. Regression test
-  pins the operator call counts.
-- **TROTS float32 precision grouping is gated on its nonzero share**
-  (`benchmarks/corpus/trots.py`). The float32-sourced rows of the linear block
-  form their own hinted group only when they hold at least 5% of its nonzeros
-  (`TROTSProblem(..., float32_group_min_share=0.05)`; `0` always splits).
-  Below that they fold into the float64 group unhinted, so a negligible share
-  no longer puts every dense solve on the refinement route.
-  - This changes the NumPy default for cases under 5%, not only the device
-    kernels: the dense solve leaves the mixed-precision refinement route,
-    the lowered block is one group (so its row order, and the multiplier
-    order in `y_ineq`, differ from the split layout), and the float32
-    structures join the float64 group's tiled plan and gate statistic.
-    Every product stays exact.
-  - `Protons_01` (0.07% float32): 0.91 → 0.82 s/iter at identical iterations
-    (`exact` + `mehrotra`, NumPy).
+- **TROTS loader, host tiled Gram: blocked lower-to-upper mirror** (`benchmarks/corpus/trots.py`, `_mirror_lower`, host NumPy only; the already-blocked CuPy/Torch device mirror in `_DeviceGramContext` and the core's `ipax.backend.sparse.cupy._mirror_lower_to_upper` were unaffected). The per-row Python copy loop cost 0.35 s per call at `n ≈ 10⁴` on `Head-and-Neck_01` (2026-09-28 profile). Replaced with the same cache-blocked panel scheme as the device mirror (`_HOST_MIRROR_BLOCK = 512` rows: a `triu_indices` gather on each diagonal block, a transposed-slice copy for the panel right of it) — a pure data copy, so the result is bitwise identical to the old loop's, including `-0.0`, for every matrix size relative to the block (below, at, and straddling it); see `test_mirror_lower_matches_row_loop_reference` in `tests/unit/test_trots_tiled_gram.py`. Re-timed on an idle machine at n = 9984 (medians of 5, interleaved): 2.5 → 0.36 s on the Fortran-ordered accumulator of the dense-chunk path; unchanged on the C-ordered buffers of the tiled Gram and the grouped exact Hessian, where both forms take 0.3–2.4 s depending on page-fault state.
+- **TROTS loader, device tiled Gram: size-aware sparse-tile choice and shared tile buffers** (`benchmarks/corpus/trots.py`, CuPy only; the NumPy kernels are unchanged). A plan's sparse tile now keeps cuSPARSE SpGEMM only when its `Σ nnz_row²` is at most `r·b·c²`. The device break-even `r` is the throughput ratio of the two kernels, measured once per problem and device on the plan's cheapest sparse tile and shared by the linear block and the exact Hessian. The host's 1% rule was far off on a consumer GPU: on `Head-and-Neck_01` three tiles at `4·10⁻³` took 37.7 s by SpGEMM against 3.1 s densified, and the measured `r` is 1.8·10⁻⁴ (logged at INFO; a single probe is good to about 2×, and the TROTS tiles measured so far lie at least 10× from the break-even). `TiledGramConfig(device_sparse_tile_flop_ratio=...)` pins `r`: `1.0` is the previous choice, `0.0` densifies every tile under the densify budget. A measured `r` can flip a tile near the break-even between processes, and with it the Gram's last bits. The densified tiles of one call now share a `b×c` buffer and a C-ordered `c×c` `syrk` result, and their lower triangles are scattered by one elementwise kernel instead of `cupy.add.at` with broadcast indices. The old scatter built a 715 MiB index at the widest tile and ran about 6× slower. The Gram's lower triangle is bitwise unchanged on the tested CuPy 14 / cuBLAS build. `TiledGramConfig` now rejects a NaN or negative device ratio. `Head-and-Neck_01`, RTX 4070 Laptop, provisional: linear-block Gram 44 s (sum of tiles) → 7.5 s, and per iteration 83.8 → 25.2 s (exact Hessian) and 75.5 → 14.0 s (L-BFGS), identical trajectory. The case still overfills the 8 GB card, which now bounds the Cholesky and the back-solves (see `docs/benchmarks/trots.md`, Head-and-Neck profile). On `Protons_01` the calibration keeps all 17 sparse tiles sparse, and the Gram time is unchanged (0.21 s).
+- **CSR/CSC index expansion by `repeat`** (`ipax/backend/operators.py`, `_expand_indptr`, used by `CSROperator`/`CSCOperator`). The per-entry major index is now `repeat(arange(len(indptr) − 1), diff(indptr))` — O(nnz), no `arange(nnz)` temporary — instead of `searchsorted(indptr, arange(nnz), 'right') − 1` (O(nnz log m)). Namespaces without a usable array-valued `repeat` (CuPy < 14, `array-api-strict` with `data_dependent_shapes` disabled, pre-2023.12 namespaces) keep the `searchsorted` form. Results are identical (values and dtype, tested on NumPy/Torch/array-api-strict incl. empty rows/matrices); an `indptr` whose span disagrees with `nnz` now raises `ValueError` instead of producing out-of-range indices. Micro-benchmark (m = 80k rows, nnz = 1e7, shared CPU, provisional): NumPy 0.45–1.35 s → 0.02–0.11 s, Torch 0.08–0.09 s → 0.016–0.028 s (medians of two runs).
+- **SciPy adapter: dense-Gram row windows densified into a reused chunk buffer** (`ipax/backend/sparse/numpy_scipy.py`, `_gram_dense_accumulate`). Each chunk is written by SciPy's own `csr_todense` kernel (what `toarray` runs; public `toarray(out=…)` fallback) straight from views of the CSR arrays into one buffer per call, instead of a `csr_matrix` + fresh `toarray()` (+ a dtype-promoting copy for float32 data) per chunk. The window constructor itself was already zero-copy for int32 indices on SciPy 1.17 (it copies only int64 windows, which it re-canonicalizes to int32). Gram results are bitwise identical (byte-compared against the previous routine: duplicates, unsorted indices, `-0.0` data, float32 data, zero / negative / non-finite weights, int64 indices, 1–N chunks). On a 1e7-nnz, n = 2000 block (shared CPU, provisional): the densify step 126 → 100 ms (m = 40k, 2 chunks) and 263 → 163 ms (m = 100k, 4 chunks) for float64 data, 197 → 154 / 536 → 306 ms for float32; whole Gram 639 → 606 ms and 1439 → 1348 ms (float64) — the syrk dominates.
+- **TROTS least-squares start without SpGEMM** (`benchmarks/corpus/trots.py`, `TROTSProblem.least_squares_fluence`, Breedveld et al. 2017 eq. (23)): the normal matrix `A_initᵀA_init` is accumulated per initialization matrix through the SciPy adapter's `gram` (chunked dense-BLAS `syrk` on the dense-ish tumour matrices) instead of a SpGEMM of the stacked blocks plus `todense`; the regularization matrix is added from its sparse entries, the ridge in place on the diagonal, and the system is solved by Cholesky (LU if it fails). Signature and return contract unchanged. Measured best-of-two on a shared machine (provisional), old → new: `Protons_01` 1.3 → 0.3 s, `Liver_01` 5.6 → 0.1 s, `Prostate_VMAT_101` 19 → 0.2 s, `Prostate_CK_01` 35 → 0.3 s, `Head-and-Neck_01` 22 → 3.5 s. The start is the same to round-off: ≤ 3.3e-11 relative difference in `x` on those five cases, no change of the clipped set. The runner counts this solve as initialization, so the reported TROTS solve times drop by the same amounts.
+- **TROTS loader: restoration Grams from the active rows; host Hessian chunks cut once** (`benchmarks/corpus/trots.py`). On NumPy, a linear-block group the tiled-Gram gate keeps off is now an `ActiveRowGramCSROperator`: interior-point Grams are the adapter's, unchanged, while the restoration phase's active-set Grams `Jᵀ diag(1[g>0]) J` (Wächter & Biegler 2006, §3.3) and gradient `Jᵀ max(g, 0)` are formed from the ~100 active rows instead of all 81,279 (`Prostate_VMAT_101`); `TiledGramCSROperator` does the same for sparse weight vectors on the host. VMAT_101, monotone-μ arm: restoration calls 148–277 s → 109–139 s, 31 iterations 946 → 631 s, same trajectory; the gated-off group is lowered as a signed row selection (solve setup 10.3 → 5.1 s, Breedveld start 31.9 → 27.0 s). The exact Hessian's gated-off structures cut zero-copy row windows once instead of slicing per call (0.34 → 0.24 s per Hessian, bit-identical). VMAT_101/102 and CK_01 trajectories are bit-identical; Liver_01 differs by round-off only. The 50 s/iteration seen for VMAT_101 in the 2026-09-27 sweep was restoration in the monotone arm, not Hessian cost (~2 s/iteration); the default probing arm converges VMAT_101 in 60 iterations / 197 s and VMAT_102 in 74.
+- **The TROTS runner's default μ schedule is `probing` with the centrality floor off** (`--mu-schedule probing --kappa-centrality 0`; `benchmarks/runners/trots.py`). A sweep over all seven TROTS sites (2026-09-27, docs/benchmarks/trots.md) located the barrier-dominated excursions of the nonconvex cases in ipax's El-Bakry centrality floor, not in the oracle: with the floor off, Mehrotra's predictor-based μ beats the monotone reduction on every measured case (Protons_01 93 vs 214 iterations, Liver_01 57 vs 74, Prostate_CK_01 39 vs 87, VMAT_101 404 vs 635 under L-BFGS; the BT pair certifies its −0.78/−0.75 optima where the monotone arm stops at objective 0). `--mu-schedule monotone --kappa-centrality 1e-2` reproduces the previous default. The runner also gained `--backend` (numpy/cupy/torch) for the solves.
+- **Fewer tall-Jacobian and O(m) passes per iteration** (`ipax/ipm/driver.py`, `barrier.py`, `corrections.py`). The monotone μ-reduction's KKT tests reuse the iteration's ∇L instead of re-forming ∇gᵀλ (one Jᵀ pass per test, on every path), and the Mehrotra/probing corrector pass no longer re-measures a direction's fraction-to-boundary length or re-evaluates the barrier directional derivative for the same step; the fraction-to-boundary rule stops allocating fill vectors. Results are bit-identical (854-run fingerprint A/B over 7 corrector/μ configurations: 0 differences). Stage timing on TROTS `Protons_01` showed the corrector itself already at its minimum: one Jᵀ·v, one J·v (~14 ms each over 369k rows) and a back-solve of the kept factor, ~76 ms per iteration under monotone μ. Regression test pins the operator call counts.
+- **TROTS float32 precision grouping is gated on its nonzero share** (`benchmarks/corpus/trots.py`). The float32-sourced rows of the linear block form their own hinted group only when they hold at least 5% of its nonzeros (`TROTSProblem(..., float32_group_min_share=0.05)`; `0` always splits). Below that they fold into the float64 group unhinted, so a negligible share no longer puts every dense solve on the refinement route.
+  - This changes the NumPy default for cases under 5%, not only the device kernels: the dense solve leaves the mixed-precision refinement route, the lowered block is one group (so its row order, and the multiplier order in `y_ineq`, differ from the split layout), and the float32 structures join the float64 group's tiled plan and gate statistic. Every product stays exact.
+  - `Protons_01` (0.07% float32): 0.91 → 0.82 s/iter at identical iterations (`exact` + `mehrotra`, NumPy).
   - `Prostate_BT_02` (100%) and VMAT (96%) are unchanged.
-- **The TROTS runner defaults to Breedveld et al. 2017's solver setup**
-  (`benchmarks/runners/trots.py`). `--solve` now runs `exact/dense` with
-  `--corrections mehrotra`, `--globalization breedveld`, monotone μ
-  (`--mu-schedule probing`, Mehrotra's predictor-based μ, is the proton lever:
-  104 vs 227 iterations on `Protons_01`, but 430 vs 74 on `Liver_01`), a new
-  `--tol` (default `1e-8`, the three KKT tolerances) and a new `--init
-  breedveld`: the paper's §3.1 initialisation.
-  - The loader gains `TROTSProblem.initial_point(strategy="breedveld")`: the
-    least-squares fluence pulled halfway to its mean and floored at 5
-    (eqs. (23)–(24)). `strategy="ipax"` stays the default and is unchanged.
-  - `TROTSProblem.breedveld_warm_start(x0, scaling=...)` returns the dual
-    start and `μ0`. It computes LSQR multipliers on the problem as ipax lowers
-    it (`atol = btol = 1e-6`: every `Protons_01` multiplier lands on the floor,
-    so `1e-8` only cost 24 s instead of 3 s), floors them and the bound
-    multipliers and slacks at 5 (eqs. (26)–(28)), and takes `μ0` as their
-    average complementarity (eq. (10)) in *solver* units — multiplied by the
-    objective scale factor `s_f` that `ipax.solve`'s gradient-based scaling
-    applies to every complementarity pair (pass the solve's `Options.scaling`).
-    It runs on the host (a NumPy twin of the problem off NumPy) and returns
-    arrays on `x0`'s device.
-  - `BenchmarkProblem` gains an optional `prepare_solve` hook returning the
-    solve's `(x0, warm_start, options)`. `run_case` times it as the
-    initialisation, reports the time as `CaseResult.prepare_time` and counts
-    it in the row's `solve_time`; the TROTS runner produces both starts in
-    the hook, so the least-squares fluence solve of eq. (23) is counted too
-    (1 s on `Protons_01`, 3.5 s on `Liver_01`, 18 s on `Prostate_VMAT_101`,
-    30 s on `Prostate_CK_01`; an earlier cut of this branch ran it in the
-    untimed build and counted only the dual start).
-  - `--slack-init-scale` applies to `--init ipax` only; combined with
-    `--init breedveld` (whose slacks come from eq. (28)) the runner errors out
-    instead of silently ignoring it.
-  - The previous recipe is still available:
-    `--config lbfgs/dense --init ipax --mu-schedule quality --globalization
-    filter --corrections none --slack-init-scale 0.1` rebuilds its options
-    exactly. `--slack-init-scale` applies only with `--init ipax`.
+- **The TROTS runner defaults to Breedveld et al. 2017's solver setup** (`benchmarks/runners/trots.py`). `--solve` now runs `exact/dense` with `--corrections mehrotra`, `--globalization breedveld`, monotone μ (`--mu-schedule probing`, Mehrotra's predictor-based μ, is the proton lever: 104 vs 227 iterations on `Protons_01`, but 430 vs 74 on `Liver_01`), a new `--tol` (default `1e-8`, the three KKT tolerances) and a new `--init breedveld`: the paper's §3.1 initialisation.
+  - The loader gains `TROTSProblem.initial_point(strategy="breedveld")`: the least-squares fluence pulled halfway to its mean and floored at 5 (eqs. (23)–(24)). `strategy="ipax"` stays the default and is unchanged.
+  - `TROTSProblem.breedveld_warm_start(x0, scaling=...)` returns the dual start and `μ0`. It computes LSQR multipliers on the problem as ipax lowers it (`atol = btol = 1e-6`: every `Protons_01` multiplier lands on the floor, so `1e-8` only cost 24 s instead of 3 s), floors them and the bound multipliers and slacks at 5 (eqs. (26)–(28)), and takes `μ0` as their average complementarity (eq. (10)) in *solver* units — multiplied by the objective scale factor `s_f` that `ipax.solve`'s gradient-based scaling applies to every complementarity pair (pass the solve's `Options.scaling`). It runs on the host (a NumPy twin of the problem off NumPy) and returns arrays on `x0`'s device.
+  - `BenchmarkProblem` gains an optional `prepare_solve` hook returning the solve's `(x0, warm_start, options)`. `run_case` times it as the initialisation, reports the time as `CaseResult.prepare_time` and counts it in the row's `solve_time`; the TROTS runner produces both starts in the hook, so the least-squares fluence solve of eq. (23) is counted too (1 s on `Protons_01`, 3.5 s on `Liver_01`, 18 s on `Prostate_VMAT_101`, 30 s on `Prostate_CK_01`; an earlier cut of this branch ran it in the untimed build and counted only the dual start).
+  - `--slack-init-scale` applies to `--init ipax` only; combined with `--init breedveld` (whose slacks come from eq. (28)) the runner errors out instead of silently ignoring it.
+  - The previous recipe is still available: `--config lbfgs/dense --init ipax --mu-schedule quality --globalization filter --corrections none --slack-init-scale 0.1` rebuilds its options exactly. `--slack-init-scale` applies only with `--init ipax`.
 
 ### Fixed
-- **The CuPy sparse adapter's products and COO builds are bitwise
-  reproducible run to run** (`ipax/backend/sparse/cupy.py`). CuPy's
-  `csr @ x` uses cuSPARSE's default algorithms, which accumulate with
-  atomics in the transposed product `A.T @ y` (every `rmatvec`), in forward
-  products of matrices with long rows, and, through `cupy.add.at`, in the
-  COO → CSR duplicate sum. Each returned 28–30 distinct results in 30
-  repeats, and with `SparseOptions(deterministic=True)` three processes on
-  `AGG` still diverged at the first `rmatvec`.
-  - Vector products now use `CUSPARSE_SPMV_CSR_ALG2` (documented
-    deterministic). Transposed products run forward on an explicit `Aᵀ`
-    that the operator caches for its values (a gather through a shared
-    per-pattern plan for the operators one adapter builds on one pattern).
-    Multi-column products use an ordered kernel (one
-    thread or one warp per output entry). The COO build sums duplicates in
-    emission order, which matches the SciPy adapter's build bit for bit.
-  - On by default: the Jacobian operators never see `SparseOptions`, and
-    the kernels cost little or nothing. A forward SpMV is unchanged, a
-    transposed one is up to 38 % faster once `Aᵀ` exists, and the COO value
-    pass is twice as fast. Eight-column products are 18–50 % faster on short
-    rows and 11–20 % slower on 52 000-entry rows. Per-operator costs:
-    building `Aᵀ` (as much as 3–11 transposed products, so once per
-    iteration for a problem's Jacobian) and compiling the COO map (+27–53 %,
-    once per pattern and adapter).
-  - Memory: a transposed operator keeps a second copy of its values and
-    indices. Above 512 MiB per transpose it builds none for its transposed
-    products and uses cuSPARSE's, which is not reproducible (the sparse Gram
-    still keeps its `Aᵀ`, as before). On `Head-and-Neck_01`'s
-    1.1e8-nonzero dose block, the cached transpose had pushed the CuPy
-    dense route past the 8 GB card.
-  - New GPU tests: `tests/unit/test_cupy_sparse_determinism_gpu.py` (30-repeat
-    bitwise products and COO builds, stale-cache checks, a repeated
-    deterministic solve in one process and across two processes).
-- **cuDSS solves on perturbed-pivot factorizations are now iteratively
-  refined** (`ipax/backend/sparse/cupy.py`). cuDSS's static pivoting replaces a
-  pivot that is too small by `±ε`, so it factors `A + E` instead of `A`. The
-  CuPy adapter's residual certificate used to accept such solves as long as
-  their relative residual was below `1e-2`. On degenerate but well-conditioned
-  KKT systems these solves were off by 1e-5–1e-2 at every iteration. An example
-  is the minimax epigraph variable's zero Hessian diagonal, which a 2×2 pivot
-  would pair off. `MAKELA1` stalled for 291 iterations where Feral's LDLᵀ
-  converges.
-  - When cuDSS reports `NPIVOTS > 0`, each solve is now refined against the
-    unperturbed matrix, `x += (A+E)⁻¹ (b − A x)` (Li & Demmel 2003; Higham
-    2002, ch. 12), before the certificate judges it.
-  - The stopping rules are IPOPT's (`PDFullSpaceSolver::Solve`): at most 10
-    steps, stop at IPOPT's residual ratio `1e-10`, and stop at the first step
-    that does not reduce the certified ratio. Unlike IPOPT, each column keeps
-    its best iterate, because refinement diverges when `‖(A+E)⁻¹E‖ > 1`.
-  - cuDSS's own refinement (`CUDSS_CONFIG_IR_N_STEPS`) was measured and
-    rejected. It runs a fixed number of steps (the pinned cuDSS 0.7 ignores
-    `IR_TOL`), and on a `ROTDISC` system those steps diverge from 1.3e-5 to
-    8e7.
-  - Unperturbed factorizations pay nothing. A perturbed one pays one SOLVE
-    phase, one SpMV and one host sync per step taken: 0.3–0.4 steps per
-    perturbed solve on the corpus.
-  - The policy is exposed as `max_refinement_steps` /
-    `perturbed_max_residual` on `CuPySparseAdapter`, `CuPySparseSolver` and
-    `CuDSSSparseSolver`, and through `SparseOptions` (see Added). The defaults
-    are unchanged apart from refinement being on.
-  - CuPy corpus A/B over the rows that meet perturbed pivots, against the v33
-    run (docs/benchmarks/s2mpj.md, "Addendum (2026-09-29)"):
-    - `exact/sparse`: +15, 16 fixed / 1 broken, all confirmed by a lone
-      re-run. The whole minimax family now converges near NumPy's iteration
-      counts.
+- **The CuPy sparse adapter's products and COO builds are bitwise reproducible run to run** (`ipax/backend/sparse/cupy.py`). CuPy's `csr @ x` uses cuSPARSE's default algorithms, which accumulate with atomics in the transposed product `A.T @ y` (every `rmatvec`), in forward products of matrices with long rows, and, through `cupy.add.at`, in the COO → CSR duplicate sum. Each returned 28–30 distinct results in 30 repeats, and with `SparseOptions(deterministic=True)` three processes on `AGG` still diverged at the first `rmatvec`.
+  - Vector products now use `CUSPARSE_SPMV_CSR_ALG2` (documented deterministic). Transposed products run forward on an explicit `Aᵀ` that the operator caches for its values (a gather through a shared per-pattern plan for the operators one adapter builds on one pattern). Multi-column products use an ordered kernel (one thread or one warp per output entry). The COO build sums duplicates in emission order, which matches the SciPy adapter's build bit for bit.
+  - On by default: the Jacobian operators never see `SparseOptions`, and the kernels cost little or nothing. A forward SpMV is unchanged, a transposed one is up to 38 % faster once `Aᵀ` exists, and the COO value pass is twice as fast. Eight-column products are 18–50 % faster on short rows and 11–20 % slower on 52 000-entry rows. Per-operator costs: building `Aᵀ` (as much as 3–11 transposed products, so once per iteration for a problem's Jacobian) and compiling the COO map (+27–53 %, once per pattern and adapter).
+  - Memory: a transposed operator keeps a second copy of its values and indices. Above 512 MiB per transpose it builds none for its transposed products and uses cuSPARSE's, which is not reproducible (the sparse Gram still keeps its `Aᵀ`, as before). On `Head-and-Neck_01`'s 1.1e8-nonzero dose block, the cached transpose had pushed the CuPy dense route past the 8 GB card.
+  - New GPU tests: `tests/unit/test_cupy_sparse_determinism_gpu.py` (30-repeat bitwise products and COO builds, stale-cache checks, a repeated deterministic solve in one process and across two processes).
+- **cuDSS solves on perturbed-pivot factorizations are now iteratively refined** (`ipax/backend/sparse/cupy.py`). cuDSS's static pivoting replaces a pivot that is too small by `±ε`, so it factors `A + E` instead of `A`. The CuPy adapter's residual certificate used to accept such solves as long as their relative residual was below `1e-2`. On degenerate but well-conditioned KKT systems these solves were off by 1e-5–1e-2 at every iteration. An example is the minimax epigraph variable's zero Hessian diagonal, which a 2×2 pivot would pair off. `MAKELA1` stalled for 291 iterations where Feral's LDLᵀ converges.
+  - When cuDSS reports `NPIVOTS > 0`, each solve is now refined against the unperturbed matrix, `x += (A+E)⁻¹ (b − A x)` (Li & Demmel 2003; Higham 2002, ch. 12), before the certificate judges it.
+  - The stopping rules are IPOPT's (`PDFullSpaceSolver::Solve`): at most 10 steps, stop at IPOPT's residual ratio `1e-10`, and stop at the first step that does not reduce the certified ratio. Unlike IPOPT, each column keeps its best iterate, because refinement diverges when `‖(A+E)⁻¹E‖ > 1`.
+  - cuDSS's own refinement (`CUDSS_CONFIG_IR_N_STEPS`) was measured and rejected. It runs a fixed number of steps (the pinned cuDSS 0.7 ignores `IR_TOL`), and on a `ROTDISC` system those steps diverge from 1.3e-5 to 8e7.
+  - Unperturbed factorizations pay nothing. A perturbed one pays one SOLVE phase, one SpMV and one host sync per step taken: 0.3–0.4 steps per perturbed solve on the corpus.
+  - The policy is exposed as `max_refinement_steps` / `perturbed_max_residual` on `CuPySparseAdapter`, `CuPySparseSolver` and `CuDSSSparseSolver`, and through `SparseOptions` (see Added). The defaults are unchanged apart from refinement being on.
+  - CuPy corpus A/B over the rows that meet perturbed pivots, against the v33 run (docs/benchmarks/s2mpj.md, "Addendum (2026-09-29)"):
+    - `exact/sparse`: +15, 16 fixed / 1 broken, all confirmed by a lone re-run. The whole minimax family now converges near NumPy's iteration counts.
     - `lbfgs/sparse`: +14 in the sweep, 12 fixed / 2 broken confirmed alone.
-    - Rejected solves fall from 99 784 in 162 rows to 96 463 in 57 rows
-      (`lbfgs/sparse`), and 36 022 solves the certificate would have rejected
-      are rescued.
-    - A `1e-5` post-refinement certificate (IPOPT's `residual_ratio_singular`)
-      nets +2 / −2 once re-runs are counted, and more than doubles the
-      rejections, so the threshold stays at `1e-2`.
-  - The S2MPJ runner gains `--cudss-refinement-steps` / `--cudss-max-residual`
-    A/B levers. They are validated at parse time and recorded in the report's
-    `environment.cudss_policy`, and `--resume` refuses to mix policies.
-    `--cupy-certificates` now bins the residual before and after refinement,
-    histograms the steps, and counts rescued solves.
-- **TROTS LSQR tolerance validation:** reject non-finite `lsqr_tol` values
-  as well as non-positive ones. The runner rejects invalid `--lsqr-tol`
-  arguments before loading data or preparing a warm start.
-- **The structured L-BFGS condensed solve had the same overflow hole as the
-  dense diagonal add, through division instead of addition.** An overflowed
-  `Sigma_x = z / (x - l)` (finite bound data, overflow on division) reaching
-  `dense_structured_solve`'s Woodbury/compact-form route (no inequality
-  rows) divides a finite right-hand side by an infinite diagonal entry
-  (`finite / inf = 0`), silently returning a finite zero step component
-  instead of failing — the division-side counterpart of the previous entry's
-  `0 * inf = NaN` addition-side hole, both feeding the same bound-dual
-  `inf * 0` (Breedveld 2017, eqs. 14-17). Fixed once at the single point the
-  condensed operator receives `Sigma_x` (`ipax/ipm/kkt.py`,
-  `_CondensedOperator.__init__`), marking non-finite entries as NaN there so
-  every consumer sees the same sanitized diagonal instead of duplicating the
-  check per call site: the dense route, the structured/Woodbury solve, the
-  Krylov exact-inverse dispatch that shares the same factors, the sparse/
-  normal-equations COO assembly, and the Jacobi preconditioner diagonal. O(n)
-  device operations, no host synchronization; bit-identical for finite
-  inputs. The plain Krylov route (matrix-free `matvec`) was already safe:
-  multiplying by an infinite entry naturally poisons to NaN or inf rather
-  than masking to zero.
-- **Overflowing dense KKT diagonals cannot masquerade as finite steps.**
-  Mark non-finite diagonal addends as NaN before the optimized update or
-  portable fallback, so the existing numerical-failure handling rejects
-  them before bound-dual recovery can compute `inf * 0`. The check uses
-  O(n) device operations and adds no host synchronization. Regression
-  coverage exercises finite bound data that overflow on division, with
-  exact and L-BFGS Hessians on multiple backends.
-- **An iteration's Hessian and inequality Jacobian no longer outlive it**
-  (`ipax/ipm/driver.py`). The line search's second-order-correction closure
-  binds them as default arguments, and it stayed bound until the next
-  iteration redefined it. That was after the next KKT assembly and
-  factorization, so every memo the previous operators held stayed alive
-  through the next iteration's memory peak. On TROTS `Head-and-Neck_01` on
-  CuPy those were the loader Hessian's dense memo and the nonlinear rows'
-  Gram memo, two `n×n` arrays of 0.76 GB each. The closure is now released
-  after the line search. No arithmetic changes: 129 small solves
-  fingerprint bit-identically on NumPy, Torch and array-api-strict.
-- **The dense solver's positive-definiteness probe now works on CuPy**
-  (`ipax/linalg/dense.py`, `ipax/linalg/solver.py`). CuPy's
-  `linalg.cholesky` does not raise on a non-PD matrix (under its default
-  `errstate` it returns a factor with a NaN — or, for a singular matrix, a
-  zero — pivot), so an indefinite condensed block passed the guard: inside an
-  equality saddle the LU then returned a finite non-descent step, the
-  PD-hinted Cholesky reuse kept a broken factor instead of falling back to
-  LU, and the mixed-precision route never saw a precision-caused PD failure.
-  New `checked_cholesky` classifies the factor by its pivots (all finite and
-  positive, the `potrf` success criterion); the dense solver uses it only on
-  backends whose Cholesky breaks down silently (`cholesky_breakdown_is_silent`,
-  probed once per solver), so NumPy, Torch and array-api-strict keep the plain
-  call — results and host-sync counts unchanged. The opt-in restoration
-  Cholesky applies the same pivot test (it accepted a finite zero-pivot
-  factor). On CuPy, HS6/HS7 on the dense route now follow the NumPy
-  trajectory (HS7: 20 → 10 iterations).
-- **The CuPy sparse adapter classifies cuDSS's silent failures**
-  (`ipax/backend/sparse/cupy.py`). A KKT matrix with inf/NaN entries now
-  raises `LinearSolveError` (as the SciPy adapter does) instead of factoring to
-  a NaN step. cuDSS's static pivoting replaces a too-small pivot by
-  `PIVOT_EPSILON`, so a singular system "solved" to a finite `±1e13` vector
-  with a plausible inertia; a solve on a factorization with perturbed pivots
-  (`NPIVOTS > 0`) is now rejected as singular when its residual exceeds 1% of
-  the right-hand side — an inconsistent singular system leaves an O(1)
-  residual, while the near-singular consistent systems an IPM produces (a
-  degenerate L-BFGS border) pass unchanged. HS9 on the CuPy sparse route:
-  `STALLED` after 27 iterations → `OPTIMAL` in 5, as on NumPy.
-- **Empty sparse patterns on CuPy** (`ipax/backend/sparse/_canonical.py`).
-  `cupy.bincount` rejects an empty input, which NumPy accepts, so compiling
-  the canonical CSR map of an empty operator (e.g. `gram_fill_estimate` of an
-  empty Jacobian) or an empty lower triangle raised `ValueError`.
-- **TROTS exact Hessian on CuPy/Torch no longer crosses gated-off structures
-  through the host** (`benchmarks/corpus/trots.py`). Curved structures that
-  fail the per-structure flop-ratio gate (the dense-ish PTVs of the CK/VMAT
-  cases) made `TROTSExactProblem.lagrangian_hessian` form the grouped Hessian
-  by host SciPy SpGEMM on every call: the whole Hessian when no structure was
-  tiled, otherwise the gated-off part plus the quadratic terms as a COO
-  upload. On device namespaces such structures now get a device plan anyway
-  (lazily, on the first dense call; a plan the gate rejected after building
-  is reused, never rebuilt), registered so a structure shared with the linear
-  block keeps one tile set; the beamlet-space quadratic terms are summed on
-  the device over their constant union pattern, so a call uploads only
-  weights and multipliers. CuPy, RTX 4070 Laptop, Breedveld setup:
-  `Prostate_CK_01` 33 → 0.96 s/iter, `Prostate_VMAT_101` 51 → ~1.2–2.3
-  s/iter, `Liver_01` 0.83 → 0.33 s/iter, `Protons_01` unchanged; results
-  match the host operator to round-off. `tiled_gram=False` keeps the
-  `CSCOperator` crossing. Device-gated regression tests pin that no index
-  array is uploaded in steady state and that matvec-only routes never plan.
-- **A programming error inside a step solve now propagates out of `ipax.solve`
-  unchanged** — e.g. a `TypeError` from a user operator's `gram()`,
-  `dense_matrix()` or `matvec()`, or from a Hessian operator's
-  materialization. Previously the dense KKT solver reclassified *any*
-  exception as a numerical failure, so it was retried up the δ_w
-  regularization ladder, handed to feasibility restoration and could end as an
-  ordinary status (or `numerical_error`) instead of surfacing. Only numerical
-  failures — the backend's `LinAlgError`, Python `ArithmeticError`s and
-  `LinearSolveError` — now reach the ladder (new
-  `ipax.linalg.solver.numerical_failure_types()`, backend classes resolved
-  without importing them in `ipax/backend/errors.py`); the same narrowing
-  applies to the Krylov exact-inverse fallback, the dense restoration solve
-  and the L-BFGS compact solves. Resource failures (`MemoryError`, CUDA
-  out-of-memory) likewise propagate. Regression tests pin propagation on the
-  first Gram call and the ladder's behaviour on genuine `LinAlgError`s; a
-  479-row S2MPJ rerun of every step-failure row (NumPy + Torch) is
-  status-identical apart from wall-clock-capped rows.
-- **The `gram()` keyword-compatibility retry** (`accumulate_dtype`/`hinted_only`)
-  now fires only for an operator whose signature rejects the keywords; a
-  `TypeError` raised inside a Gram that accepted them is no longer retried
-  away (which silently degraded the mixed-precision Gram to the exact one).
-- **TROTS device tiled Gram on the raw `cupy` module** (`benchmarks/corpus/trots.py`).
-  The device kernels use Array API `device=` keywords that plain `cupy` (as
-  opposed to the compat wrapper the test fixtures hand out) does not accept,
-  so a problem built on `cupy` itself failed at its first lowered-block Gram;
-  the solver swallowed that as a step-solve failure and the error surfaced
-  from restoration. The device context now normalizes its namespace through
-  `array_namespace`. Regression test on Protons_01.
-- **Restoration no longer densifies a tall Gram-capable Jacobian**
-  (`ipax/ipm/restoration.py`). The dense restoration route (taken by
-  `RestorationOptions(linear_solver="auto")` below 10 000 variables, and by
-  `"dense"`) built the Gauss-Newton matrix from full dense copies of the
-  equality and inequality Jacobians. On TROTS `Protons_01` (inequality block
-  369 445 × 1101) that is 3.2 GB of float64 per restoration iteration; on an
-  8 GB GPU one restoration phase ran for 1127 s. A block with more than the new
-  `RestorationOptions.dense_materialize_max_elements` entries (`m_b · n`,
-  default 10⁷) whose operator is Gram-capable now contributes
-  `J_bᵀ Σ_b J_b = J_b.gram(Σ_b)` and `J_bᵀ r_b = J_b.rmatvec(r_b)` instead.
-  The matrices are the same and only the round-off differs. Smaller blocks, and
-  operators without a Gram, keep the verbatim densified arithmetic. Every
-  S2MPJ block is below the default (largest `m · n` ≈ 3.9·10⁶), so the corpus
-  results do not change. The Krylov restoration route already worked through
-  products only and is unchanged. Measured on CuPy (RTX 4070 Laptop, 8 GB),
-  `restore()` from the `Protons_01` initial point reaches feasibility in the
-  same 40 outer iterations: 560 s (14.0 s per iteration) densified vs 9.7 s
-  (0.23 s per iteration) through the Gram.
+    - Rejected solves fall from 99 784 in 162 rows to 96 463 in 57 rows (`lbfgs/sparse`), and 36 022 solves the certificate would have rejected are rescued.
+    - A `1e-5` post-refinement certificate (IPOPT's `residual_ratio_singular`) nets +2 / −2 once re-runs are counted, and more than doubles the rejections, so the threshold stays at `1e-2`.
+  - The S2MPJ runner gains `--cudss-refinement-steps` / `--cudss-max-residual` A/B levers. They are validated at parse time and recorded in the report's `environment.cudss_policy`, and `--resume` refuses to mix policies. `--cupy-certificates` now bins the residual before and after refinement, histograms the steps, and counts rescued solves.
+- **TROTS LSQR tolerance validation:** reject non-finite `lsqr_tol` values as well as non-positive ones. The runner rejects invalid `--lsqr-tol` arguments before loading data or preparing a warm start.
+- **The structured L-BFGS condensed solve had the same overflow hole as the dense diagonal add, through division instead of addition.** An overflowed `Sigma_x = z / (x - l)` (finite bound data, overflow on division) reaching `dense_structured_solve`'s Woodbury/compact-form route (no inequality rows) divides a finite right-hand side by an infinite diagonal entry (`finite / inf = 0`), silently returning a finite zero step component instead of failing — the division-side counterpart of the previous entry's `0 * inf = NaN` addition-side hole, both feeding the same bound-dual `inf * 0` (Breedveld 2017, eqs. 14-17). Fixed once at the single point the condensed operator receives `Sigma_x` (`ipax/ipm/kkt.py`, `_CondensedOperator.__init__`), marking non-finite entries as NaN there so every consumer sees the same sanitized diagonal instead of duplicating the check per call site: the dense route, the structured/Woodbury solve, the Krylov exact-inverse dispatch that shares the same factors, the sparse/ normal-equations COO assembly, and the Jacobi preconditioner diagonal. O(n) device operations, no host synchronization; bit-identical for finite inputs. The plain Krylov route (matrix-free `matvec`) was already safe: multiplying by an infinite entry naturally poisons to NaN or inf rather than masking to zero.
+- **Overflowing dense KKT diagonals cannot masquerade as finite steps.** Mark non-finite diagonal addends as NaN before the optimized update or portable fallback, so the existing numerical-failure handling rejects them before bound-dual recovery can compute `inf * 0`. The check uses O(n) device operations and adds no host synchronization. Regression coverage exercises finite bound data that overflow on division, with exact and L-BFGS Hessians on multiple backends.
+- **An iteration's Hessian and inequality Jacobian no longer outlive it** (`ipax/ipm/driver.py`). The line search's second-order-correction closure binds them as default arguments, and it stayed bound until the next iteration redefined it. That was after the next KKT assembly and factorization, so every memo the previous operators held stayed alive through the next iteration's memory peak. On TROTS `Head-and-Neck_01` on CuPy those were the loader Hessian's dense memo and the nonlinear rows' Gram memo, two `n×n` arrays of 0.76 GB each. The closure is now released after the line search. No arithmetic changes: 129 small solves fingerprint bit-identically on NumPy, Torch and array-api-strict.
+- **The dense solver's positive-definiteness probe now works on CuPy** (`ipax/linalg/dense.py`, `ipax/linalg/solver.py`). CuPy's `linalg.cholesky` does not raise on a non-PD matrix (under its default `errstate` it returns a factor with a NaN — or, for a singular matrix, a zero — pivot), so an indefinite condensed block passed the guard: inside an equality saddle the LU then returned a finite non-descent step, the PD-hinted Cholesky reuse kept a broken factor instead of falling back to LU, and the mixed-precision route never saw a precision-caused PD failure. New `checked_cholesky` classifies the factor by its pivots (all finite and positive, the `potrf` success criterion); the dense solver uses it only on backends whose Cholesky breaks down silently (`cholesky_breakdown_is_silent`, probed once per solver), so NumPy, Torch and array-api-strict keep the plain call — results and host-sync counts unchanged. The opt-in restoration Cholesky applies the same pivot test (it accepted a finite zero-pivot factor). On CuPy, HS6/HS7 on the dense route now follow the NumPy trajectory (HS7: 20 → 10 iterations).
+- **The CuPy sparse adapter classifies cuDSS's silent failures** (`ipax/backend/sparse/cupy.py`). A KKT matrix with inf/NaN entries now raises `LinearSolveError` (as the SciPy adapter does) instead of factoring to a NaN step. cuDSS's static pivoting replaces a too-small pivot by `PIVOT_EPSILON`, so a singular system "solved" to a finite `±1e13` vector with a plausible inertia; a solve on a factorization with perturbed pivots (`NPIVOTS > 0`) is now rejected as singular when its residual exceeds 1% of the right-hand side — an inconsistent singular system leaves an O(1) residual, while the near-singular consistent systems an IPM produces (a degenerate L-BFGS border) pass unchanged. HS9 on the CuPy sparse route: `STALLED` after 27 iterations → `OPTIMAL` in 5, as on NumPy.
+- **Empty sparse patterns on CuPy** (`ipax/backend/sparse/_canonical.py`). `cupy.bincount` rejects an empty input, which NumPy accepts, so compiling the canonical CSR map of an empty operator (e.g. `gram_fill_estimate` of an empty Jacobian) or an empty lower triangle raised `ValueError`.
+- **TROTS exact Hessian on CuPy/Torch no longer crosses gated-off structures through the host** (`benchmarks/corpus/trots.py`). Curved structures that fail the per-structure flop-ratio gate (the dense-ish PTVs of the CK/VMAT cases) made `TROTSExactProblem.lagrangian_hessian` form the grouped Hessian by host SciPy SpGEMM on every call: the whole Hessian when no structure was tiled, otherwise the gated-off part plus the quadratic terms as a COO upload. On device namespaces such structures now get a device plan anyway (lazily, on the first dense call; a plan the gate rejected after building is reused, never rebuilt), registered so a structure shared with the linear block keeps one tile set; the beamlet-space quadratic terms are summed on the device over their constant union pattern, so a call uploads only weights and multipliers. CuPy, RTX 4070 Laptop, Breedveld setup: `Prostate_CK_01` 33 → 0.96 s/iter, `Prostate_VMAT_101` 51 → ~1.2–2.3 s/iter, `Liver_01` 0.83 → 0.33 s/iter, `Protons_01` unchanged; results match the host operator to round-off. `tiled_gram=False` keeps the `CSCOperator` crossing. Device-gated regression tests pin that no index array is uploaded in steady state and that matvec-only routes never plan.
+- **A programming error inside a step solve now propagates out of `ipax.solve` unchanged** — e.g. a `TypeError` from a user operator's `gram()`, `dense_matrix()` or `matvec()`, or from a Hessian operator's materialization. Previously the dense KKT solver reclassified *any* exception as a numerical failure, so it was retried up the δ_w regularization ladder, handed to feasibility restoration and could end as an ordinary status (or `numerical_error`) instead of surfacing. Only numerical failures — the backend's `LinAlgError`, Python `ArithmeticError`s and `LinearSolveError` — now reach the ladder (new `ipax.linalg.solver.numerical_failure_types()`, backend classes resolved without importing them in `ipax/backend/errors.py`); the same narrowing applies to the Krylov exact-inverse fallback, the dense restoration solve and the L-BFGS compact solves. Resource failures (`MemoryError`, CUDA out-of-memory) likewise propagate. Regression tests pin propagation on the first Gram call and the ladder's behaviour on genuine `LinAlgError`s; a 479-row S2MPJ rerun of every step-failure row (NumPy + Torch) is status-identical apart from wall-clock-capped rows.
+- **The `gram()` keyword-compatibility retry** (`accumulate_dtype`/`hinted_only`) now fires only for an operator whose signature rejects the keywords; a `TypeError` raised inside a Gram that accepted them is no longer retried away (which silently degraded the mixed-precision Gram to the exact one).
+- **TROTS device tiled Gram on the raw `cupy` module** (`benchmarks/corpus/trots.py`). The device kernels use Array API `device=` keywords that plain `cupy` (as opposed to the compat wrapper the test fixtures hand out) does not accept, so a problem built on `cupy` itself failed at its first lowered-block Gram; the solver swallowed that as a step-solve failure and the error surfaced from restoration. The device context now normalizes its namespace through `array_namespace`. Regression test on Protons_01.
+- **Restoration no longer densifies a tall Gram-capable Jacobian** (`ipax/ipm/restoration.py`). The dense restoration route (taken by `RestorationOptions(linear_solver="auto")` below 10 000 variables, and by `"dense"`) built the Gauss-Newton matrix from full dense copies of the equality and inequality Jacobians. On TROTS `Protons_01` (inequality block 369 445 × 1101) that is 3.2 GB of float64 per restoration iteration; on an 8 GB GPU one restoration phase ran for 1127 s. A block with more than the new `RestorationOptions.dense_materialize_max_elements` entries (`m_b · n`, default 10⁷) whose operator is Gram-capable now contributes `J_bᵀ Σ_b J_b = J_b.gram(Σ_b)` and `J_bᵀ r_b = J_b.rmatvec(r_b)` instead. The matrices are the same and only the round-off differs. Smaller blocks, and operators without a Gram, keep the verbatim densified arithmetic. Every S2MPJ block is below the default (largest `m · n` ≈ 3.9·10⁶), so the corpus results do not change. The Krylov restoration route already worked through products only and is unchanged. Measured on CuPy (RTX 4070 Laptop, 8 GB), `restore()` from the `Protons_01` initial point reaches feasibility in the same 40 outer iterations: 560 s (14.0 s per iteration) densified vs 9.7 s (0.23 s per iteration) through the Gram.
 - **TROTS cost-function singular points** (`benchmarks/corpus/trots.py`).
-  - The gEUD gradient/Hessian at zero dose with `a < 2` returned `inf`/`nan`;
-    the negative-exponent powers now use `max(|d|, 1e-12)`.
-  - An all-zero structure dose raised `ZeroDivisionError`; it now gives a zero
-    gradient and zero curvature.
+  - The gEUD gradient/Hessian at zero dose with `a < 2` returned `inf`/`nan`; the negative-exponent powers now use `max(|d|, 1e-12)`.
+  - An all-zero structure dose raised `ZeroDivisionError`; it now gives a zero gradient and zero curvature.
   - The LTCP exponent is clipped at 500 so it cannot overflow.
   - Values away from these points are bitwise unchanged.
-  - The fixed 1e-12 floor still overflowed for strongly negative gEUD
-    exponents (`a < ≈ -23.7`, `0·∞ = nan`); the floor now rises with the
-    exponent so the floored power stays finite, and a cold voxel with `a < 0`
-    (`S = ∞`) gives a zero gradient and curvature.
-- **TROTS tiled Gram / grouped exact Hessian review fixes**
-  (`benchmarks/corpus/trots.py`).
-  - Tiles were stored in float32 under a float32 hint without checking the
-    values, and those tiles also serve exact float64 requests; a structure
-    whose values are not exact float32 widenings is now stored in float64.
-  - On Torch/CuPy/JAX the grouped Hessian round-tripped to the host on every
-    matvec; it is now formed once per call and crossed as a `CSCOperator`.
-  - A segment/row mismatch in the linear block now falls back to the plain
-    operator with a logged warning instead of aborting the load; segment
-    signs other than ±1 are rejected.
+  - The fixed 1e-12 floor still overflowed for strongly negative gEUD exponents (`a < ≈ -23.7`, `0·∞ = nan`); the floor now rises with the exponent so the floored power stays finite, and a cold voxel with `a < 0` (`S = ∞`) gives a zero gradient and curvature.
+- **TROTS tiled Gram / grouped exact Hessian review fixes** (`benchmarks/corpus/trots.py`).
+  - Tiles were stored in float32 under a float32 hint without checking the values, and those tiles also serve exact float64 requests; a structure whose values are not exact float32 widenings is now stored in float64.
+  - On Torch/CuPy/JAX the grouped Hessian round-tripped to the host on every matvec; it is now formed once per call and crossed as a `CSCOperator`.
+  - A segment/row mismatch in the linear block now falls back to the plain operator with a logged warning instead of aborting the load; segment signs other than ±1 are rejected.
 - **TROTS device tiled Gram review fixes** (`benchmarks/corpus/trots.py`).
-  - CuPy sparse tiles no longer pay a canonical-format check (a kernel plus
-    a host sync) per tile and call, and float32-stored tiles no longer have
-    their transpose recast to float64 on every exact call. The memo
-    comparison and the weight-flag transfer are one host read per Gram
-    call. The docs now state the real sync inventory, including the
-    unavoidable SpGEMM output-size read per sparse tile on exact CuPy Grams.
-  - `TROTSDeviceExactHessian.matvec` on Torch used a host bridge that cannot
-    read CUDA tensors; it now downloads through the context. Torch-CUDA is
-    documented as unsupported and untested.
-  - New `TiledGramConfig.device_densify_budget_bytes` (default 256 MiB): a
-    sparse tile whose densified `b×c` temporary would exceed it is never
-    densified on a device (CuPy: SpGEMM at every precision; Torch: the host
-    SciPy product). The docs note that on Torch and for float32 requests the
-    gate statistic underestimates the cost of densified sparse tiles.
-  - When the share gate folds a float32 structure that is also curved, the
-    exact Hessian now plans it under the same key as the linear block, so
-    they share one tile set instead of holding two.
-  - An all-empty float32 group is folded too; `float32_group_folded` reports
-    the decision. The device tile cache key includes the namespace, device
-    and kernel knobs; the device `diagonal` uploads once.
+  - CuPy sparse tiles no longer pay a canonical-format check (a kernel plus a host sync) per tile and call, and float32-stored tiles no longer have their transpose recast to float64 on every exact call. The memo comparison and the weight-flag transfer are one host read per Gram call. The docs now state the real sync inventory, including the unavoidable SpGEMM output-size read per sparse tile on exact CuPy Grams.
+  - `TROTSDeviceExactHessian.matvec` on Torch used a host bridge that cannot read CUDA tensors; it now downloads through the context. Torch-CUDA is documented as unsupported and untested.
+  - New `TiledGramConfig.device_densify_budget_bytes` (default 256 MiB): a sparse tile whose densified `b×c` temporary would exceed it is never densified on a device (CuPy: SpGEMM at every precision; Torch: the host SciPy product). The docs note that on Torch and for float32 requests the gate statistic underestimates the cost of densified sparse tiles.
+  - When the share gate folds a float32 structure that is also curved, the exact Hessian now plans it under the same key as the linear block, so they share one tile set instead of holding two.
+  - An all-empty float32 group is folded too; `float32_group_folded` reports the decision. The device tile cache key includes the namespace, device and kernel knobs; the device `diagonal` uploads once.
 
 ## [0.11.0] - 2026-09-17
 
 ### Added
-- **Linear-inequality L-BFGS performance review and benchmark.** Document
-  dense, Krylov, and sparse costs, portable candidates, and optional adapter/JIT
-  proposals for bounded problems with affine inequalities.
-- **Performance proposals in the contributor documentation.** Record optional
-  compact-factor/BLAS adapters and JIT experiments for bound-only L-BFGS,
-  including dependency candidates, numerical safeguards, and validation criteria.
-- **Matrix-free feasibility restoration, auto-selected by size.**
-  `RestorationOptions(linear_solver="krylov")` solves the reduced, damped
-  Gauss-Newton restoration model through Jacobian `matvec`/`rmatvec`
-  products, eliminating the dense `n x n` identity, Hessian, and Jacobian
-  materializations. The new default `"auto"` follows the main route's dense
-  size cutoff — dense below 10 000 variables, Krylov at and above — because
-  the paired S2MPJ sweep (v29, 2026-09-04) put the Krylov route at −12
-  correct of 6600 rows on that corpus of small problems (an n×n dense solve
-  is cheaper there than a Krylov ladder per damping trial; every flipped
-  problem had n ≤ 1247, so `"auto"` reproduces the dense results on the whole
-  corpus), while at n = 12 000 the dense route spends 22 s and 2.3 GB on a
-  trivial restoration that the matrix-free route finishes in milliseconds.
-  `"dense"` and `"krylov"` force a route regardless of size;
-  `--restoration-linear-solver` exposes all three in the sweep runner. A
-  work-capped inner solve contributes its truncated Krylov
-  iterate as the Levenberg-Marquardt trial direction (a descent direction of
-  the Gauss-Newton model, Steihaug 1983) instead of being discarded; only a
-  solve that yields no finite direction climbs the damping ladder, and if
-  none ever does restoration returns an uncertified failure. It never
-  silently falls back to a scale-breaking dense allocation. A matvec-only
-  Jacobian is refused at `solve()` entry rather than at the first restoration,
-  and the solver is built per restoration entry so the last restoration
-  point's Jacobians are released when it returns.
-- **Docs: bound-only RT recipe and objective/gradient work-sharing.** The
-  TROTS benchmark page gains a measured recipe for bound-only fluence-map
-  runs (`LBFGSOptions(seed_formula="scalar1", memory=20-50)` + the default
-  monotone mu schedule; objective 13.4 -> 8.396 at 300 iterations on the
-  n = 50k study problem, beating SciPy L-BFGS-B at equal memory), with a
-  matching signature row on the routing-hints page. The Problem guide gains
-  a "Sharing work between the objective and the gradient" recipe: a one-slot
-  identity-keyed cache for a shared intermediate such as `A @ x`, which the
-  driver's once-per-point callback evaluation turns into a guaranteed hit at
-  every accepted point (verified: 145 callback calls -> 81 products on a
-  bound-constrained composite least-squares solve).
+- **Linear-inequality L-BFGS performance review and benchmark.** Document dense, Krylov, and sparse costs, portable candidates, and optional adapter/JIT proposals for bounded problems with affine inequalities.
+- **Performance proposals in the contributor documentation.** Record optional compact-factor/BLAS adapters and JIT experiments for bound-only L-BFGS, including dependency candidates, numerical safeguards, and validation criteria.
+- **Matrix-free feasibility restoration, auto-selected by size.** `RestorationOptions(linear_solver="krylov")` solves the reduced, damped Gauss-Newton restoration model through Jacobian `matvec`/`rmatvec` products, eliminating the dense `n x n` identity, Hessian, and Jacobian materializations. The new default `"auto"` follows the main route's dense size cutoff — dense below 10 000 variables, Krylov at and above — because the paired S2MPJ sweep (v29, 2026-09-04) put the Krylov route at −12 correct of 6600 rows on that corpus of small problems (an n×n dense solve is cheaper there than a Krylov ladder per damping trial; every flipped problem had n ≤ 1247, so `"auto"` reproduces the dense results on the whole corpus), while at n = 12 000 the dense route spends 22 s and 2.3 GB on a trivial restoration that the matrix-free route finishes in milliseconds. `"dense"` and `"krylov"` force a route regardless of size; `--restoration-linear-solver` exposes all three in the sweep runner. A work-capped inner solve contributes its truncated Krylov iterate as the Levenberg-Marquardt trial direction (a descent direction of the Gauss-Newton model, Steihaug 1983) instead of being discarded; only a solve that yields no finite direction climbs the damping ladder, and if none ever does restoration returns an uncertified failure. It never silently falls back to a scale-breaking dense allocation. A matvec-only Jacobian is refused at `solve()` entry rather than at the first restoration, and the solver is built per restoration entry so the last restoration point's Jacobians are released when it returns.
+- **Docs: bound-only RT recipe and objective/gradient work-sharing.** The TROTS benchmark page gains a measured recipe for bound-only fluence-map runs (`LBFGSOptions(seed_formula="scalar1", memory=20-50)` + the default monotone mu schedule; objective 13.4 -> 8.396 at 300 iterations on the n = 50k study problem, beating SciPy L-BFGS-B at equal memory), with a matching signature row on the routing-hints page. The Problem guide gains a "Sharing work between the objective and the gradient" recipe: a one-slot identity-keyed cache for a shared intermediate such as `A @ x`, which the driver's once-per-point callback evaluation turns into a guaranteed hit at every accepted point (verified: 145 callback calls -> 81 products on a bound-constrained composite least-squares solve).
 
 ### Fixed
-- **`Dense.row_gram_diagonal` no longer overflows on large entries.** It
-  squared the matrix before weighting (`(A·A)·w`); it now weights first
-  (`(A·w)·A`, matching `gram_diagonal`), so the equality-saddle Schur diagonal
-  stays finite whenever the weighted product is representable.
-- **Row scaling preserves batched adjoint products.** Forward `rmatmat` to
-  the wrapped operator, including supported empty batches, instead of looping
-  over columns.
-- **Changelog verification on Windows.** Run `kacl-verify` in Python UTF-8 mode
-  so mathematical symbols in `CHANGELOG.md` do not trigger a CP1252 decoding
-  error in python-kacl's locale-dependent file reader.
-- **Restoration probes for a saddle before certifying local infeasibility.**
-  On a symmetry-invariant subspace (equal components at a permutation-symmetric
-  start — S2MPJ POWERSUMNE, HADAMARD — or the cyclic ring of CYCLOOCT) every
-  Gauss-Newton direction stays in the subspace, and a critical point of the
-  restricted infeasibility is a critical point of the full one (Palais 1979): a
-  saddle, which the first-order STATIONARY/NO_DESCENT certificate reported as
-  local infeasibility. The dense reference solve escaped only through LU
-  round-off in near-null directions; the exact matrix-free route did not and
-  labelled feasible problems `infeasible`. `restore()` now kicks the iterate
-  once along a fixed, deterministic aperiodic direction before certifying and
-  lets the damped Gauss-Newton loop continue — a saddle's unstable manifold
-  amplifies the kick, a genuine local minimizer re-certifies at the same point.
-- **SOC rounds reuse the loop's own fallback factorization.** When round 1's
-  re-solve fails and its fresh ladder ends regularized, the later rounds now
-  re-solve that factorization instead of re-climbing the ladder per round —
-  on the Krylov routes every rung is a full CG solve, and DRUGDIS spent 161
-  of 170 in-SOC ladders re-deriving the same δ_w (v29 sweep). Whether the
-  step's own regularized matrix is reused for the first correction depends
-  on the solver kind — see "SOC reuse policy follows the solver kind" under
-  Changed.
-- **SOC factorization reuse follows the retained factorization.** The reuse
-  gate read two hand-maintained flags (`factor_matches_step`, the step's
-  `δ_w`) that went stale inside the SOC loop: after a failed re-solve, the
-  fresh fallback could leave the solver factored at `δ_w > 0` and later
-  rounds still re-solved against that inflated matrix; and a phase-2 ladder
-  success (δ_w reset to 0, δ_c escalated) reported `δ_w = 0` and was reused
-  as if unregularized. `_solve_step` now records at factor time whether the
-  retained matrix is the unregularized one, and the gate reads that per round.
-- **Out-of-memory inside the exact L-BFGS Woodbury apply propagates.** It was
-  relabeled as a Krylov convergence failure, which sticky-disabled the exact
-  inverse and hid the cause behind a slower Jacobi retry (torch's CUDA OOM is
-  a `RuntimeError`, not a `MemoryError`).
-- **Bound-only L-BFGS problems no longer materialize the dense condensed
-  block.** Before the first curvature pair `LBFGSOperator.compact_form` raised,
-  the structured Woodbury solve propagated the error and `DenseSolver` fell
-  through to forming and LU-factoring the full `n×n` matrix — 39 GB and
-  488 s per iteration at `n = 50k` on an RT-style box-bounded least-squares
-  problem. The pair-less seed `B = I` is now solved as the diagonal it is, so
-  `linsolve="dense"` stays on the structured path from iteration 0
-  (5 ms per step at `n = 50k`).
+- **`Dense.row_gram_diagonal` no longer overflows on large entries.** It squared the matrix before weighting (`(A·A)·w`); it now weights first (`(A·w)·A`, matching `gram_diagonal`), so the equality-saddle Schur diagonal stays finite whenever the weighted product is representable.
+- **Row scaling preserves batched adjoint products.** Forward `rmatmat` to the wrapped operator, including supported empty batches, instead of looping over columns.
+- **Changelog verification on Windows.** Run `kacl-verify` in Python UTF-8 mode so mathematical symbols in `CHANGELOG.md` do not trigger a CP1252 decoding error in python-kacl's locale-dependent file reader.
+- **Restoration probes for a saddle before certifying local infeasibility.** On a symmetry-invariant subspace (equal components at a permutation-symmetric start — S2MPJ POWERSUMNE, HADAMARD — or the cyclic ring of CYCLOOCT) every Gauss-Newton direction stays in the subspace, and a critical point of the restricted infeasibility is a critical point of the full one (Palais 1979): a saddle, which the first-order STATIONARY/NO_DESCENT certificate reported as local infeasibility. The dense reference solve escaped only through LU round-off in near-null directions; the exact matrix-free route did not and labelled feasible problems `infeasible`. `restore()` now kicks the iterate once along a fixed, deterministic aperiodic direction before certifying and lets the damped Gauss-Newton loop continue — a saddle's unstable manifold amplifies the kick, a genuine local minimizer re-certifies at the same point.
+- **SOC rounds reuse the loop's own fallback factorization.** When round 1's re-solve fails and its fresh ladder ends regularized, the later rounds now re-solve that factorization instead of re-climbing the ladder per round — on the Krylov routes every rung is a full CG solve, and DRUGDIS spent 161 of 170 in-SOC ladders re-deriving the same δ_w (v29 sweep). Whether the step's own regularized matrix is reused for the first correction depends on the solver kind — see "SOC reuse policy follows the solver kind" under Changed.
+- **SOC factorization reuse follows the retained factorization.** The reuse gate read two hand-maintained flags (`factor_matches_step`, the step's `δ_w`) that went stale inside the SOC loop: after a failed re-solve, the fresh fallback could leave the solver factored at `δ_w > 0` and later rounds still re-solved against that inflated matrix; and a phase-2 ladder success (δ_w reset to 0, δ_c escalated) reported `δ_w = 0` and was reused as if unregularized. `_solve_step` now records at factor time whether the retained matrix is the unregularized one, and the gate reads that per round.
+- **Out-of-memory inside the exact L-BFGS Woodbury apply propagates.** It was relabeled as a Krylov convergence failure, which sticky-disabled the exact inverse and hid the cause behind a slower Jacobi retry (torch's CUDA OOM is a `RuntimeError`, not a `MemoryError`).
+- **Bound-only L-BFGS problems no longer materialize the dense condensed block.** Before the first curvature pair `LBFGSOperator.compact_form` raised, the structured Woodbury solve propagated the error and `DenseSolver` fell through to forming and LU-factoring the full `n×n` matrix — 39 GB and 488 s per iteration at `n = 50k` on an RT-style box-bounded least-squares problem. The pair-less seed `B = I` is now solved as the diagonal it is, so `linsolve="dense"` stays on the structured path from iteration 0 (5 ms per step at `n = 50k`).
 
 ### Changed
-- **Dense Cholesky reuse for the L-BFGS block with inequalities.** A new
-  optional `LinearOperator.positive_definite_hint()` (declared by the
-  Powell-damped L-BFGS Hessian and the condensed block built on it) lets
-  `DenseSolver` Cholesky-factor the materialized block it previously solved by
-  LU on every right-hand side, keeping the factor for corrector/SOC back-solves
-  through the existing back-substitution gap-filler. A numerical Cholesky
-  failure falls back to LU; the PD guard for explicit Hessians is unchanged.
-  Such a breakdown is bookkept like the mixed route's failures: after
-  `DenseOptions.pd_hint_failure_limit` (default 3) *consecutive* breakdowns
-  the solver stops attempting the hinted Cholesky for the rest of the run
-  (any success resets the count — conditioning along an IPM run is not
-  monotone, so one hard iterate must not forfeit the reuse everywhere else),
-  and `DenseSolver.describe()` — hence `Result.routes` — carries a sticky
-  `pd-hint->lu` marker once any breakdown has occurred, so a run in which
-  the hinted factorization fell back to LU never reads as a clean `dense`
-  run. A breakdown on the mixed route's reduced-precision matrix is marked
-  but counts toward neither kill switch: it may be precision noise, and the
-  refinement pass is the certificate that judges that matrix.
-- **Lower temporary memory for dense Gram diagonals.** Reuse the owned
-  weighted-Jacobian buffer on mutable backends in `Dense.gram_diagonal` and
-  `Dense.row_gram_diagonal` (one `m×n` temporary instead of two), leaving
-  caller arrays unchanged; `gram_diagonal` keeps its `(w·A)·A` order.
-- **L-BFGS compact setup reuse.** Check the generation-keyed Woodbury cache
-  before rebuilding diagonal/Gram arrays, and share the cached-Gram shortcut
-  for fully unbounded systems between dense and Krylov consumers. Bound-only
-  arithmetic and cache invalidation are preserved. Add a three-route review
-  and reproducible NumPy/Torch/CuPy measurements under `benchmarks/`.
-- **SOC reuse policy follows the solver kind.** A new optional capability
-  protocol `SolverKind` declares `is_direct()` (`DenseSolver`/
-  `SparseDirectSolver` `True`, `KrylovSolver` `False`); the driver reads it
-  through duck typing and treats a solver without it as direct, and it is
-  deliberately *not* a member of `LinearSolver`, so existing third-party
-  solvers keep satisfying that protocol unchanged. Iterative routes now re-solve the
-  step's retained system for every second-order correction even when it is
-  regularized (Wächter & Biegler 2006 eq. (26) verbatim): a fresh `δ_w = 0`
-  solve there is a full Krylov ladder per round, which turned DRUGDIS
-  lbfgs/krylov from 21 s into `max_time` and cost DALLASS/NET1/SPECANNE in the
-  v29 sweep. Direct routes keep the fresh first correction at `δ_w = 0`
-  (their factorization per rung is cheap, and reusing the inflated matrix
-  rerouted ZAMB2/ACOPP30). Iterative routes also never solve fresh inside
-  SOC: a failed re-solve, or a step whose own ladder failed
-  (`_factor_failed`, recorded alongside the unregularized flag), skips the
-  opportunistic correction instead of climbing a ladder — with the fresh
-  fallback still in place, DRUGDIS's 233 failed re-solves cost 120 s. Direct
-  routes keep the fresh fallback on either event. Confirming S2MPJ sweep
-  (v30 vs v29, 2026-09-04, machine factor 0.99–1.01): +2 correct of 6600;
-  the Krylov routes trade 9 basin flips each way at 22 % less total wall on
-  `exact/krylov` (11.2 h → 8.7 h) with DRUGDIS/DALLASS/NET1/SPECANNE back
-  from `max_time`; the direct routes are trajectory-identical.
-- `KrylovOptions` no longer requires `rtol <= adaptive_rtol_max` when
-  `adaptive_tol=False`: the cap bounds the inexact-Newton forcing only, so a
-  fixed tolerance (e.g. a loosened `RestorationOptions.krylov.rtol`) is free
-  of it.
-- **L-BFGS compact applies keep their finiteness guard on device.** A
-  non-finite compact solve output is replaced by zeros before the low-rank
-  products, preserving the identity-seed fallback without synchronizing once
-  per operator application.
-- **New opt-in: quadratic-interpolation backtracking in the filter line
-  search.** After a rejected trial,
-  `LineSearchOptions(backtrack_interpolation=True)` steps to the minimizer of
-  the quadratic merit model through `phi(0)`, `phi'(0)` and the rejected
-  `phi(alpha)` (Nocedal & Wright 2006, eq. (3.58)), safeguarded into
-  `[0.1 alpha, 0.5 alpha]` (`backtrack_shrink_min`/`backtrack_shrink_max`,
-  validated to `0 < shrink_min <= shrink_max < 1` so an interpolated trial
-  can never grow the step) — never longer than plain halving — falling back
-  to halving whenever the
-  model is unusable (non-finite trial merit, non-descent direction,
-  non-positive model curvature). The opt-in free-mode search has no merit
-  model and always halves. Measured on the RT-style bound-only L-BFGS study
-  (n = 50k, `scalar1` seed): 3.3-4.1 objective evaluations per iteration drop
-  to 2.0-2.4 — each one a dose-projection `D@x` at scale — and a hopeless ray
-  concedes to restoration in ~7 trials instead of 21. **Default stays `False`
-  (plain halving)**: this lever's own contribution to the 2026-08-31 full
-  S2MPJ corpus sweep is **+11/6600**, and not unanimously — the three
-  Hessian-agnostic `exact/*` configs (which isolate this lever alone, since
-  they never touch the L-BFGS code the other changes below target) net
-  -1/3300, including reproducible worse-basin flips on HS97/HS98/OSBORNEB on
-  2 of the 3 exact routes, while the default L-BFGS Hessian mode nets +12/3300
-  (a same-commit A/B with the other L-BFGS-specific changes below held fixed).
-  See `benchmarks/routing_hints.py` (e.g. HS25) and `docs/benchmarks/s2mpj.md`
-  for the per-problem detail and the full table (the raw candidate-vs-baseline
-  delta there is +18/6600, but that credits all three perf commits at once —
-  not this lever in isolation).
-- **The L-BFGS compact factor stays in S/Y block form on the hot path.** The
-  operator no longer materializes and copies `U = [xiS Y]` (n x 2k) on every
-  curvature update; the matvec, the structured Woodbury solves and the exact
-  inverse consume the `S`/`Y` blocks directly (new `compact_blocks` hook, with
-  `compact_form` materializing on demand for the sparse assembly). The inner
-  Woodbury factor is assembled from three n x k Gram products instead of the
-  2k-wide product. The algebra is identical but the operation order differs at
-  round-off level, so knife-edge trajectories may flip — the 2026-08-31 full
-  S2MPJ sweep (v24 vs v23) confirmed only knife-edge churn, +18/6600 for the
-  three L-BFGS perf commits together (see the interpolated-backtracking entry
-  below for the per-lever split); at n = 50k the per-iteration
-  bookkeeping drops from ~17 to ~13 ms at memory 20 and the memory-50
-  configuration falls from ~88 to ~55 ms/iteration end to end.
-- **Krylov applies the exact L-BFGS inverse on bound-only systems.** With no
-  inequality Gram term the condensed Woodbury inverse is the exact `N⁻¹`, so
-  the default (`"jacobi"`) and `"auto"` preconditioner modes now use it
-  directly (`Result.linear_solver` reports `pc=lbfgs-exact`): a direct
-  one-apply solve — verified by a true-residual check, with working-precision
-  iterative refinement covering round-off, and falling back to the
-  CG-preconditioned route whenever refinement stalls, so robustness is a
-  strict superset of the old CG wrapper — instead of ~30 CG iterations, and
-  no O(n·k²) L-BFGS diagonal per solve — 34 → 6 ms per step at `n = 50k`.
-  Iterates are unchanged up to the inner tolerance. A solve that breaks down
-  under the exact inverse retries on Jacobi. `"none"` still disables
-  preconditioning entirely.
-- **Second-order corrections reuse the step's factorization at
-  unregularized steps.** Each SOC round used to rebuild the condensed/saddle
-  operator and re-run the delta_w escalation ladder from zero — a fresh
-  factorization per round — even though at a `delta_w = 0` step the retained
-  matrix is exactly the reference SOC system (Wächter & Biegler 2006, §2.4,
-  eq. (26): "the same matrix as in (13)... to avoid additional matrix
-  factorizations"). SOC now re-solves the retained factorization there,
-  like the centrality correctors; on HS71 under defaults this cuts the
-  dense route from 28 factorizations to 8 (20 of 28 KKT solves per run are
-  SOC re-solves), and on the sparse-direct route each avoided factorization
-  is a full LDLT. At a *regularized* step (`delta_w > 0`) on a direct route
-  SOC keeps ipax's long-standing fresh `delta_w = 0` solve — a deliberate,
-  now-documented deviation from eq. (26): reusing the delta_w-inflated
-  matrix measurably degrades the feasibility correction there
-  (ZAMB2/ZAMB2m11/ACOPP30/TWIRIMD1 left their baseline trajectories for
-  restoration-heavy paths 10-60x more expensive per iteration), so direct
-  routes' iterate trajectories are unchanged. Iterative routes reuse the
-  step's system regardless — see "SOC reuse policy follows the solver kind"
-  under Changed. The fresh solve is also the fallback when a re-solve fails.
-- **Less redundant work around the condensed Woodbury factors.** The
-  condensed
-  operator memoizes its Woodbury factorization per instance (keyed on the
-  L-BFGS window's new `generation` token, so a curvature update can never
-  serve stale factors): the Krylov auto-promotion probe and a promoted retry
-  reuse the factors the solve already built instead of repeating the O(n·k²)
-  product. The `"auto"` promotion check now also tests slowness *before*
-  probing availability, so a fast successful solve no longer pays a
-  build-and-discard factorization every iteration. Reused factors are
-  bitwise-identical — results do not change.
+- **Dense Cholesky reuse for the L-BFGS block with inequalities.** A new optional `LinearOperator.positive_definite_hint()` (declared by the Powell-damped L-BFGS Hessian and the condensed block built on it) lets `DenseSolver` Cholesky-factor the materialized block it previously solved by LU on every right-hand side, keeping the factor for corrector/SOC back-solves through the existing back-substitution gap-filler. A numerical Cholesky failure falls back to LU; the PD guard for explicit Hessians is unchanged. Such a breakdown is bookkept like the mixed route's failures: after `DenseOptions.pd_hint_failure_limit` (default 3) *consecutive* breakdowns the solver stops attempting the hinted Cholesky for the rest of the run (any success resets the count — conditioning along an IPM run is not monotone, so one hard iterate must not forfeit the reuse everywhere else), and `DenseSolver.describe()` — hence `Result.routes` — carries a sticky `pd-hint->lu` marker once any breakdown has occurred, so a run in which the hinted factorization fell back to LU never reads as a clean `dense` run. A breakdown on the mixed route's reduced-precision matrix is marked but counts toward neither kill switch: it may be precision noise, and the refinement pass is the certificate that judges that matrix.
+- **Lower temporary memory for dense Gram diagonals.** Reuse the owned weighted-Jacobian buffer on mutable backends in `Dense.gram_diagonal` and `Dense.row_gram_diagonal` (one `m×n` temporary instead of two), leaving caller arrays unchanged; `gram_diagonal` keeps its `(w·A)·A` order.
+- **L-BFGS compact setup reuse.** Check the generation-keyed Woodbury cache before rebuilding diagonal/Gram arrays, and share the cached-Gram shortcut for fully unbounded systems between dense and Krylov consumers. Bound-only arithmetic and cache invalidation are preserved. Add a three-route review and reproducible NumPy/Torch/CuPy measurements under `benchmarks/`.
+- **SOC reuse policy follows the solver kind.** A new optional capability protocol `SolverKind` declares `is_direct()` (`DenseSolver`/ `SparseDirectSolver` `True`, `KrylovSolver` `False`); the driver reads it through duck typing and treats a solver without it as direct, and it is deliberately *not* a member of `LinearSolver`, so existing third-party solvers keep satisfying that protocol unchanged. Iterative routes now re-solve the step's retained system for every second-order correction even when it is regularized (Wächter & Biegler 2006 eq. (26) verbatim): a fresh `δ_w = 0` solve there is a full Krylov ladder per round, which turned DRUGDIS lbfgs/krylov from 21 s into `max_time` and cost DALLASS/NET1/SPECANNE in the v29 sweep. Direct routes keep the fresh first correction at `δ_w = 0` (their factorization per rung is cheap, and reusing the inflated matrix rerouted ZAMB2/ACOPP30). Iterative routes also never solve fresh inside SOC: a failed re-solve, or a step whose own ladder failed (`_factor_failed`, recorded alongside the unregularized flag), skips the opportunistic correction instead of climbing a ladder — with the fresh fallback still in place, DRUGDIS's 233 failed re-solves cost 120 s. Direct routes keep the fresh fallback on either event. Confirming S2MPJ sweep (v30 vs v29, 2026-09-04, machine factor 0.99–1.01): +2 correct of 6600; the Krylov routes trade 9 basin flips each way at 22 % less total wall on `exact/krylov` (11.2 h → 8.7 h) with DRUGDIS/DALLASS/NET1/SPECANNE back from `max_time`; the direct routes are trajectory-identical.
+- `KrylovOptions` no longer requires `rtol <= adaptive_rtol_max` when `adaptive_tol=False`: the cap bounds the inexact-Newton forcing only, so a fixed tolerance (e.g. a loosened `RestorationOptions.krylov.rtol`) is free of it.
+- **L-BFGS compact applies keep their finiteness guard on device.** A non-finite compact solve output is replaced by zeros before the low-rank products, preserving the identity-seed fallback without synchronizing once per operator application.
+- **New opt-in: quadratic-interpolation backtracking in the filter line search.** After a rejected trial, `LineSearchOptions(backtrack_interpolation=True)` steps to the minimizer of the quadratic merit model through `phi(0)`, `phi'(0)` and the rejected `phi(alpha)` (Nocedal & Wright 2006, eq. (3.58)), safeguarded into `[0.1 alpha, 0.5 alpha]` (`backtrack_shrink_min`/`backtrack_shrink_max`, validated to `0 < shrink_min <= shrink_max < 1` so an interpolated trial can never grow the step) — never longer than plain halving — falling back to halving whenever the model is unusable (non-finite trial merit, non-descent direction, non-positive model curvature). The opt-in free-mode search has no merit model and always halves. Measured on the RT-style bound-only L-BFGS study (n = 50k, `scalar1` seed): 3.3-4.1 objective evaluations per iteration drop to 2.0-2.4 — each one a dose-projection `D@x` at scale — and a hopeless ray concedes to restoration in ~7 trials instead of 21. **Default stays `False` (plain halving)**: this lever's own contribution to the 2026-08-31 full S2MPJ corpus sweep is **+11/6600**, and not unanimously — the three Hessian-agnostic `exact/*` configs (which isolate this lever alone, since they never touch the L-BFGS code the other changes below target) net -1/3300, including reproducible worse-basin flips on HS97/HS98/OSBORNEB on 2 of the 3 exact routes, while the default L-BFGS Hessian mode nets +12/3300 (a same-commit A/B with the other L-BFGS-specific changes below held fixed). See `benchmarks/routing_hints.py` (e.g. HS25) and `docs/benchmarks/s2mpj.md` for the per-problem detail and the full table (the raw candidate-vs-baseline delta there is +18/6600, but that credits all three perf commits at once — not this lever in isolation).
+- **The L-BFGS compact factor stays in S/Y block form on the hot path.** The operator no longer materializes and copies `U = [xiS Y]` (n x 2k) on every curvature update; the matvec, the structured Woodbury solves and the exact inverse consume the `S`/`Y` blocks directly (new `compact_blocks` hook, with `compact_form` materializing on demand for the sparse assembly). The inner Woodbury factor is assembled from three n x k Gram products instead of the 2k-wide product. The algebra is identical but the operation order differs at round-off level, so knife-edge trajectories may flip — the 2026-08-31 full S2MPJ sweep (v24 vs v23) confirmed only knife-edge churn, +18/6600 for the three L-BFGS perf commits together (see the interpolated-backtracking entry below for the per-lever split); at n = 50k the per-iteration bookkeeping drops from ~17 to ~13 ms at memory 20 and the memory-50 configuration falls from ~88 to ~55 ms/iteration end to end.
+- **Krylov applies the exact L-BFGS inverse on bound-only systems.** With no inequality Gram term the condensed Woodbury inverse is the exact `N⁻¹`, so the default (`"jacobi"`) and `"auto"` preconditioner modes now use it directly (`Result.linear_solver` reports `pc=lbfgs-exact`): a direct one-apply solve — verified by a true-residual check, with working-precision iterative refinement covering round-off, and falling back to the CG-preconditioned route whenever refinement stalls, so robustness is a strict superset of the old CG wrapper — instead of ~30 CG iterations, and no O(n·k²) L-BFGS diagonal per solve — 34 → 6 ms per step at `n = 50k`. Iterates are unchanged up to the inner tolerance. A solve that breaks down under the exact inverse retries on Jacobi. `"none"` still disables preconditioning entirely.
+- **Second-order corrections reuse the step's factorization at unregularized steps.** Each SOC round used to rebuild the condensed/saddle operator and re-run the delta_w escalation ladder from zero — a fresh factorization per round — even though at a `delta_w = 0` step the retained matrix is exactly the reference SOC system (Wächter & Biegler 2006, §2.4, eq. (26): "the same matrix as in (13)... to avoid additional matrix factorizations"). SOC now re-solves the retained factorization there, like the centrality correctors; on HS71 under defaults this cuts the dense route from 28 factorizations to 8 (20 of 28 KKT solves per run are SOC re-solves), and on the sparse-direct route each avoided factorization is a full LDLT. At a *regularized* step (`delta_w > 0`) on a direct route SOC keeps ipax's long-standing fresh `delta_w = 0` solve — a deliberate, now-documented deviation from eq. (26): reusing the delta_w-inflated matrix measurably degrades the feasibility correction there (ZAMB2/ZAMB2m11/ACOPP30/TWIRIMD1 left their baseline trajectories for restoration-heavy paths 10-60x more expensive per iteration), so direct routes' iterate trajectories are unchanged. Iterative routes reuse the step's system regardless — see "SOC reuse policy follows the solver kind" under Changed. The fresh solve is also the fallback when a re-solve fails.
+- **Less redundant work around the condensed Woodbury factors.** The condensed operator memoizes its Woodbury factorization per instance (keyed on the L-BFGS window's new `generation` token, so a curvature update can never serve stale factors): the Krylov auto-promotion probe and a promoted retry reuse the factors the solve already built instead of repeating the O(n·k²) product. The `"auto"` promotion check now also tests slowness *before* probing availability, so a fast successful solve no longer pays a build-and-discard factorization every iteration. Reused factors are bitwise-identical — results do not change.
 
 ## [0.10.1] - 2026-08-27
 
 ### Changed
-- **Problem callbacks are evaluated once per point.** The driver memoizes
-  objective, gradient, constraint and Jacobian values at recently visited
-  primal points (keyed by array identity, no device sync) and adopts the
-  line search's accepted trial array as the next iterate, so the loop-top
-  evaluation, the `phi0`/`theta0` merit re-evaluation, the L-BFGS overshoot
-  gradient guard and the second-order correction all reuse what was already
-  computed. On 100-d Rosenbrock this takes ipax from 3.15 `f` / 2.0 `∇f` per
-  iteration to 1.15 / 1.0 — SciPy L-BFGS-B parity at an identical iterate
-  sequence — and a small constrained NLP from 5.1 to 3.0 constraint
-  evaluations per iteration (the remainder are the corrector's own probe
-  points). Iterates are bitwise unchanged; regression tests pin the counts.
-  The cache retains only the current iterate when the loop advances, so no
-  stale Jacobians outlive their iteration.
-- **Less per-iteration overhead in the IPM loop.** The inertia check asks the
-  linear solver for an inertia *before* computing the target (dense/Krylov
-  solvers never report one, so the L-BFGS middle-block eigensolve it cost every
-  step is gone); bound-free problems skip the masked bound arithmetic in the
-  merit function, its directional derivative, the KKT residual, the
-  fraction-to-boundary rule, the condensed RHS and the step recovery; and the
-  Lagrangian gradient is formed once per iteration for both the KKT residual
-  and the L-BFGS curvature pair instead of twice.
-- **Fewer host syncs per IPM iteration.** The merit function, its directional
-  derivative, the feasibility measures, the KKT residual and the
-  fraction-to-boundary rule now reduce their per-block scalars on the device
-  and read back once (`ipax.ipm.barrier.boundary_ratio` is the device-side
-  half of `fraction_to_boundary`), and the descent-enforcement probe's
-  directional derivative is reused by the line search. Measured on Torch:
-  60 → 29 host syncs per iteration on HS71 (equalities, inequalities and
-  bounds), 15 → 12 on unconstrained Rosenbrock; a regression test pins the
-  budgets.
-- **L-BFGS Gram blocks are maintained incrementally.** `SᵀS` and `SᵀY` are
-  bordered by the new pair (O(n·k)) and sliced when a pair drops, instead of
-  being recomputed from scratch (O(n·k²)) on every update; the compact `M`
-  is assembled from the cached blocks. Round-off differs at machine precision
-  from the from-scratch product, so iterate sequences may change in the last
-  digits.
-- **Bound-free L-BFGS dense solves skip the `Uᵀ D⁻¹ U` product.** With no
-  bounds `Σ_x ≡ 0` (the driver now declares this via
-  `build_condensed_operator(..., sigma_x_zero=True)`), so `D = (ξ + δ_w)·I`
-  and the Woodbury inner factor is `M − UᵀU/D`; `UᵀU` is assembled in O(k²)
-  from the operator's incrementally maintained `SᵀS`/`SᵀY`/`YᵀY` blocks
-  (`LBFGSOperator.gram_blocks`) instead of the O(n·k²) product per solve. The
-  Woodbury/diagonal-solve helpers and `LBFGSOperator` also take the namespace
-  from the caller (or remember it from the first pair) rather than
-  re-resolving it from every intermediate array.
+- **Problem callbacks are evaluated once per point.** The driver memoizes objective, gradient, constraint and Jacobian values at recently visited primal points (keyed by array identity, no device sync) and adopts the line search's accepted trial array as the next iterate, so the loop-top evaluation, the `phi0`/`theta0` merit re-evaluation, the L-BFGS overshoot gradient guard and the second-order correction all reuse what was already computed. On 100-d Rosenbrock this takes ipax from 3.15 `f` / 2.0 `∇f` per iteration to 1.15 / 1.0 — SciPy L-BFGS-B parity at an identical iterate sequence — and a small constrained NLP from 5.1 to 3.0 constraint evaluations per iteration (the remainder are the corrector's own probe points). Iterates are bitwise unchanged; regression tests pin the counts. The cache retains only the current iterate when the loop advances, so no stale Jacobians outlive their iteration.
+- **Less per-iteration overhead in the IPM loop.** The inertia check asks the linear solver for an inertia *before* computing the target (dense/Krylov solvers never report one, so the L-BFGS middle-block eigensolve it cost every step is gone); bound-free problems skip the masked bound arithmetic in the merit function, its directional derivative, the KKT residual, the fraction-to-boundary rule, the condensed RHS and the step recovery; and the Lagrangian gradient is formed once per iteration for both the KKT residual and the L-BFGS curvature pair instead of twice.
+- **Fewer host syncs per IPM iteration.** The merit function, its directional derivative, the feasibility measures, the KKT residual and the fraction-to-boundary rule now reduce their per-block scalars on the device and read back once (`ipax.ipm.barrier.boundary_ratio` is the device-side half of `fraction_to_boundary`), and the descent-enforcement probe's directional derivative is reused by the line search. Measured on Torch: 60 → 29 host syncs per iteration on HS71 (equalities, inequalities and bounds), 15 → 12 on unconstrained Rosenbrock; a regression test pins the budgets.
+- **L-BFGS Gram blocks are maintained incrementally.** `SᵀS` and `SᵀY` are bordered by the new pair (O(n·k)) and sliced when a pair drops, instead of being recomputed from scratch (O(n·k²)) on every update; the compact `M` is assembled from the cached blocks. Round-off differs at machine precision from the from-scratch product, so iterate sequences may change in the last digits.
+- **Bound-free L-BFGS dense solves skip the `Uᵀ D⁻¹ U` product.** With no bounds `Σ_x ≡ 0` (the driver now declares this via `build_condensed_operator(..., sigma_x_zero=True)`), so `D = (ξ + δ_w)·I` and the Woodbury inner factor is `M − UᵀU/D`; `UᵀU` is assembled in O(k²) from the operator's incrementally maintained `SᵀS`/`SᵀY`/`YᵀY` blocks (`LBFGSOperator.gram_blocks`) instead of the O(n·k²) product per solve. The Woodbury/diagonal-solve helpers and `LBFGSOperator` also take the namespace from the caller (or remember it from the first pair) rather than re-resolving it from every intermediate array.
 
 ## [0.10.0] - 2026-08-11
 
 ### Added
-- **TROTS matrix cache (benchmarks).** Parsing the MATLAB v7.3 dose matrices
-  dominated every TROTS run's startup; parsed matrices are now mirrored to
-  `.npz` beside the dataset, keyed by the source file's size, mtime and a
-  format version (an edited `.mat` misses rather than serving a stale
-  matrix). Warm vs cold: `Prostate_CK_01` 7.3 s → 3.1 s, `Prostate_VMAT_101`
-  12.5 s → 4.5 s, assembled constraint block identical either way. Values
-  whose float64 widening is provably lossless are stored narrow (checked, not
-  assumed), and sparse indices are narrowed to int32 where they fit — which
-  also halves index memory at runtime, ~330 MB on VMAT's 82 M nonzeros. The
-  cache is strictly an optimization: any read/write failure falls back to
-  parsing. `IPAX_TROTS_CACHE` relocates it, or `off` disables it.
-- **Mixed-precision condensed Gram: `DenseOptions(gram_dtype)`, default `"auto"`.**
-  The dense condensed route's dominant kernel — accumulating `∇gᵀ Σ_s ∇g`,
-  80–90% of per-iteration wall at radiotherapy scale — can now run in float32
-  (many radiotherapy dose matrices are stored float32 — measured across the
-  TROTS corpus: the brachytherapy cases are float32 throughout, `Prostate_VMAT_101`
-  is 96% float32 by nnz, while `Protons_01` is 99.93% float64 and so gains
-  essentially nothing; scoped in by
-  explicit decision, with AGENTS.md updated), while every other block stays
-  float64. The `"auto"` default prefers the precision the constraint data
-  actually carries: it engages exactly when the inequality Jacobian declares
-  float32-grade data via the new `gram_accumulate_dtype_hint()` operator hook
-  (float32 storage, or float64 values that are exact float32 upcasts declared
-  by their producer — declared metadata, never a value scan) and is a strict
-  no-op for fully-float64 problems; `"float32"` forces the reduction,
-  `"native"` disables it. A Jacobian assembled from sources of differing
-  precision is reduced **per block**: `"auto"` asks a stacked operator to
-  accumulate reduced only in the blocks whose own data permits it, leaving the
-  genuinely-float64 blocks exact — so a plan that is overwhelmingly float32 but
-  held back by a single float64 matrix keeps the reduction rather than
-  forfeiting it (`Prostate_VMAT_101`: 96% of nonzeros reduce, 0% before).
-  Working accuracy is restored per solve by fixed-precision iterative
-  refinement against the exact float64 operator matvec (Carson & Higham 2018);
-  every returned step carries a measured exact-residual certificate:
-  refinement targets `refine_tol`, budget-exhausted/plateaued solves are
-  still accepted within the looser `refine_accept_tol`, and a solve missing
-  even that — or a positive-definiteness failure the exact matrix does not
-  reproduce (a `κ(N)·u32 ≳ 1` stretch) — answers from an exact rebuild, with
-  `refine_failure_limit` *consecutive* failures returning the instance to
-  native precision for good (conditioning along an IPM run is not monotone,
-  so one hard factorization is not terminal). Measured on TROTS Protons_01
-  (CPU, 32-thread BLAS): the Gram kernel 11.7 → 5.4 s per compute (2.15×).
-  Plumbing: `LinearOperator.gram` gains an optional best-effort
-  `accumulate_dtype` keyword (forwarded by `VStack`, the CSR routing wrapper
-  and row scaling — through the new `forward_gram`, which falls back to the
-  pre-keyword `gram(weights)` so a user operator written against 0.9.x keeps
-  working when the solver stacks or row-scales it; honored by the SciPy and
-  CuPy adapters via a cast-once reduced-data CSR), `_CondensedOperator.dense_matrix_mixed` covers
-  gram-capable and generic (pure Array-API `float32`) Jacobians alike, and
-  `Result.routes` reports the engaged route as `dense (gram=float32)` (or
-  `dense (gram=auto:float32)` when the hint chose it). On the benchmark side
-  the TROTS loader now tracks source precision per *row* and groups its lowered
-  `G z + h ≤ 0` block so each precision forms a contiguous operator — the
-  assembly the per-block reduction needs.
-- **Routing-hints registry + report section.** `benchmarks/routing_hints.py`
-  is a curated registry of *measured* per-problem wins for the opt-in levers
-  (recipe, metrics, failure signature, budget), and the S2MPJ sweep report
-  gained a *Routing hints* section that prints the known win next to any
-  default-configuration row that missed a hinted problem — omitted entirely
-  when nothing applies. The new docs page *Routing hints* maps each failure
-  signature to its lever (quality-μ for the `AGG` class, `slack_init_scale`
-  for the `HS59` class, `damping_skip_ratio` for the `ORTHRGDS` class,
-  `seed_formula="scalar1"` for the `GASOIL` class).
-- **`LBFGSOptions.seed_formula`** — which Rayleigh estimate seeds the L-BFGS
-  identity block ξ. `"direct"` (the default, Nocedal & Wright eq. 7.20
-  inverted for the direct Hessian: `ξ = γᵀγ/δᵀγ`) and `"scalar1"` (IPOPT's
-  `limited_memory_initialization`: `ξ = δᵀγ/δᵀδ`) differ by exactly the δ–γ
-  misalignment factor `1/cos²∠(δ,γ)` — and badly-scaled least squares drives
-  that factor to ~1e15: S2MPJ `NELSONLS` runs the direct seed at a median
-  `ξ ≈ 1e20` (steps frozen, KKT pinned at 4.8 for 1000 iterations) where
-  scalar1 sits at 6e3. The over-stiff seed also feeds the Powell-damping test
-  an inflated `δᵀBδ`, so every pair looks damping-worthy — the mechanism
-  behind part of the L-BFGS-vs-IPOPT quality gap. Probed under scalar1:
-  `GASOIL` goes from 508 stalled iterations to **optimal in 25 (IPOPT
-  parity)** on both routes, `ORTHRGDS` to optimal in 24 without the
-  damping-skip knob, `SINROSNB` to its documented optimum.
+- **TROTS matrix cache (benchmarks).** Parsing the MATLAB v7.3 dose matrices dominated every TROTS run's startup; parsed matrices are now mirrored to `.npz` beside the dataset, keyed by the source file's size, mtime and a format version (an edited `.mat` misses rather than serving a stale matrix). Warm vs cold: `Prostate_CK_01` 7.3 s → 3.1 s, `Prostate_VMAT_101` 12.5 s → 4.5 s, assembled constraint block identical either way. Values whose float64 widening is provably lossless are stored narrow (checked, not assumed), and sparse indices are narrowed to int32 where they fit — which also halves index memory at runtime, ~330 MB on VMAT's 82 M nonzeros. The cache is strictly an optimization: any read/write failure falls back to parsing. `IPAX_TROTS_CACHE` relocates it, or `off` disables it.
+- **Mixed-precision condensed Gram: `DenseOptions(gram_dtype)`, default `"auto"`.** The dense condensed route's dominant kernel — accumulating `∇gᵀ Σ_s ∇g`, 80–90% of per-iteration wall at radiotherapy scale — can now run in float32 (many radiotherapy dose matrices are stored float32 — measured across the TROTS corpus: the brachytherapy cases are float32 throughout, `Prostate_VMAT_101` is 96% float32 by nnz, while `Protons_01` is 99.93% float64 and so gains essentially nothing; scoped in by explicit decision, with AGENTS.md updated), while every other block stays float64. The `"auto"` default prefers the precision the constraint data actually carries: it engages exactly when the inequality Jacobian declares float32-grade data via the new `gram_accumulate_dtype_hint()` operator hook (float32 storage, or float64 values that are exact float32 upcasts declared by their producer — declared metadata, never a value scan) and is a strict no-op for fully-float64 problems; `"float32"` forces the reduction, `"native"` disables it. A Jacobian assembled from sources of differing precision is reduced **per block**: `"auto"` asks a stacked operator to accumulate reduced only in the blocks whose own data permits it, leaving the genuinely-float64 blocks exact — so a plan that is overwhelmingly float32 but held back by a single float64 matrix keeps the reduction rather than forfeiting it (`Prostate_VMAT_101`: 96% of nonzeros reduce, 0% before). Working accuracy is restored per solve by fixed-precision iterative refinement against the exact float64 operator matvec (Carson & Higham 2018); every returned step carries a measured exact-residual certificate: refinement targets `refine_tol`, budget-exhausted/plateaued solves are still accepted within the looser `refine_accept_tol`, and a solve missing even that — or a positive-definiteness failure the exact matrix does not reproduce (a `κ(N)·u32 ≳ 1` stretch) — answers from an exact rebuild, with `refine_failure_limit` *consecutive* failures returning the instance to native precision for good (conditioning along an IPM run is not monotone, so one hard factorization is not terminal). Measured on TROTS Protons_01 (CPU, 32-thread BLAS): the Gram kernel 11.7 → 5.4 s per compute (2.15×). Plumbing: `LinearOperator.gram` gains an optional best-effort `accumulate_dtype` keyword (forwarded by `VStack`, the CSR routing wrapper and row scaling — through the new `forward_gram`, which falls back to the pre-keyword `gram(weights)` so a user operator written against 0.9.x keeps working when the solver stacks or row-scales it; honored by the SciPy and CuPy adapters via a cast-once reduced-data CSR), `_CondensedOperator.dense_matrix_mixed` covers gram-capable and generic (pure Array-API `float32`) Jacobians alike, and `Result.routes` reports the engaged route as `dense (gram=float32)` (or `dense (gram=auto:float32)` when the hint chose it). On the benchmark side the TROTS loader now tracks source precision per *row* and groups its lowered `G z + h ≤ 0` block so each precision forms a contiguous operator — the assembly the per-block reduction needs.
+- **Routing-hints registry + report section.** `benchmarks/routing_hints.py` is a curated registry of *measured* per-problem wins for the opt-in levers (recipe, metrics, failure signature, budget), and the S2MPJ sweep report gained a *Routing hints* section that prints the known win next to any default-configuration row that missed a hinted problem — omitted entirely when nothing applies. The new docs page *Routing hints* maps each failure signature to its lever (quality-μ for the `AGG` class, `slack_init_scale` for the `HS59` class, `damping_skip_ratio` for the `ORTHRGDS` class, `seed_formula="scalar1"` for the `GASOIL` class).
+- **`LBFGSOptions.seed_formula`** — which Rayleigh estimate seeds the L-BFGS identity block ξ. `"direct"` (the default, Nocedal & Wright eq. 7.20 inverted for the direct Hessian: `ξ = γᵀγ/δᵀγ`) and `"scalar1"` (IPOPT's `limited_memory_initialization`: `ξ = δᵀγ/δᵀδ`) differ by exactly the δ–γ misalignment factor `1/cos²∠(δ,γ)` — and badly-scaled least squares drives that factor to ~1e15: S2MPJ `NELSONLS` runs the direct seed at a median `ξ ≈ 1e20` (steps frozen, KKT pinned at 4.8 for 1000 iterations) where scalar1 sits at 6e3. The over-stiff seed also feeds the Powell-damping test an inflated `δᵀBδ`, so every pair looks damping-worthy — the mechanism behind part of the L-BFGS-vs-IPOPT quality gap. Probed under scalar1: `GASOIL` goes from 508 stalled iterations to **optimal in 25 (IPOPT parity)** on both routes, `ORTHRGDS` to optimal in 24 without the damping-skip knob, `SINROSNB` to its documented optimum.
 
   As a blanket default, scalar1 **loses decisively** — the full-corpus
   characterization sweep scores net **−140** over the three L-BFGS routes
@@ -1335,16 +223,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   corpus, and the softer seed lets steps overshoot. So the option stays
   opt-in, documented as the routing hint for the frozen-KKT-plateau
   signature.
-- **`LBFGSOptions.damping_skip_ratio`** — opt-in threshold on how much a
-  curvature pair may *contradict* positive curvature before the L-BFGS update
-  drops it instead of Powell-damping it: a pair with `δᵀγ < −ratio·δᵀBδ` is
-  skipped, anything milder gets the usual blend. Powell damping keeps `B`
-  positive definite by θ-mixing `γ` toward `Bδ`, which on a strongly
-  indefinite stretch *fabricates* curvature evidence the function actively
-  contradicts — and that fabricated pair then steers every step for the next
-  `m` updates. On S2MPJ `ORTHRGDS` a handful of such pairs (`δᵀγ/δᵀBδ` down to
-  −25, only 12 of 996 updates damped at all) cost 1000+ iterations at a worse
-  optimum; with them skipped the solve reaches IPOPT's objective in ~20.
+- **`LBFGSOptions.damping_skip_ratio`** — opt-in threshold on how much a curvature pair may *contradict* positive curvature before the L-BFGS update drops it instead of Powell-damping it: a pair with `δᵀγ < −ratio·δᵀBδ` is skipped, anything milder gets the usual blend. Powell damping keeps `B` positive definite by θ-mixing `γ` toward `Bδ`, which on a strongly indefinite stretch *fabricates* curvature evidence the function actively contradicts — and that fabricated pair then steers every step for the next `m` updates. On S2MPJ `ORTHRGDS` a handful of such pairs (`δᵀγ/δᵀBδ` down to −25, only 12 of 996 updates damped at all) cost 1000+ iterations at a worse optimum; with them skipped the solve reaches IPOPT's objective in ~20.
 
   It is a threshold, not a switch, because the full-corpus damp-vs-skip A/B
   refuted blanket skipping (IPOPT's limited-memory policy,
@@ -1366,58 +245,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `HS25` and `ELATTAR` also flip to `optimal`).
 
 ### Changed
-- **The tall sparse-Gram gate now outranks the small-`n` dense rule in
-  `linsolve="auto"`.** A tall problem (`m ≥ 10n`) whose Gram *pattern* is
-  provably sparse (banded/localized rows, fill ≤ 1 %) previously routed to the
-  dense solver whenever `n < 10 000` — forming the condensed block and then
-  densely factoring a matrix it certifiably knew was sparse. The sparse
-  normal-equations route is measured **16–49× faster per iteration at every
-  `n` from 250 to 9000** on banded tall QPs (`m = 10n`), so the fill-certified
-  gate is now consulted first. Dense-rowed tall problems (the radiotherapy
-  dose-matrix regime, density past the dense-GEMM crossover) are unaffected —
-  the fill probe is not even consulted there, and TROTS routing is verified
-  unchanged. The fill certificate (`gram_fill_estimate`) is conservative, so
-  problems without provable Gram sparsity keep their previous routes.
-- **The dense-accumulated Gram uses the symmetric rank-k BLAS update.** The
-  SciPy sparse adapter's chunked accumulation of `Aᵀ diag(w) A` — the dominant
-  per-iteration cost of the condensed route on tall dense-ish problems
-  (radiotherapy dose matrices: 80–90 % of wall time) — now scales each chunk
-  in place by `√w` and accumulates one triangle via `syrk` instead of a
-  general GEMM, mirroring the triangle once at the end. Half the FLOPs on the
-  hot kernel: **1.5–1.7×** measured on RT-shaped matrices
-  (`m=2e5, n≈1e3–8e3`), ~1.2× end-to-end on TROTS `Protons_01`. The result is
-  now *bitwise* symmetric (the GEMM form was only symmetric to rounding),
-  which the downstream Cholesky reads. Mixed-sign, non-finite, or non-float
-  weights keep the previous GEMM path; for finite weights the results differ
-  only at rounding level (the √w split also *halves* the dynamic range of the
-  intermediates — the caveat that its overflow envelope differs at float32
-  extremes is documented on the kernel).
-- **The TROTS loader holds the lowered constraint block once (benchmarks).**
-  The constant `G z + h ≤ 0` block is by far the largest array in a
-  radiotherapy problem — 86 M nonzeros on `Prostate_VMAT_101` — and on a CuPy
-  namespace the loader mirrored it to the device a second time to evaluate the
-  constraint values, on top of the copy inside the operator it hands the
-  solver. Those rows are now evaluated through that operator (whose backend
-  adapter already holds exactly them on the device), and the pre-lowering
-  two-sided assembly is released once lowering is done rather than retained
-  for the problem's lifetime. Measured on `Prostate_VMAT_101`: 4040 → 3057 MiB
-  in the CuPy pool, constraint values identical to the host route.
+- **The tall sparse-Gram gate now outranks the small-`n` dense rule in `linsolve="auto"`.** A tall problem (`m ≥ 10n`) whose Gram *pattern* is provably sparse (banded/localized rows, fill ≤ 1 %) previously routed to the dense solver whenever `n < 10 000` — forming the condensed block and then densely factoring a matrix it certifiably knew was sparse. The sparse normal-equations route is measured **16–49× faster per iteration at every `n` from 250 to 9000** on banded tall QPs (`m = 10n`), so the fill-certified gate is now consulted first. Dense-rowed tall problems (the radiotherapy dose-matrix regime, density past the dense-GEMM crossover) are unaffected — the fill probe is not even consulted there, and TROTS routing is verified unchanged. The fill certificate (`gram_fill_estimate`) is conservative, so problems without provable Gram sparsity keep their previous routes.
+- **The dense-accumulated Gram uses the symmetric rank-k BLAS update.** The SciPy sparse adapter's chunked accumulation of `Aᵀ diag(w) A` — the dominant per-iteration cost of the condensed route on tall dense-ish problems (radiotherapy dose matrices: 80–90 % of wall time) — now scales each chunk in place by `√w` and accumulates one triangle via `syrk` instead of a general GEMM, mirroring the triangle once at the end. Half the FLOPs on the hot kernel: **1.5–1.7×** measured on RT-shaped matrices (`m=2e5, n≈1e3–8e3`), ~1.2× end-to-end on TROTS `Protons_01`. The result is now *bitwise* symmetric (the GEMM form was only symmetric to rounding), which the downstream Cholesky reads. Mixed-sign, non-finite, or non-float weights keep the previous GEMM path; for finite weights the results differ only at rounding level (the √w split also *halves* the dynamic range of the intermediates — the caveat that its overflow envelope differs at float32 extremes is documented on the kernel).
+- **The TROTS loader holds the lowered constraint block once (benchmarks).** The constant `G z + h ≤ 0` block is by far the largest array in a radiotherapy problem — 86 M nonzeros on `Prostate_VMAT_101` — and on a CuPy namespace the loader mirrored it to the device a second time to evaluate the constraint values, on top of the copy inside the operator it hands the solver. Those rows are now evaluated through that operator (whose backend adapter already holds exactly them on the device), and the pre-lowering two-sided assembly is released once lowering is done rather than retained for the problem's lifetime. Measured on `Prostate_VMAT_101`: 4040 → 3057 MiB in the CuPy pool, constraint values identical to the host route.
 
 ### Fixed
-- **A run parked at an acceptable KKT point no longer reports failure because
-  of multipliers the point never asked for.** The per-iteration convergence
-  test evaluates the KKT residual with whatever duals the trajectory happens
-  to carry — but KKT satisfaction is an existence claim over the multipliers.
-  Two ways the carried duals lie about a certifiable point, both from the
-  IPOPT-triage "class B" backlog ("reached the answer, won't certify"): a
-  rank-deficient `∇c` under-determines `y`, so S2MPJ `NONSCOMPNE` ends
-  `stalled` reporting KKT 6.8e-5 at a point whose least-squares multipliers
-  give dual infeasibility *exactly zero* (its objective is identically zero,
-  forcing `y* = 0`); and a frozen line search strands the μ-complementarity
-  bound duals where initialization put them, so `WEEDS` reports `stalled`
-  while the best iterate it *returns* sits at KKT 3.8e-7 — inside the
-  acceptable band — because the in-loop check only ever saw the frozen tail
-  iterate at 6.2e-6.
+- **A run parked at an acceptable KKT point no longer reports failure because of multipliers the point never asked for.** The per-iteration convergence test evaluates the KKT residual with whatever duals the trajectory happens to carry — but KKT satisfaction is an existence claim over the multipliers. Two ways the carried duals lie about a certifiable point, both from the IPOPT-triage "class B" backlog ("reached the answer, won't certify"): a rank-deficient `∇c` under-determines `y`, so S2MPJ `NONSCOMPNE` ends `stalled` reporting KKT 6.8e-5 at a point whose least-squares multipliers give dual infeasibility *exactly zero* (its objective is identically zero, forcing `y* = 0`); and a frozen line search strands the μ-complementarity bound duals where initialization put them, so `WEEDS` reports `stalled` while the best iterate it *returns* sits at KKT 3.8e-7 — inside the acceptable band — because the in-loop check only ever saw the frozen tail iterate at 6.2e-6.
 
   Runs ending `stalled` / `max_iter` / `max_time` now re-judge the returned
   best iterate. First against the relaxed KKT tolerance as the budget exits
@@ -1446,36 +279,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [0.9.0] - 2026-07-31
 
 ### Added
-- **Full-corpus IPOPT triage column.** `benchmarks.runners.s2mpj_baselines` grew
-  the accuracy sweep's unattended-run machinery — `--all`/`--names-file`/
-  `--exclude` selection, `--jobs N` worker processes, `--resume`, and a
-  flush-after-every-problem JSON + Markdown report — so the ipax-vs-IPOPT
-  comparison runs over the whole ~1100-problem corpus instead of one problem at
-  a time. Every failure in the accuracy sweep now carries a verdict: hard
-  problem (the reference fails too) or ipax gap (the reference solves it). The
-  first full run and its classified backlog are documented in
-  `docs/benchmarks/ipopt.md`.
-- `IpyoptBaseline` accepts `max_iter`, `max_time` and arbitrary `options`
-  overrides, so the reference carries the same budget ipax does and a gap can be
-  re-run with IPOPT's parameters matched to ipax's (`mu_strategy`,
-  `limited_memory_max_history`) — separating a defaults difference from a
-  structural gap.
-- Comparison rows record the **constraint violation at both solvers' returned
-  points**, measured on the raw (unscaled) constraints. A lower objective at a
-  less feasible point is not a better answer, and without this the largest class
-  of gaps was unreadable.
+- **Full-corpus IPOPT triage column.** `benchmarks.runners.s2mpj_baselines` grew the accuracy sweep's unattended-run machinery — `--all`/`--names-file`/ `--exclude` selection, `--jobs N` worker processes, `--resume`, and a flush-after-every-problem JSON + Markdown report — so the ipax-vs-IPOPT comparison runs over the whole ~1100-problem corpus instead of one problem at a time. Every failure in the accuracy sweep now carries a verdict: hard problem (the reference fails too) or ipax gap (the reference solves it). The first full run and its classified backlog are documented in `docs/benchmarks/ipopt.md`.
+- `IpyoptBaseline` accepts `max_iter`, `max_time` and arbitrary `options` overrides, so the reference carries the same budget ipax does and a gap can be re-run with IPOPT's parameters matched to ipax's (`mu_strategy`, `limited_memory_max_history`) — separating a defaults difference from a structural gap.
+- Comparison rows record the **constraint violation at both solvers' returned points**, measured on the raw (unscaled) constraints. A lower objective at a less feasible point is not a better answer, and without this the largest class of gaps was unreadable.
 
-- **`RegularizationOptions.equality_dual_repair`** — opt-in, divergence-gated
-  repair of the equality multipliers on every accepted step. A rank-deficient
-  `∇c` leaves the multipliers *under-determined*: the dual block is singular, so
-  `‖Δy‖` is bounded only by `delta_c` and a single step can inject `‖c‖/δ_c ≈ 1e7`
-  of null-space noise. The filter cannot see it — its acceptance tests are on
-  `(θ, φ)` only — so a step that improves feasibility while destroying
-  stationarity is taken at full length, and the poisoned multipliers then feed the
-  L-BFGS Lagrangian pairs and every later step system. On `NONSCOMPNE`, whose
-  Jacobian is rank 24 of 25 at the starting point, `‖y‖_∞` goes from `0` to
-  `7.9e7` between iterations 0 and 1 — on a problem whose zero objective forces
-  `y* = 0`.
+- **`RegularizationOptions.equality_dual_repair`** — opt-in, divergence-gated repair of the equality multipliers on every accepted step. A rank-deficient `∇c` leaves the multipliers *under-determined*: the dual block is singular, so `‖Δy‖` is bounded only by `delta_c` and a single step can inject `‖c‖/δ_c ≈ 1e7` of null-space noise. The filter cannot see it — its acceptance tests are on `(θ, φ)` only — so a step that improves feasibility while destroying stationarity is taken at full length, and the poisoned multipliers then feed the L-BFGS Lagrangian pairs and every later step system. On `NONSCOMPNE`, whose Jacobian is rank 24 of 25 at the starting point, `‖y‖_∞` goes from `0` to `7.9e7` between iterations 0 and 1 — on a problem whose zero objective forces `y* = 0`.
 
   When set, `y_eq` is replaced by the least-squares estimate whenever the current
   multipliers' stationarity residual exceeds this factor times the estimate's.
@@ -1512,26 +320,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   (per-iteration Krylov solve 4–11x more expensive). With the L-BFGS
   preconditioner `METHANL8` and `HYDCAR6` go from `max_time` back to `optimal` in
   3 and 4 iterations.
-- `ipax.ipm.init.least_squares_duals` — the equality-multiplier estimate
-  `argmin_y ‖∇f + Aᵀy‖`, solved matrix-free by conjugate gradients on the
-  regularized normal equations. The Array API has no `lstsq` and forming the
-  Jacobian densely would defeat the sparse and matrix-free routes at scale, so
-  it touches the operator only through `matvec`/`rmatvec`. This fills the dual
-  initialization the module has documented as unimplemented since it was
-  written; it is currently used for the repair below, not yet at startup.
+- `ipax.ipm.init.least_squares_duals` — the equality-multiplier estimate `argmin_y ‖∇f + Aᵀy‖`, solved matrix-free by conjugate gradients on the regularized normal equations. The Array API has no `lstsq` and forming the Jacobian densely would defeat the sparse and matrix-free routes at scale, so it touches the operator only through `matvec`/`rmatvec`. This fills the dual initialization the module has documented as unimplemented since it was written; it is currently used for the repair below, not yet at startup.
 
 ### Fixed
-- **The solver no longer stalls short of feasibility on equality-only problems.**
-  A globalization failure at an already-feasible iterate repairs the barrier
-  state instead of entering a restoration that cannot move the point — but the
-  guard doing so required inequality constraints to exist, because re-centering
-  means re-flooring *slacks*. On the CUTEst nonlinear-equation systems, which
-  have no inequalities, it therefore never fired and the driver did exactly what
-  the guard exists to prevent: entered restoration, got the identical point
-  back, resumed with stale state, and re-derived the same rejected direction
-  until the stall detector ended the run. Measured beforehand, `METHANL8`,
-  `DRCAVTY1` and `CYCLOOCF` each entered restoration 26 times, every one exiting
-  "feasible" at an unchanged `x`.
+- **The solver no longer stalls short of feasibility on equality-only problems.** A globalization failure at an already-feasible iterate repairs the barrier state instead of entering a restoration that cannot move the point — but the guard doing so required inequality constraints to exist, because re-centering means re-flooring *slacks*. On the CUTEst nonlinear-equation systems, which have no inequalities, it therefore never fired and the driver did exactly what the guard exists to prevent: entered restoration, got the identical point back, resumed with stale state, and re-derived the same rejected direction until the stall detector ended the run. Measured beforehand, `METHANL8`, `DRCAVTY1` and `CYCLOOCF` each entered restoration 26 times, every one exiting "feasible" at an unchanged `x`.
 
   Three things were needed. The guard now applies whenever the problem has
   constraints at all, not only inequalities. It measures the violation the way
@@ -1547,106 +339,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   the rest (14 gains, 2 losses; `ACOPP30`/`ACOPR30` on the sparse route lose
   their acceptable-tolerance exit).
 
-- **Problems with no constraints are unaffected.** The feasible-point repair
-  applies only when there is barrier state tied to constraints; a bound-only
-  problem has `θ ≡ 0`, so an unguarded test would fire on every failure and
-  choose between two no-ops. It cost `HADAMALS` its convergence during
-  development and is now covered by a regression test.
+- **Problems with no constraints are unaffected.** The feasible-point repair applies only when there is barrier state tied to constraints; a bound-only problem has `θ ≡ 0`, so an unguarded test would fire on every failure and choose between two no-ops. It cost `HADAMALS` its convergence during development and is now covered by a regression test.
 
-- **A singular L-BFGS middle matrix no longer aborts the solve.** `SᵀS`
-  degenerates when a stored curvature pair is nearly collinear with an earlier
-  one — an exact zero is dropped by the existing safeguard, a near-duplicate is
-  not — and the backend's `LinAlgError` escaped all the way out of `solve`
-  (S2MPJ `LINSPANH` on the Krylov route). `diagonal()` now reports the diagonal
-  as unavailable through the `NotImplementedError` channel its callers already
-  handle, and applying the operator falls back to the identity seed, which keeps
-  the approximation positive definite. `LINSPANH` converges instead of raising.
-  The apply-path guard checks the *solve output* (`2k`-sized, `k` = L-BFGS
-  memory) rather than the finished `n`-sized product: `_apply` is the matvec, so
-  scanning the result would allocate a temporary and force a host
-  synchronisation on every application — invisible on a CPU profile, where the
-  condensed Gram build dominates, but the pattern that cost ~23x on GPU in
-  `barrier.py`.
-- The comparison runner credited a solver for reaching the documented objective
-  without converging, so a stall parked on the optimum scored as correct and two
-  *failed* solvers scored as agreeing with each other. Correctness now requires
-  solver success on both sides, matching the accuracy sweep's `run_case`.
-- Reports are written atomically with a retried rename, and a write failure
-  degrades to a warning instead of ending the run. A plain write truncates
-  first, so a crash during a flush replaced the whole report with an empty file
-  — and the first fix for it made a transient Windows sharing violation fatal.
-- A worker now records the problem it is running in its own pid-suffixed
-  in-flight marker, in **both** the comparison runner and the S2MPJ accuracy
-  sweep. The previous parent-side list contained every *unstarted* problem too,
-  so after a native crash it named the entire queue rather than the culprit.
-- `IpyoptBaseline` declared a Jacobian sparsity pattern too narrow to hold the
-  problem. It sampled two points and, when they agreed, passed the operator's
-  values through unscattered — but `EIGMINA` emits five nonzeros at both of
-  those points and six once the iterates move, so IPOPT received an array of the
-  wrong length and NumPy raised an unattributable shape error from inside the
-  solve. The union pattern is now built from more points, sampled strictly
-  *inside* the bounds (entries vanish exactly *on* them, which is where the old
-  clamp put every sample), and the values callback always scatters into the
-  declared layout — vectorized, so it is faster than the pass-through it
-  replaces — rejecting an out-of-pattern nonzero explicitly. All 20 problems
-  that previously could not reach the reference solver now run.
+- **A singular L-BFGS middle matrix no longer aborts the solve.** `SᵀS` degenerates when a stored curvature pair is nearly collinear with an earlier one — an exact zero is dropped by the existing safeguard, a near-duplicate is not — and the backend's `LinAlgError` escaped all the way out of `solve` (S2MPJ `LINSPANH` on the Krylov route). `diagonal()` now reports the diagonal as unavailable through the `NotImplementedError` channel its callers already handle, and applying the operator falls back to the identity seed, which keeps the approximation positive definite. `LINSPANH` converges instead of raising. The apply-path guard checks the *solve output* (`2k`-sized, `k` = L-BFGS memory) rather than the finished `n`-sized product: `_apply` is the matvec, so scanning the result would allocate a temporary and force a host synchronisation on every application — invisible on a CPU profile, where the condensed Gram build dominates, but the pattern that cost ~23x on GPU in `barrier.py`.
+- The comparison runner credited a solver for reaching the documented objective without converging, so a stall parked on the optimum scored as correct and two *failed* solvers scored as agreeing with each other. Correctness now requires solver success on both sides, matching the accuracy sweep's `run_case`.
+- Reports are written atomically with a retried rename, and a write failure degrades to a warning instead of ending the run. A plain write truncates first, so a crash during a flush replaced the whole report with an empty file — and the first fix for it made a transient Windows sharing violation fatal.
+- A worker now records the problem it is running in its own pid-suffixed in-flight marker, in **both** the comparison runner and the S2MPJ accuracy sweep. The previous parent-side list contained every *unstarted* problem too, so after a native crash it named the entire queue rather than the culprit.
+- `IpyoptBaseline` declared a Jacobian sparsity pattern too narrow to hold the problem. It sampled two points and, when they agreed, passed the operator's values through unscattered — but `EIGMINA` emits five nonzeros at both of those points and six once the iterates move, so IPOPT received an array of the wrong length and NumPy raised an unattributable shape error from inside the solve. The union pattern is now built from more points, sampled strictly *inside* the bounds (entries vanish exactly *on* them, which is where the old clamp put every sample), and the values callback always scatters into the declared layout — vectorized, so it is faster than the pass-through it replaces — rejecting an out-of-pattern nonzero explicitly. All 20 problems that previously could not reach the reference solver now run.
 
 ## [0.8.0] - 2026-07-26
 
 ### Added
-- **Opt-in scale-aware slack initialization** (`BarrierOptions.slack_init_scale`,
-  default `0.0` = unchanged). The flat slack floor (`1e-2`) pins every
-  violated-constraint slack near zero on a deeply-infeasible start, so the Newton
-  direction drives them toward their infeasible target `s = −g < 0` and the
-  fraction-to-boundary rule clips the primal step to ~`1e-3` for many iterations
-  (the radiotherapy "Phase-1" feasibility stall, isolated via the IPOPT
-  cross-check). With `slack_init_scale > 0` the floor becomes
-  `max(1e-2, slack_init_scale·max|g(x₀)|)`, so the slacks — and, via
-  `y = μ_init/s`, the initial multipliers — start scaled to the constraint
-  magnitude. On `Protons_01` (TROTS) `slack_init_scale = 0.1` reaches feasibility
-  at iteration ~20 (IPOPT parity) vs ~42 with the flat floor, and roughly halves
-  the transient objective excursion. It stays **opt-in** (default `0.0` keeps the
-  solver bit-for-bit unchanged): the win is specific to deeply-infeasible,
-  many-constraint starts, and the full three-route S2MPJ A/B is net-neutral
-  (dense +3, krylov −1, sparse −3 correct; robust gains on HS59/HS97/HS98/SINROSNB
-  offset by robust regressions on HS116/WOMFLET), which does not clear the bar to
-  change the default.
+- **Opt-in scale-aware slack initialization** (`BarrierOptions.slack_init_scale`, default `0.0` = unchanged). The flat slack floor (`1e-2`) pins every violated-constraint slack near zero on a deeply-infeasible start, so the Newton direction drives them toward their infeasible target `s = −g < 0` and the fraction-to-boundary rule clips the primal step to ~`1e-3` for many iterations (the radiotherapy "Phase-1" feasibility stall, isolated via the IPOPT cross-check). With `slack_init_scale > 0` the floor becomes `max(1e-2, slack_init_scale·max|g(x₀)|)`, so the slacks — and, via `y = μ_init/s`, the initial multipliers — start scaled to the constraint magnitude. On `Protons_01` (TROTS) `slack_init_scale = 0.1` reaches feasibility at iteration ~20 (IPOPT parity) vs ~42 with the flat floor, and roughly halves the transient objective excursion. It stays **opt-in** (default `0.0` keeps the solver bit-for-bit unchanged): the win is specific to deeply-infeasible, many-constraint starts, and the full three-route S2MPJ A/B is net-neutral (dense +3, krylov −1, sparse −3 correct; robust gains on HS59/HS97/HS98/SINROSNB offset by robust regressions on HS116/WOMFLET), which does not clear the bar to change the default.
 
-- **IPOPT cross-solver comparison on S2MPJ** — `benchmarks.baselines.IpyoptBaseline`
-  (IPOPT via the sparse-native `ipyopt` binding) and the
-  `benchmarks.runners.s2mpj_baselines` runner. Unlike the existing SciPy-style
-  `cyipopt` path, this consumes the constraint Jacobian as a COO pattern +
-  values (ipax's `to_coo()`/`coo_values()` contract), so it does not densify and
-  scales to the tall, sparse RT-sized systems. The runner turns each ipax result
-  into a diagnosable verdict against IPOPT from the same start — `agree`,
-  `ipax-gap` (reference solved, ipax did not), `ipax-wins`, `both-hard` — on the
-  language-neutral axis (correctness + iteration count, not wall-clock across a
-  compiled solver and a pure-Python one). It immediately confirmed `AGG` as an
-  ipax gap (IPOPT solves it in 185 iterations) and `OET7` as genuinely hard
-  (IPOPT also fails to converge). Both are opt-in dev tooling — `ipyopt` is not a
-  runtime dependency.
+- **IPOPT cross-solver comparison on S2MPJ** — `benchmarks.baselines.IpyoptBaseline` (IPOPT via the sparse-native `ipyopt` binding) and the `benchmarks.runners.s2mpj_baselines` runner. Unlike the existing SciPy-style `cyipopt` path, this consumes the constraint Jacobian as a COO pattern + values (ipax's `to_coo()`/`coo_values()` contract), so it does not densify and scales to the tall, sparse RT-sized systems. The runner turns each ipax result into a diagnosable verdict against IPOPT from the same start — `agree`, `ipax-gap` (reference solved, ipax did not), `ipax-wins`, `both-hard` — on the language-neutral axis (correctness + iteration count, not wall-clock across a compiled solver and a pure-Python one). It immediately confirmed `AGG` as an ipax gap (IPOPT solves it in 185 iterations) and `OET7` as genuinely hard (IPOPT also fails to converge). Both are opt-in dev tooling — `ipyopt` is not a runtime dependency.
 
-- **Two opt-in Wächter & Biegler line-search refinements.** Both are faithful to
-  the paper (and verified against IPOPT's `FilterLSAcceptor`), and both **lost**
-  against the shipped baseline on the full S2MPJ corpus, so both default to off
-  and the default solver is bit-for-bit unchanged. See `docs/benchmarks/s2mpj.md`
-  for the A/B.
+- **Two opt-in Wächter & Biegler line-search refinements.** Both are faithful to the paper (and verified against IPOPT's `FilterLSAcceptor`), and both **lost** against the shipped baseline on the full S2MPJ corpus, so both default to off and the default solver is bit-for-bit unchanged. See `docs/benchmarks/s2mpj.md` for the A/B.
 
-  - `LineSearchOptions.gamma_alpha` (γ_α, default `None`) switches α_min from the
-    flat `alpha_min_frac` to the **adaptive eq. (23) rule**, deriving it per
-    iteration from the current θ and ∇φᵀd:
-    `α_min = max(alpha_min_frac, γ_α·min{γ_θ, γ_φ·θ/(−∇φᵀd), δ·θ^{s_θ}/(−∇φᵀd)^{s_φ}})`.
-    A hopeless ray then concedes to restoration as soon as no acceptable step
-    remains, instead of after a fixed 27 halvings. IPOPT applies this
-    unconditionally with γ_α = `0.05`, which is the value to request. Scored −4
-    as a default: conceding earlier is the point of the rule, but ipax's
-    restoration phase is a weaker recovery than IPOPT's, so the trade loses here.
-  - `LineSearchOptions.ftype_requires_theta_min` (default `False`) adds the
-    **θ ≤ θ_min conjunct to the f-type test** (Algorithm A, Step 4), so an
-    infeasible iterate is judged by the eq. (20) sufficient-decrease test in θ
-    *or* φ rather than by Armijo on φ. ipax keys the branch on the eq. (19)
-    switching condition alone. Scored −10 as a default, in two modes: 10 problems
-    reached a *different, worse* optimum, and 12 stalled.
+  - `LineSearchOptions.gamma_alpha` (γ_α, default `None`) switches α_min from the flat `alpha_min_frac` to the **adaptive eq. (23) rule**, deriving it per iteration from the current θ and ∇φᵀd: `α_min = max(alpha_min_frac, γ_α·min{γ_θ, γ_φ·θ/(−∇φᵀd), δ·θ^{s_θ}/(−∇φᵀd)^{s_φ}})`. A hopeless ray then concedes to restoration as soon as no acceptable step remains, instead of after a fixed 27 halvings. IPOPT applies this unconditionally with γ_α = `0.05`, which is the value to request. Scored −4 as a default: conceding earlier is the point of the rule, but ipax's restoration phase is a weaker recovery than IPOPT's, so the trade loses here.
+  - `LineSearchOptions.ftype_requires_theta_min` (default `False`) adds the **θ ≤ θ_min conjunct to the f-type test** (Algorithm A, Step 4), so an infeasible iterate is judged by the eq. (20) sufficient-decrease test in θ *or* φ rather than by Armijo on φ. ipax keys the branch on the eq. (19) switching condition alone. Scored −10 as a default, in two modes: 10 problems reached a *different, worse* optimum, and 12 stalled.
 
   Both consume a new eq. (23) constraint-violation threshold
   θ_min = `1e-4`·max(1, θ(x_0)), fixed from the initial iterate — the mirror of
@@ -1659,1218 +370,193 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   requesting eq. (23) can make the search concede sooner but never backtrack
   further. The free-mode search is unaffected either way: eq. (23) is defined
   through the switching/Armijo tests, which free mode does not use.
-- **`benchmarks.runners.compare` — an A/B diff for two sweep reports.** The
-  full-corpus sweep is the gate for every default change, and this is what reads
-  it: correctness delta per configuration, the count of problems whose
-  linear-solver **route** changed (a config with zero route changes is a
-  built-in control when A/B-ing linear algebra), and **objective drift**.
-  The last one closes a real blind spot: `correct` is scored against the
-  dataset's documented optimum and many problems have none, so a change that
-  converges to a *different, much worse* local optimum scores unchanged — the
-  sparse normal-equations default moved `OET7` from `4.45e-05` to `0.0872`
-  (~2000x worse) with no signal in the correct-count. Drift on such problems is
-  now reported and flagged `unscored`.
-- **`SparseOptions(kkt_route="auto")` — per-problem KKT-form selection on the
-  explicit sparse route, now the default.** `linsolve="sparse"` honored
-  `kkt_route` blindly, so a tall problem (`m ≫ n`) with a dense inequality
-  Jacobian factored an effectively dense `(n+m)`-sized augmented system through
-  sparse LDLᵀ machinery — on a TROTS Prostate_BT case (n=70, m=5747, dose
-  matrix 100% dense) that is 13.6s where the n×n normal-equations condensation
-  takes 1.8s on the identical iteration path (7.6×), and the gap grows with
-  case size (median 21× per-iteration across the family). `"auto"` reuses the
-  `linsolve="auto"` tall gate and measured thresholds: for `m ≥ 10·n` it picks
-  the normal-equations form when the sampled Gram-fill estimate stays sparse
-  *or* the Jacobian density is past the dense crossover, and stays on
-  `"augmented"` whenever the NE prerequisites (L-BFGS Hessian, `gram_coo`,
-  COO-emittable equality Jacobians) are unmet or the problem is not tall — so
-  non-tall problems are untouched by construction. Pass
-  `kkt_route="augmented"` explicitly to restore the previous behaviour. The
-  picked form is reported in `Result.routes.kkt_form`.
+- **`benchmarks.runners.compare` — an A/B diff for two sweep reports.** The full-corpus sweep is the gate for every default change, and this is what reads it: correctness delta per configuration, the count of problems whose linear-solver **route** changed (a config with zero route changes is a built-in control when A/B-ing linear algebra), and **objective drift**. The last one closes a real blind spot: `correct` is scored against the dataset's documented optimum and many problems have none, so a change that converges to a *different, much worse* local optimum scores unchanged — the sparse normal-equations default moved `OET7` from `4.45e-05` to `0.0872` (~2000x worse) with no signal in the correct-count. Drift on such problems is now reported and flagged `unscored`.
+- **`SparseOptions(kkt_route="auto")` — per-problem KKT-form selection on the explicit sparse route, now the default.** `linsolve="sparse"` honored `kkt_route` blindly, so a tall problem (`m ≫ n`) with a dense inequality Jacobian factored an effectively dense `(n+m)`-sized augmented system through sparse LDLᵀ machinery — on a TROTS Prostate_BT case (n=70, m=5747, dose matrix 100% dense) that is 13.6s where the n×n normal-equations condensation takes 1.8s on the identical iteration path (7.6×), and the gap grows with case size (median 21× per-iteration across the family). `"auto"` reuses the `linsolve="auto"` tall gate and measured thresholds: for `m ≥ 10·n` it picks the normal-equations form when the sampled Gram-fill estimate stays sparse *or* the Jacobian density is past the dense crossover, and stays on `"augmented"` whenever the NE prerequisites (L-BFGS Hessian, `gram_coo`, COO-emittable equality Jacobians) are unmet or the problem is not tall — so non-tall problems are untouched by construction. Pass `kkt_route="augmented"` explicitly to restore the previous behaviour. The picked form is reported in `Result.routes.kkt_form`.
 
 ### Fixed
-- **The TROTS benchmark loader reads all-zero dose matrices.** MATLAB v7.3
-  stores an nnz = 0 sparse matrix as an HDF5 group holding only `jc` (`data`
-  and `ir` are omitted), which crashed `_load_matrix` with a KeyError and made
-  `Head-and-Neck_05` — whose 'Brainstem' matrix is all-zero — unloadable. The
-  case now loads and reproduces its reference objective to machine precision.
-- **Filter augmentation now tests ¬(switching ∧ Armijo)**, per W&B Step 5 (IPOPT
-  `UpdateForNextIteration`: `!IsFtype(α) || !ArmijoHolds(α)`, over a
-  switching-only `IsFtype`); ipax tested ¬switching alone, missing the Armijo
-  conjunct. This is inert unless `ftype_requires_theta_min` is set — with the
-  gate off, an accepted trial for which switching holds must have passed Armijo
-  (it took the f-type branch), so the conjunct cannot change the answer. With the
-  gate on it matters: above θ_min the eq. (20) test can accept a step that fails
-  Armijo, and that step must be recorded or nothing bounds it away from the point
-  it came from.
+- **The TROTS benchmark loader reads all-zero dose matrices.** MATLAB v7.3 stores an nnz = 0 sparse matrix as an HDF5 group holding only `jc` (`data` and `ir` are omitted), which crashed `_load_matrix` with a KeyError and made `Head-and-Neck_05` — whose 'Brainstem' matrix is all-zero — unloadable. The case now loads and reproduces its reference objective to machine precision.
+- **Filter augmentation now tests ¬(switching ∧ Armijo)**, per W&B Step 5 (IPOPT `UpdateForNextIteration`: `!IsFtype(α) || !ArmijoHolds(α)`, over a switching-only `IsFtype`); ipax tested ¬switching alone, missing the Armijo conjunct. This is inert unless `ftype_requires_theta_min` is set — with the gate off, an accepted trial for which switching holds must have passed Armijo (it took the f-type branch), so the conjunct cannot change the answer. With the gate on it matters: above θ_min the eq. (20) test can accept a step that fails Armijo, and that step must be recorded or nothing bounds it away from the point it came from.
 
 ### Changed
-- **The NWW §5 free-mode line-search acceptance is now opt-in**
-  (`LineSearchOptions.free_mode_acceptance` defaults to `"rigorous"`; was
-  `"obj-constr-filter"` in 0.7.0). It only ever applied under a non-monotone
-  `mu_schedule` (itself opt-in), so the default solver is unaffected either
-  way — but a user selecting an adaptive μ oracle now keeps the Wächter &
-  Biegler gate unless they ask for the weak test. Two reasons. **Parity:**
-  `"rigorous"` is what IPOPT actually does — released IPOPT never weakens its
-  *per-trial* test (`SetRigorousLineSearch(false)` is commented out in
-  `IpAdaptiveMuUpdate.cpp`, and its `rigorous_` flag only skips restoration,
-  never the acceptance test); IPOPT's own `(f, θ)` margin filter is an
-  *iterate*-level progress check. The mechanisms that make its free mode work
-  — the filter reset on every μ change and the KKT-error monitor — are
-  unconditional in ipax and unaffected by this default. **Evidence:** paired
-  full-corpus A/Bs scored the weak test ≈ neutral (`quality` +6, `probing` ±0)
-  but with ~55 flips each way per arm, about half landing on a *different,
-  worse* local optimum on basin-sensitive nonconvex problems (`WOMFLET`,
-  `OET7`, `SPIRAL`, `READING5`, `ELATTAR`, `DISCS` — the same set in both arms,
-  so characterizable rather than noise). Enable it explicitly
-  (`free_mode_acceptance="obj-constr-filter"`) for central-path-following
-  workloads (radiotherapy-style) where the rigorous gate grinds at
-  near-feasible iterates.
+- **The NWW §5 free-mode line-search acceptance is now opt-in** (`LineSearchOptions.free_mode_acceptance` defaults to `"rigorous"`; was `"obj-constr-filter"` in 0.7.0). It only ever applied under a non-monotone `mu_schedule` (itself opt-in), so the default solver is unaffected either way — but a user selecting an adaptive μ oracle now keeps the Wächter & Biegler gate unless they ask for the weak test. Two reasons. **Parity:** `"rigorous"` is what IPOPT actually does — released IPOPT never weakens its *per-trial* test (`SetRigorousLineSearch(false)` is commented out in `IpAdaptiveMuUpdate.cpp`, and its `rigorous_` flag only skips restoration, never the acceptance test); IPOPT's own `(f, θ)` margin filter is an *iterate*-level progress check. The mechanisms that make its free mode work — the filter reset on every μ change and the KKT-error monitor — are unconditional in ipax and unaffected by this default. **Evidence:** paired full-corpus A/Bs scored the weak test ≈ neutral (`quality` +6, `probing` ±0) but with ~55 flips each way per arm, about half landing on a *different, worse* local optimum on basin-sensitive nonconvex problems (`WOMFLET`, `OET7`, `SPIRAL`, `READING5`, `ELATTAR`, `DISCS` — the same set in both arms, so characterizable rather than noise). Enable it explicitly (`free_mode_acceptance="obj-constr-filter"`) for central-path-following workloads (radiotherapy-style) where the rigorous gate grinds at near-feasible iterates.
 
 ## [0.7.0] - 2026-07-16
 
 ### Added
-- **Free-mode line-search acceptance — the NWW §5 two-regime globalization**
-  (`LineSearchOptions.free_mode_acceptance`, default `"obj-constr-filter"`;
-  `"rigorous"` opts out). Under a non-monotone μ oracle
-  (`Options.mu_schedule` other than the default `"monotone"`) the barrier
-  problem changes every iteration, so the W&B filter/Armijo machinery is not
-  a consistent per-trial merit gate; NWW 2009 §5 carries global convergence
-  entirely in the iterate-level KKT-error monitor (`BarrierOptions.fallback`)
-  and lets the free-mode search "interfere with adaptive steps as little as
-  possible". While the monitor is in free mode, a trial is now accepted when
-  `(θ + margin, f + margin)` — the **raw objective**, comparable across μ
-  re-targets, not φ_μ — is acceptable to a filter of the previous free
-  iterates, with IPOPT's margins
-  (`free_filter_margin_fact · min(free_filter_max_margin, kkt_error)`; the
-  `filter_margin_fact`/`filter_max_margin` defaults). The θ_max guard,
-  non-finite rejections, and the L-BFGS overshoot check stay as safety
-  invariants. A *failed* free-mode search switches to monotone mode (IPOPT's
-  skipped-line-search signal: the μ oracle is suspended, μ restarts from the
-  centrality-floored complementarity, and the rigorous W&B search — with SOC,
-  the feasible-point rescue, and restoration — governs until the monitor
-  re-admits free mode). Inert for the default monotone schedule: default
-  behavior is unchanged. This is the IPOPT-parity fix for the RT filter-route
-  stall (μ descends legitimately, then every iteration needs 11–27 Armijo
-  backtracks at exact feasibility while IPOPT accepts first trials).
-- **Feasible-point KKT-progress acceptance in the filter line search**
-  (`LineSearchOptions.feasible_kkt_progress`; **opt-in** — `None` by default,
-  set e.g. `0.1` to enable. The S2MPJ v14 sweep attributed 48
-  correct→incorrect flips to the rescue as a default: on
-  unconstrained/bounds-only problems — θ ≡ 0, exactly its domain — accepting
-  Armijo-failing, KKT-decreasing steps walked nonconvex least-squares runs
-  into worse stationary points or diverged, while only 3 wins depended on it;
-  the free-mode acceptance below covers the RT endgame it was built for).
-  At a (numerically) feasible iterate the W&B eq. (19) switching condition
-  holds for every descent direction — its right side is `δ·θ0^{s_θ} ≈ 0` — so
-  every trial faces the full Armijo test and the θ-type acceptance branch
-  IPOPT effectively lives on at its θ ≈ 1e-6 iterates is unreachable. On the
-  RT fluence case this ground the solve to 11–27 backtracks per iteration
-  while the objective crawled (IPOPT's productive phase is visibly
-  φ-non-monotone; Armijo rejects those steps). A *first* trial that fails
-  Armijo is now still accepted when the scaled KKT error decreases by the
-  configured fraction — at a feasible iterate, optimality progress *is*
-  progress (the KKT-error-globalization philosophy of NWW 2009, §5.1, applied
-  to step acceptance). Guarded: first trial only (one extra gradient/Jacobian
-  evaluation), armijo-failures only — ascent directions take the θ-branch and
-  stay rejected, so the feasible ascent-stall fix is untouched — and the
-  filter is not augmented (f-type-like).
-- **`mu_schedule="quality"` — the quality-function μ oracle** (Nocedal,
-  Wächter & Waltz 2009, §3.3; IPOPT's adaptive default), completing the NWW
-  oracle set alongside probing and LOQO. σ is chosen by minimizing a linear
-  model of the *full* predicted KKT residual — dual and primal infeasibility
-  at the fraction-to-boundary steplengths the direction attains, plus the
-  predicted complementarity — over the affine/centering family
-  `d(σ) = d_aff + σ·d_cen` (one extra solve against the already-factored KKT
-  operator; candidates are vector algebra by linearity; log-grid bracket +
-  golden section per NWW §4). Unlike the complementarity-tracking oracles
-  (Mehrotra σ ≤ 1, LOQO σ ≤ 0.8) it is **bidirectional**: σ > 1 *raises* μ
-  when the dual residual dominates a collapsed complementarity — the
-  decentered-iterate failure mode behind the RT fluence stall — while staying
-  closed-loop (a large μ scores badly through its own predicted
-  complementarity, so raises are self-limiting). Opt-in; the default schedule
-  remains `monotone`.
-- **The sparse-direct inertia check now covers the L-BFGS (default) Hessian
-  route.** `_CondensedOperator.expected_inertia` previously returned `None` for
-  a diagonal-plus-low-rank Hessian, so a genuinely nonconvex problem on the
-  L-BFGS route relied purely on Powell damping and never got the IPOPT
-  inertia-guided δ_w correction (Wächter & Biegler 2006, §3.1). The bordered
-  system `[D U; Uᵀ M]` has, by Haynsworth inertia additivity, `In(K) = In(M) +
-  In(N)`, so the target now folds the compact middle-block signature in:
-  `(n + M₊, M₋ + m_I, 0)`, with `In(M)` from a cheap dense eigensolve of the
-  `r × r` block (`r` = the L-BFGS memory window). A singular or oversized `M`
-  block returns `None`, deferring to the factorization-failure escalation as
-  before. Applies to both the condensed and equality-saddle assemblies.
-- **Per-trial line-search debug trace.** At `verbose >= 6` (DEBUG) the filter
-  line search now logs every backtracking trial with its `alpha`, `theta`, `phi`
-  and the reason it was rejected (`filter` / `armijo` / `no-decrease` /
-  `theta-max` / `non-finite` / `non-finite-grad`, or `accept`), plus `soc-*` for
-  second-order-correction trials — so an iteration with a high `ls` count can be
-  diagnosed straight from the log without a rerun.
+- **Free-mode line-search acceptance — the NWW §5 two-regime globalization** (`LineSearchOptions.free_mode_acceptance`, default `"obj-constr-filter"`; `"rigorous"` opts out). Under a non-monotone μ oracle (`Options.mu_schedule` other than the default `"monotone"`) the barrier problem changes every iteration, so the W&B filter/Armijo machinery is not a consistent per-trial merit gate; NWW 2009 §5 carries global convergence entirely in the iterate-level KKT-error monitor (`BarrierOptions.fallback`) and lets the free-mode search "interfere with adaptive steps as little as possible". While the monitor is in free mode, a trial is now accepted when `(θ + margin, f + margin)` — the **raw objective**, comparable across μ re-targets, not φ_μ — is acceptable to a filter of the previous free iterates, with IPOPT's margins (`free_filter_margin_fact · min(free_filter_max_margin, kkt_error)`; the `filter_margin_fact`/`filter_max_margin` defaults). The θ_max guard, non-finite rejections, and the L-BFGS overshoot check stay as safety invariants. A *failed* free-mode search switches to monotone mode (IPOPT's skipped-line-search signal: the μ oracle is suspended, μ restarts from the centrality-floored complementarity, and the rigorous W&B search — with SOC, the feasible-point rescue, and restoration — governs until the monitor re-admits free mode). Inert for the default monotone schedule: default behavior is unchanged. This is the IPOPT-parity fix for the RT filter-route stall (μ descends legitimately, then every iteration needs 11–27 Armijo backtracks at exact feasibility while IPOPT accepts first trials).
+- **Feasible-point KKT-progress acceptance in the filter line search** (`LineSearchOptions.feasible_kkt_progress`; **opt-in** — `None` by default, set e.g. `0.1` to enable. The S2MPJ v14 sweep attributed 48 correct→incorrect flips to the rescue as a default: on unconstrained/bounds-only problems — θ ≡ 0, exactly its domain — accepting Armijo-failing, KKT-decreasing steps walked nonconvex least-squares runs into worse stationary points or diverged, while only 3 wins depended on it; the free-mode acceptance below covers the RT endgame it was built for). At a (numerically) feasible iterate the W&B eq. (19) switching condition holds for every descent direction — its right side is `δ·θ0^{s_θ} ≈ 0` — so every trial faces the full Armijo test and the θ-type acceptance branch IPOPT effectively lives on at its θ ≈ 1e-6 iterates is unreachable. On the RT fluence case this ground the solve to 11–27 backtracks per iteration while the objective crawled (IPOPT's productive phase is visibly φ-non-monotone; Armijo rejects those steps). A *first* trial that fails Armijo is now still accepted when the scaled KKT error decreases by the configured fraction — at a feasible iterate, optimality progress *is* progress (the KKT-error-globalization philosophy of NWW 2009, §5.1, applied to step acceptance). Guarded: first trial only (one extra gradient/Jacobian evaluation), armijo-failures only — ascent directions take the θ-branch and stay rejected, so the feasible ascent-stall fix is untouched — and the filter is not augmented (f-type-like).
+- **`mu_schedule="quality"` — the quality-function μ oracle** (Nocedal, Wächter & Waltz 2009, §3.3; IPOPT's adaptive default), completing the NWW oracle set alongside probing and LOQO. σ is chosen by minimizing a linear model of the *full* predicted KKT residual — dual and primal infeasibility at the fraction-to-boundary steplengths the direction attains, plus the predicted complementarity — over the affine/centering family `d(σ) = d_aff + σ·d_cen` (one extra solve against the already-factored KKT operator; candidates are vector algebra by linearity; log-grid bracket + golden section per NWW §4). Unlike the complementarity-tracking oracles (Mehrotra σ ≤ 1, LOQO σ ≤ 0.8) it is **bidirectional**: σ > 1 *raises* μ when the dual residual dominates a collapsed complementarity — the decentered-iterate failure mode behind the RT fluence stall — while staying closed-loop (a large μ scores badly through its own predicted complementarity, so raises are self-limiting). Opt-in; the default schedule remains `monotone`.
+- **The sparse-direct inertia check now covers the L-BFGS (default) Hessian route.** `_CondensedOperator.expected_inertia` previously returned `None` for a diagonal-plus-low-rank Hessian, so a genuinely nonconvex problem on the L-BFGS route relied purely on Powell damping and never got the IPOPT inertia-guided δ_w correction (Wächter & Biegler 2006, §3.1). The bordered system `[D U; Uᵀ M]` has, by Haynsworth inertia additivity, `In(K) = In(M) + In(N)`, so the target now folds the compact middle-block signature in: `(n + M₊, M₋ + m_I, 0)`, with `In(M)` from a cheap dense eigensolve of the `r × r` block (`r` = the L-BFGS memory window). A singular or oversized `M` block returns `None`, deferring to the factorization-failure escalation as before. Applies to both the condensed and equality-saddle assemblies.
+- **Per-trial line-search debug trace.** At `verbose >= 6` (DEBUG) the filter line search now logs every backtracking trial with its `alpha`, `theta`, `phi` and the reason it was rejected (`filter` / `armijo` / `no-decrease` / `theta-max` / `non-finite` / `non-finite-grad`, or `accept`), plus `soc-*` for second-order-correction trials — so an iteration with a high `ls` count can be diagnosed straight from the log without a rerun.
 
 ### Fixed
-- **The W&B filter is re-initialized whenever the barrier parameter changes.**
-  The filter's entries are `(θ, φ_μ)` pairs whose φ coordinate is specific to
-  the μ it was recorded at; W&B/IPOPT discard the filter history at every
-  barrier update (`FilterLSAcceptor::Reset` from both `MonotoneMuUpdate` and
-  `AdaptiveMuUpdate`; NWW 2009 §5: "the history in the filter [is] reset at
-  every free iteration because the barrier problem itself changes"). ipax
-  created one filter per solve and never cleared it, so stale old-μ φ entries
-  were compared against new-μ trial values — a spurious extra rejection gate
-  that tightens as μ shrinks. The θ_max guard region is separate state and
-  still applies across resets.
-- **The KKT-error fallback's monotone re-entry μ now respects the El-Bakry
-  centrality floor.** The free-mode μ oracles were already floored at
-  `κ_cent·max(dual, primal infeasibility)` (El-Bakry et al. 1996), but the
-  NWW §5.1 fallback re-initialized μ from `0.8·(average complementarity)`
-  alone — powerless exactly in the failure mode it guards against: a frozen
-  primal against full-fraction dual steps collapses the complementarity far
-  *below* the true KKT error, so the fallback re-entered monotone mode at the
-  ε/10 floor and was stuck there (monotone never raises μ). Observed as a
-  480-iteration μ pin at lg(μ) = −9 on an RT fluence case whose dual residual
-  sat at ~1e-4 throughout; the floored re-entry lands at ~1e-6 instead.
-- **A repeated feasible-point re-center now raises μ instead of treadmilling
-  at the same barrier.** Observed on an RT fluence case (4882 lower-bounded
-  variables, L-BFGS/sparse): the free-mode μ oracle pinned μ at its ε/10 floor
-  while the iterate sat at exact feasibility, where the W&B eq. (19) switching
-  condition holds for every descent direction — each trial faced the full
-  Armijo test against a barrier made stiff by thousands of near-active bounds
-  (11–27 backtracking trials per iteration), and every line-search failure
-  re-centered slacks/duals at the *same* pinned μ, reproducing the identical
-  stall for hundreds of iterations. The first feasible re-center is unchanged
-  (the 0.6.1 HS101 repair); a repeat now raises μ to the scale of the stall's
-  KKT error (at least 10×, capped at `mu_init` — cf. IPOPT's adaptive oracle
-  raising μ; Nocedal, Wächter & Waltz 2009, §5.1) and suspends the free-mode
-  μ oracle until the KKT error improves, so the raise is not immediately
-  re-targeted away.
+- **The W&B filter is re-initialized whenever the barrier parameter changes.** The filter's entries are `(θ, φ_μ)` pairs whose φ coordinate is specific to the μ it was recorded at; W&B/IPOPT discard the filter history at every barrier update (`FilterLSAcceptor::Reset` from both `MonotoneMuUpdate` and `AdaptiveMuUpdate`; NWW 2009 §5: "the history in the filter [is] reset at every free iteration because the barrier problem itself changes"). ipax created one filter per solve and never cleared it, so stale old-μ φ entries were compared against new-μ trial values — a spurious extra rejection gate that tightens as μ shrinks. The θ_max guard region is separate state and still applies across resets.
+- **The KKT-error fallback's monotone re-entry μ now respects the El-Bakry centrality floor.** The free-mode μ oracles were already floored at `κ_cent·max(dual, primal infeasibility)` (El-Bakry et al. 1996), but the NWW §5.1 fallback re-initialized μ from `0.8·(average complementarity)` alone — powerless exactly in the failure mode it guards against: a frozen primal against full-fraction dual steps collapses the complementarity far *below* the true KKT error, so the fallback re-entered monotone mode at the ε/10 floor and was stuck there (monotone never raises μ). Observed as a 480-iteration μ pin at lg(μ) = −9 on an RT fluence case whose dual residual sat at ~1e-4 throughout; the floored re-entry lands at ~1e-6 instead.
+- **A repeated feasible-point re-center now raises μ instead of treadmilling at the same barrier.** Observed on an RT fluence case (4882 lower-bounded variables, L-BFGS/sparse): the free-mode μ oracle pinned μ at its ε/10 floor while the iterate sat at exact feasibility, where the W&B eq. (19) switching condition holds for every descent direction — each trial faced the full Armijo test against a barrier made stiff by thousands of near-active bounds (11–27 backtracking trials per iteration), and every line-search failure re-centered slacks/duals at the *same* pinned μ, reproducing the identical stall for hundreds of iterations. The first feasible re-center is unchanged (the 0.6.1 HS101 repair); a repeat now raises μ to the scale of the stall's KKT error (at least 10×, capped at `mu_init` — cf. IPOPT's adaptive oracle raising μ; Nocedal, Wächter & Waltz 2009, §5.1) and suspends the free-mode μ oracle until the KKT error improves, so the raise is not immediately re-targeted away.
 
 ### Changed
-- **Iteration table uses IPOPT-style log10 columns.** The `mu` and `reg` columns
-  are now `lg(mu)` and `lg(rg)` (base-10 logs), and a step that needed no
-  regularization prints `lg(rg)` as `-` instead of `0.00e+00`, so a nonzero δ_w
-  stands out. This affects only the human-readable log; `IterationRecord` still
-  carries the raw `mu` / `regularization` values.
-- `LineSearchOptions` now validates `feasible_kkt_progress`: it must lie in
-  `(0, 1)` (or be `None`). The gate accepts when `e_t ≤ (1 − γ)·e0`, so γ ≤ 0
-  would certify a KKT-error *increase* as progress and γ ≥ 1 could never fire —
-  both now raise instead of degenerating silently.
+- **Iteration table uses IPOPT-style log10 columns.** The `mu` and `reg` columns are now `lg(mu)` and `lg(rg)` (base-10 logs), and a step that needed no regularization prints `lg(rg)` as `-` instead of `0.00e+00`, so a nonzero δ_w stands out. This affects only the human-readable log; `IterationRecord` still carries the raw `mu` / `regularization` values.
+- `LineSearchOptions` now validates `feasible_kkt_progress`: it must lie in `(0, 1)` (or be `None`). The gate accepts when `e_t ≤ (1 − γ)·e0`, so γ ≤ 0 would certify a KKT-error *increase* as progress and γ ≥ 1 could never fire — both now raise instead of degenerating silently.
 
 ## [0.6.1] - 2026-07-13
 
 ### Fixed
-- **A near-feasible restoration stall is no longer reported as `infeasible`.**
-  A *terminal* near-feasibility band at IPOPT's `constr_viol_tol` level
-  (`1e-4` at the default) now downgrades restoration's local-infeasibility
-  verdict to `stalled` when the restored point — or an accepted iterate — is
-  itself feasible to that band: a point feasible to ~`1e-4` cannot be
-  distinguished from a degenerate near-feasible optimum, so "locally
-  infeasible" is the wrong verdict (the honest one is "stalled: could not
-  improve"). This corrects LEWISPOL (9 nonlinear equalities / 6 variables with
-  a multiplicity-3 degenerate root, which floors at a violation of ~`1e-5`, the
-  float64 limit) and the ARGAUSS / LANCZOS / MISRA1B nonlinear-least-squares
-  cluster. The downgrade is applied **only at the terminal verdict**, leaving
-  the tighter threshold that gates restoration's resume / second-chance rescue
-  path untouched — so genuinely rescuable problems keep their basin — and
-  genuinely infeasible problems, whose violation is bounded well away from zero
-  (BURKEHAN `1.0`, PDE1 `2.5`), are unaffected.
-- **A step-solve failure hands to feasibility restoration instead of reporting
-  `numerical_error`.** When the condensed/saddle factorization could not be
-  completed even after the full δ_w regularization ladder, the driver reported
-  `numerical_error` outright. Wächter & Biegler 2006 (§3.1 inertia correction,
-  which reverts to the §3.3 *feasibility restoration* phase once δ_w exceeds
-  its ceiling) treats an uncompletable inertia-corrected step as a restoration
-  trigger — the same globalization fallback a filter line-search failure
-  already took. The driver now routes such a step-solve failure through
-  the shared restoration handler: it either recovers (restoration reaches a
-  feasible point and the main loop resumes) or terminates with an honest
-  `infeasible` / `restoration_failed` / `stalled` verdict. This upgrades the
-  diagnostics on the objective-free nonlinear-equation / NLS cluster (S2MPJ v11
-  exact-route `*NE` problems, ~44 rows: `min 0 s.t. r(x)=0` where the equality
-  multipliers diverge and no δ_w regularizes the runaway Hessian `Σ yᵢ ∇²cᵢ`),
-  which now report the same honest infeasibility the L-BFGS routes already did
-  instead of a crash-like `numerical_error`. The near-optimal step-failure
-  salvage (report `acceptable`) is unchanged. Internally the restoration branch
-  is extracted into a single `_handle_restoration` method shared by both entry
-  points.
-- **A line-search failure at an already-feasible point re-centers the barrier
-  state instead of looping through restoration.** When the filter line search
-  could not find an acceptable step at a feasible iterate (`θ ≤` the
-  feasibility tolerance), the driver handed off to feasibility restoration —
-  but restoration cannot move an already-feasible point, so it exited at the
-  same `x` and the loop re-derived the same rejected direction until the stall
-  detector returned an *infeasible* best iterate. In the S2MPJ v11 sweep this
-  was the HS101 exact-route limit cycle: boundary-floor slacks against
-  inequality multipliers grown to ~1e6 gave `Σ_s = λ/s ~ 1e18`, forcing
-  `δ_w ~ 1e5` every iteration and capping every step at ~1e-11 through the
-  fraction-to-boundary rule. The driver now repairs the barrier state at such
-  a point — re-flooring the slacks on the current `μ` and clipping the
-  inequality multipliers into the central band `[μ/(κ·s), κ·μ/s]` (Wächter &
-  Biegler 2006, §3.3 / eq. (16)) — and resumes the main loop. HS101 now
-  reaches its optimum (`f* = 1809.76476`) on all three exact routes.
+- **A near-feasible restoration stall is no longer reported as `infeasible`.** A *terminal* near-feasibility band at IPOPT's `constr_viol_tol` level (`1e-4` at the default) now downgrades restoration's local-infeasibility verdict to `stalled` when the restored point — or an accepted iterate — is itself feasible to that band: a point feasible to ~`1e-4` cannot be distinguished from a degenerate near-feasible optimum, so "locally infeasible" is the wrong verdict (the honest one is "stalled: could not improve"). This corrects LEWISPOL (9 nonlinear equalities / 6 variables with a multiplicity-3 degenerate root, which floors at a violation of ~`1e-5`, the float64 limit) and the ARGAUSS / LANCZOS / MISRA1B nonlinear-least-squares cluster. The downgrade is applied **only at the terminal verdict**, leaving the tighter threshold that gates restoration's resume / second-chance rescue path untouched — so genuinely rescuable problems keep their basin — and genuinely infeasible problems, whose violation is bounded well away from zero (BURKEHAN `1.0`, PDE1 `2.5`), are unaffected.
+- **A step-solve failure hands to feasibility restoration instead of reporting `numerical_error`.** When the condensed/saddle factorization could not be completed even after the full δ_w regularization ladder, the driver reported `numerical_error` outright. Wächter & Biegler 2006 (§3.1 inertia correction, which reverts to the §3.3 *feasibility restoration* phase once δ_w exceeds its ceiling) treats an uncompletable inertia-corrected step as a restoration trigger — the same globalization fallback a filter line-search failure already took. The driver now routes such a step-solve failure through the shared restoration handler: it either recovers (restoration reaches a feasible point and the main loop resumes) or terminates with an honest `infeasible` / `restoration_failed` / `stalled` verdict. This upgrades the diagnostics on the objective-free nonlinear-equation / NLS cluster (S2MPJ v11 exact-route `*NE` problems, ~44 rows: `min 0 s.t. r(x)=0` where the equality multipliers diverge and no δ_w regularizes the runaway Hessian `Σ yᵢ ∇²cᵢ`), which now report the same honest infeasibility the L-BFGS routes already did instead of a crash-like `numerical_error`. The near-optimal step-failure salvage (report `acceptable`) is unchanged. Internally the restoration branch is extracted into a single `_handle_restoration` method shared by both entry points.
+- **A line-search failure at an already-feasible point re-centers the barrier state instead of looping through restoration.** When the filter line search could not find an acceptable step at a feasible iterate (`θ ≤` the feasibility tolerance), the driver handed off to feasibility restoration — but restoration cannot move an already-feasible point, so it exited at the same `x` and the loop re-derived the same rejected direction until the stall detector returned an *infeasible* best iterate. In the S2MPJ v11 sweep this was the HS101 exact-route limit cycle: boundary-floor slacks against inequality multipliers grown to ~1e6 gave `Σ_s = λ/s ~ 1e18`, forcing `δ_w ~ 1e5` every iteration and capping every step at ~1e-11 through the fraction-to-boundary rule. The driver now repairs the barrier state at such a point — re-flooring the slacks on the current `μ` and clipping the inequality multipliers into the central band `[μ/(κ·s), κ·μ/s]` (Wächter & Biegler 2006, §3.3 / eq. (16)) — and resumes the main loop. HS101 now reaches its optimum (`f* = 1809.76476`) on all three exact routes.
 
 ## [0.6.0] - 2026-07-11
 
 ### Added
-- **`Result.routes` — the auto-selection decisions, recorded on the result.**
-  The solver resolves several routes at setup (`linsolve="auto"` picks
-  dense/Krylov/sparse-NE, the KKT assembly form, the Hessian source) and
-  runs others as configured; a new frozen `Routes` dataclass records them
-  all in one place: `linear_solver` (resolved, incl. the dispatched
-  backend), `linsolve_requested`, `kkt_form`
-  (`"condensed"`/`"augmented"`/`"normal_equations"`, reflecting runtime
-  fallbacks — read from a new duck-typed `kkt_form()` hook on each solver),
-  `hessian`/`hessian_requested`, `globalization`, `mu_schedule`, `scaling`,
-  and `corrections`. `None` on pre-solver exits (e.g. infeasible bounds).
-  The tier-1 (`verbose >= 1`) result summary prints the same record as a
-  compact `routes = linsolve:auto->… kkt:… hessian:auto->…` line.
-  Complements the existing `Result.derivative_sources` (the derivative half
-  of the story) without changing any existing field.
-- **The sparse normal-equations route now takes equality constraints.** The
-  NE form previously rejected any problem with equalities; the equality
-  Jacobian now borders in as a Schur/equality block — the inequality Gram
-  still condenses sparsely into the `n×n` block while `∇c` stays explicit,
-  so the factored matrix is the `(n+m_E)` quasidefinite saddle over the
-  condensed-Gram block (Friedlander–Orban 2012), with any L-BFGS low-rank
-  border carried through at the tail and full structure/symbolic reuse. The
-  Haynsworth inertia offset is unchanged (the eliminated `−Σ_s⁻¹` block's
-  `m_I` negatives; the `−δ_c` block stays *in* the factor), so the
-  inertia-guided δ_w correction works for the bordered form too.
-  Auto-selection no longer vetoes equality problems: the tall sparse-Gram
-  gate now also verifies the equality Jacobian can emit COO structure
-  (a matrix-free `∇c` keeps Krylov rather than crashing at the first
-  factorization).
-- **A one-time warning when the inertia safety net cannot engage.** The
-  IPM's inertia-guided δ_w correction runs only when the KKT operator knows
-  its target inertia *and* the backend factorization reports the factor's
-  inertia. When the target is known (an assemblable, possibly nonconvex
-  Hessian) but the backend cannot report inertia (e.g. the SuperLU
-  fallback), the check used to no-op silently — a symmetric-indefinite LDLᵀ
-  can then succeed with the wrong inertia and hand back a non-descent step.
-  `SparseDirectSolver` now logs a warning (once per solver lifetime)
-  naming the gap and the fix (`ipax[sparse-cpu]`/Feral on CPU, cuDSS on
-  CUDA). No warning on the L-BFGS route (PD by damping, no target) or on
-  the dense/Krylov routes (each has its own PD mechanism).
-- **The sparse KKT forms are now documented** in `docs/concepts/linalg.md`:
-  the augmented vs normal-equations assembly, the Gram fill-in trap and the
-  `gram_fill_estimate` probe, the auto-selection gate, and inertia as a
-  backend capability.
-- **Sparse normal-equations auto-selection.** The 0.5.0 sparse-NE route
-  (`SparseOptions(kkt_route="normal_equations")`) was opt-in because nothing
-  could predict whether the Gram `∇gᵀ Σ_s ∇g` stays sparse. A new
-  `LinearOperator.gram_fill_estimate` capability answers that without forming
-  the Gram: the pattern of Gram column `j` is exactly the union of the column
-  patterns of the rows touching `j`, so sampling evenly spaced columns and
-  averaging the union sizes estimates `nnz(∇gᵀ∇g)/n²` (SciPy + CuPy adapters;
-  forwarded through `VStack` and the scaling wrapper; measured within 1% of
-  the exact fill at n=10k–20k for ~25–60 ms, once, at selection time).
-  `select_solver(linsolve="auto")` now consults it for tall (`m ≥ 10n`)
-  problems whose sparse Jacobian is below the dense-GEMM Gram crossover:
-  estimated fill ≤ 1% (banded validation case sits at ~0.2–0.5%, scattered
-  sparsity saturates toward 1) selects the sparse-NE route — the regime where
-  it measured 3–4.6× faster per iteration than the bordered augmented factor
-  and solved n=20k in 62 s while Krylov ran 50+ min unconverged — restricted
-  to the L-BFGS Hessian route (the fold the NE form supports; see the
-  equality-border entry above for the constraint mixes). Everything else
-  keeps the previous selection unchanged.
-  `SparseDirectSolver` also gained a public `form` property, and its
-  `describe()` now reports `sparse-NE [...]` for the normal-equations form.
+- **`Result.routes` — the auto-selection decisions, recorded on the result.** The solver resolves several routes at setup (`linsolve="auto"` picks dense/Krylov/sparse-NE, the KKT assembly form, the Hessian source) and runs others as configured; a new frozen `Routes` dataclass records them all in one place: `linear_solver` (resolved, incl. the dispatched backend), `linsolve_requested`, `kkt_form` (`"condensed"`/`"augmented"`/`"normal_equations"`, reflecting runtime fallbacks — read from a new duck-typed `kkt_form()` hook on each solver), `hessian`/`hessian_requested`, `globalization`, `mu_schedule`, `scaling`, and `corrections`. `None` on pre-solver exits (e.g. infeasible bounds). The tier-1 (`verbose >= 1`) result summary prints the same record as a compact `routes = linsolve:auto->… kkt:… hessian:auto->…` line. Complements the existing `Result.derivative_sources` (the derivative half of the story) without changing any existing field.
+- **The sparse normal-equations route now takes equality constraints.** The NE form previously rejected any problem with equalities; the equality Jacobian now borders in as a Schur/equality block — the inequality Gram still condenses sparsely into the `n×n` block while `∇c` stays explicit, so the factored matrix is the `(n+m_E)` quasidefinite saddle over the condensed-Gram block (Friedlander–Orban 2012), with any L-BFGS low-rank border carried through at the tail and full structure/symbolic reuse. The Haynsworth inertia offset is unchanged (the eliminated `−Σ_s⁻¹` block's `m_I` negatives; the `−δ_c` block stays *in* the factor), so the inertia-guided δ_w correction works for the bordered form too. Auto-selection no longer vetoes equality problems: the tall sparse-Gram gate now also verifies the equality Jacobian can emit COO structure (a matrix-free `∇c` keeps Krylov rather than crashing at the first factorization).
+- **A one-time warning when the inertia safety net cannot engage.** The IPM's inertia-guided δ_w correction runs only when the KKT operator knows its target inertia *and* the backend factorization reports the factor's inertia. When the target is known (an assemblable, possibly nonconvex Hessian) but the backend cannot report inertia (e.g. the SuperLU fallback), the check used to no-op silently — a symmetric-indefinite LDLᵀ can then succeed with the wrong inertia and hand back a non-descent step. `SparseDirectSolver` now logs a warning (once per solver lifetime) naming the gap and the fix (`ipax[sparse-cpu]`/Feral on CPU, cuDSS on CUDA). No warning on the L-BFGS route (PD by damping, no target) or on the dense/Krylov routes (each has its own PD mechanism).
+- **The sparse KKT forms are now documented** in `docs/concepts/linalg.md`: the augmented vs normal-equations assembly, the Gram fill-in trap and the `gram_fill_estimate` probe, the auto-selection gate, and inertia as a backend capability.
+- **Sparse normal-equations auto-selection.** The 0.5.0 sparse-NE route (`SparseOptions(kkt_route="normal_equations")`) was opt-in because nothing could predict whether the Gram `∇gᵀ Σ_s ∇g` stays sparse. A new `LinearOperator.gram_fill_estimate` capability answers that without forming the Gram: the pattern of Gram column `j` is exactly the union of the column patterns of the rows touching `j`, so sampling evenly spaced columns and averaging the union sizes estimates `nnz(∇gᵀ∇g)/n²` (SciPy + CuPy adapters; forwarded through `VStack` and the scaling wrapper; measured within 1% of the exact fill at n=10k–20k for ~25–60 ms, once, at selection time). `select_solver(linsolve="auto")` now consults it for tall (`m ≥ 10n`) problems whose sparse Jacobian is below the dense-GEMM Gram crossover: estimated fill ≤ 1% (banded validation case sits at ~0.2–0.5%, scattered sparsity saturates toward 1) selects the sparse-NE route — the regime where it measured 3–4.6× faster per iteration than the bordered augmented factor and solved n=20k in 62 s while Krylov ran 50+ min unconverged — restricted to the L-BFGS Hessian route (the fold the NE form supports; see the equality-border entry above for the constraint mixes). Everything else keeps the previous selection unchanged. `SparseDirectSolver` also gained a public `form` property, and its `describe()` now reports `sparse-NE [...]` for the normal-equations form.
 
 ### Changed
-- **Dense route: the PD-probe Cholesky factor is now reused for the solve.**
-  `DenseSolver` already Cholesky-probes the condensed block `N` to reject
-  indefinite systems (the δ_w escalation guard); that factor was then
-  discarded and the same matrix re-factored with LU by `xp.linalg.solve`.
-  A new backend gap-filler `get_dense_cholesky_solve` (`ipax/backend/dense/`;
-  the Array API `linalg` extension has no triangular solve — BLAS `trsm` /
-  LAPACK `potrs`) back-substitutes the kept factor instead: SciPy `cho_solve`
-  on NumPy, `torch.cholesky_solve` on Torch (CPU/CUDA), two
-  `cupyx.scipy.linalg.solve_triangular` sweeps on CuPy. Every solve against
-  one factorization drops from O(n³) to O(n²), which also makes
-  Mehrotra/Gondzio corrector and SOC back-solves near-free on the dense
-  route. Measured (NumPy, single-threaded BLAS, n=1000–4000, m=n/2):
-  1.2–1.4× per factor+solve, 1.7–1.9× for the factor+3-back-solves pattern.
-  Backends without the primitive (array-api-strict, JAX) and the equality
-  saddle route (indefinite bordered matrix; only its leading `N` block is
-  probed) keep the LU path unchanged.
+- **Dense route: the PD-probe Cholesky factor is now reused for the solve.** `DenseSolver` already Cholesky-probes the condensed block `N` to reject indefinite systems (the δ_w escalation guard); that factor was then discarded and the same matrix re-factored with LU by `xp.linalg.solve`. A new backend gap-filler `get_dense_cholesky_solve` (`ipax/backend/dense/`; the Array API `linalg` extension has no triangular solve — BLAS `trsm` / LAPACK `potrs`) back-substitutes the kept factor instead: SciPy `cho_solve` on NumPy, `torch.cholesky_solve` on Torch (CPU/CUDA), two `cupyx.scipy.linalg.solve_triangular` sweeps on CuPy. Every solve against one factorization drops from O(n³) to O(n²), which also makes Mehrotra/Gondzio corrector and SOC back-solves near-free on the dense route. Measured (NumPy, single-threaded BLAS, n=1000–4000, m=n/2): 1.2–1.4× per factor+solve, 1.7–1.9× for the factor+3-back-solves pattern. Backends without the primitive (array-api-strict, JAX) and the equality saddle route (indefinite bordered matrix; only its leading `N` block is probed) keep the LU path unchanged.
 
 ## [0.5.0] - 2026-07-10
 
 ### Added
-- **More informative progress logging.** The `verbose >= 1` (info) tier now
-  opens with a condensed one-line problem/solver headline before the result
-  summary — variable/bound counts, equality/inequality counts, the resolved
-  linear solver, and the resolved Hessian source (`format_setup`). The
-  `verbose >= 2` per-iteration table gains an `ls` column reporting the
-  number of backtracking trial step sizes the line search (filter or
-  Breedveld) evaluated to reach each row, and rows produced by a
-  feasibility-restoration jump are now tagged with a trailing `R`
-  (`IterationRecord.line_search_iters`/`.restored`, combinable with the
-  existing acceptable-iterate `*` tag).
-- **Sparse condensed normal-equations route**
-  (`Options(linsolve="sparse", sparse=SparseOptions(kkt_route="normal_equations"))`).
-  The condensed matrix ``N = W + Σ_x + δ_w I + ∇gᵀ Σ_s ∇g`` is assembled
-  *sparsely*: a new ``LinearOperator.gram_coo`` capability (SciPy and CuPy
-  adapters, forwarded through `COOOperator`/`CSROperator`, `VStack` and the
-  gradient-scaling wrapper) emits ``∇gᵀ Σ_s ∇g`` as pattern-stable COO
-  triplets, and the condensed KKT operator folds them into its logical
-  ``n×n`` block (`normal_equations_coo`; an L-BFGS Hessian keeps its
-  low-rank border). `SparseDirectSolver(form="normal_equations")` factors
-  the result with full structure/symbolic reuse and translates the factor's
-  inertia back into bordered terms (Haynsworth additivity: the eliminated
-  ``−Σ_s⁻¹`` block's ``m_I`` negatives), so the inertia-guided δ_w
-  correction works unchanged. For tall (``m ≫ n``) problems with
-  **localized** Jacobian rows (banded/block dose-influence structure) this
-  replaces a ``(n+m)``-sized bordered factor or a Krylov iteration with one
-  small sparse Cholesky-sized factorization per iteration (Breedveld 2017
-  §2). Measured on banded tall QPs (``m = 10n``, 20 nnz/row): 3–4.6× faster
-  per iteration than the bordered augmented factor at ``n`` = 10k–30k
-  (6.2 vs 15.6 s at 20k), 32× faster than the dense condensed route at 10k
-  (1.27 vs 40.4 s, 237 MB vs 3.3 GB peak), and on par with matrix-free
-  Krylov on early well-conditioned iterations — but decisively ahead at
-  convergence, where the late-IPM Σ blows up CG's inner iteration counts
-  while the direct factor's cost stays flat: at ``n`` = 20k the sparse-NE
-  solve reaches OPTIMAL (KKT 4e-9) in 25 iterations / 62 s, while the
-  Krylov route had not converged after 50+ minutes. Deliberately opt-in:
-  with non-localized rows the Gram fills in toward dense ``n²``, which no
-  cheap structural probe can detect.
-- **Tall sparse QP generator** (`benchmarks.generators.make_tall_sparse_problem`):
-  seeded ``m ≫ n`` bound-constrained QPs with a Gram-capable sparse-operator
-  Jacobian, random or banded (``bandwidth=``) column structure — the
-  measurement vehicle for the tall-selection thresholds and the sparse-NE
-  route.
-- **Tall auto-selection is now density-gated.** The tall-crossover
-  measurement (2026-07, tall QPs at ``m = 10n``) showed the dense condensed
-  route beating Krylov 5.4× at ``n = 5000`` but *losing* (75.5 vs
-  46.5 s/iteration) at ``n = 10 000`` with a ~1%-dense Jacobian: the
-  tall-dense advantage comes from the adapters' dense-GEMM Gram, which only
-  engages at ≥ ~5% density. `select_solver`'s tall branch now also probes
-  ``nnz/(m·n)`` of the inequality Jacobian and keeps Krylov below 5%
-  density; dense-ish Jacobians (TROTS dose matrices, 11–53%) keep the
-  measured 13–19× dense-route wins.
-- **Stall detection** (`Options.max_stall_iter`, default 25; new
-  `Status.STALLED`): consecutive frozen iterations — no accepted step and a
-  bit-for-bit unchanged KKT error — now terminate honestly (or as
-  `ACCEPTABLE` within the relaxed KKT tolerance) instead of re-deriving the
-  identical rejected direction until `max_iter` (S2MPJ POWELLBSLS burned
-  10 001 iterations this way). Limit cycles that keep moving the iterate reset
-  the counter and still run to the ordinary budgets.
-- **Condensed normal-equations tuning for tall (`n ≪ m`) problems.** The
-  SciPy/CuPy sparse adapters now cache the Gram fast path per operator: a
-  last-weights memo returns the memoized `∇gᵀ Σ_s ∇g` for the bit-identical
-  Σ_s re-requested by δ_w retries, SOC and Mehrotra re-solves within an IPM
-  iteration, and cache misses reuse a one-time `Aᵀ` CSR transpose +
-  same-pattern scaled buffer (plus a shared `A∘A` for the Gram diagonals), so
-  only value work and the SpGEMM itself remain per iteration. Dense-ish
-  Jacobians (row density ≥ 5%, e.g. TROTS dose matrices at ~30%) switch to a
-  chunked dense-GEMM accumulation instead — SpGEMM's Σ nnz_row² hash
-  arithmetic plus its per-call symbolic pass is the wrong algorithm there
-  (measured 27× on TROTS Prostate_CK: 90 s → 3.4 s per Gram). Solver
-  auto-selection gained the same awareness: `select_solver` now accepts the
-  inequality row count and a lazy `gram_capable()` probe (new
-  `LinearOperator.gram_capable`, forwarded by row scaling and `VStack`) and
-  keeps the dense condensed route up to 20k variables when `m ≥ 10·n`, where
-  one `n×n` factorization per iteration beats Krylov matvecs through the huge
-  Jacobian (Breedveld et al. 2017). `DenseOptions.augmented_max_size`
-  (default 20 000) guards the dense augmented route against materializing the
-  `(n+m_eq+m_I)²` bordered matrix at such row counts — it falls back to the
-  condensed route before allocating, losing only the inertia diagnostic.
-- **Barrier μ oracles, orthogonal to higher-order corrections.**
-  `Options(mu_schedule=...)` is now honored and grew a value: `"adaptive"`
-  re-targets μ every iteration by the LOQO centrality rule (Nocedal, Wächter &
-  Waltz 2009, eq. (3.6)), `"breedveld"` applies the steplength-driven
-  duality-gap reduction σ(α) = ((α−1)/(α+10))² of Breedveld et al. 2017
-  (eqs. (10)–(12)), `"probing"` runs the Mehrotra σ-rule from an affine probe
-  (also standalone, without a corrector), and `"monotone"` is the guarded
-  Fiacco–McCormick loop. Mehrotra/Gondzio correctors now *consume* the oracle's
-  μ target instead of choosing it, so any oracle can steer any corrector.
-  Previously the non-monotone values were accepted but silently ran the
-  monotone schedule.
-- **Centrality floor for the free-mode oracles**
-  (`BarrierOptions.kappa_centrality`, default `1e-2`): μ never drops below
-  κ_cent·max(dual, primal infeasibility), the practical rendering of the
-  centrality condition in El-Bakry et al. (1996)'s Newton interior-point
-  convergence theory. Without it an aggressive oracle can crush μ near a
-  saddle while the iterate is far from stationary, pinning it to the boundary
-  beyond the reach of the KKT-error fallback's complementarity-based re-entry.
-- **Free-mode KKT-error safeguard** (NWW 2009, §5.1, Algorithm A): a
-  non-monotone μ oracle is suspended when the scaled KKT error stops making
-  sufficient progress (`fallback_kappa`/`fallback_window`, paper defaults
-  κ = 0.9999, l_max = 5), falling back to the monotone reduction re-initialized
-  at 0.8× the average complementarity until the error recovers —
-  the counterpart of IPOPT's `adaptive_mu_globalization="kkt-error"`.
-  `BarrierOptions(fallback="never")` restores pure free mode.
-- **TROTS radiotherapy benchmark corpus** (`benchmarks/corpus/trots.py`,
-  download-gated on `IPAX_TROTS_DIR`). Loads the TROTS treatment-planning problems
-  (MATLAB v7.3/HDF5) into an ipax `Problem`: all cost functions (linear
-  max/min/mean, quadratic, gEUD, LTCP, smoothed DVH) with the weighted
-  scalarisation, the pointwise-max objectives lowered to a minimax epigraph, the
-  elementwise dose constraints emitted as Array-API sparse operators, an exact
-  Lagrangian Hessian variant, and the dataset's least-squares warm start
-  (`misc.Initialise*`). Objective evaluated at the reference `solutionX` reproduces
-  the published `Objective Function Value` to the significant figures each solve
-  reports (validated across the proton/photon/liver groups). Runner + gated tests
-  included.
-- **Sparse-Gram condensation for the dense KKT route.** `LinearOperator` gains an
-  optional `gram(weights)` capability returning the dense `n×n` weighted Gram
-  `Aᵀ diag(w) A`, implemented on the sparse operators (`COO`/`CSR`/`CSC`, the
-  per-backend `SparseOperator`, and `VStack`) by sparse arithmetic. The condensed
-  dense route (`ipm/kkt.py`) now forms the inequality term `∇gᵀ Σ_s ∇g` through it
-  instead of densifying the Jacobian to `m×n` first — the decisive change for
-  problems with far more constraints than variables (`n ≪ m`), where the old path
-  materialized a gigabytes-scale dense Jacobian to build a small `n×n` matrix
-  (e.g. a TROTS proton case: a 369k×1101 Jacobian ≈ 3.2 GB, now a ~4 s sparse
-  Gram). Falls back to the previous densify-and-multiply when the Jacobian exposes
-  no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
+- **More informative progress logging.** The `verbose >= 1` (info) tier now opens with a condensed one-line problem/solver headline before the result summary — variable/bound counts, equality/inequality counts, the resolved linear solver, and the resolved Hessian source (`format_setup`). The `verbose >= 2` per-iteration table gains an `ls` column reporting the number of backtracking trial step sizes the line search (filter or Breedveld) evaluated to reach each row, and rows produced by a feasibility-restoration jump are now tagged with a trailing `R` (`IterationRecord.line_search_iters`/`.restored`, combinable with the existing acceptable-iterate `*` tag).
+- **Sparse condensed normal-equations route** (`Options(linsolve="sparse", sparse=SparseOptions(kkt_route="normal_equations"))`). The condensed matrix ``N = W + Σ_x + δ_w I + ∇gᵀ Σ_s ∇g`` is assembled *sparsely*: a new ``LinearOperator.gram_coo`` capability (SciPy and CuPy adapters, forwarded through `COOOperator`/`CSROperator`, `VStack` and the gradient-scaling wrapper) emits ``∇gᵀ Σ_s ∇g`` as pattern-stable COO triplets, and the condensed KKT operator folds them into its logical ``n×n`` block (`normal_equations_coo`; an L-BFGS Hessian keeps its low-rank border). `SparseDirectSolver(form="normal_equations")` factors the result with full structure/symbolic reuse and translates the factor's inertia back into bordered terms (Haynsworth additivity: the eliminated ``−Σ_s⁻¹`` block's ``m_I`` negatives), so the inertia-guided δ_w correction works unchanged. For tall (``m ≫ n``) problems with **localized** Jacobian rows (banded/block dose-influence structure) this replaces a ``(n+m)``-sized bordered factor or a Krylov iteration with one small sparse Cholesky-sized factorization per iteration (Breedveld 2017 §2). Measured on banded tall QPs (``m = 10n``, 20 nnz/row): 3–4.6× faster per iteration than the bordered augmented factor at ``n`` = 10k–30k (6.2 vs 15.6 s at 20k), 32× faster than the dense condensed route at 10k (1.27 vs 40.4 s, 237 MB vs 3.3 GB peak), and on par with matrix-free Krylov on early well-conditioned iterations — but decisively ahead at convergence, where the late-IPM Σ blows up CG's inner iteration counts while the direct factor's cost stays flat: at ``n`` = 20k the sparse-NE solve reaches OPTIMAL (KKT 4e-9) in 25 iterations / 62 s, while the Krylov route had not converged after 50+ minutes. Deliberately opt-in: with non-localized rows the Gram fills in toward dense ``n²``, which no cheap structural probe can detect.
+- **Tall sparse QP generator** (`benchmarks.generators.make_tall_sparse_problem`): seeded ``m ≫ n`` bound-constrained QPs with a Gram-capable sparse-operator Jacobian, random or banded (``bandwidth=``) column structure — the measurement vehicle for the tall-selection thresholds and the sparse-NE route.
+- **Tall auto-selection is now density-gated.** The tall-crossover measurement (2026-07, tall QPs at ``m = 10n``) showed the dense condensed route beating Krylov 5.4× at ``n = 5000`` but *losing* (75.5 vs 46.5 s/iteration) at ``n = 10 000`` with a ~1%-dense Jacobian: the tall-dense advantage comes from the adapters' dense-GEMM Gram, which only engages at ≥ ~5% density. `select_solver`'s tall branch now also probes ``nnz/(m·n)`` of the inequality Jacobian and keeps Krylov below 5% density; dense-ish Jacobians (TROTS dose matrices, 11–53%) keep the measured 13–19× dense-route wins.
+- **Stall detection** (`Options.max_stall_iter`, default 25; new `Status.STALLED`): consecutive frozen iterations — no accepted step and a bit-for-bit unchanged KKT error — now terminate honestly (or as `ACCEPTABLE` within the relaxed KKT tolerance) instead of re-deriving the identical rejected direction until `max_iter` (S2MPJ POWELLBSLS burned 10 001 iterations this way). Limit cycles that keep moving the iterate reset the counter and still run to the ordinary budgets.
+- **Condensed normal-equations tuning for tall (`n ≪ m`) problems.** The SciPy/CuPy sparse adapters now cache the Gram fast path per operator: a last-weights memo returns the memoized `∇gᵀ Σ_s ∇g` for the bit-identical Σ_s re-requested by δ_w retries, SOC and Mehrotra re-solves within an IPM iteration, and cache misses reuse a one-time `Aᵀ` CSR transpose + same-pattern scaled buffer (plus a shared `A∘A` for the Gram diagonals), so only value work and the SpGEMM itself remain per iteration. Dense-ish Jacobians (row density ≥ 5%, e.g. TROTS dose matrices at ~30%) switch to a chunked dense-GEMM accumulation instead — SpGEMM's Σ nnz_row² hash arithmetic plus its per-call symbolic pass is the wrong algorithm there (measured 27× on TROTS Prostate_CK: 90 s → 3.4 s per Gram). Solver auto-selection gained the same awareness: `select_solver` now accepts the inequality row count and a lazy `gram_capable()` probe (new `LinearOperator.gram_capable`, forwarded by row scaling and `VStack`) and keeps the dense condensed route up to 20k variables when `m ≥ 10·n`, where one `n×n` factorization per iteration beats Krylov matvecs through the huge Jacobian (Breedveld et al. 2017). `DenseOptions.augmented_max_size` (default 20 000) guards the dense augmented route against materializing the `(n+m_eq+m_I)²` bordered matrix at such row counts — it falls back to the condensed route before allocating, losing only the inertia diagnostic.
+- **Barrier μ oracles, orthogonal to higher-order corrections.** `Options(mu_schedule=...)` is now honored and grew a value: `"adaptive"` re-targets μ every iteration by the LOQO centrality rule (Nocedal, Wächter & Waltz 2009, eq. (3.6)), `"breedveld"` applies the steplength-driven duality-gap reduction σ(α) = ((α−1)/(α+10))² of Breedveld et al. 2017 (eqs. (10)–(12)), `"probing"` runs the Mehrotra σ-rule from an affine probe (also standalone, without a corrector), and `"monotone"` is the guarded Fiacco–McCormick loop. Mehrotra/Gondzio correctors now *consume* the oracle's μ target instead of choosing it, so any oracle can steer any corrector. Previously the non-monotone values were accepted but silently ran the monotone schedule.
+- **Centrality floor for the free-mode oracles** (`BarrierOptions.kappa_centrality`, default `1e-2`): μ never drops below κ_cent·max(dual, primal infeasibility), the practical rendering of the centrality condition in El-Bakry et al. (1996)'s Newton interior-point convergence theory. Without it an aggressive oracle can crush μ near a saddle while the iterate is far from stationary, pinning it to the boundary beyond the reach of the KKT-error fallback's complementarity-based re-entry.
+- **Free-mode KKT-error safeguard** (NWW 2009, §5.1, Algorithm A): a non-monotone μ oracle is suspended when the scaled KKT error stops making sufficient progress (`fallback_kappa`/`fallback_window`, paper defaults κ = 0.9999, l_max = 5), falling back to the monotone reduction re-initialized at 0.8× the average complementarity until the error recovers — the counterpart of IPOPT's `adaptive_mu_globalization="kkt-error"`. `BarrierOptions(fallback="never")` restores pure free mode.
+- **TROTS radiotherapy benchmark corpus** (`benchmarks/corpus/trots.py`, download-gated on `IPAX_TROTS_DIR`). Loads the TROTS treatment-planning problems (MATLAB v7.3/HDF5) into an ipax `Problem`: all cost functions (linear max/min/mean, quadratic, gEUD, LTCP, smoothed DVH) with the weighted scalarisation, the pointwise-max objectives lowered to a minimax epigraph, the elementwise dose constraints emitted as Array-API sparse operators, an exact Lagrangian Hessian variant, and the dataset's least-squares warm start (`misc.Initialise*`). Objective evaluated at the reference `solutionX` reproduces the published `Objective Function Value` to the significant figures each solve reports (validated across the proton/photon/liver groups). Runner + gated tests included.
+- **Sparse-Gram condensation for the dense KKT route.** `LinearOperator` gains an optional `gram(weights)` capability returning the dense `n×n` weighted Gram `Aᵀ diag(w) A`, implemented on the sparse operators (`COO`/`CSR`/`CSC`, the per-backend `SparseOperator`, and `VStack`) by sparse arithmetic. The condensed dense route (`ipm/kkt.py`) now forms the inequality term `∇gᵀ Σ_s ∇g` through it instead of densifying the Jacobian to `m×n` first — the decisive change for problems with far more constraints than variables (`n ≪ m`), where the old path materialized a gigabytes-scale dense Jacobian to build a small `n×n` matrix (e.g. a TROTS proton case: a 369k×1101 Jacobian ≈ 3.2 GB, now a ~4 s sparse Gram). Falls back to the previous densify-and-multiply when the Jacobian exposes no `gram` (dense/matrix-free) or `Σ_s` is non-diagonal.
 
 ### Fixed
-- **The cuDSS route now actually works against a real runtime** (first
-  hardware validation of the GPU sparse-direct path; previously it was only
-  exercised through NumPy-backed fakes). Three defects found by running on
-  a live cuDSS 0.7/CUDA 12 stack, each now also modeled by the fake so the
-  CPU test suite guards them:
-  - **Dense RHS/solution descriptors were created ``ROW_MAJOR``**, which
-    cuDSS rejects (`NOT_SUPPORTED` — it supports only column-major dense
-    matrices). They are now ``COL_MAJOR`` over Fortran-ordered device
-    buffers with ``ld = nrows``.
-  - **The LDLᵀ inertia was read as ``int64[2]``**, which cuDSS rejects
-    (`INVALID_VALUE`; observed layout is ``int32[2]``). The read now tries
-    the observed layout first and falls back to the widened one. Inertia is
-    also reported **best-effort** through ``inertia_or_none`` (lazily, one
-    host sync at most per factor, symmetric factors only) instead of only
-    under ``require_inertia`` — parity with the Feral CPU adapter, so the
-    IPM's inertia-guided δ_w correction now engages on the cuDSS route
-    (verified on GPU: the saddle-trap QP now escapes to the minimizer).
-  - **A cuDSS runtime whose ABI does not match the nvmath-python bindings**
-    (e.g. cuDSS 0.8 under nvmath 0.9, which is built against 0.7; nvmath's
-    high-level API refuses the pairing, the raw bindings do not check)
-    failed every ``matrix_create`` with `INVALID_VALUE`, which the driver's
-    regularization ladder retried until reporting an inscrutable
-    ``numerical_error`` at iteration 0. Creation-time rejections now
-    degrade to the spsolve fallback instead.
-  Additionally, **every silent degrade to CuPy spsolve now emits a
-  ``RuntimeWarning``** (missing runtime or ABI mismatch): spsolve
-  re-factorizes from scratch on every solve, and two real environments hit
-  the silent fallback without noticing.
-- **The cuDSS symmetric route no longer crashes on CuPy < 14.** The
-  compiled full-CSR → lower-triangle map (`compile_lower_triangle`) built its
-  nnz→row ownership vector with ``xp.repeat(arange(n), diff(indptr))``;
-  NumPy accepts array-valued repeat counts but CuPy only does from v14, so
-  the first symmetric factorization through a real cuDSS runtime raised
-  ``ValueError: cupy.ndaray cannot be specified as `repeats` argument.`` on
-  older CuPy. The map is now derived with ``searchsorted`` over ``indptr``
-  (the same construction as the adapters' Gram row maps), which is
-  version-independent and avoids materializing the repeat. The fake-CuPy
-  test fixture that masked this now models the restrictive ``repeat``
-  semantics, and the canonical-map tests run against both a CuPy-semantics
-  namespace stub and (GPU-gated) real CuPy.
-- **Unbounded detection requires the objective to diverge, not just ‖x‖.**
-  The diverging-iterates test fired on the iterate norm alone, misreporting
-  convergent problems whose iterates wander astronomically far before
-  returning (S2MPJ KOEBHELB: ‖x‖ grows monotonically past 1e22 across ~30
-  iterations, then converges to f = 112 — flagged ``unbounded`` on the
-  exact/dense and exact/sparse routes in every sweep since v5) or whose
-  optimum is legitimately huge. "Unbounded below" means f → −∞, so
-  `Status.UNBOUNDED` now additionally requires the objective to sit below
-  ``−diverging_iterates_tol``. KOEBHELB exact/dense: ``unbounded`` →
-  ``optimal`` (KKT 2.4e-9); genuinely unbounded problems (INDEF,
-  f → −3.6e21) are detected at the same iteration as before.
-- **The Mehrotra corrector degrades gracefully when the correction hurts.**
-  The corrected direction was accepted unconditionally, but its ``−ΔΔ`` term
-  presumes a Newton predictor whose full step reduces complementarity — on
-  nonconvex or quasi-Newton curvature it can instead collapse the maximal
-  fraction-to-boundary step, leaving the solve at a convergence knife-edge
-  (S2MPJ HS71 × ``exact/dense+mehrotra``: converged in ~10 iterations or
-  stalled at KKT ≈ 36 depending on last-bit arithmetic across Torch builds).
-  A corrected step that retains less than half the predictor's combined
-  boundary step length is now discarded for the plain centered Newton step
-  at the same μ target (the direction ``corrections="none"`` computes),
-  falling back to the affine predictor only if that re-solve fails. The
-  Gondzio corrector builds on the same guarded base. The HS71
-  ``exclude_configs`` workaround in the QC corpus is removed; the gate runs
-  200/200 with the corrector configs swept again.
-- **Budget exhaustion at a near-optimal iterate now reports `ACCEPTABLE`.**
-  The driver already returns the best accepted iterate on failure statuses;
-  when that iterate satisfies the relaxed KKT tolerances (1e2 × the
-  optimality tolerances, IPOPT ``acceptable_tol``), `MAX_ITER`/`MAX_TIME`
-  now report `ACCEPTABLE` like the stall and step-failure salvage paths
-  already did — previously a run that oscillated at the acceptable level
-  without holding it for the consecutive-iteration window read as a harsh
-  budget failure from an essentially optimal point (S2MPJ budget-cluster
-  audit: DIAMON2DLS at KKT 6.7e-7 reported ``max_time``).
-- **CuPy adapter no longer calls the deprecated ``ndarray.scatter_add``.**
-  ``cupyx.scatter_add`` delegates to it and warns as of CuPy 14 (which
-  escalates to an error under pytest's warning filter, breaking every CuPy
-  ``from_coo`` assembly); the canonical-map scatter now uses its documented
-  replacement ``cupy.add.at``.
-- **Restoration solves the reduced Gauss-Newton system on the free set.**
-  With variables pinned at their bounds, the full-space GN step is dominated
-  by the blocked components; the box projection swallowed it and the
-  Levenberg–Marquardt loop degraded into a microscopic gradient crawl (S2MPJ
-  DRUGDIS: θ 0.19 → 0.16 in a full 200-iteration restoration budget; UBH5
-  crawled through nine consecutive budgets). Bound-blocked variables (the
-  binding set of the projected-gradient test) now have their rows/columns
-  removed from the normal system — projected Newton on the free set
-  (Bertsekas 1999, §2.3) — restoring the GN rate: DRUGDIS reaches θ 8e-4 and
-  UBH5 drops 4× further per budget, box-stationary certificates arrive in
-  seconds instead of full budgets (MESH: 300 s → 3 s), and CSFI2/DEGENLPB/
-  CORE2 gain converged finishes on the false-infeasible subset.
-- **Uncertified restoration stalls no longer report `INFEASIBLE`.** The
-  feasibility restoration now distinguishes *how* it ended: only a
-  stationarity-type exit (projected gradient ≈ 0, or no descent at the
-  Levenberg–Marquardt damping ceiling) certifies local infeasibility
-  (Wächter & Biegler 2006, §3.3). A trailing-window plateau or an exhausted
-  iteration budget resumes the main loop while restoration keeps reducing the
-  violation between stalls, spends the one-shot x0-anchored probe before
-  giving up, and then terminates as the honest `Status.RESTORATION_FAILED`
-  (previously never emitted) — an early window exit could relabel an
-  out-of-budget failure as a false claim about the problem (S2MPJ:
-  LAKES/NASH/SWOPF on the Krylov routes). On the 53-problem false-infeasible
-  subset × 6 configs: +5 correct / +9 converged, ~16 false-INFEASIBLE rows per
-  config relabeled, zero regressions on previously-optimal runs, and the
-  genuinely infeasible control (BURKEHAN) still reports `INFEASIBLE`
-  everywhere.
-- **CG breakdown on a vanished preconditioned inner product.** ``⟨r, M⁻¹r⟩``
-  can underflow to an exact zero with a nonzero residual on an ill-scaled
-  problem (MGH09LS under ``preconditioner="auto"`` crashed with
-  ``ZeroDivisionError: 0/0`` in the β update); a zero, negative or non-finite
-  preconditioned inner product now raises ``KrylovConvergenceError`` so the
-  driver escalates δ_w — MGH09LS lbfgs/krylov pc=auto: crash → OPTIMAL.
-- **Second-chance restoration anchored at the starting point.** Feasibility
-  restoration is a local method: entered from a wandered-off iterate it can
-  converge to a nonzero local minimizer of the constraint infeasibility on a
-  perfectly feasible problem, and the driver then declared `INFEASIBLE`. The
-  2026-07 S2MPJ audit found 28 of the 52 falsely-INFEASIBLE problems (160
-  config-rows) restorable directly from the user's `x0` (CATENARY, CRESC4/50,
-  ELATTAR, GASOIL, HS39/87/90/91/101/102/111, MESH, ROBOT, SWOPF, TRAINH,
-  TRUSPYR1, UBH5, ...). The driver now probes a believed local-infeasibility
-  claim once with a restoration anchored at the starting point and resumes the
-  main loop when that reaches believable feasibility (CATENARY exact/dense:
-  INFEASIBLE → OPTIMAL; TRUSPYR1: INFEASIBLE → ACCEPTABLE). Genuine
-  infeasibility verdicts are unaffected — the probe simply fails there too.
-- **Restoration Levenberg–Marquardt damping control.** A rejected trial step
-  now retries with a larger damping *without* rebuilding the Jacobian and
-  Gauss-Newton normal matrix (they belong to the unchanged iterate); the outer
-  budget spent on genuinely converging runs grew 80 → 200 iterations, paid for
-  by a trailing-window progress guard that exits accept/reject limit cycles
-  near a nonzero local minimizer early. Stationarity is now tested on the
-  **projected** gradient, so an active-bound stall (MANNE-class) is recognized
-  as first-order stationary for the bound-constrained infeasibility problem
-  instead of grinding the damping to its ceiling with one Jacobian rebuild per
-  projection-swallowed trial.
-- **False "locally infeasible" verdicts on feasible problems** (S2MPJ audit:
-  52 feasible problems reported INFEASIBLE across the configs, most since
-  v8). Two changes: a local-infeasibility claim is now *vetoed* when an
-  accepted iterate already reached the verdict's own believe-threshold — a
-  diverged endgame (degenerate duals at tiny μ) is a stall at a feasible
-  problem, not evidence of infeasibility, and reports `Status.STALLED`
-  instead; and every failure status now returns the accepted iterate with
-  the lowest scaled KKT error rather than the final iteration's wreckage
-  (DEGENLPA: previously INFEASIBLE at a diverged point, now STALLED
-  returning its essentially optimal iterate, f = 3.05986 at KKT 1.7e-6).
-  The W&B eq. (16) κ_Σ dual clip was prototyped as a further cure and
-  measured on the same subset: it fixed nothing and broke CRESC4, so it was
-  deliberately not shipped (regression:
-  `tests/regression/test_false_infeasible_veto.py`).
-- **Iterative KKT solves could freeze the solver at feasible iterates with a
-  non-descent direction.** CG on an indefinite condensed operator can
-  "succeed" with a garbage direction — success is not a descent certificate —
-  and at θ = 0 the filter line search rightly rejects every ascent trial while
-  restoration is a no-op, so nothing ever changed (85 of the 126 S2MPJ v9
-  `exact/krylov` regressions, mostly `*LS` problems). A step with a
-  meaningful positive barrier-directional-derivative at a feasible iterate is
-  now treated like a failed factorization: δ_w is escalated and the system
-  re-solved until the direction is descent — the Krylov analogue of the dense
-  route's Cholesky PD-probe (Wächter & Biegler 2006, §3.1 inertia-correction
-  semantics). POWELLBSLS/SANTALS/PALMER2A now solve to the reference optima
-  on `exact/krylov` (regression:
-  `tests/regression/test_feasible_ascent_stall.py`).
-- **Non-monotone μ oracles ran away on ill-scaled problems** (found via the
-  radiotherapy example: every free-mode oracle stagnated at a huge constant μ
-  with L-BFGS, with or without correctors). Five stacked defects, each with a
-  regression test (`tests/regression/test_mu_oracle_inflation.py`):
-  the monotone reducer computed κ_μ·μ^θ_μ — which *increases* for μ ≥ 25 and
-  locked any inflated μ forever — and is now κ_μ·min(μ, μ^θ_μ), an aggressive
-  variant of Wächter & Biegler eq. (7) that keeps the historical (S2MPJ-tuned)
-  pace for μ ≤ 1 while decreasing linearly from any inflated magnitude;
-  the Mehrotra probing σ = (μ_aff/μ)³ was unguarded above 1
-  and exploded μ on a quasi-Newton affine probe (now clipped at 1); the filter
-  line search's θ-progress branch degenerated to "0 ≤ 0" at feasible iterates
-  (θ = 0) and accepted arbitrary ascent steps (W&B §2.3: only f-type/φ-decrease
-  acceptance applies there); the Mehrotra −ΔΔ corrector targets built from a
-  low-quality affine direction were unbounded (now clipped into the symmetric
-  neighbourhood [γμ, μ/γ], Colombo & Gondzio 2008); and a corrected direction
-  that loses the barrier descent property (NWW 2009 §5) is now discarded for
-  the plain centered step toward the same μ.
-- **S2MPJ benchmark: batched evaluation preserves overflow semantics.** The
-  original (and per-element) S2MPJ code raises `OverflowError` at wild
-  line-search trial points (Python-float powers via `to_scalar`), which the
-  bridge maps to a cleanly rejected trial; the vectorized batch stayed in
-  NumPy and silently returned inf/nan instead. A non-finite batched result
-  now re-evaluates that point on the per-element path, restoring exact
-  behavioral parity (regression test with an overflow-prone generated-style
-  element).
+- **The cuDSS route now actually works against a real runtime** (first hardware validation of the GPU sparse-direct path; previously it was only exercised through NumPy-backed fakes). Three defects found by running on a live cuDSS 0.7/CUDA 12 stack, each now also modeled by the fake so the CPU test suite guards them:
+  - **Dense RHS/solution descriptors were created ``ROW_MAJOR``**, which cuDSS rejects (`NOT_SUPPORTED` — it supports only column-major dense matrices). They are now ``COL_MAJOR`` over Fortran-ordered device buffers with ``ld = nrows``.
+  - **The LDLᵀ inertia was read as ``int64[2]``**, which cuDSS rejects (`INVALID_VALUE`; observed layout is ``int32[2]``). The read now tries the observed layout first and falls back to the widened one. Inertia is also reported **best-effort** through ``inertia_or_none`` (lazily, one host sync at most per factor, symmetric factors only) instead of only under ``require_inertia`` — parity with the Feral CPU adapter, so the IPM's inertia-guided δ_w correction now engages on the cuDSS route (verified on GPU: the saddle-trap QP now escapes to the minimizer).
+  - **A cuDSS runtime whose ABI does not match the nvmath-python bindings** (e.g. cuDSS 0.8 under nvmath 0.9, which is built against 0.7; nvmath's high-level API refuses the pairing, the raw bindings do not check) failed every ``matrix_create`` with `INVALID_VALUE`, which the driver's regularization ladder retried until reporting an inscrutable ``numerical_error`` at iteration 0. Creation-time rejections now degrade to the spsolve fallback instead. Additionally, **every silent degrade to CuPy spsolve now emits a ``RuntimeWarning``** (missing runtime or ABI mismatch): spsolve re-factorizes from scratch on every solve, and two real environments hit the silent fallback without noticing.
+- **The cuDSS symmetric route no longer crashes on CuPy < 14.** The compiled full-CSR → lower-triangle map (`compile_lower_triangle`) built its nnz→row ownership vector with ``xp.repeat(arange(n), diff(indptr))``; NumPy accepts array-valued repeat counts but CuPy only does from v14, so the first symmetric factorization through a real cuDSS runtime raised ``ValueError: cupy.ndaray cannot be specified as `repeats` argument.`` on older CuPy. The map is now derived with ``searchsorted`` over ``indptr`` (the same construction as the adapters' Gram row maps), which is version-independent and avoids materializing the repeat. The fake-CuPy test fixture that masked this now models the restrictive ``repeat`` semantics, and the canonical-map tests run against both a CuPy-semantics namespace stub and (GPU-gated) real CuPy.
+- **Unbounded detection requires the objective to diverge, not just ‖x‖.** The diverging-iterates test fired on the iterate norm alone, misreporting convergent problems whose iterates wander astronomically far before returning (S2MPJ KOEBHELB: ‖x‖ grows monotonically past 1e22 across ~30 iterations, then converges to f = 112 — flagged ``unbounded`` on the exact/dense and exact/sparse routes in every sweep since v5) or whose optimum is legitimately huge. "Unbounded below" means f → −∞, so `Status.UNBOUNDED` now additionally requires the objective to sit below ``−diverging_iterates_tol``. KOEBHELB exact/dense: ``unbounded`` → ``optimal`` (KKT 2.4e-9); genuinely unbounded problems (INDEF, f → −3.6e21) are detected at the same iteration as before.
+- **The Mehrotra corrector degrades gracefully when the correction hurts.** The corrected direction was accepted unconditionally, but its ``−ΔΔ`` term presumes a Newton predictor whose full step reduces complementarity — on nonconvex or quasi-Newton curvature it can instead collapse the maximal fraction-to-boundary step, leaving the solve at a convergence knife-edge (S2MPJ HS71 × ``exact/dense+mehrotra``: converged in ~10 iterations or stalled at KKT ≈ 36 depending on last-bit arithmetic across Torch builds). A corrected step that retains less than half the predictor's combined boundary step length is now discarded for the plain centered Newton step at the same μ target (the direction ``corrections="none"`` computes), falling back to the affine predictor only if that re-solve fails. The Gondzio corrector builds on the same guarded base. The HS71 ``exclude_configs`` workaround in the QC corpus is removed; the gate runs 200/200 with the corrector configs swept again.
+- **Budget exhaustion at a near-optimal iterate now reports `ACCEPTABLE`.** The driver already returns the best accepted iterate on failure statuses; when that iterate satisfies the relaxed KKT tolerances (1e2 × the optimality tolerances, IPOPT ``acceptable_tol``), `MAX_ITER`/`MAX_TIME` now report `ACCEPTABLE` like the stall and step-failure salvage paths already did — previously a run that oscillated at the acceptable level without holding it for the consecutive-iteration window read as a harsh budget failure from an essentially optimal point (S2MPJ budget-cluster audit: DIAMON2DLS at KKT 6.7e-7 reported ``max_time``).
+- **CuPy adapter no longer calls the deprecated ``ndarray.scatter_add``.** ``cupyx.scatter_add`` delegates to it and warns as of CuPy 14 (which escalates to an error under pytest's warning filter, breaking every CuPy ``from_coo`` assembly); the canonical-map scatter now uses its documented replacement ``cupy.add.at``.
+- **Restoration solves the reduced Gauss-Newton system on the free set.** With variables pinned at their bounds, the full-space GN step is dominated by the blocked components; the box projection swallowed it and the Levenberg–Marquardt loop degraded into a microscopic gradient crawl (S2MPJ DRUGDIS: θ 0.19 → 0.16 in a full 200-iteration restoration budget; UBH5 crawled through nine consecutive budgets). Bound-blocked variables (the binding set of the projected-gradient test) now have their rows/columns removed from the normal system — projected Newton on the free set (Bertsekas 1999, §2.3) — restoring the GN rate: DRUGDIS reaches θ 8e-4 and UBH5 drops 4× further per budget, box-stationary certificates arrive in seconds instead of full budgets (MESH: 300 s → 3 s), and CSFI2/DEGENLPB/ CORE2 gain converged finishes on the false-infeasible subset.
+- **Uncertified restoration stalls no longer report `INFEASIBLE`.** The feasibility restoration now distinguishes *how* it ended: only a stationarity-type exit (projected gradient ≈ 0, or no descent at the Levenberg–Marquardt damping ceiling) certifies local infeasibility (Wächter & Biegler 2006, §3.3). A trailing-window plateau or an exhausted iteration budget resumes the main loop while restoration keeps reducing the violation between stalls, spends the one-shot x0-anchored probe before giving up, and then terminates as the honest `Status.RESTORATION_FAILED` (previously never emitted) — an early window exit could relabel an out-of-budget failure as a false claim about the problem (S2MPJ: LAKES/NASH/SWOPF on the Krylov routes). On the 53-problem false-infeasible subset × 6 configs: +5 correct / +9 converged, ~16 false-INFEASIBLE rows per config relabeled, zero regressions on previously-optimal runs, and the genuinely infeasible control (BURKEHAN) still reports `INFEASIBLE` everywhere.
+- **CG breakdown on a vanished preconditioned inner product.** ``⟨r, M⁻¹r⟩`` can underflow to an exact zero with a nonzero residual on an ill-scaled problem (MGH09LS under ``preconditioner="auto"`` crashed with ``ZeroDivisionError: 0/0`` in the β update); a zero, negative or non-finite preconditioned inner product now raises ``KrylovConvergenceError`` so the driver escalates δ_w — MGH09LS lbfgs/krylov pc=auto: crash → OPTIMAL.
+- **Second-chance restoration anchored at the starting point.** Feasibility restoration is a local method: entered from a wandered-off iterate it can converge to a nonzero local minimizer of the constraint infeasibility on a perfectly feasible problem, and the driver then declared `INFEASIBLE`. The 2026-07 S2MPJ audit found 28 of the 52 falsely-INFEASIBLE problems (160 config-rows) restorable directly from the user's `x0` (CATENARY, CRESC4/50, ELATTAR, GASOIL, HS39/87/90/91/101/102/111, MESH, ROBOT, SWOPF, TRAINH, TRUSPYR1, UBH5, ...). The driver now probes a believed local-infeasibility claim once with a restoration anchored at the starting point and resumes the main loop when that reaches believable feasibility (CATENARY exact/dense: INFEASIBLE → OPTIMAL; TRUSPYR1: INFEASIBLE → ACCEPTABLE). Genuine infeasibility verdicts are unaffected — the probe simply fails there too.
+- **Restoration Levenberg–Marquardt damping control.** A rejected trial step now retries with a larger damping *without* rebuilding the Jacobian and Gauss-Newton normal matrix (they belong to the unchanged iterate); the outer budget spent on genuinely converging runs grew 80 → 200 iterations, paid for by a trailing-window progress guard that exits accept/reject limit cycles near a nonzero local minimizer early. Stationarity is now tested on the **projected** gradient, so an active-bound stall (MANNE-class) is recognized as first-order stationary for the bound-constrained infeasibility problem instead of grinding the damping to its ceiling with one Jacobian rebuild per projection-swallowed trial.
+- **False "locally infeasible" verdicts on feasible problems** (S2MPJ audit: 52 feasible problems reported INFEASIBLE across the configs, most since v8). Two changes: a local-infeasibility claim is now *vetoed* when an accepted iterate already reached the verdict's own believe-threshold — a diverged endgame (degenerate duals at tiny μ) is a stall at a feasible problem, not evidence of infeasibility, and reports `Status.STALLED` instead; and every failure status now returns the accepted iterate with the lowest scaled KKT error rather than the final iteration's wreckage (DEGENLPA: previously INFEASIBLE at a diverged point, now STALLED returning its essentially optimal iterate, f = 3.05986 at KKT 1.7e-6). The W&B eq. (16) κ_Σ dual clip was prototyped as a further cure and measured on the same subset: it fixed nothing and broke CRESC4, so it was deliberately not shipped (regression: `tests/regression/test_false_infeasible_veto.py`).
+- **Iterative KKT solves could freeze the solver at feasible iterates with a non-descent direction.** CG on an indefinite condensed operator can "succeed" with a garbage direction — success is not a descent certificate — and at θ = 0 the filter line search rightly rejects every ascent trial while restoration is a no-op, so nothing ever changed (85 of the 126 S2MPJ v9 `exact/krylov` regressions, mostly `*LS` problems). A step with a meaningful positive barrier-directional-derivative at a feasible iterate is now treated like a failed factorization: δ_w is escalated and the system re-solved until the direction is descent — the Krylov analogue of the dense route's Cholesky PD-probe (Wächter & Biegler 2006, §3.1 inertia-correction semantics). POWELLBSLS/SANTALS/PALMER2A now solve to the reference optima on `exact/krylov` (regression: `tests/regression/test_feasible_ascent_stall.py`).
+- **Non-monotone μ oracles ran away on ill-scaled problems** (found via the radiotherapy example: every free-mode oracle stagnated at a huge constant μ with L-BFGS, with or without correctors). Five stacked defects, each with a regression test (`tests/regression/test_mu_oracle_inflation.py`): the monotone reducer computed κ_μ·μ^θ_μ — which *increases* for μ ≥ 25 and locked any inflated μ forever — and is now κ_μ·min(μ, μ^θ_μ), an aggressive variant of Wächter & Biegler eq. (7) that keeps the historical (S2MPJ-tuned) pace for μ ≤ 1 while decreasing linearly from any inflated magnitude; the Mehrotra probing σ = (μ_aff/μ)³ was unguarded above 1 and exploded μ on a quasi-Newton affine probe (now clipped at 1); the filter line search's θ-progress branch degenerated to "0 ≤ 0" at feasible iterates (θ = 0) and accepted arbitrary ascent steps (W&B §2.3: only f-type/φ-decrease acceptance applies there); the Mehrotra −ΔΔ corrector targets built from a low-quality affine direction were unbounded (now clipped into the symmetric neighbourhood [γμ, μ/γ], Colombo & Gondzio 2008); and a corrected direction that loses the barrier descent property (NWW 2009 §5) is now discarded for the plain centered step toward the same μ.
+- **S2MPJ benchmark: batched evaluation preserves overflow semantics.** The original (and per-element) S2MPJ code raises `OverflowError` at wild line-search trial points (Python-float powers via `to_scalar`), which the bridge maps to a cleanly rejected trial; the vectorized batch stayed in NumPy and silently returned inf/nan instead. A non-finite batched result now re-evaluates that point on the per-element path, restoring exact behavioral parity (regression test with an overflow-prone generated-style element).
 
 ### Changed
-- **Default μ schedule stays `"monotone"`**, now by measurement: the S2MPJ v10
-  paired A/B (full CUTEst matrix, identical flags per arm) had monotone beat
-  probing on every solver/Hessian config — 3837 vs 3770 correct overall — an
-  aggressive oracle can crash μ faster than the duals converge, stalling just
-  above tolerance. `"probing"` remains a supported opt-in (it uniquely solves
-  12–18 problems per config that monotone misses). One behavioral change vs
-  the previous release survives: Mehrotra/Gondzio corrections now aim at the
-  oracle's μ, so with the monotone default they no longer imply the probing
-  σ-rule — pass `mu_schedule="probing"` alongside `corrections=` to restore
-  the old pairing.
-- **S2MPJ benchmark: precompiled Lagrangian Hessian.** The fast S2MPJ evaluator
-  (`benchmarks/corpus/_s2mpj_fast.py`) now also replaces the interpretive
-  `LgHxy` path used by the exact-Hessian sweep configs: the Hessian's COO
-  structure is compiled once per instance and each call only fills values
-  (measured ~3–70× per call, median ~10× over a 96-problem sample; e.g. the
-  ACOPP14 `exact/dense` solve drops from 1.7 s to 0.9 s with `LgHxy` gone from
-  the profile top). Verified at build time against the original `LgHxy` with
-  its own independent fallback — a Hessian-only mismatch or an oversized
-  structure keeps the fast `fx/cx` and reverts just the Hessian to the
-  original (94/96 sampled problems verify; 2 very large ones fall back by the
-  structure-size guard).
-- **S2MPJ benchmark: `cJx` fills a precompiled CSR layout.** The constraint
-  Jacobian's sparsity is fixed per instance, so its canonical CSR
-  `indices`/`indptr` and all element/linear-term scatter positions are now
-  computed once at build time; each call only fills the `data` vector (no
-  per-call `searchsorted`, no COO→CSR sort). ~2× per `cJx` call on
-  element-light problems (HS71, DTOC1L), ~20–40% on element-heavy ones.
-- **S2MPJ benchmark: per-elftype batched element evaluation.** S2MPJ's
-  generated element functions are scalar-coded (`EV_[i,0]`, `np.zeros(dim)`,
-  `self.elpar[iel_]`), so the fast evaluator now vectorizes them with a
-  mechanical AST rewrite and evaluates all same-type elements in one call per
-  type, scattering gradients through precomputed CSR slots (the objective
-  gradient becomes support-based in the same stroke). Every batched type is
-  verified numerically against its per-element original at build time and
-  demoted to the per-element path on any mismatch or unsupported construct;
-  the whole-evaluator verification against the original methods still guards
-  the composition. On a 96-problem corpus sample all 158 element types (277k
-  element occurrences) batch, with no verification fallbacks. Measured:
-  ~4–25× per `cx`/`cJx` call over the pre-batching evaluator (ACOPP14
-  1.03→0.04 ms; ~25–250× vs S2MPJ's original `evalgrsum`), ~2× per `fgx`,
-  and an element-heavy L-BFGS solve runs ~2× faster end-to-end.
-- **S2MPJ benchmark: remaining per-call hot spots batched/precomputed.**
-  Non-TRIVIAL *group* functions now batch per gftype through the same AST
-  transform + verify-or-demote pipeline (the `gL2` least-squares corpus is
-  the main beneficiary: LUKSAN11LS `fgx` 15×, DTOC1L 9×, PALMER1C 5×); the
-  bridge splits the bundled Jacobian into eq/ineq blocks with precomputed
-  signed row selectors (`P @ J` instead of per-call fancy-slicing + vstack)
-  and memoizes `(f, ∇f)` per point so a same-point objective request after a
-  gradient reuses one `fgx` evaluation; and the fast Lagrangian Hessian's
-  COO→CSR reduction (sort order + duplicate-run starts) is precomputed, so
-  per-call assembly is a gather + `np.add.reduceat` with no COO sort.
+- **Default μ schedule stays `"monotone"`**, now by measurement: the S2MPJ v10 paired A/B (full CUTEst matrix, identical flags per arm) had monotone beat probing on every solver/Hessian config — 3837 vs 3770 correct overall — an aggressive oracle can crash μ faster than the duals converge, stalling just above tolerance. `"probing"` remains a supported opt-in (it uniquely solves 12–18 problems per config that monotone misses). One behavioral change vs the previous release survives: Mehrotra/Gondzio corrections now aim at the oracle's μ, so with the monotone default they no longer imply the probing σ-rule — pass `mu_schedule="probing"` alongside `corrections=` to restore the old pairing.
+- **S2MPJ benchmark: precompiled Lagrangian Hessian.** The fast S2MPJ evaluator (`benchmarks/corpus/_s2mpj_fast.py`) now also replaces the interpretive `LgHxy` path used by the exact-Hessian sweep configs: the Hessian's COO structure is compiled once per instance and each call only fills values (measured ~3–70× per call, median ~10× over a 96-problem sample; e.g. the ACOPP14 `exact/dense` solve drops from 1.7 s to 0.9 s with `LgHxy` gone from the profile top). Verified at build time against the original `LgHxy` with its own independent fallback — a Hessian-only mismatch or an oversized structure keeps the fast `fx/cx` and reverts just the Hessian to the original (94/96 sampled problems verify; 2 very large ones fall back by the structure-size guard).
+- **S2MPJ benchmark: `cJx` fills a precompiled CSR layout.** The constraint Jacobian's sparsity is fixed per instance, so its canonical CSR `indices`/`indptr` and all element/linear-term scatter positions are now computed once at build time; each call only fills the `data` vector (no per-call `searchsorted`, no COO→CSR sort). ~2× per `cJx` call on element-light problems (HS71, DTOC1L), ~20–40% on element-heavy ones.
+- **S2MPJ benchmark: per-elftype batched element evaluation.** S2MPJ's generated element functions are scalar-coded (`EV_[i,0]`, `np.zeros(dim)`, `self.elpar[iel_]`), so the fast evaluator now vectorizes them with a mechanical AST rewrite and evaluates all same-type elements in one call per type, scattering gradients through precomputed CSR slots (the objective gradient becomes support-based in the same stroke). Every batched type is verified numerically against its per-element original at build time and demoted to the per-element path on any mismatch or unsupported construct; the whole-evaluator verification against the original methods still guards the composition. On a 96-problem corpus sample all 158 element types (277k element occurrences) batch, with no verification fallbacks. Measured: ~4–25× per `cx`/`cJx` call over the pre-batching evaluator (ACOPP14 1.03→0.04 ms; ~25–250× vs S2MPJ's original `evalgrsum`), ~2× per `fgx`, and an element-heavy L-BFGS solve runs ~2× faster end-to-end.
+- **S2MPJ benchmark: remaining per-call hot spots batched/precomputed.** Non-TRIVIAL *group* functions now batch per gftype through the same AST transform + verify-or-demote pipeline (the `gL2` least-squares corpus is the main beneficiary: LUKSAN11LS `fgx` 15×, DTOC1L 9×, PALMER1C 5×); the bridge splits the bundled Jacobian into eq/ineq blocks with precomputed signed row selectors (`P @ J` instead of per-call fancy-slicing + vstack) and memoizes `(f, ∇f)` per point so a same-point objective request after a gradient reuses one `fgx` evaluation; and the fast Lagrangian Hessian's COO→CSR reduction (sort order + duplicate-run starts) is precomputed, so per-call assembly is a gather + `np.add.reduceat` with no COO sort.
 
 ## [0.4.0] - 2026-07-05
 
 ### Added
-- **Adaptive Krylov tolerance (inexact Newton).** The matrix-free solver now drives
-  an Eisenstat–Walker forcing sequence by default: the inner solve is only as tight
-  as the current outer KKT residual demands —
-  `inner_rtol = clip(adaptive_eta · ‖KKT residual‖, rtol, adaptive_rtol_max)` — so
-  early iterations solve loosely (fast, and *robust*: an ill-conditioned initial KKT
-  system that the fixed `rtol=1e-10` could never reach — the inner CG/MINRES/GMRES
-  just fails and triggers a δ_w runaway → `numerical_error` — now yields a usable
-  step) and tighten toward `rtol` as the IPM converges. New `KrylovOptions`:
-  `adaptive_tol` (default `True`), `adaptive_eta` (`0.1`), `adaptive_rtol_max`
-  (`1e-8`, calibrated to the outer tol — a looser cap drives step-sensitive IPM
-  problems into infeasibility). Set `adaptive_tol=False` to force the fixed `rtol`.
-  The `LinearSolver` protocol gained a `set_outer_residual` hint (no-op for the
-  direct solvers). On the S2MPJ Krylov route this both *solves* problems that
-  previously errored (e.g. MRIBASIS: `numerical_error` → `optimal`) and *speeds up*
-  ones that timed out chasing 1e-10 (NET1/LAUNCH/CLNLBEAM: `max_time` → `optimal`).
-- **Unbounded-problem detection.** An IPOPT-style diverging-iterates test now reports
-  `Status.UNBOUNDED` (previously in the enum but never emitted) when `‖x‖_∞` exceeds
-  the new `Options.diverging_iterates_tol` (default `1e20`, `None` disables). An
-  unbounded-below objective drove the iterate off to infinity while the KKT residual
-  never fell and only surfaced as a misleading `numerical_error` once the runaway
-  iterate overflowed to non-finite (e.g. the CUTEst INDEF problem: objective marching
-  to `-1e155`); it is now stopped early and labelled honestly (INDEF → `unbounded` at
-  iteration 27 instead of `numerical_error` at 186).
-- Opt-in **block-Schur preconditioner** for the matrix-free Krylov route on
-  equality saddles: `KrylovOptions(preconditioner="lbfgs")` now builds the
-  block-diagonal `diag(N⁻¹, S⁻¹)` (Murphy–Golub–Wathen) on `_SaddleOperator` —
-  the L-BFGS-aware Woodbury inverse `N⁻¹` on the (1,1) block and the reciprocal
-  approximate-Schur diagonal on the (2,2) block. Because it is non-diagonal, the
-  default `cg` route switches to **GMRES** (which left-applies it) for the saddle
-  when it is available; MINRES admits only a diagonal. It clusters the saddle
-  spectrum far better than the diagonal Jacobi block and cuts iterations on
-  ill-conditioned equality-constrained systems once L-BFGS has curvature pairs.
-  Purely opt-in: the default preconditioner remains `jacobi`, so default behavior
-  is unchanged, and it degrades to Jacobi before the first curvature pair or with
-  a non-L-BFGS Hessian.
-- Adaptive **`KrylovOptions(preconditioner="auto")`** mode that self-tunes between
-  the two preconditioners: it starts on the cheap Jacobi diagonal and promotes to
-  the L-BFGS preconditioner the first time a solve struggles. Two triggers, with
-  deliberately asymmetric aggressiveness so promotion never regresses a solve:
-  a **convergence failure** is rescued by retrying the same solve with *any*
-  available L-BFGS structure (the alternative is a definite failure and δ_w
-  escalation), whereas a merely **slow success** (more than the new
-  `auto_switch_ratio` fraction, default `0.5`, of the iteration budget) promotes
-  only to the *near-exact condensed Woodbury inverse* `N⁻¹`. The approximate
-  saddle block preconditioner is never promoted speculatively — on a
-  rank-deficient equality Jacobian its approximate Schur diagonal can yield worse
-  steps than the slow-but-stable Jacobi solve (observed on the ACOPP power-flow
-  cluster). Promotion is sticky for the life of the solver instance (one IPM run),
-  so ill-conditioned systems get the stronger preconditioner while well-conditioned
-  ones never pay the per-iteration Woodbury cost. The default remains `jacobi`;
-  `auto` is opt-in.
-- The S2MPJ / CUTEst benchmark harness now scores a second **`converged`** tier
-  alongside `correct`: a case that reaches a valid KKT point (a small scaled KKT
-  residual at a success status — which already bounds primal infeasibility)
-  counts as converged regardless of *which* optimum it found, so a solve to a
-  different local minimum on a nonconvex problem is credited as genuine
-  convergence rather than a failure. `correct` (which additionally matches the
-  dataset-documented objective) is a strict subset. Both counts appear in the
-  runner summary, the per-config table, and the report header; the per-case table
-  flags a converged-but-not-`correct` case with `≈` (and a non-converged one with
-  `⚠️`). Pure benchmark/reporting change — no solver behavior is affected.
-- **Precompiled S2MPJ evaluator** (`benchmarks/corpus/_s2mpj_fast.py`): profiling
-  the S2MPJ sweep showed ~90% of solve wall-time inside `s2mpjlib`'s interpretive
-  `evalgrsum` loop (per-element `eval()` string dispatch, `lil_matrix` row
-  assembly, per-group sparse slicing of the linear term). The bridge now compiles
-  the group-partially-separable structure once per instance — element/group
-  functions resolved via `getattr`, all linear terms as one `A @ x − gconst`
-  product, Jacobians assembled as COO triplets on the precomputed support — while
-  the generated element/group math itself is untouched. It is **verified against
-  the original methods at build time** (start point + a perturbed point) and
-  falls back to them on any unsupported feature or mismatch, so a corpus oddity
-  cannot corrupt scores. Measured: 8–130× per constraint evaluation, 6–37×
-  end-to-end solves (AIRPORT 68.8 s → 1.9 s, BATCH 38.5 s → 1.7 s); many former
-  `max_time` rows now run to completion. Benchmark-side only.
-- The S2MPJ sweep runner gained **`--jobs N`**: problems fan out over worker
-  processes (each worker runs one problem's whole config matrix, keeping the
-  shared instance + verified evaluator amortized). Reports are now flushed in
-  sorted row order, so they are deterministic and diff cleanly regardless of
-  completion order; the per-problem crash-surviving flush is kept, and on a
-  worker's native crash the `.inflight` file lists the candidate culprits for
-  `--resume --exclude`.
-- Public sparse operators `COOOperator`, `CSROperator`, and `CSCOperator`
-  (exported from `ipax`), so a `Problem` can return a sparse Jacobian or Hessian
-  without a concrete sparse library in user code. They carry Array-API
-  index/value vectors and emit structure for the sparse-direct route
-  (`to_coo`/`coo_values`/`coo_pattern_signature`) in pure Array API, delegating
-  the matvec-family, diagonal, and Gram-diagonal algebra to the per-backend
-  adapter (invariant #4). Pattern reuse is opt-in via `pattern_key` (declare the
-  sparsity fixed across a solve to unlock symbolic-analysis and structure-cache
-  reuse). CSR/CSC are ergonomic constructors over the same core — the solver
-  factorizes the assembled KKT matrix, not the user block, so the compressed
-  format is a convenience, not a performance, choice. The SciPy and CuPy adapter
-  operators gained `gram_diagonal`/`row_gram_diagonal`/`rmatmat` so these
-  operators are first-class on the condensed-Jacobi and saddle-MINRES
-  preconditioner paths.
+- **Adaptive Krylov tolerance (inexact Newton).** The matrix-free solver now drives an Eisenstat–Walker forcing sequence by default: the inner solve is only as tight as the current outer KKT residual demands — `inner_rtol = clip(adaptive_eta · ‖KKT residual‖, rtol, adaptive_rtol_max)` — so early iterations solve loosely (fast, and *robust*: an ill-conditioned initial KKT system that the fixed `rtol=1e-10` could never reach — the inner CG/MINRES/GMRES just fails and triggers a δ_w runaway → `numerical_error` — now yields a usable step) and tighten toward `rtol` as the IPM converges. New `KrylovOptions`: `adaptive_tol` (default `True`), `adaptive_eta` (`0.1`), `adaptive_rtol_max` (`1e-8`, calibrated to the outer tol — a looser cap drives step-sensitive IPM problems into infeasibility). Set `adaptive_tol=False` to force the fixed `rtol`. The `LinearSolver` protocol gained a `set_outer_residual` hint (no-op for the direct solvers). On the S2MPJ Krylov route this both *solves* problems that previously errored (e.g. MRIBASIS: `numerical_error` → `optimal`) and *speeds up* ones that timed out chasing 1e-10 (NET1/LAUNCH/CLNLBEAM: `max_time` → `optimal`).
+- **Unbounded-problem detection.** An IPOPT-style diverging-iterates test now reports `Status.UNBOUNDED` (previously in the enum but never emitted) when `‖x‖_∞` exceeds the new `Options.diverging_iterates_tol` (default `1e20`, `None` disables). An unbounded-below objective drove the iterate off to infinity while the KKT residual never fell and only surfaced as a misleading `numerical_error` once the runaway iterate overflowed to non-finite (e.g. the CUTEst INDEF problem: objective marching to `-1e155`); it is now stopped early and labelled honestly (INDEF → `unbounded` at iteration 27 instead of `numerical_error` at 186).
+- Opt-in **block-Schur preconditioner** for the matrix-free Krylov route on equality saddles: `KrylovOptions(preconditioner="lbfgs")` now builds the block-diagonal `diag(N⁻¹, S⁻¹)` (Murphy–Golub–Wathen) on `_SaddleOperator` — the L-BFGS-aware Woodbury inverse `N⁻¹` on the (1,1) block and the reciprocal approximate-Schur diagonal on the (2,2) block. Because it is non-diagonal, the default `cg` route switches to **GMRES** (which left-applies it) for the saddle when it is available; MINRES admits only a diagonal. It clusters the saddle spectrum far better than the diagonal Jacobi block and cuts iterations on ill-conditioned equality-constrained systems once L-BFGS has curvature pairs. Purely opt-in: the default preconditioner remains `jacobi`, so default behavior is unchanged, and it degrades to Jacobi before the first curvature pair or with a non-L-BFGS Hessian.
+- Adaptive **`KrylovOptions(preconditioner="auto")`** mode that self-tunes between the two preconditioners: it starts on the cheap Jacobi diagonal and promotes to the L-BFGS preconditioner the first time a solve struggles. Two triggers, with deliberately asymmetric aggressiveness so promotion never regresses a solve: a **convergence failure** is rescued by retrying the same solve with *any* available L-BFGS structure (the alternative is a definite failure and δ_w escalation), whereas a merely **slow success** (more than the new `auto_switch_ratio` fraction, default `0.5`, of the iteration budget) promotes only to the *near-exact condensed Woodbury inverse* `N⁻¹`. The approximate saddle block preconditioner is never promoted speculatively — on a rank-deficient equality Jacobian its approximate Schur diagonal can yield worse steps than the slow-but-stable Jacobi solve (observed on the ACOPP power-flow cluster). Promotion is sticky for the life of the solver instance (one IPM run), so ill-conditioned systems get the stronger preconditioner while well-conditioned ones never pay the per-iteration Woodbury cost. The default remains `jacobi`; `auto` is opt-in.
+- The S2MPJ / CUTEst benchmark harness now scores a second **`converged`** tier alongside `correct`: a case that reaches a valid KKT point (a small scaled KKT residual at a success status — which already bounds primal infeasibility) counts as converged regardless of *which* optimum it found, so a solve to a different local minimum on a nonconvex problem is credited as genuine convergence rather than a failure. `correct` (which additionally matches the dataset-documented objective) is a strict subset. Both counts appear in the runner summary, the per-config table, and the report header; the per-case table flags a converged-but-not-`correct` case with `≈` (and a non-converged one with `⚠️`). Pure benchmark/reporting change — no solver behavior is affected.
+- **Precompiled S2MPJ evaluator** (`benchmarks/corpus/_s2mpj_fast.py`): profiling the S2MPJ sweep showed ~90% of solve wall-time inside `s2mpjlib`'s interpretive `evalgrsum` loop (per-element `eval()` string dispatch, `lil_matrix` row assembly, per-group sparse slicing of the linear term). The bridge now compiles the group-partially-separable structure once per instance — element/group functions resolved via `getattr`, all linear terms as one `A @ x − gconst` product, Jacobians assembled as COO triplets on the precomputed support — while the generated element/group math itself is untouched. It is **verified against the original methods at build time** (start point + a perturbed point) and falls back to them on any unsupported feature or mismatch, so a corpus oddity cannot corrupt scores. Measured: 8–130× per constraint evaluation, 6–37× end-to-end solves (AIRPORT 68.8 s → 1.9 s, BATCH 38.5 s → 1.7 s); many former `max_time` rows now run to completion. Benchmark-side only.
+- The S2MPJ sweep runner gained **`--jobs N`**: problems fan out over worker processes (each worker runs one problem's whole config matrix, keeping the shared instance + verified evaluator amortized). Reports are now flushed in sorted row order, so they are deterministic and diff cleanly regardless of completion order; the per-problem crash-surviving flush is kept, and on a worker's native crash the `.inflight` file lists the candidate culprits for `--resume --exclude`.
+- Public sparse operators `COOOperator`, `CSROperator`, and `CSCOperator` (exported from `ipax`), so a `Problem` can return a sparse Jacobian or Hessian without a concrete sparse library in user code. They carry Array-API index/value vectors and emit structure for the sparse-direct route (`to_coo`/`coo_values`/`coo_pattern_signature`) in pure Array API, delegating the matvec-family, diagonal, and Gram-diagonal algebra to the per-backend adapter (invariant #4). Pattern reuse is opt-in via `pattern_key` (declare the sparsity fixed across a solve to unlock symbolic-analysis and structure-cache reuse). CSR/CSC are ergonomic constructors over the same core — the solver factorizes the assembled KKT matrix, not the user block, so the compressed format is a convenience, not a performance, choice. The SciPy and CuPy adapter operators gained `gram_diagonal`/`row_gram_diagonal`/`rmatmat` so these operators are first-class on the condensed-Jacobi and saddle-MINRES preconditioner paths.
 
 ### Changed
-- **Acceptable-level termination is now enabled by default** (IPOPT convention:
-  `acceptable_tol = 1e-6` — 1e2 × the optimality tolerance — held for
-  `acceptable_iter = 15` consecutive iterations). The mechanism existed
-  (`AcceptableStoppingOptions`, `Status.ACCEPTABLE`) but every tolerance defaulted
-  to `None`, so a solve whose achievable KKT floor sits between 1e-8 and 1e-6 —
-  degenerate optima, ill-conditioned least squares — ground thousands of
-  iterations into `max_iter`/`max_time` at an essentially optimal point (v6 S2MPJ
-  sweep: PALMER1A spent 300 s at kkt 4.2e-8; it now stops ACCEPTABLE at the same
-  point in 1.2 s). New defaults: `dual_inf_tol = constr_viol_tol = compl_inf_tol
-  = 1e-6`, `n_iter = 15`; set all three to `None` to restore the old
-  grind-to-the-cap behavior.
-- Cheaper S2MPJ exact-Hessian bridge: under gradient-based scaling (`σ = s_f ≠ 1`)
-  the bridge assembled `σ∇²f + Σ y∇²c` with **two** `LgHxy` calls (one for the
-  `(σ−1)∇²f` correction); it now folds the scaling into the multipliers via
-  `σ·LgHxy(x, Y/σ)` for `σ > 0` — one interpretive Hessian assembly instead of
-  two. The bridge also seeds its constraint-value memo from `cJx`'s returned
-  `c(x)`, so the driver's same-point value requests after a Jacobian evaluation
-  skip a full `cx` call. Benchmark-side only.
-- Faster dense KKT solve: the condensed, saddle, and L-BFGS Hessian operators now
-  implement native batched `matmat`/`rmatmat` (and `rmatmat` is available across the
-  `LinearOperator` subclasses), so materializing the operator for the dense route
-  pushes the whole identity through each sub-block once instead of looping
-  `matvec` column-by-column — far fewer kernel launches at scale. The Cholesky
-  positive-definite guard also reuses the already-materialized matrix instead of
-  re-forming the primal block. Bound-only L-BFGS dense solves now use an exact
-  Woodbury compact solve (and equality saddles use the corresponding Schur
-  complement) before falling back to full materialization. Explicit operators now
-  expose a `dense_matrix` hook, so the fallback dense route can assemble exact
-  dense/saddle blocks directly instead of probing with an identity matmul; the
-  materialized matrix is cached across repeated `solve()` calls after `factor()`,
-  and diagonal exact-Hessian bound-only systems use a direct diagonal solve.
-- Faster sparse-direct KKT solves: explicit operators and KKT assemblers now
-  expose conservative `coo_pattern_signature()` metadata, letting sparse adapters
-  split stable structure from per-iteration values. The CuPy/cuDSS route reuses
-  symbolic analysis with `matrix_set_values` for same-pattern factors instead of
-  comparing GPU CSR index arrays, while unknown/value-dependent exact-Hessian
-  patterns still force re-analysis. Condensed and equality-saddle regularization
-  diagonals are reserved so `delta_w`/`delta_c` activation changes values rather
-  than sparsity, and the sparse facade guards cached adapters against backend or
-  device changes.
-- Faster sparse assembly (values-only refactor): the SciPy and CuPy sparse
-  adapters now compile the COO→canonical-CSR/CSC transform once per fixed
-  `pattern_signature` into a gather/segment-sum map, then recompute only the value
-  array on subsequent factorizations — replacing the per-iteration
-  `coo_matrix(...).tocsc()` / `tocsr().sum_duplicates().sort_indices()` sort
-  (`O(nnz log nnz)`, never amortized by the factorization's symbolic reuse) with a
-  single `O(nnz)` scatter-add. The cuDSS symmetric route likewise caches its
-  full-CSR→lower-triangle map instead of re-running `tril(...)` plus a
-  re-canonicalization each iteration, and the device-routing adapter (Torch/JAX)
-  now persists its delegate so the cache survives across iterations. The cuDSS
-  route also uploads int32 CSR offsets/indices when the system fits a signed
-  32-bit integer (halving index bandwidth), falling back to int64 otherwise.
-- Faster sparse assembly (cached COO structure): `LinearOperator` gained an
-  optional `coo_values()` hook (the values-only counterpart of `to_coo()`), and
-  the condensed/saddle KKT blocks plus `Dense`/`Diagonal`/`Identity`/`VStack`
-  implement it. The `SparseDirectSolver` facade now caches the COO row/column
-  vectors keyed on `coo_pattern_signature` and recomputes only the values each
-  iteration, so the per-step assembly skips rebuilding the index vectors — most
-  notably the L-BFGS low-rank border's `O(n·m)` index grids — on a fixed pattern.
-- Faster cuDSS solves (descriptor reuse): the cuDSS dense RHS/solution
-  descriptors and their device buffers are now created once and reused across
-  solves and the factorization phase (rebuilt only when the system size changes),
-  replacing the per-solve `matrix_create_dn`/`matrix_destroy` churn with a buffer
-  copy.
-- `Options.hessian` now defaults to `"auto"` (use a supplied analytic
-  `lagrangian_hessian`, else L-BFGS). The default behavior is unchanged, but the
-  explicit modes are now honored literally even when an analytic Hessian exists:
-  `"lbfgs"` always uses the limited-memory approximation and `"autodiff-hvp"`
-  always uses autodiff Hessian-vector products. Previously a supplied
-  `lagrangian_hessian` silently overrode `hessian="lbfgs"`, so the L-BFGS route
-  could not be exercised on a problem that also defined an exact Hessian.
+- **Acceptable-level termination is now enabled by default** (IPOPT convention: `acceptable_tol = 1e-6` — 1e2 × the optimality tolerance — held for `acceptable_iter = 15` consecutive iterations). The mechanism existed (`AcceptableStoppingOptions`, `Status.ACCEPTABLE`) but every tolerance defaulted to `None`, so a solve whose achievable KKT floor sits between 1e-8 and 1e-6 — degenerate optima, ill-conditioned least squares — ground thousands of iterations into `max_iter`/`max_time` at an essentially optimal point (v6 S2MPJ sweep: PALMER1A spent 300 s at kkt 4.2e-8; it now stops ACCEPTABLE at the same point in 1.2 s). New defaults: `dual_inf_tol = constr_viol_tol = compl_inf_tol = 1e-6`, `n_iter = 15`; set all three to `None` to restore the old grind-to-the-cap behavior.
+- Cheaper S2MPJ exact-Hessian bridge: under gradient-based scaling (`σ = s_f ≠ 1`) the bridge assembled `σ∇²f + Σ y∇²c` with **two** `LgHxy` calls (one for the `(σ−1)∇²f` correction); it now folds the scaling into the multipliers via `σ·LgHxy(x, Y/σ)` for `σ > 0` — one interpretive Hessian assembly instead of two. The bridge also seeds its constraint-value memo from `cJx`'s returned `c(x)`, so the driver's same-point value requests after a Jacobian evaluation skip a full `cx` call. Benchmark-side only.
+- Faster dense KKT solve: the condensed, saddle, and L-BFGS Hessian operators now implement native batched `matmat`/`rmatmat` (and `rmatmat` is available across the `LinearOperator` subclasses), so materializing the operator for the dense route pushes the whole identity through each sub-block once instead of looping `matvec` column-by-column — far fewer kernel launches at scale. The Cholesky positive-definite guard also reuses the already-materialized matrix instead of re-forming the primal block. Bound-only L-BFGS dense solves now use an exact Woodbury compact solve (and equality saddles use the corresponding Schur complement) before falling back to full materialization. Explicit operators now expose a `dense_matrix` hook, so the fallback dense route can assemble exact dense/saddle blocks directly instead of probing with an identity matmul; the materialized matrix is cached across repeated `solve()` calls after `factor()`, and diagonal exact-Hessian bound-only systems use a direct diagonal solve.
+- Faster sparse-direct KKT solves: explicit operators and KKT assemblers now expose conservative `coo_pattern_signature()` metadata, letting sparse adapters split stable structure from per-iteration values. The CuPy/cuDSS route reuses symbolic analysis with `matrix_set_values` for same-pattern factors instead of comparing GPU CSR index arrays, while unknown/value-dependent exact-Hessian patterns still force re-analysis. Condensed and equality-saddle regularization diagonals are reserved so `delta_w`/`delta_c` activation changes values rather than sparsity, and the sparse facade guards cached adapters against backend or device changes.
+- Faster sparse assembly (values-only refactor): the SciPy and CuPy sparse adapters now compile the COO→canonical-CSR/CSC transform once per fixed `pattern_signature` into a gather/segment-sum map, then recompute only the value array on subsequent factorizations — replacing the per-iteration `coo_matrix(...).tocsc()` / `tocsr().sum_duplicates().sort_indices()` sort (`O(nnz log nnz)`, never amortized by the factorization's symbolic reuse) with a single `O(nnz)` scatter-add. The cuDSS symmetric route likewise caches its full-CSR→lower-triangle map instead of re-running `tril(...)` plus a re-canonicalization each iteration, and the device-routing adapter (Torch/JAX) now persists its delegate so the cache survives across iterations. The cuDSS route also uploads int32 CSR offsets/indices when the system fits a signed 32-bit integer (halving index bandwidth), falling back to int64 otherwise.
+- Faster sparse assembly (cached COO structure): `LinearOperator` gained an optional `coo_values()` hook (the values-only counterpart of `to_coo()`), and the condensed/saddle KKT blocks plus `Dense`/`Diagonal`/`Identity`/`VStack` implement it. The `SparseDirectSolver` facade now caches the COO row/column vectors keyed on `coo_pattern_signature` and recomputes only the values each iteration, so the per-step assembly skips rebuilding the index vectors — most notably the L-BFGS low-rank border's `O(n·m)` index grids — on a fixed pattern.
+- Faster cuDSS solves (descriptor reuse): the cuDSS dense RHS/solution descriptors and their device buffers are now created once and reused across solves and the factorization phase (rebuilt only when the system size changes), replacing the per-solve `matrix_create_dn`/`matrix_destroy` churn with a buffer copy.
+- `Options.hessian` now defaults to `"auto"` (use a supplied analytic `lagrangian_hessian`, else L-BFGS). The default behavior is unchanged, but the explicit modes are now honored literally even when an analytic Hessian exists: `"lbfgs"` always uses the limited-memory approximation and `"autodiff-hvp"` always uses autodiff Hessian-vector products. Previously a supplied `lagrangian_hessian` silently overrode `hessian="lbfgs"`, so the L-BFGS route could not be exercised on a problem that also defined an exact Hessian.
 
 ### Removed
-- The unimplemented `"lsr1"` value of `Options.hessian`. It was never wired to a
-  solver path — selecting it silently ran L-BFGS (or the analytic Hessian) — so
-  it is dropped rather than left as a false promise. A limited-memory SR1 update
-  remains possible future work but requires the indefinite augmented/inertia route
-  (its indefinite approximation is incompatible with the condensed route's
-  PD-by-Powell-damping design); see the note in `ipax/ipm/hessian.py`.
+- The unimplemented `"lsr1"` value of `Options.hessian`. It was never wired to a solver path — selecting it silently ran L-BFGS (or the analytic Hessian) — so it is dropped rather than left as a false promise. A limited-memory SR1 update remains possible future work but requires the indefinite augmented/inertia route (its indefinite approximation is incompatible with the condensed route's PD-by-Powell-damping design); see the note in `ipax/ipm/hessian.py`.
 
 ### Fixed
-- **δ_c escalation no longer contaminates a pure-δ_w repair** (regression in the
-  rank-deficient-∇c fix, caught by the v6 S2MPJ sweep: HS61 went from optimal at
-  kkt 1e-14 in 12 iterations to cycling at kkt ~1e3 until `max_time`). Exploded
-  equality multipliers can leave ~1e8–1e9 negative curvature in the primal block;
-  that is repaired by δ_w *alone* (HS61: δ_w = 2.3e9), and the resulting dual step
-  is exactly what heals the multipliers. With `delta_c_trigger = 1e4`, δ_c grew
-  alongside δ_w during that climb, so the eventually-successful factorization
-  carried a meaningful δ_c whose relaxed dual step never repaired the multipliers.
-  The regularization ladder is now **two-phase**: phase 1 escalates δ_w alone
-  (`delta_c_trigger` default raised 1e4 → 1e10, above any legitimate primal
-  repair); only when that ladder is exhausted is the failure attributed to a
-  singular dual block, and phase 2 then *resets δ_w to its floor* and escalates
-  (small δ_w, growing δ_c) together — a huge leftover δ_w would poison the very
-  solve δ_c is meant to rescue. The rank-deficient motivations are preserved and
-  improved: ACOPP14 now reaches OPTIMAL in ~15 iterations on the exact routes
-  (the phase-2 steps carry a small δ_w instead of ≥1e4), and BT1/DISC2 stay
-  optimal. Regression test: HS61 (gated) alongside the existing BT1/DISC2 case.
-- **Matrix-free MINRES failures on equality saddles now fall back to GMRES** instead
-  of surfacing as `numerical_error`. On the default `method="cg"` route an equality
-  saddle is solved with MINRES, which is fragile on ill-conditioned indefinite
-  saddles: it can return a garbage/non-finite step at iteration 1, which the driver
-  answers with an unbounded (and, on the iterative route, counterproductive) `δ_w`
-  escalation to `1e40` → `numerical_error` on step 1. GMRES — minimizing the true
-  residual with restarts — is markedly more robust here, and because the SPD
-  *diagonal* (incl. the approximate-Schur dual block) actively hurts GMRES on these
-  saddles, the fallback runs **unpreconditioned**. Recovers a large slice of the
-  S2MPJ optimal-control cluster on the Krylov route (HAGER*/DTOC*/CATENARY:
-  `numerical_error` → `optimal`). An explicit `method="minres"` is honored verbatim
-  (no fallback); the default `cg` route gets it automatically.
-- **`preconditioner="auto"` no longer regresses equality-constrained saddles.** The
-  failure-rescue trigger previously promoted a struggling saddle solve to the
-  *approximate* block preconditioner, whose approximate Schur diagonal can diverge a
-  solve plain Jacobi handles (S2MPJ HS109/CLNLBEAM/DISC2/EIGMAXA turned `optimal` →
-  `numerical_error` under auto). Auto now only ever promotes to the **near-exact
-  condensed Woodbury inverse** (equality-free) under *either* trigger — never the
-  saddle block — so it is `≡ jacobi` on saddles (zero regressions) while keeping the
-  equality-free acceleration. Saddle robustness is the GMRES fallback's job above;
-  the block preconditioner stays reachable via explicit `preconditioner="lbfgs"`.
-- The KKT-solve regularization loop now escalates the **dual regularization `δ_c`**
-  alongside `δ_w` on a failed saddle solve. `δ_w` regularizes only the (1,1)
-  primal block, so a **rank-deficient equality Jacobian** — e.g. AC optimal
-  power-flow's reference-bus degeneracy — left the bordered saddle singular in the
-  (2,2) dual block, and the solver escalated `δ_w` to `1e27` uselessly (into
-  numerical singularity) before reporting `numerical_error` at iteration 1. `δ_c`
-  now grows (capped by `RegularizationOptions.delta_c_max`, default `1e-1`) within
-  the failing solve and resets on the next step (Wächter & Biegler 2006, §3.1).
-  This unsticks the S2MPJ lbfgs/krylov `numerical_error` cluster (ACOPP*/ACOPR*
-  now make progress instead of dying on step 1) and fixes solves with redundant /
-  linearly-dependent equality constraints on every route. `δ_c` escalation is a
-  **last resort**, gated on `δ_w` first growing past `delta_c_trigger` (default
-  `1e4`): a rank-deficient `∇c` leaves `δ_w` running to its ceiling uselessly (only
-  `δ_c` repairs the (2,2) block), whereas an ordinary indefinite (1,1) block is
-  fixed by a *small* `δ_w`. Escalating `δ_c` while `δ_w` is still small perturbs the
-  (2,2) block needlessly and — on the inertia route — changes the very inertia the
-  check tests against, which diverged well-conditioned equality problems (e.g.
-  BT1/DISC2/FLETCHER on the exact routes). The trigger keeps `δ_c` away from them
-  while still activating for the genuinely rank-deficient case.
-- The filter line search no longer diverges (and falsely reports `infeasible`) on
-  problems where a quasi-Newton step's barrier objective collapses while the
-  constraint violation explodes. The filter is now initialized with the
-  Wächter & Biegler 2006 eq. (18) guard region `{θ ≥ θ_max}`,
-  `θ_max = 1e4·max(1, θ(x₀))`, so a trial with non-finite or wildly large `θ` is
-  rejected outright before the switching/Armijo test (surfaced by the L-BFGS route
-  on Hock-Schittkowski HS7 in the S2MPJ sweep).
-- The sparse-direct route no longer aborts the whole solve with an uncaught
-  `ValueError` when an upstream Hessian/Jacobian overflows to inf/NaN at a bad
-  trial iterate. The sparse adapter now rejects a non-finite KKT matrix with a
-  `LinearSolveError`, which the IPM regularization loop already handles (δ_w
-  escalation, then a graceful step-failure classification) — matching the dense
-  route. This clears the S2MPJ sweep's `solve_error` cluster (EIGMAXA, EIGMINA,
-  LUKVLE8, MESH, BRATU1D, RAT42LS, RAT43, INDEF); several now converge to an
-  `optimal`/`acceptable` point once the failed factorization is recovered instead
-  of crashing.
-- Two robustness guards for problems whose element functions overflow (exp /
-  rational terms evaluated far outside their safe range), which previously drove
-  the L-BFGS route to a `numerical_error` on the S2MPJ sweep:
-  - The L-BFGS update now drops a **non-finite curvature pair** instead of
-    appending it. A non-finite gradient difference `γ = grad L(x+) - grad L(x)`
-    would otherwise corrupt the compact form permanently (the poisoned column
-    survives the memory window, and the Powell/positive-curvature safeguards miss
-    it because the curvature `δ·γ` is then NaN).
-  - The filter line search now rejects a trial whose **barrier objective `φ_t` is
-    non-finite** (not only non-finite `θ_t`). A step that overshoots into a region
-    where the objective evaluates to `-inf` would otherwise pass the Armijo test
-    (`-inf` is below any finite bound) instead of backtracking to a finite iterate.
-- The L-BFGS route now recovers from a step that overshoots into a region where
-  the **objective gradient is non-finite** while `θ`/`φ` are still finite (e.g.
-  RAT42LS's logistic, whose residual stays finite while its derivative becomes
-  `inf/inf = NaN`). The filter line search evaluates only `θ`/`φ`, so it accepted
-  such a step and the next KKT solve was poisoned (`numerical_error`). A
-  `grad_finite(α)` check is now threaded into the line search on the L-BFGS route:
-  a non-finite-gradient trial is unacceptable, so the search backtracks to a
-  damped step in the finite region (handing off to restoration only if the whole
-  ray is bad). Moves RAT42LS from `numerical_error` to `optimal` on the sparse
-  route. The exact-Hessian route, whose scaled steps do not overshoot, skips the
-  extra gradient evaluation.
-- The GMRES fallback no longer crashes with a raw `ZeroDivisionError` on a
-  **singular KKT system** (QC gate: HS9 with `hessian="exact", linsolve="krylov"`
-  from the standard start, where the exact Lagrangian Hessian is identically zero
-  so the first condensed (1,1) block is the zero operator). When the operator
-  image of a basis vector vanishes after orthogonalization, the rotated
-  Hessenberg diagonal is exactly zero; the back-substitution now takes the
-  minimal-norm choice for that rank-deficient column and lets the true-residual
-  check raise the controlled `KrylovConvergenceError`, so the driver escalates
-  δ_w and recovers (HS9: OPTIMAL in 5 iterations). The Jacobi preconditioner
-  build also skips its `1/diag(N)` divide-by-zero warning for a non-positive
-  primal diagonal it was going to discard anyway.
-- The solver no longer reports a **feasible iterate as `infeasible`**. Feasibility
-  restoration can stall a hair above its own (differently scaled) tolerance at a
-  point that is feasible by the driver's constraint-violation metric — a
-  degenerate optimum where constraint qualification fails (HS13), or a limit cycle
-  that keeps re-reaching feasibility (HS56) — and then declared local
-  infeasibility, which contradicts the point being feasible. The restoration
-  verdict is now believed only when the restored iterate's violation genuinely
-  exceeds the constraint-violation tolerance (by `1e3×`, far below any
-  bounded-away-from-zero infeasible stationary point); otherwise the main
-  iteration resumes from the feasible point. This clears the false `infeasible`
-  on HS13/HS56/HS72/HS102 in the S2MPJ sweep — several now converge to the true
-  optimum once the limit cycle is broken — while genuinely-infeasible problems
-  (e.g. `BURKEHAN`) are still detected.
+- **δ_c escalation no longer contaminates a pure-δ_w repair** (regression in the rank-deficient-∇c fix, caught by the v6 S2MPJ sweep: HS61 went from optimal at kkt 1e-14 in 12 iterations to cycling at kkt ~1e3 until `max_time`). Exploded equality multipliers can leave ~1e8–1e9 negative curvature in the primal block; that is repaired by δ_w *alone* (HS61: δ_w = 2.3e9), and the resulting dual step is exactly what heals the multipliers. With `delta_c_trigger = 1e4`, δ_c grew alongside δ_w during that climb, so the eventually-successful factorization carried a meaningful δ_c whose relaxed dual step never repaired the multipliers. The regularization ladder is now **two-phase**: phase 1 escalates δ_w alone (`delta_c_trigger` default raised 1e4 → 1e10, above any legitimate primal repair); only when that ladder is exhausted is the failure attributed to a singular dual block, and phase 2 then *resets δ_w to its floor* and escalates (small δ_w, growing δ_c) together — a huge leftover δ_w would poison the very solve δ_c is meant to rescue. The rank-deficient motivations are preserved and improved: ACOPP14 now reaches OPTIMAL in ~15 iterations on the exact routes (the phase-2 steps carry a small δ_w instead of ≥1e4), and BT1/DISC2 stay optimal. Regression test: HS61 (gated) alongside the existing BT1/DISC2 case.
+- **Matrix-free MINRES failures on equality saddles now fall back to GMRES** instead of surfacing as `numerical_error`. On the default `method="cg"` route an equality saddle is solved with MINRES, which is fragile on ill-conditioned indefinite saddles: it can return a garbage/non-finite step at iteration 1, which the driver answers with an unbounded (and, on the iterative route, counterproductive) `δ_w` escalation to `1e40` → `numerical_error` on step 1. GMRES — minimizing the true residual with restarts — is markedly more robust here, and because the SPD *diagonal* (incl. the approximate-Schur dual block) actively hurts GMRES on these saddles, the fallback runs **unpreconditioned**. Recovers a large slice of the S2MPJ optimal-control cluster on the Krylov route (HAGER*/DTOC*/CATENARY: `numerical_error` → `optimal`). An explicit `method="minres"` is honored verbatim (no fallback); the default `cg` route gets it automatically.
+- **`preconditioner="auto"` no longer regresses equality-constrained saddles.** The failure-rescue trigger previously promoted a struggling saddle solve to the *approximate* block preconditioner, whose approximate Schur diagonal can diverge a solve plain Jacobi handles (S2MPJ HS109/CLNLBEAM/DISC2/EIGMAXA turned `optimal` → `numerical_error` under auto). Auto now only ever promotes to the **near-exact condensed Woodbury inverse** (equality-free) under *either* trigger — never the saddle block — so it is `≡ jacobi` on saddles (zero regressions) while keeping the equality-free acceleration. Saddle robustness is the GMRES fallback's job above; the block preconditioner stays reachable via explicit `preconditioner="lbfgs"`.
+- The KKT-solve regularization loop now escalates the **dual regularization `δ_c`** alongside `δ_w` on a failed saddle solve. `δ_w` regularizes only the (1,1) primal block, so a **rank-deficient equality Jacobian** — e.g. AC optimal power-flow's reference-bus degeneracy — left the bordered saddle singular in the (2,2) dual block, and the solver escalated `δ_w` to `1e27` uselessly (into numerical singularity) before reporting `numerical_error` at iteration 1. `δ_c` now grows (capped by `RegularizationOptions.delta_c_max`, default `1e-1`) within the failing solve and resets on the next step (Wächter & Biegler 2006, §3.1). This unsticks the S2MPJ lbfgs/krylov `numerical_error` cluster (ACOPP*/ACOPR* now make progress instead of dying on step 1) and fixes solves with redundant / linearly-dependent equality constraints on every route. `δ_c` escalation is a **last resort**, gated on `δ_w` first growing past `delta_c_trigger` (default `1e4`): a rank-deficient `∇c` leaves `δ_w` running to its ceiling uselessly (only `δ_c` repairs the (2,2) block), whereas an ordinary indefinite (1,1) block is fixed by a *small* `δ_w`. Escalating `δ_c` while `δ_w` is still small perturbs the (2,2) block needlessly and — on the inertia route — changes the very inertia the check tests against, which diverged well-conditioned equality problems (e.g. BT1/DISC2/FLETCHER on the exact routes). The trigger keeps `δ_c` away from them while still activating for the genuinely rank-deficient case.
+- The filter line search no longer diverges (and falsely reports `infeasible`) on problems where a quasi-Newton step's barrier objective collapses while the constraint violation explodes. The filter is now initialized with the Wächter & Biegler 2006 eq. (18) guard region `{θ ≥ θ_max}`, `θ_max = 1e4·max(1, θ(x₀))`, so a trial with non-finite or wildly large `θ` is rejected outright before the switching/Armijo test (surfaced by the L-BFGS route on Hock-Schittkowski HS7 in the S2MPJ sweep).
+- The sparse-direct route no longer aborts the whole solve with an uncaught `ValueError` when an upstream Hessian/Jacobian overflows to inf/NaN at a bad trial iterate. The sparse adapter now rejects a non-finite KKT matrix with a `LinearSolveError`, which the IPM regularization loop already handles (δ_w escalation, then a graceful step-failure classification) — matching the dense route. This clears the S2MPJ sweep's `solve_error` cluster (EIGMAXA, EIGMINA, LUKVLE8, MESH, BRATU1D, RAT42LS, RAT43, INDEF); several now converge to an `optimal`/`acceptable` point once the failed factorization is recovered instead of crashing.
+- Two robustness guards for problems whose element functions overflow (exp / rational terms evaluated far outside their safe range), which previously drove the L-BFGS route to a `numerical_error` on the S2MPJ sweep:
+  - The L-BFGS update now drops a **non-finite curvature pair** instead of appending it. A non-finite gradient difference `γ = grad L(x+) - grad L(x)` would otherwise corrupt the compact form permanently (the poisoned column survives the memory window, and the Powell/positive-curvature safeguards miss it because the curvature `δ·γ` is then NaN).
+  - The filter line search now rejects a trial whose **barrier objective `φ_t` is non-finite** (not only non-finite `θ_t`). A step that overshoots into a region where the objective evaluates to `-inf` would otherwise pass the Armijo test (`-inf` is below any finite bound) instead of backtracking to a finite iterate.
+- The L-BFGS route now recovers from a step that overshoots into a region where the **objective gradient is non-finite** while `θ`/`φ` are still finite (e.g. RAT42LS's logistic, whose residual stays finite while its derivative becomes `inf/inf = NaN`). The filter line search evaluates only `θ`/`φ`, so it accepted such a step and the next KKT solve was poisoned (`numerical_error`). A `grad_finite(α)` check is now threaded into the line search on the L-BFGS route: a non-finite-gradient trial is unacceptable, so the search backtracks to a damped step in the finite region (handing off to restoration only if the whole ray is bad). Moves RAT42LS from `numerical_error` to `optimal` on the sparse route. The exact-Hessian route, whose scaled steps do not overshoot, skips the extra gradient evaluation.
+- The GMRES fallback no longer crashes with a raw `ZeroDivisionError` on a **singular KKT system** (QC gate: HS9 with `hessian="exact", linsolve="krylov"` from the standard start, where the exact Lagrangian Hessian is identically zero so the first condensed (1,1) block is the zero operator). When the operator image of a basis vector vanishes after orthogonalization, the rotated Hessenberg diagonal is exactly zero; the back-substitution now takes the minimal-norm choice for that rank-deficient column and lets the true-residual check raise the controlled `KrylovConvergenceError`, so the driver escalates δ_w and recovers (HS9: OPTIMAL in 5 iterations). The Jacobi preconditioner build also skips its `1/diag(N)` divide-by-zero warning for a non-positive primal diagonal it was going to discard anyway.
+- The solver no longer reports a **feasible iterate as `infeasible`**. Feasibility restoration can stall a hair above its own (differently scaled) tolerance at a point that is feasible by the driver's constraint-violation metric — a degenerate optimum where constraint qualification fails (HS13), or a limit cycle that keeps re-reaching feasibility (HS56) — and then declared local infeasibility, which contradicts the point being feasible. The restoration verdict is now believed only when the restored iterate's violation genuinely exceeds the constraint-violation tolerance (by `1e3×`, far below any bounded-away-from-zero infeasible stationary point); otherwise the main iteration resumes from the feasible point. This clears the false `infeasible` on HS13/HS56/HS72/HS102 in the S2MPJ sweep — several now converge to the true optimum once the limit cycle is broken — while genuinely-infeasible problems (e.g. `BURKEHAN`) are still detected.
 
 ## [0.3.0] - 2026-06-26
 
 ### Added
-- Documentation: a published **S2MPJ / CUTEst benchmark** page
-  (`docs/benchmarks/s2mpj.md`) recording the latest full-corpus run — system
-  information, per-configuration metrics for the `{lbfgs, exact} × {dense, krylov,
-  sparse}` matrix, the optimization-vs-feasibility split, and the dataset-sourced
-  scoring methodology.
-- The per-iteration log table reprints its column header every
-  `HEADER_REPEAT_INTERVAL` (10) rows so it stays readable on long runs, and marks
-  any iterate that already satisfies every enabled acceptable-stopping criterion
-  (before the required consecutive count) with a trailing `*`.
-- Expanded the Hock–Schittkowski analytic-oracle set in `ipax.testing.problems`
-  with `HS9`, `HS21`, `HS28`, and `HS71`, covering active bound multipliers, a
-  degenerate (zero) equality multiplier, a non-unique periodic optimum, and the
-  full equality+inequality+bounds constraint mix. Each is exercised across every
-  backend in the integration suite, wired into the QC benchmark corpus, and
-  checked by a new finite-difference derivative-consistency test that also
-  back-fills the previously untested HS oracles.
-- Two-sided linear inequalities (`Problem.linear_ineq`, `l ≤ A x ≤ u`) are now
-  solved: the constant-data block is lowered into the standard one-sided
-  inequality machinery (finite lower rows → `l − A x ≤ 0`, finite upper rows →
-  `A x − u ≤ 0`, both-finite rows yield a range pair), so the IPM, gradient
-  scaling, and every solver route handle it with no special-casing and the block
-  contributes no Lagrangian-Hessian term. Previously `solve` raised
-  `NotImplementedError` despite the interface being documented. A matrix-free
-  (operator) `linear_ineq` matrix still raises with guidance to use
-  `ineq_constraints` instead.
+- Documentation: a published **S2MPJ / CUTEst benchmark** page (`docs/benchmarks/s2mpj.md`) recording the latest full-corpus run — system information, per-configuration metrics for the `{lbfgs, exact} × {dense, krylov, sparse}` matrix, the optimization-vs-feasibility split, and the dataset-sourced scoring methodology.
+- The per-iteration log table reprints its column header every `HEADER_REPEAT_INTERVAL` (10) rows so it stays readable on long runs, and marks any iterate that already satisfies every enabled acceptable-stopping criterion (before the required consecutive count) with a trailing `*`.
+- Expanded the Hock–Schittkowski analytic-oracle set in `ipax.testing.problems` with `HS9`, `HS21`, `HS28`, and `HS71`, covering active bound multipliers, a degenerate (zero) equality multiplier, a non-unique periodic optimum, and the full equality+inequality+bounds constraint mix. Each is exercised across every backend in the integration suite, wired into the QC benchmark corpus, and checked by a new finite-difference derivative-consistency test that also back-fills the previously untested HS oracles.
+- Two-sided linear inequalities (`Problem.linear_ineq`, `l ≤ A x ≤ u`) are now solved: the constant-data block is lowered into the standard one-sided inequality machinery (finite lower rows → `l − A x ≤ 0`, finite upper rows → `A x − u ≤ 0`, both-finite rows yield a range pair), so the IPM, gradient scaling, and every solver route handle it with no special-casing and the block contributes no Lagrangian-Hessian term. Previously `solve` raised `NotImplementedError` despite the interface being documented. A matrix-free (operator) `linear_ineq` matrix still raises with guidance to use `ineq_constraints` instead.
 
-- S2MPJ scoring now uses the **dataset's own documented outcome** instead of
-  convergence alone: the loader parses each source file for the CUTEst
-  classification (`pbclass`), the SIF author's solution objective
-  (`# LO SOLTN`, present on ~72% of the corpus), and an explicit
-  `Solution (infeasible)` / `Source: an infeasible problem` marker. A case is
-  scored *correct* when it reaches the documented objective, or — for a
-  documented-infeasible problem like BURKEHAN — when it **detects infeasibility**
-  (previously flagged as a failure). The report shows the gap to the documented
-  optimum (`Δf*`) and annotates `infeasible (exp)`. The objective-free problems
-  (CUTEst feasibility / nonlinear-equation systems) can now be run via
-  `--include-objective-free` as `min 0` subject to the constraints, and one
-  configuration can be swept per process with `--config` for parallel runs.
-- S2MPJ sweep gained a size-aware run strategy for tractable full-corpus runs:
-  **per-route variable caps** (dense 2000, Krylov 10000, sparse 25000) so each
-  config runs only on problems that fit its route — small problems are
-  cross-validated across every route while larger ones fall through to Krylov and
-  the sparse-direct route — with `--max-vars` kept as a global ceiling; **sized
-  instantiation** (`--size N`, with `PROBLEM(N)` for the scalable problems and a
-  SIF-default fallback for the rest) to reach the sparse route's intended large-`n`
-  regime; an optional subprocess **build-time guard** (`--max-build-seconds`) that
-  abandons a pathological O(n²) pure-Python construction before it stalls an
-  unattended sweep; and per-problem instance **caching** so the per-config fan-out
-  rebuilds each problem once instead of up to five times.
-- S2MPJ benchmark sweep now exercises the **exact Lagrangian Hessian** and the
-  **sparse-direct route**, not only L-BFGS. The adapter (`_S2MPJExactProblem`) wires
-  S2MPJ's `LgHxy`/`LHxyv` (convention `L = f + yᵀc`) into ipax's exact-Hessian route,
-  mapping `(σ, y_eq, y_ineq)` onto S2MPJ's single multiplier vector with the correct
-  signs for lowered inequality sides (lower `−y`, upper `+y`) and honoring `σ` on the
-  objective term so it stays correct under gradient-based scaling. With `sparse=True`
-  the Jacobians and Hessian cross as `SparseOperator`s (true COO sparsity) for the
-  sparse-direct (Feral/cuDSS) factorization. The runner's regular matrix is now
-  `{lbfgs, exact} × {dense, krylov, sparse}` (`exact/sparse` factors true sparsity —
-  raise `--max-vars` to reach the large, sparse models), and its `--scaling` now
-  defaults to `gradient-based` to match the solver default rather than benchmarking a
-  scaling-off configuration users do not get.
-- S2MPJ benchmark corpus: `benchmarks/corpus/s2mpj.py` loads the pure-Python
-  S2MPJ translations of the CUTEst/Hock–Schittkowski problems (no Fortran/SIF
-  toolchain) and bridges their NumPy/SciPy evaluation onto any CPU Array-API
-  backend, mapping S2MPJ's two-sided `clower ≤ c(x) ≤ cupper` constraints onto
-  ipax's eq/ineq split. A `benchmarks/runners/s2mpj.py` L-BFGS accuracy sweep
-  consumes it. `list_s2mpj_problems()` enumerates a checkout and the runner's
-  `--all` flag sweeps the **entire CUTEst set**, with `--max-vars`/`--max-iter`/
-  `--max-time` caps, per-problem isolation, automatic skipping of objective-free
-  problems, and a status summary. Download-gated (`IPAX_S2MPJ_DIR`); not vendored
-  (S2MPJ has no license) and not part of per-PR CI — the loader returns `[]` and
-  the gated tests skip when no checkout is present.
+- S2MPJ scoring now uses the **dataset's own documented outcome** instead of convergence alone: the loader parses each source file for the CUTEst classification (`pbclass`), the SIF author's solution objective (`# LO SOLTN`, present on ~72% of the corpus), and an explicit `Solution (infeasible)` / `Source: an infeasible problem` marker. A case is scored *correct* when it reaches the documented objective, or — for a documented-infeasible problem like BURKEHAN — when it **detects infeasibility** (previously flagged as a failure). The report shows the gap to the documented optimum (`Δf*`) and annotates `infeasible (exp)`. The objective-free problems (CUTEst feasibility / nonlinear-equation systems) can now be run via `--include-objective-free` as `min 0` subject to the constraints, and one configuration can be swept per process with `--config` for parallel runs.
+- S2MPJ sweep gained a size-aware run strategy for tractable full-corpus runs: **per-route variable caps** (dense 2000, Krylov 10000, sparse 25000) so each config runs only on problems that fit its route — small problems are cross-validated across every route while larger ones fall through to Krylov and the sparse-direct route — with `--max-vars` kept as a global ceiling; **sized instantiation** (`--size N`, with `PROBLEM(N)` for the scalable problems and a SIF-default fallback for the rest) to reach the sparse route's intended large-`n` regime; an optional subprocess **build-time guard** (`--max-build-seconds`) that abandons a pathological O(n²) pure-Python construction before it stalls an unattended sweep; and per-problem instance **caching** so the per-config fan-out rebuilds each problem once instead of up to five times.
+- S2MPJ benchmark sweep now exercises the **exact Lagrangian Hessian** and the **sparse-direct route**, not only L-BFGS. The adapter (`_S2MPJExactProblem`) wires S2MPJ's `LgHxy`/`LHxyv` (convention `L = f + yᵀc`) into ipax's exact-Hessian route, mapping `(σ, y_eq, y_ineq)` onto S2MPJ's single multiplier vector with the correct signs for lowered inequality sides (lower `−y`, upper `+y`) and honoring `σ` on the objective term so it stays correct under gradient-based scaling. With `sparse=True` the Jacobians and Hessian cross as `SparseOperator`s (true COO sparsity) for the sparse-direct (Feral/cuDSS) factorization. The runner's regular matrix is now `{lbfgs, exact} × {dense, krylov, sparse}` (`exact/sparse` factors true sparsity — raise `--max-vars` to reach the large, sparse models), and its `--scaling` now defaults to `gradient-based` to match the solver default rather than benchmarking a scaling-off configuration users do not get.
+- S2MPJ benchmark corpus: `benchmarks/corpus/s2mpj.py` loads the pure-Python S2MPJ translations of the CUTEst/Hock–Schittkowski problems (no Fortran/SIF toolchain) and bridges their NumPy/SciPy evaluation onto any CPU Array-API backend, mapping S2MPJ's two-sided `clower ≤ c(x) ≤ cupper` constraints onto ipax's eq/ineq split. A `benchmarks/runners/s2mpj.py` L-BFGS accuracy sweep consumes it. `list_s2mpj_problems()` enumerates a checkout and the runner's `--all` flag sweeps the **entire CUTEst set**, with `--max-vars`/`--max-iter`/ `--max-time` caps, per-problem isolation, automatic skipping of objective-free problems, and a status summary. Download-gated (`IPAX_S2MPJ_DIR`); not vendored (S2MPJ has no license) and not part of per-PR CI — the loader returns `[]` and the gated tests skip when no checkout is present.
 
 ### Changed
-- **Gradient-based scaling is now the default** (`ScalingOptions.method`
-  `"none"` → `"gradient-based"`), matching IPOPT. Across the full CUTEst/S2MPJ
-  corpus this solves a net **+67** problems (≈92 recovered, mostly from the
-  slow-converging `max_iter` bucket; ≈23 regressed, of which only 3–4 genuinely
-  fail — hard nonconvex/minimax cases that diverge under scaling — and the rest
-  merely converge slower). The returned `x`, objective, and multipliers are
-  reported in the original problem's units; pass `scaling="none"` to opt out.
-- Promoted the driver's private vertical-stack operator to a public
-  `ipax.backend.operators.VStack` (now also exposing `row_inf_norms` for
-  gradient scaling), reused by both the equality assembly and the new
-  linear-inequality lowering.
+- **Gradient-based scaling is now the default** (`ScalingOptions.method` `"none"` → `"gradient-based"`), matching IPOPT. Across the full CUTEst/S2MPJ corpus this solves a net **+67** problems (≈92 recovered, mostly from the slow-converging `max_iter` bucket; ≈23 regressed, of which only 3–4 genuinely fail — hard nonconvex/minimax cases that diverge under scaling — and the rest merely converge slower). The returned `x`, objective, and multipliers are reported in the original problem's units; pass `scaling="none"` to opt out.
+- Promoted the driver's private vertical-stack operator to a public `ipax.backend.operators.VStack` (now also exposing `row_inf_norms` for gradient scaling), reused by both the equality assembly and the new linear-inequality lowering.
 
 ### Fixed
-- A stall at a near-optimal iterate is now reported `ACCEPTABLE` instead of
-  being discarded. Near a solution the condensed system is ill-conditioned (μ
-  driven below the achieved KKT residual), so the Newton step can come out
-  non-finite and the line search can fail to make progress even though the
-  iterate is essentially optimal. The solver now salvages such an iterate —
-  whether the failure is a non-finite **step solve** (previously
-  `NUMERICAL_ERROR`) or the line search **handing off to restoration**
-  (previously a false `INFEASIBLE`) — when its scaled KKT components are within a
-  relaxed multiple (IPOPT `acceptable_tol` ≈ 1e2 × `tol`) of the optimality
-  tolerances, rather than throwing away a usable solution.
-- Fixed variables (`x_L == x_U`) — common in CUTEst-style models — no longer make
-  the solve fail at the first iteration. Such a variable has no strict barrier
-  interior, so `z = μ/(x − x_L)` was singular and the first Newton step came out
-  non-finite (`numerical_error`). The solver now relaxes fixed / near-degenerate
-  bound pairs symmetrically about their midpoint (IPOPT
-  `fixed_variable_treatment='relax_bounds'`), leaving well-separated bounds
-  untouched. Surfaced by the S2MPJ sweep, where it accounted for the bulk of the
-  first-iteration `numerical_error` failures.
-- The filter line-search switching condition no longer raises `OverflowError` on
-  a badly-scaled iterate. Python's `float ** s_phi` raises instead of returning
-  `inf` once the result exceeds the double range (an enormous directional
-  derivative `dphi`), which crashed the whole solve; the power now uses IEEE
-  overflow semantics (`→ inf`). Surfaced by the S2MPJ INDEF sweep. The S2MPJ
-  benchmark adapter likewise sanitizes overflow in its NumPy-bridged
-  objective/gradient (returning `inf`), so a trial point that overflows the
-  problem's own generated `float**` is rejected rather than crashing
-  (e.g. LUKVLE4C, which then solves).
-- Feasibility restoration no longer crashes on a numerically singular or
-  extreme-scale Gauss-Newton system. The damped (Levenberg–Marquardt) step now
-  treats a failed/non-finite linear solve as a rejected step — growing the
-  damping (up to a ceiling) and retrying — instead of letting the backend's
-  ``solve`` raise (e.g. numpy ``LinAlgError: Singular matrix`` when a constraint
-  Jacobian blows up far from feasibility). Surfaced by the S2MPJ HS7 sweep; the
-  solve now degrades to a reported status rather than raising.
-- `configure_verbosity` no longer attaches a second console handler when the
-  application has already configured its own handler on the `"ipax"` logger,
-  which previously printed every iteration record twice. Propagation to ancestor
-  handlers (and `caplog`) is unchanged.
+- A stall at a near-optimal iterate is now reported `ACCEPTABLE` instead of being discarded. Near a solution the condensed system is ill-conditioned (μ driven below the achieved KKT residual), so the Newton step can come out non-finite and the line search can fail to make progress even though the iterate is essentially optimal. The solver now salvages such an iterate — whether the failure is a non-finite **step solve** (previously `NUMERICAL_ERROR`) or the line search **handing off to restoration** (previously a false `INFEASIBLE`) — when its scaled KKT components are within a relaxed multiple (IPOPT `acceptable_tol` ≈ 1e2 × `tol`) of the optimality tolerances, rather than throwing away a usable solution.
+- Fixed variables (`x_L == x_U`) — common in CUTEst-style models — no longer make the solve fail at the first iteration. Such a variable has no strict barrier interior, so `z = μ/(x − x_L)` was singular and the first Newton step came out non-finite (`numerical_error`). The solver now relaxes fixed / near-degenerate bound pairs symmetrically about their midpoint (IPOPT `fixed_variable_treatment='relax_bounds'`), leaving well-separated bounds untouched. Surfaced by the S2MPJ sweep, where it accounted for the bulk of the first-iteration `numerical_error` failures.
+- The filter line-search switching condition no longer raises `OverflowError` on a badly-scaled iterate. Python's `float ** s_phi` raises instead of returning `inf` once the result exceeds the double range (an enormous directional derivative `dphi`), which crashed the whole solve; the power now uses IEEE overflow semantics (`→ inf`). Surfaced by the S2MPJ INDEF sweep. The S2MPJ benchmark adapter likewise sanitizes overflow in its NumPy-bridged objective/gradient (returning `inf`), so a trial point that overflows the problem's own generated `float**` is rejected rather than crashing (e.g. LUKVLE4C, which then solves).
+- Feasibility restoration no longer crashes on a numerically singular or extreme-scale Gauss-Newton system. The damped (Levenberg–Marquardt) step now treats a failed/non-finite linear solve as a rejected step — growing the damping (up to a ceiling) and retrying — instead of letting the backend's ``solve`` raise (e.g. numpy ``LinAlgError: Singular matrix`` when a constraint Jacobian blows up far from feasibility). Surfaced by the S2MPJ HS7 sweep; the solve now degrades to a reported status rather than raising.
+- `configure_verbosity` no longer attaches a second console handler when the application has already configured its own handler on the `"ipax"` logger, which previously printed every iteration record twice. Propagation to ancestor handlers (and `caplog`) is unchanged.
 
 ## [0.2.0] - 2026-06-21
 
 ### Added
-- GPU/device-efficiency profiling harness: `DeviceMetrics` and
-  `measure_device_solve` in `benchmarks/harness` (host↔device sync counter plus a
-  CuPy GPU/CPU time split), the `benchmarks/runners/device_efficiency.py` CLI
-  runner (GPU-gated, a no-op on CI), and kernel micro-benchmarks (matvec / dense
-  solve / one Newton step) parametrized over every installed backend.
-- Device reporting: backend `capabilities()` now discovers available devices via
-  the Array-API inspection API (`__array_namespace_info__().devices()`) instead of
-  assuming CPU, and `Result.device` records where the solve ran — surfaced in the
-  tier-1 result summary.
+- GPU/device-efficiency profiling harness: `DeviceMetrics` and `measure_device_solve` in `benchmarks/harness` (host↔device sync counter plus a CuPy GPU/CPU time split), the `benchmarks/runners/device_efficiency.py` CLI runner (GPU-gated, a no-op on CI), and kernel micro-benchmarks (matvec / dense solve / one Newton step) parametrized over every installed backend.
+- Device reporting: backend `capabilities()` now discovers available devices via the Array-API inspection API (`__array_namespace_info__().devices()`) instead of assuming CPU, and `Result.device` records where the solve ran — surfaced in the tier-1 result summary.
 
 ### Changed
-- Vectorized `fraction_to_boundary`, removing a per-element Python loop that forced
-  `O(n)` host↔device synchronizations per call (and it is called six times per
-  iteration). On a CUDA backend this cut the per-iteration sync count from
-  thousands — scaling linearly with `n` — to a small constant, speeding up
-  matrix-free GPU iterations by roughly 20× at scale; iterates and results are
-  unchanged (CPU behavior is identical).
-- CI uploads coverage with `codecov/codecov-action@v5` using a repository
-  `CODECOV_TOKEN`.
+- Vectorized `fraction_to_boundary`, removing a per-element Python loop that forced `O(n)` host↔device synchronizations per call (and it is called six times per iteration). On a CUDA backend this cut the per-iteration sync count from thousands — scaling linearly with `n` — to a small constant, speeding up matrix-free GPU iterations by roughly 20× at scale; iterates and results are unchanged (CPU behavior is identical).
+- CI uploads coverage with `codecov/codecov-action@v5` using a repository `CODECOV_TOKEN`.
 
 ## [0.1.1] - 2026-06-21
 
 ### Fixed
-- CI `test` jobs no longer error while collecting `--doctest-modules` over the
-  `ipax` package when an optional backend is absent. The JAX/CuPy autodiff and
-  sparse adapters import their concrete library at module top level (the
-  invariant #1 carve-out), so importing them fails when that backend is not
-  installed — the normal CI case (neither JAX nor CuPy is installed there). A
-  root `conftest.py` now skips those adapter modules during collection unless the
-  backend can be imported; runtime dispatch already tolerated their absence.
-- CI `lint` job no longer fails `mypy` on the NumPy/SciPy sparse adapter when
-  NumPy is not installed in the minimal `[lint]` environment. `numpy.*` joins the
-  optional-backend `ignore_missing_imports` overrides alongside torch/jax/cupy/scipy.
+- CI `test` jobs no longer error while collecting `--doctest-modules` over the `ipax` package when an optional backend is absent. The JAX/CuPy autodiff and sparse adapters import their concrete library at module top level (the invariant #1 carve-out), so importing them fails when that backend is not installed — the normal CI case (neither JAX nor CuPy is installed there). A root `conftest.py` now skips those adapter modules during collection unless the backend can be imported; runtime dispatch already tolerated their absence.
+- CI `lint` job no longer fails `mypy` on the NumPy/SciPy sparse adapter when NumPy is not installed in the minimal `[lint]` environment. `numpy.*` joins the optional-backend `ignore_missing_imports` overrides alongside torch/jax/cupy/scipy.
 
 ### Added
-- Pre-commit hooks: `kacl-verify` enforces the Keep a Changelog format of this
-  file, and `validate-pyproject` schema-validates `pyproject.toml`; both also run
-  in the CI `lint` job.
-- CI packaging job (sdist + wheel build with `twine check`) on `main`/`develop`
-  pushes and pull requests, plus a tag-triggered `release.yml` workflow that
-  publishes to PyPI (Trusted Publishing) and creates a GitHub release with notes
-  drawn from this changelog and the tag annotation.
+- Pre-commit hooks: `kacl-verify` enforces the Keep a Changelog format of this file, and `validate-pyproject` schema-validates `pyproject.toml`; both also run in the CI `lint` job.
+- CI packaging job (sdist + wheel build with `twine check`) on `main`/`develop` pushes and pull requests, plus a tag-triggered `release.yml` workflow that publishes to PyPI (Trusted Publishing) and creates a GitHub release with notes drawn from this changelog and the tag annotation.
 
 ### Changed
-- Project version corrected to `0.1.1` in both `pyproject.toml` (previously a
-  stale `0.0.0`) and `ipax.__version__`.
+- Project version corrected to `0.1.1` in both `pyproject.toml` (previously a stale `0.0.0`) and `ipax.__version__`.
 
 ## [0.1.0] - 2026-06-21
 
 ### Added
-- Primal–dual interior-point solver for general NLP with equality, inequality,
-  and bound constraints (`ipax.solve`, `Problem` interface).
-- Capability-graded derivatives: analytic → autodiff → finite-difference for
-  gradients/Jacobians; analytic → autodiff-HVP → Powell-damped L-BFGS for the
-  Lagrangian Hessian.
-- Pluggable linear algebra behind `LinearOperator` / `LinearSolver`: dense
-  (Cholesky/solve), matrix-free Krylov (CG/MINRES/GMRES), and per-backend
-  sparse-direct routes with automatic selection.
-- IPOPT-style filter line search with second-order correction and feasibility
-  restoration; optional Breedveld step controller; optional Mehrotra–Gondzio
-  higher-order corrections.
-- Inertia-guided δ_w regularization on the sparse-direct route: when the backend
-  reports the LDLᵀ inertia (Feral / cuDSS), the IPM bumps δ_w until the factor's
-  inertia matches the KKT operator's target, steering nonconvex solves away from
-  saddle points. Falls back to factorization-failure escalation otherwise.
-- Positive-definiteness guard on the dense reference route: with an exact Hessian
-  the condensed block ``N`` is Cholesky-probed before the LU solve, so an
-  indefinite ``N`` triggers δ_w escalation instead of a silent non-descent step
-  (the dense analog of the sparse inertia check). Pure Array API.
+- Primal–dual interior-point solver for general NLP with equality, inequality, and bound constraints (`ipax.solve`, `Problem` interface).
+- Capability-graded derivatives: analytic → autodiff → finite-difference for gradients/Jacobians; analytic → autodiff-HVP → Powell-damped L-BFGS for the Lagrangian Hessian.
+- Pluggable linear algebra behind `LinearOperator` / `LinearSolver`: dense (Cholesky/solve), matrix-free Krylov (CG/MINRES/GMRES), and per-backend sparse-direct routes with automatic selection.
+- IPOPT-style filter line search with second-order correction and feasibility restoration; optional Breedveld step controller; optional Mehrotra–Gondzio higher-order corrections.
+- Inertia-guided δ_w regularization on the sparse-direct route: when the backend reports the LDLᵀ inertia (Feral / cuDSS), the IPM bumps δ_w until the factor's inertia matches the KKT operator's target, steering nonconvex solves away from saddle points. Falls back to factorization-failure escalation otherwise.
+- Positive-definiteness guard on the dense reference route: with an exact Hessian the condensed block ``N`` is Cholesky-probed before the LU solve, so an indefinite ``N`` triggers δ_w escalation instead of a silent non-descent step (the dense analog of the sparse inertia check). Pure Array API.
 - Gradient-based NLP auto-scaling, warm-start seeding, and layered diagnostics.
-- Multi-backend (NumPy + PyTorch in CI; CuPy/JAX supported) with `array-api-strict`
-  as the purity gate; import-purity gate (`scripts/check_purity.py`) enforcing
-  invariants #1/#4.
-- Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/
-  regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
+- Multi-backend (NumPy + PyTorch in CI; CuPy/JAX supported) with `array-api-strict` as the purity gate; import-purity gate (`scripts/check_purity.py`) enforcing invariants #1/#4.
+- Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/ regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
 [Unreleased]: https://github.com/wahln/ipax/compare/v0.11.0...HEAD
 [0.11.0]: https://github.com/wahln/ipax/compare/v0.10.1...v0.11.0
