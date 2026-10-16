@@ -34,6 +34,7 @@ FreeModeAcceptance = Literal["obj-constr-filter", "rigorous"]
 KrylovMethod = Literal["cg", "minres", "gmres"]
 KrylovPreconditioner = Literal["none", "jacobi", "lbfgs", "auto"]
 RestorationLinearSolver = Literal["auto", "dense", "krylov"]
+RestorationDenseFactorization = Literal["lu", "cholesky"]
 DenseKKTRoute = Literal["condensed", "augmented"]
 SparseKKTRoute = Literal["auto", "augmented", "normal_equations"]
 ScalingMethod = Literal["none", "gradient-based"]
@@ -563,6 +564,28 @@ class RestorationOptions:
     corpus the dense route was tuned on (largest ``m · n`` ≈ 3.9·10⁶,
     TWIRIBG1, ≈ 7.7·10⁶ even if every row were two-sided), so that corpus
     stays on the identical arithmetic.
+
+    ``dense_factorization`` selects how the *dense* route solves each
+    Levenberg–Marquardt trial ``(Jᵀ Σ J + λ I) Δx = −∇F`` (Nocedal & Wright
+    2006, §10.3). ``"lu"`` (the default) is the established
+    ``xp.linalg.solve`` (LU with partial pivoting), so the S2MPJ corpus
+    arithmetic is untouched. ``"cholesky"`` exploits that the matrix is
+    symmetric positive definite for ``λ > 0`` (a Gauss–Newton Gram plus a
+    positive shift): ``xp.linalg.cholesky`` plus two triangular solves
+    through the per-backend ``get_dense_cholesky_solve`` gap-filler — about
+    half the LU's flops (``n³/3`` vs ``2n³/3``; Golub & Van Loan 2013, §§3.2,
+    4.2). Use it when restoration's dense solves dominate the wall time at a
+    few thousand variables (TROTS ``Prostate_VMAT_101``, n = 1976, 2026-09:
+    the LU was ~60 % of restoration time, 157–200 LM trials per call; its
+    first 25 restoration iterations spent 17 s in LU solves vs 8 s in
+    Cholesky ones, NumPy). The gain shrinks with ``n`` on OpenBLAS — about
+    even at ``n = 5000``. The iterate agrees with the LU one to round-off,
+    not bit for bit. A Cholesky breakdown — the backend raising a numerical
+    failure, a non-finite factor or a non-finite solution (an extreme-scale,
+    numerically indefinite matrix) — falls back to the LU solve for that
+    trial. On a backend without a triangular-solve adapter (JAX,
+    array-api-strict) ``"cholesky"`` behaves exactly like ``"lu"``. The
+    iterative route (``linear_solver="krylov"``) ignores this option.
     """
 
     linear_solver: RestorationLinearSolver = "auto"
@@ -575,12 +598,15 @@ class RestorationOptions:
         )
     )
     dense_materialize_max_elements: int = 10_000_000
+    dense_factorization: RestorationDenseFactorization = "lu"
 
     def __post_init__(self) -> None:
         if self.linear_solver not in ("auto", "dense", "krylov"):
             raise ValueError(
                 "restoration linear solver must be 'auto', 'dense' or 'krylov'"
             )
+        if self.dense_factorization not in ("lu", "cholesky"):
+            raise ValueError("dense_factorization must be 'lu' or 'cholesky'")
         limit = self.dense_materialize_max_elements
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError(
@@ -1095,6 +1121,7 @@ __all__ = [
     "Options",
     "ProbingSigma",
     "RegularizationOptions",
+    "RestorationDenseFactorization",
     "RestorationLinearSolver",
     "RestorationOptions",
     "ScalingMethod",

@@ -16,6 +16,11 @@ from tests._helpers import array, assert_allclose, backend_linalg_error
 
 
 def test_dense_solver_wraps_backend_singular_failure(namespace):
+    # Only a backend that raises on a singular LU has an exception to wrap;
+    # CuPy/JAX return inf/NaN instead, the other failure signal the
+    # LinearSolver contract accepts (TestDenseSolver's contract battery,
+    # ``test_numerical_failure_is_classified``, covers that on every backend).
+    backend_linalg_error(namespace)
     operator = Dense(array(namespace, [[1.0, 2.0], [2.0, 4.0]]))
     solver = DenseSolver()
     solver.factor(operator)
@@ -44,6 +49,65 @@ def test_dense_solver_rejects_indefinite_condensed_block(namespace):
 
     with pytest.raises(LinearSolveError, match="not positive definite"):
         solver.solve(array(namespace, [1.0, 1.0]))
+
+
+def test_dense_solver_rejects_indefinite_primal_block_of_a_saddle(namespace):
+    # Regression (CuPy): the PD probe must fail on an indefinite N inside an
+    # equality saddle too. There the probe's factor is discarded and the full
+    # bordered matrix is solved by LU, which happily returns a finite
+    # non-descent step — so a Cholesky that reports its breakdown silently
+    # (CuPy returns a NaN factor instead of raising) let it through unseen.
+    condensed = _condensed(namespace, array(namespace, [[1.0, 0.0], [0.0, -1.0]]))
+    saddle = build_saddle_operator(
+        condensed, Dense(array(namespace, [[1.0, 1.0]])), 1e-4
+    )
+    solver = DenseSolver()
+    solver.factor(saddle)
+
+    with pytest.raises(LinearSolveError, match="not positive definite"):
+        solver.solve(array(namespace, [1.0, 1.0, 0.5]))
+
+
+def test_dense_solver_rejects_singular_condensed_block(namespace):
+    # N = diag(1, 0) is PSD but singular. NumPy/Torch raise on the zero pivot;
+    # CuPy returns a *finite* factor with l_22 = 0, and a zero right-hand-side
+    # entry makes the triangular solves skip that pivot, so the reused factor
+    # "solved" the singular system to a finite vector (regression). The pivot
+    # check classifies the factor itself, whatever the right-hand side.
+    op = _condensed(namespace, array(namespace, [[1.0, 0.0], [0.0, 0.0]]))
+    solver = DenseSolver()
+    solver.factor(op)
+
+    with pytest.raises(LinearSolveError, match="not positive definite"):
+        solver.solve(array(namespace, [1.0, 0.0]))
+
+
+def test_dense_solver_checks_pivots_only_where_cholesky_is_silent(
+    namespace, monkeypatch
+):
+    # The pivot check costs a host sync per factorization; where the backend
+    # raises on a breakdown itself (NumPy, Torch, array-api-strict) it could
+    # never trip, so the guard must not pay it there — the PD probe then runs
+    # exactly as before (same syncs, same factor). CuPy/JAX pay it.
+    import ipax.linalg.solver as solver_mod
+
+    calls = {"n": 0}
+    original = solver_mod.cholesky_factor_ok
+
+    def spy(xp, factor):
+        calls["n"] += 1
+        return original(xp, factor)
+
+    monkeypatch.setattr(solver_mod, "cholesky_factor_ok", spy)
+    op = _condensed(namespace, array(namespace, [[2.0, 0.0], [0.0, 3.0]]))
+    rhs = array(namespace, [2.0, 3.0])
+    solver = DenseSolver()
+    for _ in range(3):
+        solver.factor(op)
+        solver.solve(rhs)
+
+    silent = solver_mod.cholesky_breakdown_is_silent(namespace, rhs)
+    assert calls["n"] == (3 if silent else 0)
 
 
 def test_dense_solver_accepts_pd_condensed_block(namespace, tol):

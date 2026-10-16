@@ -13,11 +13,18 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
 from ipax.backend.errors import backend_linalg_error_types
-from ipax.linalg.solver import LinearSolveError, numerical_failure_types
-from tests._helpers import array, backend_linalg_error
+from ipax.linalg.solver import (
+    LinearSolveError,
+    checked_cholesky,
+    cholesky_breakdown_is_silent,
+    cholesky_factor_ok,
+    numerical_failure_types,
+)
+from tests._helpers import array, backend_linalg_error, to_numpy
 
 
 def test_backend_singular_solve_is_a_numerical_failure(namespace):
@@ -27,9 +34,71 @@ def test_backend_singular_solve_is_a_numerical_failure(namespace):
 
 
 def test_backend_cholesky_breakdown_is_a_numerical_failure(namespace):
+    # A backend that raises must raise a classified type. CuPy (default
+    # errstate) raises nothing — it hands back a factor with a NaN pivot —
+    # so there the breakdown must be visible to the pivot check instead.
     indefinite = array(namespace, [[1.0, 2.0], [2.0, 1.0]])
+    try:
+        factor = namespace.linalg.cholesky(indefinite)
+    except Exception as exc:  # whatever the backend raises
+        assert isinstance(exc, numerical_failure_types())
+        return
+    assert not bool(cholesky_factor_ok(namespace, factor))
+
+
+@pytest.mark.parametrize(
+    "matrix",
+    [
+        [[1.0, 2.0], [2.0, 1.0]],  # indefinite: a negative second pivot
+        [[1.0, 0.0], [0.0, 0.0]],  # singular PSD: CuPy's factor stays finite
+        [[float("nan"), 0.0], [0.0, 1.0]],  # NaN input: NumPy returns NaN
+    ],
+    ids=["indefinite", "singular", "nan"],
+)
+def test_checked_cholesky_raises_a_numerical_failure_on_every_backend(
+    namespace, matrix
+):
+    # The dense PD guard and the restoration Cholesky rely on this: whether
+    # the backend raises its own LinAlgError or reports the breakdown
+    # silently in the factor, the outcome is a classified numerical failure.
     with pytest.raises(numerical_failure_types()):
-        namespace.linalg.cholesky(indefinite)
+        checked_cholesky(namespace, array(namespace, matrix))
+
+
+def test_cholesky_breakdown_probe_matches_the_backend(namespace):
+    # The one-off probe must agree with how the backend treats a genuinely
+    # indefinite matrix of another size: silent exactly when it returns.
+    silent = cholesky_breakdown_is_silent(namespace, array(namespace, [1.0]))
+    try:
+        namespace.linalg.cholesky(array(namespace, [[1.0, 2.0], [2.0, 1.0]]))
+    except Exception:  # whatever the backend raises
+        raised = True
+    else:
+        raised = False
+    assert silent is not raised
+
+
+def test_cholesky_breakdown_probe_does_not_read_the_device_attribute():
+    # Regression: the probe must place its 1×1 matrix via
+    # ``ipax.backend.namespace.device``; ``x.device`` does not exist on
+    # NumPy < 2 (still supported), and reading it crashed every DenseSolver.
+    import array_api_compat.numpy as xp
+
+    class _NoDeviceAttribute(np.ndarray):
+        @property
+        def device(self):
+            raise AttributeError("'numpy.ndarray' object has no attribute 'device'")
+
+    like = np.ones(1).view(_NoDeviceAttribute)
+    assert cholesky_breakdown_is_silent(xp, like) is False
+
+
+def test_checked_cholesky_returns_the_backend_factor_unchanged(namespace):
+    spd = array(namespace, [[4.0, 2.0], [2.0, 3.0]])
+    np.testing.assert_array_equal(
+        to_numpy(checked_cholesky(namespace, spd)),
+        to_numpy(namespace.linalg.cholesky(spd)),
+    )
 
 
 @pytest.mark.parametrize(

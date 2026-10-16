@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from ipax.backend.namespace import Capabilities
     from ipax.backend.operators import LinearOperator
     from ipax.options import Options
-    from ipax.typing import Array
+    from ipax.typing import Array, Namespace
 
 # Auto-selection thresholds. Below ``_DENSE_AUTO_MAX_VARS`` the dense route is
 # the reference choice regardless of constraint shape. Between that and
@@ -103,6 +103,70 @@ def numerical_failure_types() -> tuple[type[BaseException], ...]:
     from ipax.backend.errors import backend_linalg_error_types
 
     return (LinearSolveError, ArithmeticError, *backend_linalg_error_types())
+
+
+def cholesky_factor_ok(xp: Namespace, factor: Array) -> Array:
+    """Device-side verdict (0-d bool array): did this Cholesky factorization succeed?
+
+    Gap-filler for a missing Array-API guarantee: the ``linalg`` extension does
+    not say how ``cholesky`` reports a matrix that is not positive definite,
+    and not every backend raises (:mod:`ipax.backend.errors`) — CuPy under its
+    default ``errstate`` and JAX return a factor instead. LAPACK ``potrf``
+    fails exactly when a pivot ``l_kk² = a_kk − Σ_j l_kj²`` is not positive
+    (its ``INFO > 0``; Golub & Van Loan 2013, §4.2), and every entry of a
+    row feeds that row's pivot, so a NaN/inf anywhere in the factor surfaces
+    on the diagonal too. Hence the classification: the factor is valid iff
+    every diagonal entry is finite and strictly positive. That covers the
+    silent breakdown modes observed on CuPy — a NaN pivot for a negative
+    one, and a *finite* factor with an exact zero pivot for a singular PSD
+    matrix, which a plain ``isfinite`` test would accept.
+
+    Returned on device so a caller can fold it into another check and pay a
+    single host synchronization; an O(n) reduction beside the O(n³)
+    factorization it validates.
+    """
+    pivots = xp.linalg.diagonal(factor)
+    return xp.all(xp.isfinite(pivots) & (pivots > 0))
+
+
+def checked_cholesky(xp: Namespace, matrix: Array) -> Array:
+    """``xp.linalg.cholesky(matrix)``, raising on a breakdown on *every* backend.
+
+    A backend that raises keeps raising its own numerical failure type (a
+    member of :func:`numerical_failure_types`); a backend that returns a
+    broken factor silently now raises :class:`LinearSolveError` instead
+    (:func:`cholesky_factor_ok`), so callers classify both identically. One
+    host synchronization per factorization.
+    """
+    factor = xp.linalg.cholesky(matrix)
+    if not bool(cholesky_factor_ok(xp, factor)):
+        raise LinearSolveError(
+            "Cholesky factorization broke down (a non-positive or non-finite pivot)"
+        )
+    return factor
+
+
+def cholesky_breakdown_is_silent(xp: Namespace, like: Array) -> bool:
+    """Whether ``xp.linalg.cholesky`` *returns* a factor for a non-PD matrix.
+
+    A one-off capability probe (a 1×1 negative-definite matrix on ``like``'s
+    device and dtype) for callers that factor repeatedly: where the backend
+    raises (NumPy, array-api-strict, Torch) :func:`checked_cholesky`'s pivot
+    check can never trip on a non-PD input, so they keep the plain
+    ``xp.linalg.cholesky`` — no extra host sync per factorization, results
+    unchanged — and pay the check only where the breakdown is silent (CuPy
+    under its default ``errstate``, JAX). Cache the answer per solver
+    instance, which stays on one backend.
+    """
+    # ``device()``, not ``like.device``: the attribute is missing on NumPy < 2.
+    from ipax.backend.namespace import device
+
+    probe = xp.full((1, 1), -1.0, dtype=like.dtype, device=device(like))
+    try:
+        xp.linalg.cholesky(probe)
+    except numerical_failure_types():
+        return False
+    return True
 
 
 @runtime_checkable
@@ -323,6 +387,9 @@ __all__ = [
     "LinearSolveError",
     "LinearSolver",
     "SolverKind",
+    "checked_cholesky",
+    "cholesky_breakdown_is_silent",
+    "cholesky_factor_ok",
     "numerical_failure_types",
     "select_restoration_solver",
     "select_solver",

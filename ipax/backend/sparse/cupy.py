@@ -22,6 +22,17 @@ indefinite factorizations. If the bindings (or the cuDSS library they wrap) are
 not installed, the adapter falls back to ``cupyx.scipy.sparse.linalg.spsolve``
 for solve-only use.
 
+Numerical failures are classified at this boundary (invariant #4), because
+neither CUDA route raises on its own: a KKT matrix with non-finite entries is
+rejected up front (as the SciPy adapter's ``_reject_non_finite`` does), and
+cuDSS's static pivoting silently replaces a too-small pivot by
+``PIVOT_EPSILON`` — an exactly singular system then "solves" to a finite,
+meaningless vector (``±1/ε``) with a plausible inertia. A solve on such a
+perturbed factorization is therefore certified by its residual (see
+:meth:`CuDSSSparseSolver._certify_perturbed_solve`) and raises
+:class:`LinearSolveError` when it does not solve the system at all; an
+accepted solve is returned unchanged.
+
 ``ipax`` deliberately does not choose a CUDA toolkit, CuPy wheel, or cuDSS
 runtime for the user. The ``[sparse-cuda]`` extra installs only the
 ``nvmath-python`` bindings; see the installation documentation for the
@@ -90,6 +101,14 @@ _GRAM_DENSE_CHUNK_ELEMENTS = 50_000_000
 # one: bounded temporaries (block² indices) and O(n/block) kernel launches
 # instead of either a full-size n² index gather or n single-row copies.
 _GRAM_MIRROR_BLOCK = 1024
+# Relative residual ``‖b − A x‖∞ / ‖b‖∞`` above which a cuDSS solve on a
+# perturbed-pivot factorization is rejected as singular (see
+# ``CuDSSSparseSolver._certify_perturbed_solve``): the forcing-term bound of
+# an inexact Newton step, set where only a solve that failed to solve the
+# system at all trips it — an inconsistent singular system leaves an O(1)
+# residual (0.25 on the 2×2 contract case), a near-singular consistent one
+# ~1e-8 (a degenerate L-BFGS border).
+_PERTURBED_SOLVE_MAX_RESIDUAL = 1e-2
 
 
 def _mirror_lower_to_upper(out: Any) -> None:
@@ -560,6 +579,23 @@ class SparseOperator(LinearOperator):
         )
 
 
+def _reject_non_finite(matrix: Any) -> None:
+    """Raise :class:`LinearSolveError` if any stored value is inf/NaN.
+
+    Mirrors ``ipax.backend.sparse.numpy_scipy._reject_non_finite``: a
+    non-finite KKT entry means upstream derivatives overflowed at a bad trial
+    iterate, a numerical failure the IPM recovers from (δ_w ladder, then
+    step-failure restoration; Wächter & Biegler 2006, §3.1 → §3.3). Neither
+    cuDSS nor ``spsolve`` raises on one — cuDSS factors it to a NaN solution
+    with a plausible inertia. One host synchronization.
+    """
+    if matrix.nnz and not bool(cupy.isfinite(matrix.data).all()):
+        raise LinearSolveError(
+            "sparse KKT matrix has non-finite entries (inf/NaN); the upstream "
+            "derivatives overflowed at this iterate"
+        )
+
+
 def _require_csr(K: LinearOperator) -> tuple[Any, Namespace]:
     """Extract a square CuPy CSR matrix + namespace from ``SparseOperator``."""
     if not isinstance(K, SparseOperator):
@@ -614,6 +650,9 @@ class CuPySpsolveSolver:
                 "compatible with the installed CUDA toolkit"
             )
         matrix, xp = _require_csr(K)
+        # spsolve re-factorizes on every solve, so the O(nnz) check here is
+        # noise beside it.
+        _reject_non_finite(matrix)
         self._matrix = matrix
         self._xp = xp
 
@@ -679,6 +718,14 @@ class CuDSSSparseSolver:
         self._n_factored = 0
         self._inertia_read = False
         self._device_id: int | None = None
+        # Failure certificate of the current factorization, settled lazily at
+        # its first solve so a factor pays no host sync of its own: the
+        # device-side "all values finite" flag, the full matrix the residual
+        # of a perturbed-pivot solve is measured against, and cuDSS's count of
+        # perturbed pivots (``None`` until read).
+        self._values_finite: Any | None = None
+        self._residual_matrix: Any | None = None
+        self._npivots: int | None = None
 
     def describe(self) -> str:
         return "cuDSS (GPU)"
@@ -723,6 +770,9 @@ class CuDSSSparseSolver:
             self._inertia = None
             self._symmetric_factor = False
             self._inertia_read = False
+            self._values_finite = None
+            self._residual_matrix = None
+            self._npivots = None
 
     def factor(self, K: LinearOperator) -> None:
         matrix, xp = _require_csr(K)
@@ -748,6 +798,12 @@ class CuDSSSparseSolver:
                 matrix_view = int(cudss.MatrixViewType.LOWER)
 
             self._xp = xp
+            # Queued on device, read by the first solve (``_certify_factor``).
+            self._values_finite = (
+                cupy.isfinite(matrix.data).all() if matrix.nnz else None
+            )
+            self._residual_matrix = matrix
+            self._npivots = None
             self._factor_csr(
                 factor_matrix,
                 matrix_type,
@@ -760,6 +816,12 @@ class CuDSSSparseSolver:
             self._symmetric_factor = symmetric
             self._n_factored = int(matrix.shape[0])
             self._inertia_read = self._require_inertia
+            if self._require_inertia:
+                # Already synchronizing for the inertia: settle the failure
+                # certificate here too, so a non-finite matrix raises at
+                # factor time (as on the CPU adapters) instead of reporting
+                # a plausible inertia the δ_w ladder would act on.
+                self._certify_factor()
             self._inertia = (
                 self._read_inertia(self._n_factored) if self._require_inertia else None
             )
@@ -778,34 +840,105 @@ class CuDSSSparseSolver:
             raise RuntimeError("factor() must be called before solve()")
         with cupy.cuda.Device(self._device_id):
             self._bind_current_stream()
-            cudss = self._cudss
+            perturbed = self._certify_factor() > 0
 
             b = cupy.asarray(_to_cupy(rhs), dtype=self._dtype)
             was_vector = len(b.shape) == 1
             if was_vector:
                 b = cupy.reshape(b, (int(b.shape[0]), 1))
-            n, ncols = int(b.shape[0]), int(b.shape[1])
-
-            # Reuse the persistent dense descriptors/buffers, then copy this RHS
-            # into the bound buffer — no per-solve cuDSS dn create/destroy.
-            self._ensure_dense(n, ncols)
-            assert self._b_buf is not None and self._x_buf is not None
-            self._b_buf[...] = b
-            self._guard(
-                cudss.execute,
-                self._handle,
-                int(cudss.Phase.SOLVE),
-                self._config,
-                self._data,
-                self._matrix,
-                self._sol_matrix,
-                self._rhs_matrix,
-            )
-
-            # Copy out of the reused solution buffer before the next solve
-            # overwrites it (the buffer outlives this call).
-            result = (self._x_buf[:, 0] if was_vector else self._x_buf).copy()
+            x = self._solve_columns(b)
+            if perturbed:
+                self._certify_perturbed_solve(b, x)
+            result = x[:, 0] if was_vector else x
             return cast("Array", to_xp_array(result, self._xp))
+
+    def _solve_columns(self, b: Any) -> Any:
+        """One cuDSS SOLVE phase for an ``(n, k)`` right-hand side (a copy out)."""
+        cudss = self._cudss
+        assert cudss is not None
+        n, ncols = int(b.shape[0]), int(b.shape[1])
+        # Reuse the persistent dense descriptors/buffers, then copy this RHS
+        # into the bound buffer — no per-solve cuDSS dn create/destroy.
+        self._ensure_dense(n, ncols)
+        assert self._b_buf is not None and self._x_buf is not None
+        self._b_buf[...] = b
+        self._guard(
+            cudss.execute,
+            self._handle,
+            int(cudss.Phase.SOLVE),
+            self._config,
+            self._data,
+            self._matrix,
+            self._sol_matrix,
+            self._rhs_matrix,
+        )
+        # Copy out of the reused solution buffer before the next solve
+        # overwrites it (the buffer outlives this call).
+        return self._x_buf.copy()
+
+    def _certify_factor(self) -> int:
+        """Settle the current factorization's failure certificate (once).
+
+        Raises :class:`LinearSolveError` for a matrix with non-finite entries
+        (see :func:`_reject_non_finite`) and returns the number of pivots
+        cuDSS perturbed. Deferred from ``factor`` to the first solve (unless
+        ``require_inertia`` already synchronizes the factor) so the
+        factorization itself stays free of host syncs. It costs two host
+        reads once per factorization — the finiteness flag and the
+        ``NPIVOTS`` query — taken while the stream is already drained by the
+        solve the IPM synchronizes on right after (its finiteness check).
+        """
+        if self._npivots is None:
+            finite = self._values_finite
+            if finite is not None and not bool(finite):
+                raise LinearSolveError(
+                    "sparse KKT matrix has non-finite entries (inf/NaN); the "
+                    "upstream derivatives overflowed at this iterate"
+                )
+            self._npivots = self._read_npivots()
+        return self._npivots
+
+    def _certify_perturbed_solve(self, b: Any, x: Any) -> None:
+        """Raise unless a solve on a perturbed-pivot factor solves ``A x = b``.
+
+        cuDSS's static pivoting replaces a pivot below ``PIVOT_EPSILON`` by
+        ``±ε`` and so factors ``A + E`` instead of ``A`` (the GESP strategy;
+        Li & Demmel 2003, ACM TOMS 29(2)). That is harmless when ``A`` is
+        merely ill-conditioned or the tiny pivot an artefact of the ordering
+        (a zero diagonal a 2×2 block pairs off): the residual ``b − A x`` stays
+        small and the solution is kept *unchanged*. But when ``A x = b`` has no
+        solution — ``A`` singular, ``b`` outside its range — the ``+ε`` pivot
+        turns the missing component into an ``O(‖b‖/ε)`` spike along the null
+        space: a finite, meaningless vector (the ``±1e13`` of a 2×2 singular
+        system), with a plausible inertia. Its residual is the component of
+        ``b`` outside ``range(A)``, which no solution can reduce, so the solve
+        fails the inexact-Newton condition ``‖b − A x‖ ≤ η ‖b‖`` (Dembo,
+        Eisenstat & Steihaug 1982) for any useful forcing term: rejected at
+        ``η = _PERTURBED_SOLVE_MAX_RESIDUAL``, a percent-level residual no
+        Newton step survives, while the near-singular *consistent* systems an
+        IPM routinely produces (a degenerate L-BFGS border: eigenvalues down to
+        1e-14, perturbed-solve residuals ~1e-8) pass untouched. The rejection
+        is the numerical failure it is — the δ_w/δ_c ladder then regularizes
+        the system (Wächter & Biegler 2006, §3.1), as on the CPU when SuperLU
+        raises or Feral reports a zero pivot. One SpMV and one host sync, only
+        on perturbed factorizations; each column of an ``(n, k)`` right-hand
+        side is certified on its own.
+        """
+        matrix = self._residual_matrix
+        assert matrix is not None
+        residual = b - matrix @ x
+        # Per right-hand-side column: a small inconsistent column must not
+        # hide behind a large consistent one. NaN compares false, so a
+        # non-finite residual is rejected too.
+        certified = cupy.all(
+            cupy.max(cupy.abs(residual), axis=0)
+            <= _PERTURBED_SOLVE_MAX_RESIDUAL * cupy.max(cupy.abs(b), axis=0)
+        )
+        if not bool(certified):
+            raise LinearSolveError(
+                f"cuDSS perturbed {self._npivots} pivot(s) and the solve does not "
+                "satisfy the system: it is singular for this right-hand side"
+            )
 
     @property
     def inertia(self) -> tuple[int, int, int]:
@@ -1152,6 +1285,35 @@ class CuDSSSparseSolver:
             return pos, neg, zero
         assert last_error is not None
         raise last_error
+
+    def _read_npivots(self) -> int:
+        """Pivots cuDSS perturbed in the current factorization (``NPIVOTS``).
+
+        ``0`` when the runtime does not report it, which leaves the solve
+        uncertified exactly as before this check existed. Same int32-then-
+        int64 buffer probing as :meth:`_read_inertia`.
+        """
+        cudss = self._cudss
+        param = getattr(getattr(cudss, "DataParam", None), "NPIVOTS", None)
+        if cudss is None or param is None or self._handle is None or self._data is None:
+            return 0
+        for count_type in (ctypes.c_int32, ctypes.c_int64):
+            count = count_type()
+            written = ctypes.c_size_t()
+            try:
+                self._guard(
+                    cudss.data_get,
+                    self._handle,
+                    self._data,
+                    int(param),
+                    ctypes.addressof(count),
+                    ctypes.sizeof(count),
+                    ctypes.addressof(written),
+                )
+            except LinearSolveError:
+                continue
+            return max(0, int(count.value))
+        return 0
 
     def _destroy_matrix(self) -> None:
         if self._cudss is not None and self._matrix is not None:

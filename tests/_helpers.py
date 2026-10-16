@@ -34,6 +34,24 @@ def backend_linalg_error(xp: Any) -> BaseException:
     pytest.skip(f"{xp.__name__} returns non-finite values instead of raising")
 
 
+def to_numpy(value: Any) -> Any:
+    """A host NumPy array holding ``value`` (a backend array, or anything
+    ``numpy.asarray`` accepts).
+
+    ``numpy.asarray`` on a CuPy array raises ("Implicit conversion to a NumPy
+    array is not allowed") — the device-to-host copy must be explicit — so
+    tests that compare against a NumPy reference go through this instead.
+    Everything else keeps the plain ``numpy.asarray`` conversion.
+    """
+    import numpy as np
+
+    if hasattr(value, "__cuda_array_interface__") and hasattr(value, "get"):
+        return np.asarray(value.get())  # CuPy: explicit device→host copy
+    if hasattr(value, "detach") and hasattr(value, "cpu"):
+        return np.asarray(value.detach().cpu())  # Torch, possibly on CUDA
+    return np.asarray(value)
+
+
 def float_dtype(xp: Any) -> Any:
     return getattr(xp, "float64", getattr(xp, "float32", None))
 

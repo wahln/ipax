@@ -8,6 +8,8 @@ reference everywhere is the dense ``Aᵀ diag(w) A`` or the plain
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -1004,6 +1006,7 @@ def test_device_sparse_tiles_match_either_kernel(namespace, device_sparse_tiles)
         flop_ratio_threshold=1.0,
         sparse_tile_flop_ratio=1.0,
         device_sparse_tiles=device_sparse_tiles,
+        device_sparse_tile_flop_ratio=1.0,  # every sparse tile stays sparse
     )
     op = trots.TiledGramCSROperator(a, xp, config=cfg)
     kernels = {t.sparse for ds in op.device_structures() for t in ds.tiles}
@@ -1188,7 +1191,9 @@ def test_loader_device_block_matches_the_numpy_block(namespace):
     planned = sum(
         len(b._plans) for b in again.blocks if isinstance(b, trots.TiledGramCSROperator)
     )
-    assert len(tiled._device_tiles) == planned
+    # (The cache also holds the device's sparse-tile calibration, one entry.)
+    tile_entries = [k for k in tiled._device_tiles if k[0] != trots._CALIBRATION_TAG]
+    assert len(tile_entries) == planned
 
 
 def test_device_cache_is_keyed_by_the_kernel_selection(namespace):
@@ -1207,7 +1212,7 @@ def test_device_cache_is_keyed_by_the_kernel_selection(namespace):
 
     def context(budget):
         return trots._DeviceGramContext(
-            xp, kind, ctx.device, cache, densify_budget_bytes=budget
+            xp, kind, ctx.device, cache, densify_budget_bytes=budget, sparse_ratio=1.0
         )
 
     rows = plan.structure.shape[0]
@@ -1371,3 +1376,309 @@ def test_device_tiled_gram_accepts_raw_cupy_namespace():
     # Two device problems scatter their tiles in their own order: agreement to
     # reduction-order round-off, not bit-for-bit.
     np.testing.assert_allclose(g_raw, g_ref, rtol=1e-12, atol=0.0)
+
+
+# --------------------------------------------------------------------------- #
+# Size-aware device sparse-tile choice (the device break-even ratio)
+# --------------------------------------------------------------------------- #
+# Head-and-Neck_01's eight host-sparse tiles (rows b, columns c, Σ nnz_row²,
+# seconds by cuSPARSE SpGEMM, seconds densified + cuBLAS syrk), each
+# multiplied alone, float64, min of 3 (2026-09-28, RTX 4070 Laptop, CuPy 14).
+_HN01_SPARSE_TILES = (
+    (2048, 2059, 46766, 5.81e-04, 3.96e-02),
+    (2048, 2080, 46854, 5.28e-04, 3.97e-02),
+    (2048, 2082, 46974, 5.52e-04, 3.97e-02),
+    (2048, 2072, 47058, 6.42e-04, 3.96e-02),
+    (1785, 1797, 40825, 5.67e-04, 2.78e-02),
+    (2048, 3609, 107043178, 2.35e00, 1.05e-01),
+    (2048, 9684, 789611950, 2.48e01, 1.87e00),
+    (1250, 8158, 332929587, 1.06e01, 1.10e00),
+)
+
+
+def test_device_break_even_ratio_is_the_throughput_ratio():
+    # 1e6 products in 10 ms (1e8/s) against 1e9 flops in 4 ms (2.5e11/s).
+    ratio = trots._device_break_even_ratio(1e6, 0.01, 1e9, 0.004)
+    assert ratio == pytest.approx(4e-4)
+    at = ratio * 100 * 30 * 30  # a tile exactly at the break-even
+    assert trots._prefer_device_sparse(at, 100, 30, ratio)
+    assert not trots._prefer_device_sparse(at * 1.01, 100, 30, ratio)
+
+
+@pytest.mark.parametrize(
+    "timings",
+    [
+        (1e6, 0.0, 1e9, 0.004),
+        (1e6, 0.01, 1e9, 0.0),
+        (1e6, float("nan"), 1e9, 0.004),
+        (1e6, 0.01, 1e9, float("inf")),
+        (0.0, 0.01, 1e9, 0.004),
+        (1e6, -1.0, 1e9, 0.004),
+    ],
+)
+def test_degenerate_calibration_densifies(timings):
+    assert trots._device_break_even_ratio(*timings) == 0.0
+
+
+def test_calibrated_choice_picks_the_faster_kernel_on_head_and_neck_tiles():
+    # The context calibrates on the candidate with the least dense work; on
+    # the measured Head-and-Neck_01 tiles that ratio (~3.5e-4, against the
+    # host's 1e-2) picks the faster kernel on every tile: 37.7 s of sparse
+    # tiles by SpGEMM become 3.1 s.
+    b, c, s2, t_sparse, t_dense = min(
+        _HN01_SPARSE_TILES, key=lambda t: t[0] * t[1] ** 2
+    )
+    ratio = trots._device_break_even_ratio(s2, t_sparse, float(b) * c * c, t_dense)
+    assert 1e-4 < ratio < 1e-3
+    for b, c, s2, t_sparse, t_dense in _HN01_SPARSE_TILES:
+        assert trots._prefer_device_sparse(s2, b, c, ratio) == (t_sparse < t_dense)
+
+
+def _mixed_matrix():
+    """A structure whose tiles span the break-even: a smoothing-like band
+    (two entries per row over the whole column range) above a dense-ish
+    block."""
+    rng = np.random.default_rng(80)
+    rows = np.repeat(np.arange(400), 2)
+    band = sp.csr_matrix(
+        (rng.uniform(0.5, 2.0, 800), (rows, rng.integers(0, 400, 800))),
+        shape=(400, 400),
+    )
+    return sp.vstack([band, _random_sparse(400, 400, 0.3, 81)]).tocsr()
+
+
+def _mixed_sparse_plan():
+    """The mixed structure planned with every tile sparse (host ratio 1), so
+    each tile is a device candidate."""
+    a = _mixed_matrix()
+    cfg = trots.TiledGramConfig(block_rows=100, sparse_tile_flop_ratio=1.0)
+    perm, tiles = trots._plan_structure(a, cfg, np.float64)
+    assert all(t.sparse for t in tiles)
+    return perm, tiles, a.shape[0], cfg.block_rows
+
+
+def _stub_attach(monkeypatch):
+    """Record the tiles given a device CSR instead of building one (cupyx):
+    the kernel choice itself needs no GPU."""
+    attached = []
+
+    def attach(self, t, dt, data_dev):
+        attached.append((t.start, t.stop))
+
+    monkeypatch.setattr(trots._DeviceGramContext, "_attach_sparse", attach)
+    return attached
+
+
+def _host_context_posing_as_cupy(cache=None, **kwargs):
+    """The device context on the NumPy compat namespace with ``kind="cupy"``:
+    materialization and the kernel choice run on the host (neither launches
+    a kernel)."""
+    return trots._DeviceGramContext(np, "cupy", "cpu", cache, **kwargs)
+
+
+def _ratios(tiles):
+    return [t.flops / ((t.stop - t.start) * float(len(t.cols)) ** 2) for t in tiles]
+
+
+def _split_ratio(tiles):
+    """A break-even halfway between two neighbouring tile statistics (no tile
+    sits at the threshold, where rounding could decide it)."""
+    r = sorted(set(_ratios(tiles)))
+    k = len(r) // 2
+    return 0.5 * (r[k - 1] + r[k])
+
+
+def test_pinned_ratio_selects_tiles_without_measuring(monkeypatch):
+    perm, tiles, m, rows = _mixed_sparse_plan()
+    attached = _stub_attach(monkeypatch)
+
+    def no_measure(*_args, **_kwargs):
+        raise AssertionError("a pinned ratio must not be calibrated")
+
+    monkeypatch.setattr(trots._DeviceGramContext, "_measure_break_even", no_measure)
+    ratio = _split_ratio(tiles)
+    ctx = _host_context_posing_as_cupy(sparse_ratio=ratio)
+    ds = ctx.structure(perm, tiles, m, rows)
+
+    chosen = [t.sparse for t in ds.tiles]
+    assert chosen == [r <= ratio for r in _ratios(tiles)]
+    assert any(chosen) and not all(chosen)  # the plan spans the break-even
+    assert attached == [(t.start, t.stop) for t in ds.tiles if t.sparse]
+    assert ctx.sparse_break_even() == ratio
+    # The extremes: 1.0 keeps every sparse tile sparse (the choice before the
+    # calibration existed), 0.0 densifies them all.
+    keep = _host_context_posing_as_cupy(sparse_ratio=1.0)
+    assert all(t.sparse for t in keep.structure(perm, tiles, m, rows).tiles)
+    none = _host_context_posing_as_cupy(sparse_ratio=0.0)
+    assert not any(t.sparse for t in none.structure(perm, tiles, m, rows).tiles)
+
+
+def test_calibration_runs_once_per_cache_on_the_cheapest_candidate(monkeypatch):
+    perm, tiles, m, rows = _mixed_sparse_plan()
+    _stub_attach(monkeypatch)
+    ratio = _split_ratio(tiles)
+    probes = []
+
+    def measure(self, t, dt, flat_dev, data_dev):
+        probes.append((t.start, t.stop))
+        return ratio
+
+    monkeypatch.setattr(trots._DeviceGramContext, "_measure_break_even", measure)
+    cache = {}
+    first = _host_context_posing_as_cupy(cache)
+    assert first.sparse_break_even() is None
+    ds = first.structure(perm, tiles, m, rows)
+    cheapest = min(tiles, key=lambda t: (t.stop - t.start) * len(t.cols) ** 2)
+    assert probes == [(cheapest.start, cheapest.stop)]
+    assert [t.sparse for t in ds.tiles] == [r <= ratio for r in _ratios(tiles)]
+    # A second context on the same cache and device (the exact Hessian's,
+    # say) reuses the calibration, also for a structure it plans itself.
+    perm2, tiles2, m2, _rows = _mixed_sparse_plan()
+    second = _host_context_posing_as_cupy(cache)
+    assert second.sparse_break_even() == ratio
+    second.structure(perm2, tiles2, m2, rows)
+    assert len(probes) == 1
+    # A pinned context never shares its tiles with a calibrated one.
+    pinned = _host_context_posing_as_cupy(cache, sparse_ratio=ratio)
+    assert pinned.signature != first.signature
+    assert pinned.structure(perm, tiles, m, rows) is not ds
+
+
+def test_over_budget_and_disabled_sparse_tiles_skip_the_choice(monkeypatch):
+    perm, tiles, m, rows = _mixed_sparse_plan()
+    _stub_attach(monkeypatch)
+
+    def no_measure(*_args, **_kwargs):
+        raise AssertionError("no candidate tile, nothing to calibrate")
+
+    monkeypatch.setattr(trots._DeviceGramContext, "_measure_break_even", no_measure)
+    # Over the densify budget: SpGEMM whatever the ratio would say.
+    capped = _host_context_posing_as_cupy(densify_budget_bytes=1)
+    ds = capped.structure(perm, tiles, m, rows)
+    assert all(t.capped and t.sparse for t in ds.tiles)
+    # device_sparse_tiles=False: every tile densified, nothing calibrated.
+    off = _host_context_posing_as_cupy(sparse_tiles=False)
+    assert not any(t.sparse for t in off.structure(perm, tiles, m, rows).tiles)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), -1e-4, float("inf")])
+def test_device_ratio_must_be_finite_and_nonnegative(bad):
+    with pytest.raises(ValueError, match="device_sparse_tile_flop_ratio"):
+        trots.TiledGramConfig(device_sparse_tile_flop_ratio=bad)
+    assert trots.TiledGramConfig(device_sparse_tile_flop_ratio=0.0)
+
+
+def test_host_kernel_ignores_the_device_ratio():
+    # NumPy runs never consult the device break-even: bitwise the same Gram.
+    a = _banded(900, 60, 4, 1)
+    w = np.random.default_rng(82).uniform(0.1, 2.0, a.shape[0])
+    base = _op(a, block_rows=64, sparse_tile_flop_ratio=0.3)
+    pinned = _op(
+        a, block_rows=64, sparse_tile_flop_ratio=0.3, device_sparse_tile_flop_ratio=0.0
+    )
+    assert any(t.sparse for p in base._plans for t in p.tiles)
+    np.testing.assert_array_equal(np.asarray(pinned.gram(w)), np.asarray(base.gram(w)))
+
+
+def test_device_calibration_measures_a_finite_ratio(namespace):
+    # On CuPy the first materialization with sparse candidates times one tile
+    # both ways. Whichever kernels the measured ratio picks, the Gram agrees
+    # with the dense reference, and with the all-sparse choice (pinned 1.0)
+    # to reduction-order round-off.
+    xp = namespace
+    kind = _device_namespace(xp)
+    if kind != "cupy":
+        pytest.skip("only CuPy has a device sparse kernel to calibrate")
+    a = _mixed_matrix()
+    w = np.random.default_rng(85).uniform(0.1, 2.0, a.shape[0])
+    ref = _dense_gram(a, w)
+    grams = {}
+    for label, ratio in (("calibrated", None), ("all-sparse", 1.0)):
+        cfg = trots.TiledGramConfig(
+            block_rows=100,
+            flop_ratio_threshold=1.0,
+            sparse_tile_flop_ratio=1.0,
+            device_sparse_tile_flop_ratio=ratio,
+        )
+        op = trots.TiledGramCSROperator(a, xp, config=cfg)
+        tiles = [t for ds in op.device_structures() for t in ds.tiles]
+        measured = op._device.sparse_break_even()
+        assert measured is not None and math.isfinite(measured) and measured >= 0.0
+        if ratio is not None:
+            assert all(t.sparse for t in tiles)
+        grams[label] = _host(op.gram(xp.asarray(w)))
+        assert _rel(grams[label], ref) < 1e-12
+        np.testing.assert_array_equal(grams[label], grams[label].T)
+    assert _rel(grams["calibrated"], grams["all-sparse"]) < 1e-13
+
+
+@pytest.mark.parametrize("layout", ["C", "F"])
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
+def test_cupy_block_scatter_matches_add_at_on_the_lower_triangle(
+    namespace, layout, dtype
+):
+    # The CuPy scatter kernel replaces cupy.add.at with broadcast ix_ indices
+    # (a c x c int64 index temporary): the lower triangle -- all the device
+    # Gram keeps before its mirror -- must be bitwise the same, whatever the
+    # block's memory order (syrk may return F-ordered blocks) and dtype
+    # (float32 accumulate requests scatter float32 blocks into float64).
+    xp = namespace
+    if _device_namespace(xp) != "cupy":
+        pytest.skip("the scatter kernel is CuPy's")
+    import cupy
+
+    rng = np.random.default_rng(90)
+    n, c = 37, 23
+    cols = cupy.asarray(np.sort(rng.choice(n, c, replace=False)).astype(np.int64))
+    base = rng.standard_normal((n, n))
+    block = cupy.asarray(rng.standard_normal((c, c)).astype(dtype), order=layout)
+    ctx = trots._DeviceGramContext(xp, "cupy", cupy.cuda.Device())
+    got = cupy.asarray(base)
+    ctx.scatter_block(got, cols, block)
+    ref = cupy.asarray(base)
+    cupy.add.at(ref, (cols[:, None], cols[None, :]), block)
+    low = np.tril(np.ones((n, n), dtype=bool))
+    np.testing.assert_array_equal(cupy.asnumpy(got)[low], cupy.asnumpy(ref)[low])
+    # Entries outside the tile's columns are untouched.
+    touched = np.zeros((n, n), dtype=bool)
+    idx = cupy.asnumpy(cols)
+    touched[np.ix_(idx, idx)] = True
+    np.testing.assert_array_equal(cupy.asnumpy(got)[~touched], base[~touched])
+
+
+@pytest.mark.parametrize("accumulate", [None, "float32"])
+@pytest.mark.parametrize("weights", ["positive", "one-signed-tile"])
+def test_cupy_dense_workspace_is_bitwise_the_allocating_path(
+    namespace, monkeypatch, accumulate, weights
+):
+    # The per-call workspace (one tile buffer, one C-ordered syrk result
+    # reused by every densified tile) changes where the products land, not
+    # what they are: bitwise the Gram of the allocate-per-tile path.
+    xp = namespace
+    if _device_namespace(xp) != "cupy":
+        pytest.skip("the dense workspace is CuPy's")
+    a = _random_sparse(1500, 300, 0.1, 91)
+    a.data = a.data.astype(np.float32).astype(np.float64)
+    w = np.random.default_rng(92).uniform(0.1, 3.0, a.shape[0])
+    if weights == "one-signed-tile":
+        # One tile takes the gemm fallback (its own product), the others the
+        # workspace syrk: the workspace must not leak between the two.
+        w[:10] = -0.5
+    cfg = trots.TiledGramConfig(
+        block_rows=256, flop_ratio_threshold=1.0, sparse_tile_flop_ratio=0.0
+    )
+    op = trots.TiledGramCSROperator(a, xp, config=cfg)
+    used = trots._DenseWorkspace.for_tiles(
+        op._device,
+        [(ds, None, None) for ds in op.device_structures()],
+        "float64",
+        xp.float64,
+    )
+    assert used is not None
+    with_work = _host(op.gram(xp.asarray(w), accumulate_dtype=accumulate))
+    monkeypatch.setattr(
+        trots._DenseWorkspace, "for_tiles", classmethod(lambda cls, *a, **k: None)
+    )
+    fresh = trots.TiledGramCSROperator(a, xp, config=cfg)
+    alloc = _host(fresh.gram(xp.asarray(w), accumulate_dtype=accumulate))
+    np.testing.assert_array_equal(with_work, alloc)

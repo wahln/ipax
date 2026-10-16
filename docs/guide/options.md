@@ -290,6 +290,33 @@ options = Options(
 )
 ```
 
+Each damping trial of the dense route solves `(Jᵀ Σ J + λ I) Δx = −∇F`, by
+default with `xp.linalg.solve` (an LU with partial pivoting).
+`RestorationOptions.dense_factorization="cholesky"` uses the fact that this
+matrix is symmetric positive definite for `λ > 0`: it factors it with
+`xp.linalg.cholesky` and back-substitutes through the per-backend triangular
+solve (SciPy `cho_solve` on NumPy, `torch.cholesky_solve`, CuPy
+`solve_triangular`), about half the LU's flops. The iterate agrees with
+the LU one to round-off, not bit for bit. If the Cholesky breaks down (the
+backend raises, or the factor or the solution is non-finite — an extreme-scale
+Gram can be numerically indefinite), that trial is solved by LU instead. On
+backends without a triangular-solve adapter (JAX, array-api-strict) the option
+behaves exactly like `"lu"`, and the iterative route ignores it. The default
+stays `"lu"`, so S2MPJ results do not change. Consider it when dense
+restoration solves dominate the wall time at a few thousand variables: on TROTS
+`Prostate_VMAT_101` (n = 1976) the LU was about 60 % of restoration time. In the
+first 25 restoration iterations from its initial point (54 trials, NumPy,
+provisional timings on a shared machine) the solves took 8 s instead of 17 s,
+`restore()` took 20 s instead of 28 s, and both options reached the same point
+to a relative 6·10⁻¹⁴. The speedup shrinks with `n` on OpenBLAS: at `n = 5000`
+the Cholesky and LU solves measured about even.
+
+```python
+options = Options(
+    restoration=RestorationOptions(dense_factorization="cholesky"),
+)
+```
+
 The one knob to know is the work cap, `RestorationOptions.krylov.max_iter`
 (default 200). Conjugate gradients on the Gauss-Newton normal operator sees
 the *squared* conditioning of the Jacobian, and on an ill-conditioned one it

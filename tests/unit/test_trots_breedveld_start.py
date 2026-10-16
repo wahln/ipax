@@ -174,6 +174,140 @@ def test_unknown_initial_point_strategy_is_rejected():
         trots.TROTSProblem(_instance(), np).initial_point(strategy="nope")
 
 
+# --------------------------------------------------------------------------- #
+# The least-squares fluence itself: eq. (23) normal equations
+# --------------------------------------------------------------------------- #
+def _ls_instance(case):
+    """``_instance()`` with its initialisation data replaced per ``case``.
+
+    ``"blocks+reg"``: two dense-ish init blocks (one with a dose offset ``b``,
+    two reference doses) plus a non-symmetric regularisation matrix — the
+    symmetrised ``R`` branch. ``"indefinite-reg"``: an ``R`` that makes the
+    normal matrix indefinite — the LU fallback after a failed Cholesky.
+    ``"rank-deficient"``: one wide block (rank 5 <
+    N) and no regularisation — only the ridge makes the solve well-posed.
+    ``"sparse-block"``: adds a block below the adapter's dense-Gram density
+    gate (SpGEMM fallback) next to a dense one.
+    """
+    rng = np.random.default_rng(7)
+    inst = _instance()
+    cache = inst._matrix_cache
+    dense = sp.csr_matrix(rng.uniform(0.5, 1.5, (20, N)))
+    offset = sp.random(30, N, density=0.4, format="csr", random_state=rng)
+    offset.data = rng.uniform(0.2, 1.0, offset.nnz)
+    cache[11] = trots.TROTSMatrix("init a", 0, dense, np.zeros(0), 0.0)
+    cache[12] = trots.TROTSMatrix(
+        "init b", 0, offset.tocsc(), rng.uniform(0.0, 0.5, 30), 0.0
+    )
+    if case == "blocks+reg":
+        reg = sp.random(N, N, density=0.3, format="csc", random_state=rng) * 0.05
+        reg = (reg + 0.2 * sp.eye(N)).tocsc()  # non-symmetric on purpose
+        cache[13] = trots.TROTSMatrix("reg", 2, reg, np.zeros(0), 0.0)
+        inst.init_matrix_ids = np.asarray([11, 12])
+        inst.init_reference_dose = np.asarray([6.0, 3.0])
+        inst.init_reg_matrix_id = 13
+    elif case == "indefinite-reg":
+        # R with one strongly negative entry: the normal matrix is indefinite
+        # (nonsingular), Cholesky fails and the general solve must take over.
+        reg = sp.diags(np.r_[-1e3, np.zeros(N - 1)]).tocsc()
+        cache[13] = trots.TROTSMatrix("reg", 2, reg, np.zeros(0), 0.0)
+        inst.init_matrix_ids = np.asarray([11])
+        inst.init_reference_dose = np.asarray([6.0])
+        inst.init_reg_matrix_id = 13
+    elif case == "rank-deficient":
+        wide = sp.csr_matrix(rng.uniform(0.5, 1.5, (5, N)))
+        cache[14] = trots.TROTSMatrix("wide", 0, wide, np.zeros(0), 0.0)
+        inst.init_matrix_ids = np.asarray([14])
+        inst.init_reference_dose = np.asarray([6.0])
+        inst.init_reg_matrix_id = 0
+    else:
+        thin = sp.random(400, N, density=0.02, format="csr", random_state=rng)
+        thin.data = rng.uniform(0.2, 1.0, thin.nnz)
+        cache[15] = trots.TROTSMatrix("thin", 0, thin, np.zeros(0), 0.0)
+        inst.init_matrix_ids = np.asarray([11, 15])
+        inst.init_reference_dose = np.asarray([6.0, 2.0])
+        inst.init_reg_matrix_id = 0
+    return inst
+
+
+def _ls_reference(inst, n, ridge):
+    """The straightforward SciPy eq. (23) solve the loader must reproduce."""
+    ids = np.asarray(inst.init_matrix_ids).ravel()
+    dose = np.asarray(inst.init_reference_dose, dtype=float).ravel()
+    blocks, rhs = [], []
+    for k, mid in enumerate(ids):
+        mat = inst.matrix(int(mid))
+        a = sp.csr_matrix(mat.matrix)
+        b = mat.b if mat.b.size == a.shape[0] else 0.0
+        blocks.append(a)
+        rhs.append(np.full(a.shape[0], dose[k]) - b)
+    a_init = sp.vstack(blocks, format="csr")
+    normal = (a_init.T @ a_init).toarray()
+    if inst.init_reg_matrix_id:
+        r = inst.matrix(inst.init_reg_matrix_id).matrix.toarray()
+        normal = normal + 0.5 * (r + r.T)
+    normal = normal + ridge * np.trace(normal) / n * np.eye(n)
+    x = np.linalg.solve(normal, a_init.T @ np.concatenate(rhs))
+    return np.maximum(x, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("case", "ridge"),
+    [
+        ("blocks+reg", 1e-8),
+        ("indefinite-reg", 1e-8),
+        ("rank-deficient", 1e-4),
+        ("sparse-block", 1e-8),
+    ],
+)
+def test_least_squares_fluence_matches_the_scipy_normal_equations(case, ridge):
+    # 2026-09-28: the normal matrix is formed by the dense-BLAS Gram and
+    # solved by Cholesky instead of SpGEMM + todense + LU — the same x to
+    # round-off (the ridge case keeps its conditioning test-friendly).
+    inst = _ls_instance(case)
+    problem = trots.TROTSProblem(inst, np)
+
+    x = problem.least_squares_fluence(ridge=ridge)
+    ref = _ls_reference(inst, N, ridge)
+
+    assert isinstance(x, np.ndarray) and x.shape == (N,)
+    assert float(np.min(x)) >= 0.0
+    assert int(np.sum(ref > 0.0)) > 0  # a non-trivial start
+    assert float(np.max(np.abs(x - ref))) <= 1e-10 * float(np.max(np.abs(ref)))
+
+
+def test_least_squares_fluence_forms_no_sparse_gram(monkeypatch):
+    # The SpGEMM ``(AᵀA).todense()`` cost 1–35 s on the TROTS cases; dense-ish
+    # init blocks must reach the Gram through dense BLAS instead.
+    compressed = pytest.importorskip("scipy.sparse._compressed")
+    base = pytest.importorskip("scipy.sparse._base")
+    if not hasattr(compressed._cs_matrix, "_matmul_sparse"):
+        pytest.skip("SciPy internals changed: no _matmul_sparse to spy on")
+    inst = _ls_instance("blocks+reg")
+    problem = trots.TROTSProblem(inst, np)
+    calls: list[str] = []
+    real_matmul = compressed._cs_matrix._matmul_sparse
+    real_todense = base._spbase.todense
+
+    def spy_matmul(self, other):
+        calls.append("spgemm")
+        return real_matmul(self, other)
+
+    def spy_todense(self, *args, **kwargs):
+        calls.append("todense")
+        return real_todense(self, *args, **kwargs)
+
+    monkeypatch.setattr(compressed._cs_matrix, "_matmul_sparse", spy_matmul)
+    monkeypatch.setattr(base._spbase, "todense", spy_todense)
+
+    problem.least_squares_fluence()
+    assert calls == []
+
+    a = sp.csr_matrix(np.ones((3, 2)))
+    (a.T @ a).todense()  # the spies do see the old formulation
+    assert calls == ["spgemm", "todense"]
+
+
 def test_breedveld_initial_point_on_the_namespace(namespace):
     host = _host(
         trots.TROTSProblem(_instance(), np).initial_point(strategy="breedveld")

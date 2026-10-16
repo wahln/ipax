@@ -81,6 +81,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -756,20 +757,37 @@ class TiledGramConfig:
     (measured: pinning it to one thread makes the pool slower, since the
     compacted scatter holds the GIL).
 
-    ``device_sparse_tiles`` (CuPy namespaces) multiplies the sparse tiles of
-    exact (float64) Grams by cuSPARSE SpGEMM; ``False`` densifies them like
-    every other tile. Reduced-precision requests and Torch densify them too.
-    Host (NumPy) runs ignore it.
+    ``device_sparse_tiles`` (CuPy namespaces) lets exact (float64) Grams
+    multiply the plan's sparse tiles by cuSPARSE SpGEMM; ``False`` densifies
+    them like every other tile. Reduced-precision requests and Torch densify
+    them too. Host (NumPy) runs ignore it. *Which* sparse tiles keep SpGEMM is
+    a size-aware choice: a sparse tile stays sparse on the device only when
+    its ``Σ nnz_row²`` is at most ``device_sparse_tile_flop_ratio`` of its
+    densified ``b·c²``. The host's 1% break-even is wrong on a device, whose
+    dense ``syrk`` runs at a very different rate relative to its SpGEMM
+    (measured on Head-and-Neck_01, RTX 4070 Laptop, float64: syrk ~250–290
+    GFLOP/s, SpGEMM 3–7·10⁷ products/s, per-tile break-evens
+    1.8–4.2·10⁻⁴; a tile at 4·10⁻³ took 24.8 s by SpGEMM against 1.9 s
+    densified). ``None`` (the
+    default) calibrates the ratio once per problem and device — one sparse
+    tile of the plan multiplied both ways (see
+    :func:`_device_break_even_ratio`) — so the choice, and with it the last
+    bits of the Gram, can differ between processes for a tile near the
+    break-even; a float pins it (``1.0`` keeps every sparse tile sparse, the
+    behaviour before the calibration; ``0.0`` densifies all but the
+    over-budget ones).
 
     Densifying a sparse tile is priced wrongly by the gate: the gate charges
     it ``Σ nnz_row²`` (its sparse-product arithmetic), but a densified tile
     costs the dense ``b·c²`` (twice that on Torch, whose ``matmul`` has no
-    one-triangle ``syrk``) and a ``b×c`` temporary. So on Torch and for
-    float32 requests the gate statistic underestimates the device cost of
-    plans with sparse tiles. ``device_densify_budget_bytes`` caps the damage:
+    one-triangle ``syrk``) and a ``b×c`` temporary. So on Torch, for
+    float32 requests, and for the CuPy sparse tiles that the device
+    break-even densifies, the gate statistic underestimates the device cost
+    of plans with sparse tiles. ``device_densify_budget_bytes`` caps the damage:
     a sparse tile whose densified ``b×c`` float64 temporary would exceed it
     is never densified on a device — CuPy multiplies it by cuSPARSE SpGEMM at
-    every precision (and whatever ``device_sparse_tiles`` says), Torch by the
+    every precision (whatever ``device_sparse_tiles`` and the device
+    break-even ratio say), Torch by the
     host SciPy SpGEMM of the plan's tile (one weight download per such tile;
     free on CPU tensors). Host (NumPy) runs ignore it (they never densify a
     sparse tile).
@@ -792,6 +810,16 @@ class TiledGramConfig:
     lane_budget_bytes: int = 1 << 30
     device_sparse_tiles: bool = True
     device_densify_budget_bytes: int = 256 << 20
+    device_sparse_tile_flop_ratio: float | None = None
+
+    def __post_init__(self) -> None:
+        r = self.device_sparse_tile_flop_ratio
+        if r is not None and not (math.isfinite(r) and r >= 0.0):
+            # NaN would silently densify every tile (s <= nan is False).
+            raise ValueError(
+                "device_sparse_tile_flop_ratio must be None or a finite "
+                f"number >= 0, got {r!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -1200,6 +1228,7 @@ class TiledGramCSROperator(CSROperator):
                 device_cache,
                 sparse_tiles=self.config.device_sparse_tiles,
                 densify_budget_bytes=self.config.device_densify_budget_bytes,
+                sparse_ratio=self.config.device_sparse_tile_flop_ratio,
             )
 
     # -- the Gram ---------------------------------------------------------------
@@ -1668,8 +1697,47 @@ def _threaded_tiles(
 # filled), plus — on exact CuPy Grams — at least one per sparse tile inside
 # cuSPARSE SpGEMM, which reads the product's nnz back to size its output
 # (unavoidable through cupyx). Torch's over-budget sparse tiles add one
-# weight download each (none on CPU tensors).
+# weight download each (none on CPU tensors). Once per problem and device,
+# the sparse-tile break-even calibration (see _device_break_even_ratio)
+# synchronizes the stream around its timed calls.
 _DEVICE_MIRROR_BLOCK = 1024
+# First element of the device cache key under which a context stores the
+# measured sparse-tile break-even (tile entries are keyed by id(tiles)).
+_CALIBRATION_TAG = "device-sparse-break-even"
+
+
+def _device_break_even_ratio(
+    sparse_products: float,
+    sparse_seconds: float,
+    dense_flops: float,
+    dense_seconds: float,
+) -> float:
+    """The device's sparse-tile break-even ``Σ nnz_row² / (b·c²)``.
+
+    One tile multiplied both ways gives the SpGEMM throughput
+    ``r_s = sparse_products / sparse_seconds`` (``Σ nnz_row²`` products per
+    second) and the densified throughput ``r_d = dense_flops / dense_seconds``
+    (``b·c²`` per second). A tile is cheaper sparse when
+    ``Σ nnz_row² / r_s < b·c² / r_d``, i.e. when ``Σ nnz_row² ≤ ratio · b·c²``
+    with ``ratio = r_s / r_d`` — the host rule's statistic
+    (``TiledGramConfig.sparse_tile_flop_ratio``, Breedveld et al. 2017 §4.2
+    tiles), with the break-even measured on the device instead of assumed.
+    Degenerate timings (non-positive or non-finite) give ``0.0``: densify,
+    the kernel whose rate does not depend on the sparsity pattern.
+    """
+    parts = (sparse_products, sparse_seconds, dense_flops, dense_seconds)
+    if not all(math.isfinite(v) and v > 0.0 for v in parts):
+        return 0.0
+    return (sparse_products / sparse_seconds) / (dense_flops / dense_seconds)
+
+
+def _prefer_device_sparse(
+    sparse_products: float, rows: int, cols: int, ratio: float
+) -> bool:
+    """Whether a ``rows × cols`` tile with ``sparse_products = Σ nnz_row²``
+    keeps the device SpGEMM kernel under the break-even ``ratio``
+    (see :func:`_device_break_even_ratio`)."""
+    return float(sparse_products) <= ratio * float(rows) * cols * cols
 
 
 def _device_kind(xp: Namespace) -> str | None:
@@ -1736,6 +1804,7 @@ class _DeviceGramContext:
         *,
         sparse_tiles: bool = True,
         densify_budget_bytes: int | None = None,
+        sparse_ratio: float | None = None,
     ) -> None:
         # Normalize to the Array API compat namespace: the device kernels use
         # ``device=`` keywords (``asarray``/``zeros``) that a raw ``cupy`` module
@@ -1758,8 +1827,19 @@ class _DeviceGramContext:
             if densify_budget_bytes is not None
             else TiledGramConfig.device_densify_budget_bytes
         )
-        self.signature = (kind, str(device), self.sparse_tiles, self.densify_budget)
+        #: Pinned device sparse-tile break-even (Σ nnz_row² / b·c²), or None to
+        #: calibrate it once per cache and device; see
+        #: TiledGramConfig.device_sparse_tile_flop_ratio.
+        self.sparse_ratio_pinned = None if sparse_ratio is None else float(sparse_ratio)
+        self.signature = (
+            kind,
+            str(device),
+            self.sparse_tiles,
+            self.densify_budget,
+            self.sparse_ratio_pinned,
+        )
         self._syrk: Any = None
+        self._scatter_kernel: Any = None  # CuPy scatter_block kernel (lazy)
         if kind == "cupy":
             try:
                 from cupy import cublas
@@ -1846,35 +1926,23 @@ class _DeviceGramContext:
         data_dev = self.put(data)
         nbytes = flat.size * np.dtype(index_dtype).itemsize + data.nbytes
         nbytes += int(np.asarray(perm).size) * 8
+        # Size-aware kernel choice among the plan's sparse tiles (the
+        # over-budget ones stay sparse whatever it says): SpGEMM only below
+        # the device's own break-even (TiledGramConfig).
+        candidates = [
+            (t, dt)
+            for t, dt in zip(tiles, dtiles, strict=True)
+            if dt.sparse and not dt.capped
+        ]
+        if candidates:
+            ratio = self._sparse_break_even(candidates, flat_dev, data_dev)
+            for t, dt in candidates:
+                dt.sparse = _prefer_device_sparse(
+                    t.flops, dt.stop - dt.start, dt.width, ratio
+                )
         for t, dt in zip(tiles, dtiles, strict=True):
             if dt.sparse:
-                import cupyx.scipy.sparse as cxs
-
-                dt.csr = cxs.csr_matrix(
-                    (
-                        data_dev[dt.lo : dt.hi],
-                        self.put(t.csr.indices, np.int32),
-                        self.put(t.csr.indptr, np.int32),
-                    ),
-                    shape=t.csr.shape,
-                )
-                # The plan's tiles are canonical (sorted, duplicate-free), and
-                # so is their transpose: say so, or cupyx checks it with a
-                # kernel and a host sync. The transpose is stored in float64,
-                # the product's dtype, so cupyx does not recast a float32
-                # tile's transpose on every call.
-                dt.csr.has_canonical_format = True
-                csr_t = dt.csr.T.tocsr()
-                if csr_t.dtype != np.float64:
-                    csr_t = csr_t.astype(np.float64)
-                csr_t.has_canonical_format = True
-                dt.csr_t = csr_t
-                dt.row_of_nnz = self.put(
-                    np.repeat(
-                        np.arange(t.stop - t.start, dtype=np.int32),
-                        np.diff(t.csr.indptr),
-                    )
-                )
+                self._attach_sparse(t, dt, data_dev)
                 # csr's indices/indptr, csr_t's indices/indptr/data, row_of_nnz
                 # (csr's data is a view of the structure's values).
                 nnz = int(t.csr.nnz)
@@ -1889,25 +1957,230 @@ class _DeviceGramContext:
             nbytes=int(nbytes),
         )
 
-    # -- kernels ----------------------------------------------------------------
-    def gram_block(self, dense: Any) -> Any:
-        """``denseᵀ dense`` (c×c): lower triangle via cuBLAS ``syrk`` on CuPy
-        (upper left zero), the full product via ``matmul`` on Torch."""
-        if self._syrk is not None:
-            return self._syrk("T", dense, lower=True)
-        return self.xp.matmul(self.xp.permute_dims(dense, (1, 0)), dense)
+    def _attach_sparse(self, t: _Tile, dt: _DeviceTile, data_dev: Any) -> None:
+        """The device CSR of sparse tile ``t`` (CuPy): ``dt.csr`` over the
+        structure's device values, its float64 transpose and the nnz → row map."""
+        import cupyx.scipy.sparse as cxs
+        import numpy as np
 
-    def scatter_block(self, out: Any, cols: Any, block: Any) -> None:
-        """``out[ix_(cols, cols)] += block`` (unique ``cols``: no collisions)."""
-        rows_ix, cols_ix = cols[:, None], cols[None, :]
+        dt.csr = cxs.csr_matrix(
+            (
+                data_dev[dt.lo : dt.hi],
+                self.put(t.csr.indices, np.int32),
+                self.put(t.csr.indptr, np.int32),
+            ),
+            shape=t.csr.shape,
+        )
+        # The plan's tiles are canonical (sorted, duplicate-free), and so is
+        # their transpose: say so, or cupyx checks it with a kernel and a host
+        # sync. The transpose is stored in float64, the product's dtype, so
+        # cupyx does not recast a float32 tile's transpose on every call.
+        dt.csr.has_canonical_format = True
+        csr_t = dt.csr.T.tocsr()
+        if csr_t.dtype != np.float64:
+            csr_t = csr_t.astype(np.float64)
+        csr_t.has_canonical_format = True
+        dt.csr_t = csr_t
+        dt.row_of_nnz = self.put(
+            np.repeat(
+                np.arange(t.stop - t.start, dtype=np.int32), np.diff(t.csr.indptr)
+            )
+        )
+
+    # -- the device sparse-tile break-even --------------------------------------
+    def sparse_break_even(self) -> float | None:
+        """The ratio the kernel choice uses: the pinned one, else the one
+        calibrated for this cache and device (None until the first structure
+        with sparse tiles is materialized)."""
+        if self.sparse_ratio_pinned is not None:
+            return self.sparse_ratio_pinned
+        hit = self.cache.get(self._calibration_key())
+        return None if hit is None else float(hit)
+
+    def _calibration_key(self) -> tuple[Any, ...]:
+        return (_CALIBRATION_TAG, self.kind, str(self.device))
+
+    def _sparse_break_even(
+        self,
+        candidates: list[tuple[_Tile, _DeviceTile]],
+        flat_dev: Any,
+        data_dev: Any,
+    ) -> float:
+        """Pinned, cached, or measured now on the cheapest candidate (once per
+        cache and device, so the linear block and the exact Hessian share it)."""
+        ratio = self.sparse_break_even()
+        if ratio is not None:
+            return ratio
+        t, dt = min(
+            candidates, key=lambda p: (p[1].stop - p[1].start) * p[1].width ** 2
+        )
+        ratio = self._measure_break_even(t, dt, flat_dev, data_dev)
+        self.cache[self._calibration_key()] = ratio
+        return ratio
+
+    def _measure_break_even(
+        self, t: _Tile, dt: _DeviceTile, flat_dev: Any, data_dev: Any
+    ) -> float:
+        """Multiply one sparse tile both ways (unit weights, into a private
+        ``c×c`` block) and return :func:`_device_break_even_ratio` of the
+        timings. Both arms are the production kernels (the dense one with its
+        :class:`_DenseWorkspace`). The candidate with the least dense work is
+        used, which bounds the calibration's cost: a plan's sparse tile
+        carries at most ``sparse_tile_flop_ratio`` of its dense work in
+        sparse products (Head-and-Neck_01: a 1785×1797 tile, 0.6 ms by
+        SpGEMM, 28 ms dense).
+
+        A single probe measures a ratio of *per-call* rates, fixed launch
+        costs included; it is not a model of how either kernel scales. On
+        a small probe the SpGEMM time is mostly its fixed cost (launches and
+        the nnz host read), and SpGEMM slows down further on large tiles
+        that spill out of device memory. So ``r`` is only accurate to about
+        2× (Head-and-Neck_01's per-tile break-evens span 1.8–4.2·10⁻⁴). That
+        separates Head-and-Neck_01's tiles, which lie at least 10× from it;
+        pin ``TiledGramConfig.device_sparse_tile_flop_ratio`` where tiles
+        crowd the break-even or where runs must be reproducible. The value
+        is logged at INFO."""
+        from dataclasses import replace
+
+        xp = self.xp
+        b, c = dt.stop - dt.start, dt.width
+        probe = replace(dt, cols=xp.arange(c, dtype=xp.int64, device=self.device))
+        self._attach_sparse(t, probe, data_dev)
+        out = xp.zeros((c, c), dtype=xp.float64, device=self.device)
+        ones = xp.ones((b,), dtype=xp.float64, device=self.device)
+        work = _DenseWorkspace(
+            xp.empty((b * c,), dtype=xp.float64, device=self.device),
+            xp.empty((c * c,), dtype=xp.float64, device=self.device),
+        )
+
+        def sparse() -> None:
+            _device_sparse_tile_into(self, out, probe, ones)
+
+        def dense() -> None:
+            _device_dense_tile_into(
+                self,
+                out,
+                flat_dev,
+                data_dev,
+                probe,
+                ones,
+                ones,
+                False,
+                xp.float64,
+                work,
+            )
+
+        t_sparse = self._best_seconds(sparse)
+        t_dense = self._best_seconds(dense)
+        ratio = _device_break_even_ratio(
+            float(t.flops), t_sparse, float(b) * c * c, t_dense
+        )
+        _LOG.info(
+            "device sparse-tile break-even r = %.3g on %s (probe %d x %d, "
+            "sum nnz_row^2 = %.3g: SpGEMM %.3g s, densified %.3g s)",
+            ratio,
+            self.device,
+            b,
+            c,
+            float(t.flops),
+            t_sparse,
+            t_dense,
+        )
+        return ratio
+
+    def _best_seconds(self, run: Callable[[], None], repeats: int = 3) -> float:
+        """Minimum wall time of ``run`` over ``repeats`` synchronized calls,
+        after one warm-up call (kernel caches, cuSPARSE handles)."""
+        import time
+
+        run()
+        self.synchronize()
+        best = float("inf")
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            run()
+            self.synchronize()
+            best = min(best, time.perf_counter() - t0)
+        return best
+
+    def synchronize(self) -> None:
+        """Wait for the device's queued work (CuPy's current stream); a no-op
+        elsewhere (only CuPy has a sparse kernel to calibrate)."""
         if self.kind == "cupy":
             import cupy
 
-            cupy.add.at(out, (rows_ix, cols_ix), block)  # one kernel, casts
+            cupy.cuda.get_current_stream().synchronize()
+
+    # -- kernels ----------------------------------------------------------------
+    def gram_block(self, dense: Any, out: Any = None) -> Any:
+        """``denseᵀ dense`` (c×c): the lower triangle via cuBLAS ``syrk`` on
+        CuPy, the full product via ``matmul`` on Torch.
+
+        CuPy with ``out`` (a C-ordered ``c×c`` workspace of the tile's dtype):
+        written in place, only its lower triangle meaningful (``β = 0``, so its
+        old contents are never read). Without ``out`` CuPy allocates a zeroed
+        F-ordered result and copies the C-ordered ``dense`` to F order first
+        (both avoided with a C-ordered ``out``)."""
+        if self._syrk is not None:
+            return self._syrk("T", dense, out=out, lower=True)
+        return self.xp.matmul(self.xp.permute_dims(dense, (1, 0)), dense)
+
+    def scatter_block(self, out: Any, cols: Any, block: Any) -> None:
+        """``out[ix_(cols, cols)] += block`` on (at least) the lower triangle —
+        the only part of ``out`` the device Gram keeps; it mirrors once at
+        the end. Unique ``cols``: no collisions.
+
+        CuPy: one elementwise kernel over the ``c×c`` block that adds its
+        lower triangle at ``out[cols[r], cols[q]]`` in place — no index
+        temporaries. ``cupy.add.at`` with broadcast ``ix_`` indices, used
+        before, materialized a ``c×c`` int64 index (715 MiB at
+        Head-and-Neck_01's widest tile, c = 9684, on an 8 GB card the case
+        already overfills) and ran ~6× slower; each updated entry receives
+        the same single addition, so the lower triangle is bitwise the
+        same. Torch: ``index_put_`` over the whole block."""
+        if self.kind == "cupy":
+            import cupy
+
+            c = int(cols.shape[0])
+            if c and out.ndim == 2 and out.flags.c_contiguous:
+                self._scatter_lower()(
+                    block, cols, c, int(out.shape[1]), out, size=c * c
+                )
+            else:  # pragma: no cover - the device Gram's out is C-ordered
+                # Adds the whole block. With a workspace ``syrk`` result the
+                # upper triangle is stale memory: harmless only because every
+                # caller overwrites out's upper triangle by the final mirror.
+                cupy.add.at(out, (cols[:, None], cols[None, :]), block)
         else:
+            rows_ix, cols_ix = cols[:, None], cols[None, :]
             if block.dtype != out.dtype:
                 block = self.xp.astype(block, out.dtype)
             out.index_put_((rows_ix, cols_ix), block, accumulate=True)
+
+    def _scatter_lower(self) -> Any:
+        """The CuPy kernel of :meth:`scatter_block`, built once per context
+        (CuPy compiles it on first launch and caches the binary)."""
+        if self._scatter_kernel is None:
+            import cupy
+
+            # Thread i handles block entry (r, q) = divmod(i, c); the raw
+            # CArray index honours the block's strides (syrk may return an
+            # F-ordered block), and the cast matches add.at's promotion of a
+            # float32 block into the float64 result.
+            self._scatter_kernel = cupy.ElementwiseKernel(
+                "raw B block, raw int64 cols, int64 c, int64 n",
+                "raw T out",
+                """
+                const ptrdiff_t r = i / c;
+                const ptrdiff_t q = i - r * c;
+                if (q <= r) {
+                    const ptrdiff_t ix[] = {r, q};
+                    out[cols[r] * n + cols[q]] += (T)block[ix];
+                }
+                """,
+                "ipax_trots_tile_scatter_lower",
+            )
+        return self._scatter_kernel
 
     def scatter_coo(self, out: Any, rows: Any, cols: Any, vals: Any) -> None:
         """``out[rows[k], cols[k]] += vals[k]`` (duplicates accumulate)."""
@@ -2005,8 +2278,8 @@ def _device_run(
 ) -> None:
     """The tile products of :func:`_device_prepare`'s output, with ``flags``
     already on the host (NumPy bool, same layout)."""
-    xp = ctx.xp
     acc = ctx.dtype(acc_name)
+    work = _DenseWorkspace.for_tiles(ctx, prepared, acc_name, acc)
     offset = 0
     for ds, wp, swp in prepared:
         for t in ds.tiles:
@@ -2022,23 +2295,103 @@ def _device_run(
                 # Over budget with no device SpGEMM (Torch): the host product.
                 _host_sparse_tile_into(ctx, out, t, wp[t.start : t.stop])
                 continue
-            b, c = t.stop - t.start, t.width
-            dense = xp.zeros((b * c,), dtype=acc, device=ctx.device)
-            vals = ds.data[t.lo : t.hi]
-            if vals.dtype != acc:
-                vals = xp.astype(vals, acc)
-            dense[ds.flat[t.lo : t.hi]] = vals
-            dense = xp.reshape(dense, (b, c))
-            if not bad_tile:
-                # Σ ≥ 0: symmetric rank-k update on √w-scaled rows.
-                dense *= swp[t.start : t.stop, None]
-                block = ctx.gram_block(dense)
-            else:
-                # Signed / non-finite weights: no square root, general product.
-                w_t = xp.astype(wp[t.start : t.stop], acc)
-                block = xp.matmul(xp.permute_dims(dense, (1, 0)), w_t[:, None] * dense)
-            ctx.scatter_block(out, t.cols, block)
+            _device_dense_tile_into(
+                ctx,
+                out,
+                ds.flat,
+                ds.data,
+                t,
+                wp[t.start : t.stop],
+                swp[t.start : t.stop],
+                bad_tile,
+                acc,
+                work,
+            )
         offset += -(-ds.rows // ds.block_rows)
+
+
+@dataclass
+class _DenseWorkspace:
+    """Per-call CuPy buffers for the densified tiles: one flat ``b·c`` tile
+    buffer and one ``c×c`` product buffer, sized for the largest densified
+    tile and reused by every tile of the call.
+
+    Without them each tile allocated a zeroed ``b×c`` tile, an F-ordered copy
+    of it for ``syrk`` and a ``c×c`` result. CuPy's pool keeps every freed
+    size it has seen, so on ``Head-and-Neck_01`` (tile widths up to 9684 of
+    9984) one Gram grew the pool by ~5.8 GB beyond the 5.7 GB it keeps — past
+    an 8 GB card, into the driver's system-memory fallback.
+    """
+
+    tile: Any  # flat, >= max b·c entries, accumulate dtype
+    block: Any  # flat, >= max c² entries, accumulate dtype
+
+    @classmethod
+    def for_tiles(
+        cls,
+        ctx: _DeviceGramContext,
+        prepared: list[tuple[_DeviceStructure, Any, Any]],
+        acc_name: str,
+        acc: Any,
+    ) -> _DenseWorkspace | None:
+        if ctx.kind != "cupy":
+            return None  # Torch: matmul allocates its product anyway
+        tile = block = 0
+        for ds, _wp, _swp in prepared:
+            for t in ds.tiles:
+                if t.capped or (t.sparse and acc_name == "float64"):
+                    continue  # never densified in this call
+                b, c = t.stop - t.start, t.width
+                tile, block = max(tile, b * c), max(block, c * c)
+        if tile == 0:
+            return None
+        xp = ctx.xp
+        return cls(
+            xp.empty((tile,), dtype=acc, device=ctx.device),
+            xp.empty((block,), dtype=acc, device=ctx.device),
+        )
+
+
+def _device_dense_tile_into(
+    ctx: _DeviceGramContext,
+    out: Any,
+    flat: Any,
+    data: Any,
+    t: _DeviceTile,
+    w_t: Any,
+    sw_t: Any,
+    bad: bool,
+    acc: Any,
+    work: _DenseWorkspace | None = None,
+) -> None:
+    """Densified tile: scatter its values (``flat``/``data``, the structure's
+    device arrays) into a zeroed ``b×c`` tile in the accumulate dtype, then
+    ``syrk`` on the ``√w``-scaled rows (``sw_t``), or ``Dᵀ(w∘D)`` when the
+    tile's weights are signed or non-finite (``bad``; Breedveld 2017
+    §5.1.2), its lower triangle scatter-added at the tile's columns."""
+    xp = ctx.xp
+    b, c = t.stop - t.start, t.width
+    if work is None:
+        dense = xp.zeros((b * c,), dtype=acc, device=ctx.device)
+    else:
+        dense = work.tile[: b * c]
+        dense[...] = 0
+    vals = data[t.lo : t.hi]
+    if vals.dtype != acc:
+        vals = xp.astype(vals, acc)
+    dense[flat[t.lo : t.hi]] = vals
+    dense = xp.reshape(dense, (b, c))
+    if not bad:
+        # Σ ≥ 0: symmetric rank-k update on √w-scaled rows.
+        dense *= sw_t[:, None]
+        block = ctx.gram_block(
+            dense, None if work is None else xp.reshape(work.block[: c * c], (c, c))
+        )
+    else:
+        # Signed / non-finite weights: no square root, general product.
+        w_acc = xp.astype(w_t, acc)
+        block = xp.matmul(xp.permute_dims(dense, (1, 0)), w_acc[:, None] * dense)
+    ctx.scatter_block(out, t.cols, block)
 
 
 def _device_sparse_tile_into(
@@ -2448,9 +2801,24 @@ class TROTSProblem(Problem):
         prescribed dose to the targets — far closer to the feasible region than a
         uniform map. Negative fluences are clipped to zero (non-negativity). Returns
         a uniform vector when the file carries no initialisation matrices.
+
+        Cost: ``A_initᵀ A_init = Σ_k A_kᵀ A_k`` is accumulated per init matrix
+        through the SciPy adapter's ``gram`` (the ``LinearOperator`` protocol),
+        which forms a dense-ish block (the tumour matrices, 10–100% dense) by
+        chunked dense-BLAS ``syrk`` rather than SpGEMM — a sparse block keeps
+        SpGEMM. ``R`` is added from its sparse entries, the ridge on the
+        diagonal in place, and the SPD system is solved by Cholesky (LU if the
+        factorization fails, e.g. an indefinite ``R``). Measured 2026-09-28 on
+        the TROTS files this takes the solve from 1–35 s (SpGEMM + ``todense``
+        + LU) to 0.1–0.3 s at n ≈ 1–2k and ~3.5 s at n ≈ 10⁴; ``x``
+        agrees with the old formulation to round-off (see
+        ``docs/benchmarks/trots.md``).
         """
         import numpy as np
+        import scipy.linalg as sla
         import scipy.sparse as sp
+
+        from ipax.backend.sparse.numpy_scipy import SparseOperator
 
         inst = self._inst
         ids = (
@@ -2461,28 +2829,49 @@ class TROTSProblem(Problem):
         if ids.size == 0:
             return np.ones((self._n,), dtype=float)
 
+        n = self._n
         dose = np.asarray(inst.init_reference_dose, dtype=float).ravel()
-        blocks: list[Any] = []
-        rhs_parts: list[Any] = []
+        normal: Any = None
+        rhs = np.zeros((n,), dtype=float)
         for k, mid in enumerate(ids):
             mat = inst.matrix(int(mid))
             a = sp.csr_matrix(mat.matrix)
-            blocks.append(a)
             target = (dose[k] if k < dose.size else 0.0) - (
                 mat.b if mat.b.size == a.shape[0] else 0.0
             )
-            rhs_parts.append(np.full(a.shape[0], 1.0) * target)
-        a_init = sp.vstack(blocks, format="csr")
-        normal = np.asarray((a_init.T @ a_init).todense())
-        rhs = a_init.T @ np.concatenate(rhs_parts)
+            # Breedveld 2017, eq. (23): the normal equations of the stacked
+            # init blocks are the sum of the per-block ones. Unit weights: the
+            # adapter's dense-BLAS Gram for dense-ish blocks (its density gate
+            # keeps SpGEMM for sparse ones). The operator is private to this
+            # call and dropped, so its (memoized) result is ours to update.
+            gram = np.asarray(SparseOperator(a, np).gram(np.ones(a.shape[0])))
+            if normal is None:
+                normal = np.asarray(gram, dtype=float)
+            else:
+                normal += gram
+            rhs += a.T @ (np.full(a.shape[0], 1.0) * target)
         if inst.init_reg_matrix_id:
             r = inst.matrix(inst.init_reg_matrix_id).matrix
-            r = np.asarray((0.5 * (r + r.T)).todense())
-            normal = normal + r
+            # Symmetric part of R added entry-wise (canonical: no duplicates),
+            # never densified into an n×n temporary.
+            r = sp.coo_matrix(0.5 * (r + r.T))
+            normal[r.row, r.col] += r.data
         # A small ridge (relative to the block's scale) keeps the solve well-posed
         # when A_init is rank-deficient or no regularisation matrix is supplied.
-        normal = normal + ridge * (np.trace(normal) / max(self._n, 1)) * np.eye(self._n)
-        x = np.linalg.solve(normal, rhs)
+        normal.flat[:: n + 1] += ridge * (np.trace(normal) / max(n, 1))
+        try:
+            # Gram + PSD R + ridge is SPD: Cholesky, half LU's arithmetic. The
+            # matrix is symmetric (bitwise for the syrk Gram, to round-off for
+            # a SpGEMM one), so its transpose is the same matrix in the Fortran
+            # order LAPACK wants — no C→F conversion. ``cho_factor`` factors a
+            # copy: ``normal`` stays intact for the fallback.
+            x = sla.cho_solve(
+                sla.cho_factor(normal.T, lower=True, check_finite=False),
+                rhs,
+                check_finite=False,
+            )
+        except np.linalg.LinAlgError:
+            x = np.linalg.solve(normal, rhs)  # indefinite R: the general solve
         return np.maximum(x, 0.0)
 
     def initial_point(
@@ -4153,6 +4542,7 @@ class TROTSExactProblem(TROTSProblem):
                 self._device_tiles,
                 sparse_tiles=self._hess_cfg.device_sparse_tiles,
                 densify_budget_bytes=self._hess_cfg.device_densify_budget_bytes,
+                sparse_ratio=self._hess_cfg.device_sparse_tile_flop_ratio,
             )
             return TROTSDeviceExactHessian(
                 self.xp,

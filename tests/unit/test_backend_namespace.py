@@ -83,8 +83,11 @@ def test_capabilities_reports_real_devices(namespace):
     assert isinstance(caps.devices, tuple)
     assert len(caps.devices) >= 1
     assert all(isinstance(d, str) for d in caps.devices)
-    # Every installed CI backend (numpy/torch/array_api_strict) exposes a CPU.
-    assert any("cpu" in d.lower() for d in caps.devices)
+    # Exactly what the namespace's own inspection API reports — a CPU for
+    # numpy/torch/array_api_strict, only CUDA devices for CuPy (which has no
+    # CPU device) — never a hard-coded "cpu".
+    info = namespace.__array_namespace_info__()
+    assert caps.devices == tuple(str(d) for d in info.devices())
 
 
 def test_capabilities_devices_falls_back_when_info_missing():

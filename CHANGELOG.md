@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **`RestorationOptions.dense_factorization`** (`"lu"` default | `"cholesky"`):
+  opt-in Cholesky solve for the dense feasibility-restoration route. Each
+  Levenberg–Marquardt trial matrix `Jᵀ Σ J + λ I` is symmetric positive
+  definite for `λ > 0`, so `"cholesky"` factors it with `xp.linalg.cholesky`
+  and back-substitutes through the existing `get_dense_cholesky_solve` backend
+  gap-filler, at about half the LU's flops. A Cholesky breakdown (the
+  backend raises, or the factor or solution is non-finite) solves that trial
+  by LU. Backends without a triangular-solve adapter (JAX, array-api-strict)
+  keep the LU path. TROTS `Prostate_VMAT_101`, first 25 restoration
+  iterations (NumPy, provisional timings): solves 17 s → 8 s, `restore()`
+  28 s → 20 s, same point to 6·10⁻¹⁴ relative. The default is unchanged, and
+  so is the S2MPJ arithmetic.
 - **`BarrierOptions.probing_sigma`** (`"nww"` default | `"mehrotra"`): opt-in
   unclipped Mehrotra σ-rule for `mu_schedule="probing"`, as Breedveld et al.
   2017 run it (Mehrotra 1992; Breedveld 2017 supplement eqs. (4)–(7)):
@@ -129,6 +141,76 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   - Torch-CUDA is untested; Torch is validated on CPU tensors.
 
 ### Changed
+- **TROTS loader, device tiled Gram: size-aware sparse-tile choice and
+  shared tile buffers** (`benchmarks/corpus/trots.py`, CuPy only; the NumPy
+  kernels are unchanged). A plan's sparse tile now keeps cuSPARSE SpGEMM only
+  when its `Σ nnz_row²` is at most `r·b·c²`. The device break-even `r` is
+  the throughput ratio of the two kernels, measured once per problem and
+  device on the plan's cheapest sparse tile and shared by the linear block
+  and the exact Hessian. The host's 1% rule was far off on a consumer GPU:
+  on `Head-and-Neck_01` three tiles at `4·10⁻³` took 37.7 s by SpGEMM
+  against 3.1 s densified, and the measured `r` is 1.8·10⁻⁴ (logged at
+  INFO; a single probe is good to about 2×, and the TROTS tiles measured so
+  far lie at least 10× from the break-even).
+  `TiledGramConfig(device_sparse_tile_flop_ratio=...)` pins `r`: `1.0` is
+  the previous choice, `0.0` densifies every tile under the densify budget.
+  A measured `r` can flip a tile near the break-even between processes, and
+  with it the Gram's last bits. The densified tiles of one call now share a
+  `b×c` buffer and a C-ordered `c×c` `syrk` result, and their lower
+  triangles are scattered by one elementwise kernel instead of
+  `cupy.add.at` with broadcast indices. The old scatter built a 715 MiB
+  index at the widest tile and ran about 6× slower. The Gram's lower
+  triangle is bitwise unchanged on the tested CuPy 14 / cuBLAS build.
+  `TiledGramConfig` now rejects a NaN or negative device ratio.
+  `Head-and-Neck_01`, RTX 4070
+  Laptop, provisional: linear-block Gram 44 s (sum of tiles) → 7.5 s, and
+  per iteration 83.8 → 25.2 s (exact Hessian) and 75.5 → 14.0 s (L-BFGS),
+  identical trajectory. The case still overfills the 8 GB card, which now
+  bounds the Cholesky and the back-solves (see
+  `docs/benchmarks/trots.md`, Head-and-Neck profile). On `Protons_01` the
+  calibration keeps all 17 sparse tiles sparse, and the Gram time is
+  unchanged (0.21 s).
+- **CSR/CSC index expansion by `repeat`** (`ipax/backend/operators.py`,
+  `_expand_indptr`, used by `CSROperator`/`CSCOperator`). The per-entry
+  major index is now `repeat(arange(len(indptr) − 1), diff(indptr))` — O(nnz),
+  no `arange(nnz)` temporary — instead of `searchsorted(indptr, arange(nnz),
+  'right') − 1` (O(nnz log m)). Namespaces without a usable array-valued
+  `repeat` (CuPy < 14, `array-api-strict` with `data_dependent_shapes`
+  disabled, pre-2023.12 namespaces) keep the `searchsorted` form. Results are
+  identical (values and dtype, tested on NumPy/Torch/array-api-strict incl.
+  empty rows/matrices); an `indptr` whose span disagrees with `nnz` now raises
+  `ValueError` instead of producing out-of-range indices. Micro-benchmark
+  (m = 80k rows, nnz = 1e7, shared CPU, provisional): NumPy 0.45–1.35 s →
+  0.02–0.11 s, Torch 0.08–0.09 s → 0.016–0.028 s (medians of two runs).
+- **SciPy adapter: dense-Gram row windows densified into a reused chunk
+  buffer** (`ipax/backend/sparse/numpy_scipy.py`, `_gram_dense_accumulate`).
+  Each chunk is written by SciPy's own `csr_todense` kernel (what `toarray`
+  runs; public `toarray(out=…)` fallback) straight from views of the CSR
+  arrays into one buffer per call, instead of a `csr_matrix` + fresh
+  `toarray()` (+ a dtype-promoting copy for float32 data) per chunk. The
+  window constructor itself was already zero-copy for int32 indices on SciPy
+  1.17 (it copies only int64 windows, which it re-canonicalizes to int32).
+  Gram results are bitwise identical (byte-compared against the previous
+  routine: duplicates, unsorted indices, `-0.0` data, float32 data, zero /
+  negative / non-finite weights, int64 indices, 1–N chunks). On a 1e7-nnz,
+  n = 2000 block (shared CPU, provisional): the densify step 126 → 100 ms
+  (m = 40k, 2 chunks) and 263 → 163 ms (m = 100k, 4 chunks) for float64
+  data, 197 → 154 / 536 → 306 ms for float32; whole Gram 639 → 606 ms and
+  1439 → 1348 ms (float64) — the syrk dominates.
+- **TROTS least-squares start without SpGEMM** (`benchmarks/corpus/trots.py`,
+  `TROTSProblem.least_squares_fluence`, Breedveld et al. 2017 eq. (23)): the
+  normal matrix `A_initᵀA_init` is accumulated per initialization matrix
+  through the SciPy adapter's `gram` (chunked dense-BLAS `syrk` on the
+  dense-ish tumour matrices) instead of a SpGEMM of the stacked blocks plus
+  `todense`; the regularization matrix is added from its sparse entries, the
+  ridge in place on the diagonal, and the system is solved by Cholesky (LU if
+  it fails). Signature and return contract unchanged. Measured best-of-two
+  on a shared machine (provisional), old → new: `Protons_01` 1.3 → 0.3 s,
+  `Liver_01` 5.6 → 0.1 s, `Prostate_VMAT_101` 19 → 0.2 s, `Prostate_CK_01`
+  35 → 0.3 s, `Head-and-Neck_01` 22 → 3.5 s. The start is the same to
+  round-off: ≤ 3.3e-11 relative difference in `x` on those five cases, no
+  change of the clipped set. The runner counts this solve as initialization,
+  so the reported TROTS solve times drop by the same amounts.
 - **TROTS loader: restoration Grams from the active rows; host Hessian
   chunks cut once** (`benchmarks/corpus/trots.py`). On NumPy, a linear-block
   group the tiled-Gram gate keeps off is now an `ActiveRowGramCSROperator`:
@@ -222,6 +304,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     exactly. `--slack-init-scale` applies only with `--init ipax`.
 
 ### Fixed
+- **The dense solver's positive-definiteness probe now works on CuPy**
+  (`ipax/linalg/dense.py`, `ipax/linalg/solver.py`). CuPy's
+  `linalg.cholesky` does not raise on a non-PD matrix (under its default
+  `errstate` it returns a factor with a NaN — or, for a singular matrix, a
+  zero — pivot), so an indefinite condensed block passed the guard: inside an
+  equality saddle the LU then returned a finite non-descent step, the
+  PD-hinted Cholesky reuse kept a broken factor instead of falling back to
+  LU, and the mixed-precision route never saw a precision-caused PD failure.
+  New `checked_cholesky` classifies the factor by its pivots (all finite and
+  positive, the `potrf` success criterion); the dense solver uses it only on
+  backends whose Cholesky breaks down silently (`cholesky_breakdown_is_silent`,
+  probed once per solver), so NumPy, Torch and array-api-strict keep the plain
+  call — results and host-sync counts unchanged. The opt-in restoration
+  Cholesky applies the same pivot test (it accepted a finite zero-pivot
+  factor). On CuPy, HS6/HS7 on the dense route now follow the NumPy
+  trajectory (HS7: 20 → 10 iterations).
+- **The CuPy sparse adapter classifies cuDSS's silent failures**
+  (`ipax/backend/sparse/cupy.py`). A KKT matrix with inf/NaN entries now
+  raises `LinearSolveError` (as the SciPy adapter does) instead of factoring to
+  a NaN step. cuDSS's static pivoting replaces a too-small pivot by
+  `PIVOT_EPSILON`, so a singular system "solved" to a finite `±1e13` vector
+  with a plausible inertia; a solve on a factorization with perturbed pivots
+  (`NPIVOTS > 0`) is now rejected as singular when its residual exceeds 1% of
+  the right-hand side — an inconsistent singular system leaves an O(1)
+  residual, while the near-singular consistent systems an IPM produces (a
+  degenerate L-BFGS border) pass unchanged. HS9 on the CuPy sparse route:
+  `STALLED` after 27 iterations → `OPTIMAL` in 5, as on NumPy.
+- **Empty sparse patterns on CuPy** (`ipax/backend/sparse/_canonical.py`).
+  `cupy.bincount` rejects an empty input, which NumPy accepts, so compiling
+  the canonical CSR map of an empty operator (e.g. `gram_fill_estimate` of an
+  empty Jacobian) or an empty lower triangle raised `ValueError`.
 - **TROTS exact Hessian on CuPy/Torch no longer crosses gated-off structures
   through the host** (`benchmarks/corpus/trots.py`). Curved structures that
   fail the per-structure flop-ratio gate (the dense-ish PTVs of the CK/VMAT

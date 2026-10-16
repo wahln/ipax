@@ -3261,6 +3261,7 @@ class IPMDriver:
             dense_materialize_max_elements=(
                 self._options.restoration.dense_materialize_max_elements
             ),
+            dense_factorization=self._options.restoration.dense_factorization,
         )
 
     def _check_restoration_adjoints(self, x: Array, m: int, m_eq: int) -> None:

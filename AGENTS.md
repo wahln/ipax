@@ -352,3 +352,16 @@ Steps:
   by iterative refinement in three precisions." *SIAM Journal on Scientific
   Computing* 40(2), A817–A847. <https://doi.org/10.1137/17M1140819>
   (mixed-precision Gram accumulation + refinement in the dense condensed route)
+- Golub, G. H. & Van Loan, C. F. (2013). *Matrix Computations*, 4th ed. Johns
+  Hopkins University Press. (Cholesky vs LU operation counts, §§3.2, 4.2, and
+  the `potrf` success criterion behind `checked_cholesky` and the restoration
+  `dense_factorization="cholesky"` option)
+- Li, X. S. & Demmel, J. W. (2003). "SuperLU_DIST: A scalable distributed-memory
+  sparse direct solver for unsymmetric linear systems." *ACM Transactions on
+  Mathematical Software* 29(2), 110–140. <https://doi.org/10.1145/779359.779361>
+  (static pivoting; why a cuDSS factorization with perturbed pivots is certified
+  by its residual in the CuPy sparse adapter)
+- Dembo, R. S., Eisenstat, S. C. & Steihaug, T. (1982). "Inexact Newton methods."
+  *SIAM Journal on Numerical Analysis* 19(2), 400–408.
+  <https://doi.org/10.1137/0719025> (the inexact-Newton forcing of the Krylov
+  route)

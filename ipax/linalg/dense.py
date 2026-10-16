@@ -56,16 +56,27 @@ Failure classification: only a numerical failure
 :class:`LinearSolveError` and so feeds the IPM's δ_w ladder. Materializing
 runs the operator's own callbacks (a user Jacobian's ``gram``, a Hessian
 operator's ``dense_matrix``), so anything else raised there is a bug and
-propagates unchanged instead of being retried as a singular system.
+propagates unchanged instead of being retried as a singular system. A backend
+that reports a breakdown *silently* (CuPy under its default ``errstate``, JAX)
+is classified by inspecting the result instead: a Cholesky factor with a NaN
+or zero pivot fails the PD probe exactly as a raised ``LinAlgError`` does
+(:func:`~ipax.linalg.solver.checked_cholesky`), and a singular LU yields the
+non-finite solution the ``LinearSolver`` contract accepts as the same signal.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import TYPE_CHECKING, Any
 
 from ipax.backend.namespace import array_namespace
-from ipax.linalg.solver import LinearSolveError, numerical_failure_types
+from ipax.linalg.solver import (
+    LinearSolveError,
+    checked_cholesky,
+    cholesky_breakdown_is_silent,
+    numerical_failure_types,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -141,6 +152,10 @@ class DenseSolver:
         self._cholesky_factor: Array | None = None
         self._cholesky_solve: Callable[[Array, Array], Array] | None = None
         self._cholesky_solve_checked = False
+        # Whether the backend's ``cholesky`` reports a breakdown silently (a
+        # broken factor instead of an exception), probed once per instance
+        # like the lookup above; ``None`` until the first PD probe.
+        self._silent_cholesky: bool | None = None
         # Mixed-precision Gram state (DenseOptions.gram_dtype): whether the
         # *current* factorization was materialized with a reduced-precision
         # Gram (so solves must be refined), and the instance-wide kill switch
@@ -469,6 +484,12 @@ class DenseSolver:
         return None  # pragma: no cover
 
     def _solve_lu(self, matrix: Array, rhs: Array, xp: Any) -> Array:
+        # A backend that does not raise on an exactly singular LU (CuPy, JAX;
+        # ``ipax.backend.errors``) returns inf/NaN instead — the zero pivot
+        # reaches the solution through the back-substitution's division —
+        # which the ``LinearSolver`` contract accepts as the same failure
+        # signal: every caller checks the solution's finiteness already, so
+        # re-checking here would only add a host sync per solve.
         try:
             return xp.linalg.solve(matrix, rhs)
         except numerical_failure_types() as exc:
@@ -641,6 +662,15 @@ class DenseSolver:
         cholesky = getattr(xp.linalg, "cholesky", None)
         if cholesky is None:
             return
+        # A backend that returns a broken factor instead of raising (CuPy,
+        # JAX) must fail this probe too, or an indefinite N would pass the
+        # guard: there the factor's pivots are checked (``checked_cholesky``,
+        # one host sync). Where the backend raises, the check could never
+        # trip, so the plain call stays — no sync added, results unchanged.
+        if self._silent_cholesky is None:
+            self._silent_cholesky = cholesky_breakdown_is_silent(xp, matrix)
+        if self._silent_cholesky:
+            cholesky = functools.partial(checked_cholesky, xp)
         primal_block = getattr(self._operator, "primal_block", None)
         block = primal_block() if primal_block is not None else None
         if block is None:
@@ -677,10 +707,12 @@ class DenseSolver:
         so a numerical breakdown simply leaves the LU path as it was.
 
         The silent fallback relies on ``cholesky`` *raising* on a non-PD input,
-        which the Array API does not mandate (JAX returns NaN). The three
-        backends with a back-substitution gap-filler (NumPy/SciPy, Torch,
-        CuPy) all raise; JAX is excluded by that same lookup — a JAX adapter
-        would need an ``isfinite`` acceptance check here (one host sync).
+        which the Array API does not mandate: CuPy (default ``errstate``) and
+        JAX return a broken factor instead. On such a backend the
+        ``cholesky`` handed in is the pivot-checked one from
+        :meth:`_guard_positive_definite`
+        (:func:`~ipax.linalg.solver.checked_cholesky`), so a breakdown raises
+        on every backend.
 
         A breakdown is not free — the attempted factorization is wasted work
         — so ``DenseOptions.pd_hint_failure_limit`` *consecutive* breakdowns

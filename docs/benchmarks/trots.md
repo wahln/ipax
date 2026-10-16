@@ -44,9 +44,16 @@ reference solve: 79 iterations / 55 s); `Liver_01`: 57 iterations / 58 s on
 CuPy (reference 36 / 22 s). The 2026-09-27 sweep below measured this recipe
 against the monotone-μ variant on all seven TROTS sites; it wins every case.
 Its times predate the runner counting the least-squares fluence of eq. (23)
-as initialization (1 s on `Protons_01`, 3.5 s on `Liver_01`, 18 s on
-`Prostate_VMAT_101`, 30 s on `Prostate_CK_01`, 20 s on `Head-and-Neck_01`),
-so add that solve to each row.
+as initialization, so add that solve to each row: since 2026-09-28 it costs
+0.3 s on `Protons_01`, 0.1 s on `Liver_01`, 0.2 s on `Prostate_VMAT_101`,
+0.3 s on `Prostate_CK_01` and 3.5 s on `Head-and-Neck_01` (n ≈ 10⁴). The
+normal matrix is now accumulated per initialization matrix by the SciPy
+adapter's dense-BLAS Gram and solved by Cholesky; the SciPy SpGEMM +
+`todense` + LU it replaced took 1.3 / 5.6 / 19 / 35 / 22 s on the same
+cases. The fluence agrees with the old formulation to ≤ 3.3e-11 relative
+(max-norm; ≤ 7e-8 absolute), and no entry changes sides of the clip at 0.
+Timings are best of two on a shared machine (provisional; the old path
+varied by up to 3× between runs).
 
 **Previous L-BFGS recipes** (still the right choice for an L-BFGS solve:
 `--config lbfgs/dense --init ipax --mu-schedule monotone --globalization filter
@@ -174,9 +181,10 @@ benchmark edge (`TROTSProblem.initial_point(strategy="breedveld")` +
 `breedveld_warm_start()`) through the public warm-start API, no core change.
 `Protons_01`, idle machine, tiled Gram, `linsolve="dense"`; "solve wall"
 excludes the initialization, which the runner's reported solve time counts
-in full: the least-squares fluence of eq. (23) — 1.0 s here, 3.5 s on
-`Liver_01`, 18 s on `Prostate_VMAT_101` and 30 s on `Prostate_CK_01`, a
-SciPy SpGEMM of the dataset's initialization matrices — and LSQR on the
+in full: the least-squares fluence of eq. (23) — 0.3 s here, 0.1–0.3 s on
+`Liver_01`, `Prostate_VMAT_101` and `Prostate_CK_01` (a dense-BLAS Gram of
+the dataset's initialization matrices since 2026-09-28; the SciPy SpGEMM it
+replaced took 1–35 s, see above) — and LSQR on the
 host (3.4 s at the loader's `atol=btol=1e-6`, 24 s at `1e-8` for a
 bit-identical start, because every LSQR multiplier is < 0.04 and the floor
 sets all 369,445 of them to 5). On CuPy the LSQR has since moved to the
@@ -373,6 +381,123 @@ loader forms its active-set Grams from the ~100 active rows instead of all
 81,279 (`ActiveRowGramCSROperator`; 946 → 631 s for the monotone arm's
 first 31 iterations, identical trajectory). Reproduce: the runner defaults;
 `--mu-schedule monotone --kappa-centrality 1e-2` for the previous arm.
+
+**Head-and-Neck_01 profile (2026-09-28, provisional).** This is the
+runner's default recipe on the only `n ≈ 10⁴` case measured so far
+(`n = 9984`, 100,223 lowered linear rows, 104 M nonzeros in 49 tiles, all
+float64). It adds the exact-Hessian arm the sweep above did not run, and
+the first CuPy numbers. Setup: a 13th-gen i9-13900HX laptop (24 cores, 32
+threads, threaded OpenBLAS, CPU load under 15 % before each run) and its
+RTX 4070 Laptop GPU (8 GB, fp64 at 1/64 rate, CuPy 14, nothing else on
+it). Every run was one process under 9 minutes. Each phase was timed
+exclusively: a phase's time excludes the phases nested in it, and the GPU
+was synchronized at every phase boundary. The per-iteration means cover
+iterations 1 to the last one. Initialization is listed separately.
+
+| per iteration (s) | NumPy exact | NumPy L-BFGS | CuPy exact, before → after | CuPy L-BFGS, before → after | paper (16-core Xeon) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| linear-block Gram (tiled) | 19.66 | 19.52 | 67.33 → 10.51 | 67.37 → 8.53 | 4.07 ("make N", incl. Hessian) |
+| other Gram rows (nonlinear constraints) | 0.34 | 0.37 | 1.29 → 1.51 | 1.34 → 0.84 | |
+| exact Hessian, dense formation | 10.99 | — | 7.57 → 2.74 | — | |
+| Cholesky factorization | 2.57 | 3.01 | 2.81 → 4.87 | 2.02 → 1.36 | 1.07 |
+| back-solves | 1.88 | 2.08 | 3.97 → 4.80 | 3.84 → 2.69 | 0.44 |
+| KKT assembly | 0.70 | 1.60 | 0.36 → 0.41 | 0.64 → 0.40 | |
+| Mehrotra corrector, line search, evaluations, driver | 0.61 | 0.68 | 0.47 → 0.35 | 0.25 → 0.21 | 0.26 (functions, TQD, step length) |
+| **total** | **36.75** | **27.24** | **83.8 → 25.2** | **75.5 → 14.0** | **6.2** (279 s / 45, incl. load and init) |
+| iterations timed | 12 | 16 | 5 → 18 | 5 → 25 | 45 |
+
+- **Initialization: 35–39 s, against the paper's 7.8 s.** It splits into
+  the least-squares start (3.3 s), the linear block's tile plan (6.2–6.9 s,
+  in the first `linear_ineq()` call), and the LSQR dual start (26.8 s on
+  CuPy, 29.6 s through SciPy on NumPy). LSQR stops at its 200-iteration cap
+  on this case ("LSQR stopped at its iteration limit"). The runner rows
+  include this time.
+- **NumPy: the tiled Gram dominates.** It is one accumulation lane here,
+  because the 1 GiB lane budget holds a single `n²` accumulator at
+  `n = 9984`, and in the exact arm the Hessian's tiled products add 11 s.
+  With `TiledGramConfig(lane_budget_bytes=4 << 30)`, which allows 5 lanes
+  and about 3.2 GB more host memory, the Gram alone drops from 19.7–20.0 s
+  to 10.4–12.2 s (3 fresh-weight samples each, results equal to 3·10⁻²⁰
+  relative). The exact iteration drops from 36.8 to 24.4 s (Gram 11.1 s,
+  Hessian 7.1 s), with the same trajectory. That is a lever, not the
+  default. The back-solves are the core's `scipy.linalg.cho_solve` copying
+  the C-ordered factor to Fortran order on every solve: 0.91 s per solve
+  against 0.053 s on an F-ordered factor, measured standalone at
+  `n = 9984`.
+- **CuPy, before:** 3 of the plan's 8 sparse tiles (`Σ nnz_row² / b·c² ≈
+  4·10⁻³`, up to 2048 × 9684) took 37.7 s by SpGEMM against 3.1 s
+  densified. One of them needs a 25 GB SpGEMM buffer. The CuPy pool grew
+  to 39–40 GB through the driver's system-memory fallback.
+- **CuPy, after:** the size-aware tile choice and the shared tile buffers
+  (described under *Device namespaces* in the tiled-Gram section below).
+  NumPy and CuPy follow the same trajectory in both arms: the
+  objectives agree to 8·10⁻¹⁴ relative through iteration 9, and to
+  5·10⁻¹⁰ at iteration 12 of the exact arm. The Gram alone now takes
+  7.5 s, of which `syrk` is 7.24 s: 2.2 TFLOP of compacted tiles at about
+  300 GFLOP/s, this card's fp64 ceiling. In the solve it takes 8.5–10.5 s.
+  The whole problem still does not fit in 8 GB. The CuPy pool sits at
+  12.4–13.9 GB, and with a 7.6 GB pool limit the start already fails
+  converting the lowered block from COO to CSR. So the dense `n×n`
+  factorization and the back-solves run in fallback memory. Standalone at
+  `n = 9984`, the Cholesky takes 1.2 s and a two-sided solve 0.02 s. With
+  6 GB of ballast allocated first, they take 5.2 s and 2.5 s, which is the
+  4.9 s and 4.8 s in the table.
+
+Device Gram of the linear block alone (fresh weights, one process per arm,
+because two copies of the problem overflow the card):
+
+| arm | Gram wall |
+| --- | ---: |
+| before: 8 sparse tiles by SpGEMM (sum of per-tile timings; the whole-Gram arm ran out of memory in its 25 GB SpGEMM buffer) | 44.4 s (6.7 s dense + 37.7 s sparse tiles) |
+| calibrated tile choice only (5 tiles sparse) | 16.8–19.2 s (4 samples) |
+| + shared tile buffers and the lower-triangle scatter kernel | **7.5 s** (3 samples) |
+
+Per-tile crossover. Each of the 8 sparse tiles was multiplied alone,
+minimum of 3 runs:
+
+| tile `b × c` | `Σ nnz_row² / b·c²` | SpGEMM | densified | faster |
+| --- | ---: | ---: | ---: | --- |
+| 4 smoothing tiles, 2048 × 2059–2082 | 5.3·10⁻⁶ | 0.5–0.6 ms | 40 ms | SpGEMM |
+| 1785 × 1797 (the calibration tile) | 7.1·10⁻⁶ | 0.6 ms | 28 ms | SpGEMM |
+| 2048 × 3609 | 4.0·10⁻³ | 2.35 s | 0.105 s | dense |
+| 1250 × 8158 | 4.0·10⁻³ | 10.6 s | 1.10 s | dense |
+| 2048 × 9684 | 4.1·10⁻³ | 24.8 s | 1.87 s | dense |
+
+This table was measured before the shared tile buffers. Its "densified"
+column therefore still includes each tile's own allocations, the F-order
+copy for `syrk` and the `cupy.add.at` scatter. On the 41 dense tiles that
+path reached 250–290 GFLOP/s, counting `b·c²`, over about 2000 columns, but
+only 76 and 103 GFLOP/s on the two widest tiles above (8158 and 9684
+columns). SpGEMM manages 3–7·10⁷ products per second, fewer on the big
+tiles, which spill. The per-tile break-even `Σ nnz_row² / b·c²` is
+1.8–4.2·10⁻⁴. Every tile lies at least 10× away from it, so any `r` in that
+range picks the faster kernel on all 8. The calibration, which times the
+1785 × 1797 tile, measured 3.4–3.7·10⁻⁴ with that probe's dense arm
+allocating per call as above. With the production dense path, which the
+committed probe times, it measures 1.8·10⁻⁴, and the Gram takes
+7.47–7.49 s (3 samples). The 41 dense tiles took 6.7 s.
+
+Convergence within the 9-minute runs, and the wall extrapolated to the
+paper's 45 iterations at the measured rate (initialization included). This
+is not a prediction of convergence:
+
+| arm | reached | objective (reference 3.5423) / KKT | 45 iterations at this rate |
+| --- | --- | --- | ---: |
+| NumPy exact (runner) | 14 it., max_time, 523 s | best iterate: 3.64·10⁵ / 29.8 (iteration 9) | 1,600 s |
+| NumPy exact (harness) | 12 it. | 4.5·10⁴ / 162 | 1,690 s (1,140 s with 5 lanes) |
+| NumPy L-BFGS (harness) | 16 it. | 5.33 / 0.31 (best KKT 0.09, iteration 6) | 1,265 s |
+| CuPy exact (runner) | 16 it., max_iter, 411 s | best iterate as NumPy | 1,090 s |
+| CuPy exact (harness) | 18 it. | 3.79·10³ / 41.5 | 1,170 s |
+| CuPy L-BFGS (harness) | 25 it. | 4.46 / 0.89 | 670 s |
+
+Neither arm is on course for the paper's 45 iterations. The exact arm's
+first step sends the objective to 7.9·10⁸, and it takes 18 iterations to
+come back to 3.8·10³. L-BFGS gets within 26 % of the reference by
+iteration 25, but with primal steps of 0.1–0.2 and a KKT error that rises
+from 0.09 at iteration 6. The runners report the best iterate, which is why
+the NumPy and CuPy exact rows agree to 10 digits. Reproduce with the
+runner's defaults, `--cases Head-and-Neck_01 --max-iter 15 --max-time 480`,
+adding `--backend cupy` or `--config lbfgs/dense`.
 
 
 
@@ -608,17 +733,52 @@ namespace on the operator's device:
   (lower triangle, as the CuPy adapter does). Torch has no public `syrk`, so it
   uses `matmul` (`Dᵀ D`) at twice the flops. Tiles with signed or non-finite
   merged weights use `Dᵀ(w∘D)`. The weight test is one reduction per
-  structure, read back once per Gram. The block is scatter-added at
-  `ix_(cols, cols)`: `cupy.add.at` on CuPy (one kernel, 2.4× faster than
-  fancy `+=`) and `index_put_(accumulate=True)` on Torch. The column sets are
-  unique, so no index collides and the result is deterministic.
-  The triangle is mirrored once, in blocked panels, so the result is exactly
-  symmetric. There are no lanes: tiles run in plan order on the stream.
-- **Sparse tiles.** On CuPy, exact Grams multiply them with cuSPARSE SpGEMM
-  (`TiledGramConfig(device_sparse_tiles=False)` densifies them instead).
-  float32 requests and Torch densify them. Measured on `Protons_01` (17
-  sparse tiles): SpGEMM 0.216 vs densified 0.240 s in float64, densified
-  0.056 vs SpGEMM 0.067 s in float32. Densifying is priced wrongly by the
+  structure, read back once per Gram. The block's lower triangle is added at
+  `ix_(cols, cols)`: on CuPy by one elementwise kernel over the `c×c` block
+  (no index temporaries), on Torch by `index_put_(accumulate=True)`. The
+  column sets are unique, so no index collides and the result is
+  deterministic. The triangle is mirrored once, in blocked panels, so the
+  result is exactly symmetric. There are no lanes: tiles run in plan order on
+  the stream. On CuPy the densified tiles of one call share two buffers
+  sized for the largest tile (the `b×c` tile and a C-ordered `c×c` `syrk`
+  result).
+  Until 2026-09-28 every tile allocated its own `b×c` tile, an F-ordered copy
+  of it for `syrk` and a `c×c` result. The scatter used `cupy.add.at` with
+  broadcast `ix_` indices, which materializes a `c×c` int64 index (715 MiB
+  at `c = 9684`) and ran about 6× slower than the kernel. On
+  `Head-and-Neck_01` that grew the CuPy pool about 5.8 GB per Gram,
+  past the 8 GB card. On this CuPy 14 / cuBLAS build the lower triangle is
+  bitwise the same either way (tested). The workspace path runs `dsyrk` in
+  the transposed orientation on C-ordered memory, so the identity holds
+  empirically; cuBLAS does not guarantee it.
+- **Sparse tiles: a size-aware choice.** On CuPy, exact Grams may multiply
+  the plan's sparse tiles with cuSPARSE SpGEMM; float32 requests and Torch
+  densify them, and `TiledGramConfig(device_sparse_tiles=False)` densifies
+  them on CuPy too. *Which* sparse tiles keep SpGEMM is decided per tile by
+  the host rule's statistic with a device break-even: a tile stays sparse
+  when `Σ nnz_row² ≤ r·b·c²`, where `r` is the ratio of the two kernels'
+  throughputs on this device. The loader measures `r` once per problem and
+  device, the first time a structure with sparse tiles is materialized. It
+  multiplies the plan's sparse tile with the least dense work both ways
+  (warm-up plus the minimum of 3 synchronized calls each), so
+  `r = (Σ nnz_row²/t_SpGEMM) / (b·c²/t_dense)`. The linear block and the exact
+  Hessian share the measurement, and it is logged at INFO. The host's 1%
+  is far off on this GPU (see the Head-and-Neck profile above): measured
+  `r` is 1.8·10⁻⁴ on `Head-and-Neck_01` and 2.1·10⁻² on `Protons_01`. A
+  single probe measures a ratio of per-call rates, fixed costs included,
+  so `r` is good to about 2×. That is enough on these cases, whose tiles
+  lie at least 10× from the break-even. Because `r` is measured, a tile
+  near the break-even can take the other kernel in another process, which
+  changes the Gram's last bits.
+  `TiledGramConfig(device_sparse_tile_flop_ratio=...)` pins it: `1.0` keeps
+  every sparse tile sparse, as before the calibration, and `0.0` densifies
+  them all. Over-budget tiles are unaffected (below). Measured on
+  `Protons_01` (17 sparse tiles, all kept sparse by the calibration):
+  calibrated 0.205–0.21 s, all-sparse (`1.0`) 0.205–0.21 s, all-densified
+  0.223–0.229 s, 5 interleaved samples each. The committed probe measures
+  the same Gram at 0.206–0.208 s. Earlier session: SpGEMM 0.216
+  vs densified 0.240 s in float64, densified 0.056 vs SpGEMM 0.067 s in
+  float32. Densifying is priced wrongly by the
   gate, which charges a sparse tile its sparse arithmetic `Σ nnz_row²`; a
   densified tile costs `b·c²` (twice that with Torch's `matmul`) and a `b×c`
   temporary, so on Torch and for float32 requests the gate statistic
@@ -637,7 +797,9 @@ namespace on the operator's device:
   flags, with the memo comparison folded in when the memo slot is filled; a
   memo hit costs the same one read). Exact CuPy Grams add at least one sync
   per sparse tile inside cuSPARSE SpGEMM, which reads the product's nnz back
-  to size its output; cupyx offers no way around it. The scaled operand is
+  to size its output; cupyx offers no way around it. The one-time break-even
+  calibration adds 8 stream synchronizations per problem, plus the four
+  calibration SpGEMMs' own. The scaled operand is
   flagged canonical and the stored transpose is float64, so cupyx neither
   re-checks nor recasts them per call. Torch's over-budget sparse tiles add
   one weight download each (free on CPU tensors).
@@ -769,10 +931,13 @@ the n×r gEUD factors. After the fix (CuPy, RTX 4070 Laptop, Breedveld setup):
 `Prostate_CK_01` 33 → 0.96 s/iter, `Prostate_VMAT_101` 51 → ~1.2–2.3 s/iter,
 `Liver_01` 0.83 → 0.33 s/iter (its `Liver minus CTV` structure was gated off
 too), `Protons_01` unchanged; results match the host operator to round-off.
-`Head-and-Neck_01` (n = 9984) stays slower on this laptop GPU than on NumPy:
-the fp64 linear-block Gram dominates (71 s per Gram with cuSPARSE sparse
-tiles, 16–18 s densified, on a 1/64-rate fp64 card) — a size-aware sparse-tile
-choice is the open follow-up. The device operator's `matvec` is exact float64
+`Head-and-Neck_01` (n = 9984) was slower on this laptop GPU than on NumPy
+(84 s vs 37 s per exact iteration): the fp64 linear-block Gram took 67 s
+per iteration. Three of its sparse tiles are far cheaper densified, and the
+per-tile temporaries overflowed the 8 GB card. With the size-aware tile
+choice and the shared tile buffers above it is 25 s per iteration, faster
+than NumPy (see the Head-and-Neck profile above). The device operator's
+`matvec` is exact float64
 and device-side on CuPy (the
 problem's device-mirrored structure matrices); on Torch every product is a
 host round trip (download, SciPy products, upload onto the operator's
@@ -1038,7 +1203,10 @@ fluence-map shape in dimensionality, sparsity, and conditioning.
 - **Head-and-Neck scale** (`n ≈ 10⁴`, `m ≈ 10⁵`): ~45 s/iteration on 32
   threads (measured before the loader's tiled Gram, which cuts that case's
   Gram from 29 s to 21 s) — a practical-budget scale limit of the generic
-  routes. RT-specific dose-matrix kernels stay out of the `ipax` core (see
+  routes. As of 2026-09-28, the laptop measurements in the Head-and-Neck
+  profile above give 36.8 s (exact) and 27.2 s (L-BFGS) per iteration on
+  NumPy, and 25.2 s and 14.0 s on an 8 GB GPU that the case overfills,
+  against the paper's 6.2 s. RT-specific dose-matrix kernels stay out of the `ipax` core (see
   `AGENTS.md`). The loader is the RT-specific layer: its tiled Gram above
   (including the float32 `ssyrk` tiles for float32-sourced data) is where that
   structure is exploited, while custom mixed-precision tiled BLAS stays out of

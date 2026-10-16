@@ -1217,11 +1217,33 @@ class COOOperator(_SparseStructured):
 def _expand_indptr(xp: object, indptr: Array, nnz: int) -> Array:
     """Compressed ``indptr`` → the major-axis index of each stored entry.
 
-    Entry ``e`` belongs to major index ``i`` where ``indptr[i] ≤ e < indptr[i+1]``;
-    ``searchsorted(..., 'right') − 1`` recovers it in one pure Array-API pass (no
-    scatter primitive, which the standard lacks).
+    Entry ``e`` belongs to major index ``i`` where ``indptr[i] ≤ e < indptr[i+1]``,
+    so the map is ``repeat(arange(len(indptr) − 1), diff(indptr))``: one O(nnz)
+    pass with no ``arange(nnz)`` temporary. ``repeat`` with array-valued counts is
+    standard since the 2023.12 revision, but it is a data-dependent-shape
+    primitive not every namespace provides (CuPy < 14 rejects array counts;
+    ``array-api-strict`` rejects them with ``data_dependent_shapes`` disabled; a
+    pre-2023.12 namespace lacks ``repeat``). Those fall back to the equivalent
+    ``searchsorted(indptr, arange(nnz), 'right') − 1`` (O(nnz log m)). Both forms
+    agree exactly — values and dtype — on a valid ``indptr``.
     """
-    arange = xp.arange(nnz, device=device(indptr))  # type: ignore[attr-defined]
+    dev = device(indptr)
+    repeat = getattr(xp, "repeat", None)
+    if repeat is not None:
+        counts = indptr[1:] - indptr[:-1]
+        major = xp.arange(int(indptr.shape[0]) - 1, device=dev)  # type: ignore[attr-defined]
+        try:
+            expanded = repeat(major, counts)
+        except (TypeError, ValueError, RuntimeError, NotImplementedError):
+            expanded = None  # array-valued ``repeat`` unsupported → searchsorted
+        if expanded is not None:
+            if int(expanded.shape[0]) != nnz:
+                raise ValueError(
+                    "compressed indptr does not span the stored entries: "
+                    f"indptr[-1] - indptr[0] = {int(expanded.shape[0])}, nnz = {nnz}"
+                )
+            return expanded
+    arange = xp.arange(nnz, device=dev)  # type: ignore[attr-defined]
     return xp.searchsorted(indptr, arange, side="right") - 1  # type: ignore[attr-defined]
 
 

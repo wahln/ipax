@@ -409,6 +409,150 @@ def test_cudss_inertia_or_none_is_none_for_general_factors(
     assert solver.inertia_or_none() is None
 
 
+class _DataParamWithPivots(enum.IntEnum):
+    INERTIA = 3
+    NPIVOTS = 7
+
+
+class _PivotingFakeCudss(_FakeCudss):
+    """Fake cuDSS reporting a configurable perturbed-pivot count (``NPIVOTS``).
+
+    Its SOLVE copies the right-hand side (``x = b``), so a test picks the
+    matrix to make that "solution" consistent or not.
+    """
+
+    DataParam = _DataParamWithPivots
+
+    def __init__(self, npivots: int) -> None:
+        super().__init__()
+        self.npivots = npivots
+        self.npivot_reads = 0
+
+    def data_get(
+        self, handle: int, data: int, param: int, value: int, size: int, written: int
+    ) -> None:
+        if int(param) != int(_DataParamWithPivots.NPIVOTS):
+            super().data_get(
+                handle, data, int(_DataParam.INERTIA), value, size, written
+            )
+            return
+        if int(size) != 4:  # int32, like INERTIA's entries on cuDSS 0.7
+            raise _CuDSSError("INVALID_VALUE (3)", status=3)
+        ctypes.c_int32.from_address(value).value = self.npivots
+        ctypes.c_size_t.from_address(written).value = 4
+        self.npivot_reads += 1
+
+
+def _cudss_solver(module, monkeypatch, fake, values, *, require_inertia=False):
+    monkeypatch.setattr(module, "_load_cudss", lambda: fake)
+    monkeypatch.setattr(module, "_ptr", lambda arr: int(arr.ctypes.data))
+    rows = np.asarray([0, 0, 1, 1])
+    cols = np.asarray([0, 1, 0, 1])
+    operator = module.CuPySparseAdapter().from_coo(
+        rows, cols, np.asarray(values, dtype=np.float64), shape=(2, 2), symmetric=True
+    )
+    solver = module.CuPySparseSolver(require_inertia=require_inertia)
+    solver.factor(operator)
+    return solver
+
+
+@pytest.mark.parametrize("fake_factory", [_FakeCudss, lambda: _PivotingFakeCudss(0)])
+def test_cudss_unperturbed_factor_is_never_certified(
+    cupy_sparse_module, monkeypatch, fake_factory
+):
+    # No perturbed pivot (or a runtime that cannot report NPIVOTS): the solve
+    # is returned as cuDSS produced it, with no residual SpMV — even when, as
+    # with this identity-solve fake, it does not solve the system.
+    fake = fake_factory()
+    calls = {"n": 0}
+    original = cupy_sparse_module.CuDSSSparseSolver._certify_perturbed_solve
+
+    def spy(self, b, x):
+        calls["n"] += 1
+        return original(self, b, x)
+
+    monkeypatch.setattr(
+        cupy_sparse_module.CuDSSSparseSolver, "_certify_perturbed_solve", spy
+    )
+    solver = _cudss_solver(cupy_sparse_module, monkeypatch, fake, [2.0, 0.0, 0.0, 3.0])
+    for _ in range(2):
+        np.testing.assert_array_equal(
+            solver.solve(np.asarray([1.0, 2.0])), np.asarray([1.0, 2.0])
+        )
+    assert calls["n"] == 0
+    if isinstance(fake, _PivotingFakeCudss):
+        assert fake.npivot_reads == 1  # once per factorization, not per solve
+
+
+def test_cudss_perturbed_consistent_solve_is_returned_unchanged(
+    cupy_sparse_module, monkeypatch
+):
+    # A perturbed pivot on a system the returned vector does solve (here
+    # A = I): accepted as is — the certificate never alters a solution.
+    fake = _PivotingFakeCudss(1)
+    solver = _cudss_solver(cupy_sparse_module, monkeypatch, fake, [1.0, 0.0, 0.0, 1.0])
+    np.testing.assert_array_equal(
+        solver.solve(np.asarray([1.0, 2.0])), np.asarray([1.0, 2.0])
+    )
+
+
+def test_cudss_perturbed_inconsistent_solve_is_a_linear_solve_error(
+    cupy_sparse_module, monkeypatch
+):
+    # Singular A = [[1, 1], [1, 1]] with b outside its range: what cuDSS's
+    # static pivoting hands back cannot solve the system (relative residual
+    # O(1)), so it is classified as the numerical failure it is.
+    from ipax.linalg.solver import LinearSolveError
+
+    fake = _PivotingFakeCudss(1)
+    solver = _cudss_solver(cupy_sparse_module, monkeypatch, fake, [1.0, 1.0, 1.0, 1.0])
+    with pytest.raises(LinearSolveError, match="perturbed 1 pivot"):
+        solver.solve(np.asarray([1.0, 2.0]))
+
+
+def test_cudss_perturbed_certificate_is_per_column(cupy_sparse_module, monkeypatch):
+    # A = diag(1, 0): column 0 of B is consistent and large, column 1
+    # inconsistent and small. A global max-norm test would let column 1's
+    # O(1) residual hide behind column 0's 1e6 scale.
+    from ipax.linalg.solver import LinearSolveError
+
+    fake = _PivotingFakeCudss(1)
+    solver = _cudss_solver(cupy_sparse_module, monkeypatch, fake, [1.0, 0.0, 0.0, 0.0])
+    rhs = np.asarray([[1e6, 0.0], [0.0, 1.0]])
+    with pytest.raises(LinearSolveError):
+        solver.solve(rhs)
+
+
+def test_cudss_non_finite_matrix_is_a_linear_solve_error(
+    cupy_sparse_module, monkeypatch
+):
+    # Deferred to the first solve (a factor stays sync-free)...
+    from ipax.linalg.solver import LinearSolveError
+
+    values = [float("nan"), 0.0, 0.0, 1.0]
+    solver = _cudss_solver(cupy_sparse_module, monkeypatch, _FakeCudss(), values)
+    with pytest.raises(LinearSolveError, match="non-finite"):
+        solver.solve(np.asarray([1.0, 2.0]))
+    # ...but raised by factor itself when require_inertia already syncs there.
+    with pytest.raises(LinearSolveError, match="non-finite"):
+        _cudss_solver(
+            cupy_sparse_module, monkeypatch, _FakeCudss(), values, require_inertia=True
+        )
+
+
+def test_spsolve_fallback_rejects_a_non_finite_matrix(cupy_sparse_module):
+    from ipax.linalg.solver import LinearSolveError
+
+    operator = cupy_sparse_module.CuPySparseAdapter().from_coo(
+        np.asarray([0, 1]),
+        np.asarray([0, 1]),
+        np.asarray([float("inf"), 1.0]),
+        shape=(2, 2),
+    )
+    with pytest.raises(LinearSolveError, match="non-finite"):
+        cupy_sparse_module.CuPySpsolveSolver().factor(operator)
+
+
 def test_cudss_solver_binds_current_stream_and_solves(
     cupy_sparse_module: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
