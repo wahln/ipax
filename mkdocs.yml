@@ -22,6 +22,7 @@ nav:
       - Routing hints: guide/routing-hints.md
       - Backends & hardware: guide/backends.md
       - Monitoring & re-solving: guide/diagnostics.md
+      - Coming from SciPy: guide/scipy.md
   - Concepts:
       - Problem interface: concepts/problem.md
       - Linear-algebra layer: concepts/linalg.md

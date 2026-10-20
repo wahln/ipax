@@ -4,9 +4,10 @@ concrete library is not installed.
 The suite runs with ``--doctest-modules`` over the ``ipax`` package (see
 ``[tool.pytest.ini_options]`` in ``pyproject.toml``), so pytest imports *every*
 module to collect docstring examples. The backend adapters under
-``ipax/problem/autodiff/`` and ``ipax/backend/sparse/`` are the one place allowed
-to import a concrete array library at module top level (invariant #1 carve-out),
-which makes them unimportable when that optional backend is absent — the normal
+``ipax/problem/autodiff/``, ``ipax/backend/{sparse,dense}/`` and the
+``ipax/interfaces/`` front ends are the one place allowed to import a concrete
+array library at module top level (invariant #1 carve-out), which makes them
+unimportable when that optional backend is absent — the normal
 case in CI (e.g. the ``test`` job installs neither JAX nor CuPy, and CuPy is never
 installed by CI at all). Without this, collection errors fail the whole job even
 though the runtime dispatch already imports these adapters lazily and tolerates
@@ -29,9 +30,10 @@ _ADAPTER_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "ipax/problem/autodiff/jax.py": ("jax",),
     "ipax/backend/sparse/cupy.py": ("cupy",),
     "ipax/backend/sparse/numpy_scipy.py": ("numpy", "scipy"),
-    "ipax/backend/dense/cupy.py": ("cupy",),
+    "ipax/backend/dense/cupy.py": ("cupy", "numpy"),
     "ipax/backend/dense/numpy_scipy.py": ("numpy", "scipy"),
     "ipax/backend/dense/torch.py": ("torch",),
+    "ipax/interfaces/scipy.py": ("numpy", "scipy"),
 }
 
 

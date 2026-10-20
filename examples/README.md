@@ -33,6 +33,9 @@ Current examples:
 - `matrix_free_krylov.py` solves a bounded QP with a matrix-free Hessian
   operator through the conjugate-gradient (`linsolve="krylov"`) route, so no
   matrix is ever formed or factored.
+- `scipy_minimize.py` runs a `scipy.optimize.minimize` model (Hock–Schittkowski
+  71 with `Bounds` and `NonlinearConstraint`s) on ipax by passing
+  `method=minimize_ipax` from `ipax.interfaces.scipy`.
 - `radiotherapy_sparse.py` is a radiotherapy-like fluence-map problem:
   minimize `½‖D x − d_pres‖²` for a sparse SciPy dose-influence matrix `D`
   (voxels × beamlets) with non-negativity bounds `x ≥ 0`. Gradient-only, so the

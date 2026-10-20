@@ -71,6 +71,9 @@ sparse-cpu = ["scipy>=1.12", "feral-solver[scipy]>=0.11,<0.12"]
 sparse-cuda = ["nvmath-python; platform_system != 'Darwin'"]
 sparse = ["ipax[sparse-cpu,sparse-cuda]"]
 strict = ["array-api-strict>=2.1"]
+# SciPy-compatible front end (`ipax.interfaces.scipy.minimize_ipax`): the
+# `scipy.optimize.minimize` calling convention, on x0's Array-API backend.
+scipy = ["numpy>=1.26", "scipy>=1.12"]
 
 test = [
     "pytest>=8",
