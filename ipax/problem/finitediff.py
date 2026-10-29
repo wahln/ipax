@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ipax.backend.namespace import array_namespace
+from ipax.backend.namespace import array_namespace, device
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -56,13 +56,13 @@ def gradient_fd(
     xp = array_namespace(x)
     n = int(x.shape[0])
     steps, _ = _steps(xp, x, rel_step)
-    eye = xp.eye(n, dtype=x.dtype)
+    eye = xp.eye(n, dtype=x.dtype, device=device(x))
     components = []
     for i in range(n):
         h = steps[i]
         e_i = eye[:, i]
-        f_plus = xp.asarray(f(x + h * e_i))
-        f_minus = xp.asarray(f(x - h * e_i))
+        f_plus = xp.asarray(f(x + h * e_i), device=device(x))
+        f_minus = xp.asarray(f(x - h * e_i), device=device(x))
         components.append((f_plus - f_minus) / (2.0 * h))
     return xp.stack(components)
 
@@ -81,13 +81,13 @@ def jacobian_fd(
     xp = array_namespace(x)
     n = int(x.shape[0])
     steps, _ = _steps(xp, x, rel_step)
-    eye = xp.eye(n, dtype=x.dtype)
+    eye = xp.eye(n, dtype=x.dtype, device=device(x))
     columns = []
     for i in range(n):
         h = steps[i]
         e_i = eye[:, i]
-        f_plus = xp.asarray(f(x + h * e_i))
-        f_minus = xp.asarray(f(x - h * e_i))
+        f_plus = xp.asarray(f(x + h * e_i), device=device(x))
+        f_minus = xp.asarray(f(x - h * e_i), device=device(x))
         columns.append((f_plus - f_minus) / (2.0 * h))
     return xp.stack(columns, axis=1)
 

@@ -20,7 +20,7 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from ipax.backend.namespace import array_namespace
+from ipax.backend.namespace import array_namespace, device
 from ipax.backend.operators import Diagonal, Identity, LinearOperator, forward_gram
 
 if TYPE_CHECKING:
@@ -77,18 +77,20 @@ class _Assembly:
     borders: tuple[_Border, ...] = ()
 
 
-def _grid_indices(xp: object, n_rows: int, n_cols: int) -> tuple[Array, Array]:
+def _grid_indices(
+    xp: object, n_rows: int, n_cols: int, dev: object
+) -> tuple[Array, Array]:
     """Row- and column-index vectors of a dense ``n_rows × n_cols`` block (COO)."""
     rows = xp.reshape(  # type: ignore[attr-defined]
         xp.broadcast_to(  # type: ignore[attr-defined]
-            xp.expand_dims(xp.arange(n_rows), axis=1),  # type: ignore[attr-defined]
+            xp.expand_dims(xp.arange(n_rows, device=dev), axis=1),  # type: ignore[attr-defined]
             (n_rows, n_cols),
         ),
         (n_rows * n_cols,),
     )
     cols = xp.reshape(  # type: ignore[attr-defined]
         xp.broadcast_to(  # type: ignore[attr-defined]
-            xp.expand_dims(xp.arange(n_cols), axis=0),  # type: ignore[attr-defined]
+            xp.expand_dims(xp.arange(n_cols, device=dev), axis=0),  # type: ignore[attr-defined]
             (n_rows, n_cols),
         ),
         (n_rows * n_cols,),
@@ -101,11 +103,11 @@ def _lowrank_border(xp: object, u: Array, m: Array) -> _Border:
     n_primal = int(u.shape[0])
     r = int(u.shape[1])
     # U entry (i, j) couples primal column i to auxiliary row j: C = Uᵀ.
-    grid_rows, grid_cols = _grid_indices(xp, n_primal, r)
+    grid_rows, grid_cols = _grid_indices(xp, n_primal, r, device(u))
     conn_rows = grid_cols  # auxiliary-local (rank) index j
     conn_cols = grid_rows  # existing primal index i
     conn_values = xp.reshape(u, (n_primal * r,))  # type: ignore[attr-defined]
-    m_rows, m_cols = _grid_indices(xp, r, r)
+    m_rows, m_cols = _grid_indices(xp, r, r, device(u))
     return _Border(
         r,
         conn_rows,
@@ -128,7 +130,7 @@ def _inequality_border(ineq_jac: LinearOperator, sigma_s: LinearOperator) -> _Bo
     g_rows, g_cols, g_values, shape = ineq_jac.to_coo()
     m_ineq = shape[0]
     xp = array_namespace(g_values)
-    diag = xp.arange(m_ineq)
+    diag = xp.arange(m_ineq, device=device(g_rows))
     inner = -1.0 / sigma_s.diagonal()  # −Σ_s⁻¹
     return _Border(m_ineq, g_rows, g_cols, g_values, diag, diag, inner)
 
@@ -355,7 +357,7 @@ def _add_dense_diagonal(matrix: Array, diagonal: Array | float) -> Array:
     if add_diagonal is not None:
         return add_diagonal(matrix, diagonal)
     n = int(matrix.shape[0])
-    return matrix + xp.eye(n, dtype=matrix.dtype) * diagonal
+    return matrix + xp.eye(n, dtype=matrix.dtype, device=device(matrix)) * diagonal
 
 
 def _sanitize_diagonal_operator(sigma_x: LinearOperator) -> LinearOperator:
@@ -415,7 +417,7 @@ def _dense_or_matmat_probe(op: LinearOperator, n_cols: int, like: Array) -> Arra
         return op.dense_matrix(like)
     except NotImplementedError:
         xp = array_namespace(like)
-        identity = xp.eye(n_cols, dtype=like.dtype)
+        identity = xp.eye(n_cols, dtype=like.dtype, device=device(like))
         return op.matmat(identity)
 
 
@@ -725,9 +727,9 @@ class _CondensedOperator(LinearOperator):
         jac, neg_inv_sigma_s = border
         xp = array_namespace(primal)
         m_ineq = jac.shape[0]
-        e_block = xp.eye(m_ineq, dtype=primal.dtype) * xp.expand_dims(
-            neg_inv_sigma_s, axis=1
-        )
+        e_block = xp.eye(
+            m_ineq, dtype=primal.dtype, device=device(primal)
+        ) * xp.expand_dims(neg_inv_sigma_s, axis=1)
         top = xp.concat((primal, xp.permute_dims(jac, (1, 0))), axis=1)
         bottom = xp.concat((jac, e_block), axis=1)
         return xp.concat((top, bottom), axis=0)
@@ -904,7 +906,7 @@ class _CondensedOperator(LinearOperator):
         n = self._W.shape[0]
         sigma_x_diag = self._sigma_x.diagonal()
         xp = array_namespace(sigma_x_diag)
-        idx = xp.arange(n)
+        idx = xp.arange(n, device=device(sigma_x_diag))
         borders: list[_Border] = []
 
         low_rank_form = getattr(self._W, "diagonal_low_rank_form", None)
@@ -914,7 +916,7 @@ class _CondensedOperator(LinearOperator):
                 d, u, m = low_rank_form()
             except NotImplementedError:
                 # L-BFGS before the first curvature pair: W = I, no low-rank part.
-                d = xp.ones((n,), dtype=sigma_x_diag.dtype)
+                d = xp.ones((n,), dtype=sigma_x_diag.dtype, device=device(sigma_x_diag))
                 u = m = None
             rows, cols, values = idx, idx, d + sigma_x_diag + self._delta_w
             if u is not None and m is not None and int(u.shape[1]) > 0:
@@ -1026,7 +1028,7 @@ class _CondensedOperator(LinearOperator):
             try:
                 d, u, m = low_rank_form()
             except NotImplementedError:
-                d = xp.ones((n,), dtype=sigma_x_diag.dtype)
+                d = xp.ones((n,), dtype=sigma_x_diag.dtype, device=device(sigma_x_diag))
                 u = m = None
             logical.append(d + sigma_x_diag + self._delta_w)
             if u is not None and m is not None and int(u.shape[1]) > 0:
@@ -1326,7 +1328,12 @@ class _SaddleOperator(LinearOperator):
         eq = self._eq_jac.dense_matrix(n_dense)
         top = xp.concat((n_dense, xp.permute_dims(eq, (1, 0))), axis=1)
         bottom = xp.concat(
-            (eq, -self._delta_c * xp.eye(self._m, dtype=n_dense.dtype)), axis=1
+            (
+                eq,
+                -self._delta_c
+                * xp.eye(self._m, dtype=n_dense.dtype, device=device(n_dense)),
+            ),
+            axis=1,
         )
         return xp.concat((top, bottom), axis=0)
 
@@ -1367,7 +1374,12 @@ class _SaddleOperator(LinearOperator):
             eq = _dense_or_matmat_probe(self._eq_jac, self._n, primal)
             top = xp.concat((primal, xp.permute_dims(eq, (1, 0))), axis=1)
             bottom = xp.concat(
-                (eq, -self._delta_c * xp.eye(m, dtype=primal.dtype)), axis=1
+                (
+                    eq,
+                    -self._delta_c
+                    * xp.eye(m, dtype=primal.dtype, device=device(primal)),
+                ),
+                axis=1,
             )
             core = xp.concat((top, bottom), axis=0)
 
@@ -1380,10 +1392,13 @@ class _SaddleOperator(LinearOperator):
         m_ineq = jac.shape[0]
         # The inequality border only couples to the primal block [0, n): pad
         # its connection with zero columns/rows over the dual block [n, n+m).
-        conn = xp.concat((jac, xp.zeros((m_ineq, m), dtype=primal.dtype)), axis=1)
-        e_block = xp.eye(m_ineq, dtype=primal.dtype) * xp.expand_dims(
-            neg_inv_sigma_s, axis=1
+        conn = xp.concat(
+            (jac, xp.zeros((m_ineq, m), dtype=primal.dtype, device=device(primal))),
+            axis=1,
         )
+        e_block = xp.eye(
+            m_ineq, dtype=primal.dtype, device=device(primal)
+        ) * xp.expand_dims(neg_inv_sigma_s, axis=1)
         top = xp.concat((core, xp.permute_dims(conn, (1, 0))), axis=1)
         bottom = xp.concat((conn, e_block), axis=1)
         return xp.concat((top, bottom), axis=0)
@@ -1411,7 +1426,7 @@ class _SaddleOperator(LinearOperator):
             solution = self._condensed.dense_structured_solve(rhs_x)
             return solution[:, 0] if vector_rhs else solution
 
-        identity_y = xp.eye(self._m, dtype=rhs.dtype)
+        identity_y = xp.eye(self._m, dtype=rhs.dtype, device=device(rhs))
         eq_t = self._eq_jac.rmatmat(identity_y)
         n_rhs = int(rhs_x.shape[1])
         batch_rhs = xp.concat((rhs_x, eq_t), axis=1)
@@ -1467,8 +1482,10 @@ class _SaddleOperator(LinearOperator):
         cols = xp.concat((inner.cols, ec, er + n))
         values = xp.concat((inner.values, ev, ev))
         if m > 0:
-            didx = xp.arange(m) + n
-            delta = xp.full((m,), -self._delta_c, dtype=values.dtype)
+            didx = xp.arange(m, device=device(er)) + n
+            delta = xp.full(
+                (m,), -self._delta_c, dtype=values.dtype, device=device(values)
+            )
             rows = xp.concat((rows, didx))
             cols = xp.concat((cols, didx))
             values = xp.concat((values, delta))
@@ -1514,7 +1531,14 @@ class _SaddleOperator(LinearOperator):
         parts.append(ev)
         parts.append(ev)
         if self._m > 0:
-            parts.append(xp.full((self._m,), -self._delta_c, dtype=logical[0].dtype))
+            parts.append(
+                xp.full(
+                    (self._m,),
+                    -self._delta_c,
+                    dtype=logical[0].dtype,
+                    device=device(logical[0]),
+                )
+            )
         parts.extend(borders)
         return xp.concat(tuple(parts))
 
@@ -1633,7 +1657,7 @@ class _SaddleOperator(LinearOperator):
         except NotImplementedError:
             # Primal-only preconditioning: SPD identity on the (strictly positive)
             # dual block keeps the whole preconditioner SPD.
-            dual = xp.ones((self._m,), dtype=diag_n.dtype)
+            dual = xp.ones((self._m,), dtype=diag_n.dtype, device=device(diag_n))
         return xp.concat((diag_n, dual))
 
     def _approximate_schur_diagonal(self, diag_n: Array) -> Array:
@@ -1647,7 +1671,7 @@ class _SaddleOperator(LinearOperator):
         try:
             dual = self._delta_c + self._eq_jac.row_gram_diagonal(1.0 / diag_n)
         except NotImplementedError:
-            dual = xp.ones((self._m,), dtype=diag_n.dtype)
+            dual = xp.ones((self._m,), dtype=diag_n.dtype, device=device(diag_n))
         return xp.where(dual > 0.0, dual, xp.ones_like(dual))
 
     def lbfgs_block_preconditioner_apply(self) -> Callable[[Array], Array]:

@@ -44,7 +44,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ipax.backend.namespace import array_namespace
+from ipax.backend.namespace import array_namespace, device
 from ipax.backend.operators import LinearOperator, as_operator, forward_gram
 from ipax.problem.base import Problem
 
@@ -196,12 +196,12 @@ def _vector_factors(
         return None
     m = jac.shape[0]
     if m == 0:
-        return xp.zeros((0,), dtype=dtype)
+        return xp.zeros((0,), dtype=dtype, device=device(like))
     try:
         row_norms = jac.row_inf_norms(like)
     except NotImplementedError:
         # Avoid m full adjoint applications for a matrix-free m-by-n Jacobian.
-        return xp.ones((m,), dtype=dtype)
+        return xp.ones((m,), dtype=dtype, device=device(like))
     safe = xp.where(row_norms > 0.0, row_norms, xp.ones_like(row_norms))
     ones = xp.ones_like(safe)
     return xp.minimum(ones, max_gradient / safe)

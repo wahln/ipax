@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ipax.backend.namespace import array_namespace
+from ipax.backend.namespace import array_namespace, device
 from ipax.backend.operators import LinearOperator, as_operator
 from ipax.problem.base import Problem
 
@@ -320,7 +320,7 @@ class LinearProblem(Problem):
     ) -> Array:
         del y_eq, y_ineq, sigma
         xp = array_namespace(x, self._c)
-        return xp.zeros((self._n_vars, self._n_vars), dtype=x.dtype)
+        return xp.zeros((self._n_vars, self._n_vars), dtype=x.dtype, device=device(x))
 
 
 __all__ = ["FunctionProblem", "LinearProblem", "QuadraticProblem"]

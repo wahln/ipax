@@ -24,6 +24,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from ipax.backend.namespace import device
+
 if TYPE_CHECKING:
     from ipax.backend.operators import LinearOperator
     from ipax.typing import Array, Namespace
@@ -93,8 +95,8 @@ def recover_eliminated(
         ds = -r_pi - jdx
         dy_ineq = sigma_s * (jdx + r_pi) - y_ineq + target_s / s
     else:
-        ds = xp.zeros((0,), dtype=dtype)
-        dy_ineq = xp.zeros((0,), dtype=dtype)
+        ds = xp.zeros((0,), dtype=dtype, device=device(dx))
+        dy_ineq = xp.zeros((0,), dtype=dtype, device=device(dx))
 
     # ``has_lower``/``has_upper`` let a bound-free problem skip the masked
     # arithmetic (the masks are all-False there, so the result is zero anyway).
@@ -113,7 +115,9 @@ def recover_eliminated(
     return NewtonStep(
         dx=dx,
         ds=ds,
-        dy_eq=xp.zeros((0,), dtype=dtype) if dy_eq is None else dy_eq,
+        dy_eq=xp.zeros((0,), dtype=dtype, device=device(dx))
+        if dy_eq is None
+        else dy_eq,
         dy_ineq=dy_ineq,
         dz_lower=dz_lower,
         dz_upper=dz_upper,

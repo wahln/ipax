@@ -480,7 +480,7 @@ class Dense(LinearOperator):
         xp = array_namespace(self._A)
         m, n = self.shape
         if n == 0:
-            return xp.zeros((m,), dtype=self._A.dtype)
+            return xp.zeros((m,), dtype=self._A.dtype, device=device(self._A))
         return xp.max(xp.abs(self._A), axis=1)
 
     def to_coo(
@@ -490,10 +490,16 @@ class Dense(LinearOperator):
         xp = array_namespace(self._A)
         m, n = self.shape
         rows = xp.reshape(
-            xp.broadcast_to(xp.expand_dims(xp.arange(m), axis=1), (m, n)), (m * n,)
+            xp.broadcast_to(
+                xp.expand_dims(xp.arange(m, device=device(self._A)), axis=1), (m, n)
+            ),
+            (m * n,),
         )
         cols = xp.reshape(
-            xp.broadcast_to(xp.expand_dims(xp.arange(n), axis=0), (m, n)), (m * n,)
+            xp.broadcast_to(
+                xp.expand_dims(xp.arange(n, device=device(self._A)), axis=0), (m, n)
+            ),
+            (m * n,),
         )
         values = xp.reshape(self._A, (m * n,))
         return rows, cols, values, (m, n)
@@ -538,7 +544,7 @@ class Diagonal(LinearOperator):
         del like
         xp = array_namespace(self._d)
         n = int(self._d.shape[0])
-        return xp.eye(n, dtype=self._d.dtype) * self._d
+        return xp.eye(n, dtype=self._d.dtype, device=device(self._d)) * self._d
 
     def diagonal(self, like: Array | None = None) -> Array:
         del like
@@ -559,7 +565,7 @@ class Diagonal(LinearOperator):
         del like
         xp = array_namespace(self._d)
         n = int(self._d.shape[0])
-        idx = xp.arange(n)
+        idx = xp.arange(n, device=device(self._d))
         return idx, idx, self._d, (n, n)
 
     def coo_values(self, like: Array | None = None) -> Array:
@@ -598,13 +604,13 @@ class Identity(LinearOperator):
         if like is None:
             raise NotImplementedError("Identity dense matrix requires a template array")
         xp = array_namespace(like)
-        return xp.eye(self._n, dtype=like.dtype)
+        return xp.eye(self._n, dtype=like.dtype, device=device(like))
 
     def diagonal(self, like: Array | None = None) -> Array:
         if like is None:
             raise NotImplementedError("Identity diagonal requires a template array")
         xp = array_namespace(like)
-        return xp.ones((self._n,), dtype=like.dtype)
+        return xp.ones((self._n,), dtype=like.dtype, device=device(like))
 
     def gram_diagonal(self, weights: Array) -> Array:
         # A = I ⇒ diag(Aᵀ W A) = weights.
@@ -614,7 +620,7 @@ class Identity(LinearOperator):
         if like is None:
             raise NotImplementedError("Identity row norms require a template array")
         xp = array_namespace(like)
-        return xp.ones((self._n,), dtype=like.dtype)
+        return xp.ones((self._n,), dtype=like.dtype, device=device(like))
 
     def to_coo(
         self, like: Array | None = None
@@ -622,15 +628,15 @@ class Identity(LinearOperator):
         if like is None:
             raise NotImplementedError("Identity COO requires a template array")
         xp = array_namespace(like)
-        idx = xp.arange(self._n)
-        ones = xp.ones((self._n,), dtype=like.dtype)
+        idx = xp.arange(self._n, device=device(like))
+        ones = xp.ones((self._n,), dtype=like.dtype, device=device(like))
         return idx, idx, ones, (self._n, self._n)
 
     def coo_values(self, like: Array | None = None) -> Array:
         if like is None:
             raise NotImplementedError("Identity COO values require a template array")
         xp = array_namespace(like)
-        return xp.ones((self._n,), dtype=like.dtype)
+        return xp.ones((self._n,), dtype=like.dtype, device=device(like))
 
     def coo_pattern_signature(self) -> object:
         return ("identity", self.shape)
@@ -1237,7 +1243,9 @@ class _SparseStructured(LinearOperator):
         del like
         xp = array_namespace(self._values)
         n = self._shape[1]
-        return self._adapter_op().matmat(xp.eye(n, dtype=self._values.dtype))
+        return self._adapter_op().matmat(
+            xp.eye(n, dtype=self._values.dtype, device=device(self._values))
+        )
 
 
 class COOOperator(_SparseStructured):
