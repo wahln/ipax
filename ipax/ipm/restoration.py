@@ -34,6 +34,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from ipax._logging import logger
+from ipax.backend.namespace import device
 from ipax.backend.operators import LinearOperator, VStack
 from ipax.linalg.solver import (
     LinearSolveError,
@@ -100,8 +101,8 @@ def feasible_theta_tol(tol: float) -> float:
     return max(tol, 1e-8)
 
 
-def _dense(op: LinearOperator, xp: Namespace, dtype: object) -> Array:
-    return op.matmat(xp.eye(op.shape[1], dtype=dtype))
+def _dense(op: LinearOperator, xp: Namespace, dtype: object, dev: object) -> Array:
+    return op.matmat(xp.eye(op.shape[1], dtype=dtype, device=dev))
 
 
 def _through_operator(op: LinearOperator, max_elements: int) -> bool:
@@ -140,14 +141,14 @@ def _dense_gauss_newton(
     off the active set). Same matrices, different round-off, and no
     ``m_b × n`` copy of a tall Jacobian (TROTS ``Protons_01``: 3.2 GB).
     """
-    hessian = xp.zeros((n, n), dtype=dtype)
-    grad = xp.zeros((n,), dtype=dtype)
+    hessian = xp.zeros((n, n), dtype=dtype, device=device(c))
+    grad = xp.zeros((n,), dtype=dtype, device=device(c))
     if eq_jac is not None:
         if _through_operator(eq_jac, max_elements):
             hessian = hessian + eq_jac.gram(xp.ones_like(c))
             grad = grad + eq_jac.rmatvec(c)
         else:
-            jc = _dense(eq_jac, xp, dtype)
+            jc = _dense(eq_jac, xp, dtype, device(c))
             jc_t = xp.permute_dims(jc, (1, 0))
             hessian = hessian + xp.matmul(jc_t, jc)
             grad = grad + xp.matmul(jc_t, c)
@@ -157,7 +158,7 @@ def _dense_gauss_newton(
             hessian = hessian + ineq_jac.gram(active)
             grad = grad + ineq_jac.rmatvec(gpos)
         else:
-            jg = _dense(ineq_jac, xp, dtype)
+            jg = _dense(ineq_jac, xp, dtype, device(c))
             jg_w = jg * xp.expand_dims(active, axis=1)
             jg_t = xp.permute_dims(jg, (1, 0))
             hessian = hessian + xp.matmul(jg_t, jg_w)
@@ -284,7 +285,7 @@ def _escape_direction(xp: Namespace, x: Array) -> Array:
     a saddle's unstable manifold amplifies the kick, a true local minimizer
     re-certifies at the same point.
     """
-    k = xp.arange(int(x.shape[0]), dtype=x.dtype)
+    k = xp.arange(int(x.shape[0]), dtype=x.dtype, device=device(x))
     return xp.sin(1.0 + _GOLDEN_ANGLE * k)
 
 
@@ -354,7 +355,9 @@ def restore(
         max_elements = dense_materialize_max_elements
     dtype = x.dtype
     n = int(x.shape[0])
-    identity = xp.eye(n, dtype=dtype) if linear_solver is None else None
+    identity = (
+        xp.eye(n, dtype=dtype, device=device(x)) if linear_solver is None else None
+    )
     # Opt-in Cholesky solve of the dense LM trials (``_cholesky_lm_direction``);
     # without a triangular-solve adapter it is the LU path unchanged.
     cholesky_solve: Callable[[Array, Array], Array] | None = None
@@ -379,8 +382,8 @@ def restore(
         return xp.where(mask_u, xp.minimum(x, upper_target), x)
 
     def infeasibility(x: Array) -> tuple[float, Array, Array, Array]:
-        c = eq_fn(x) if m_eq > 0 else xp.zeros((0,), dtype=dtype)
-        g = ineq_fn(x) if m > 0 else xp.zeros((0,), dtype=dtype)
+        c = eq_fn(x) if m_eq > 0 else xp.zeros((0,), dtype=dtype, device=device(x))
+        g = ineq_fn(x) if m > 0 else xp.zeros((0,), dtype=dtype, device=device(x))
         gpos = xp.maximum(g, xp.zeros_like(g)) if m > 0 else g
         f = 0.5 * (float(xp.sum(c * c)) + float(xp.sum(gpos * gpos)))
         return f, c, g, gpos
@@ -388,7 +391,7 @@ def restore(
     def recover_slack(g: Array) -> Array:
         if m == 0:
             return s
-        floor = xp.full((m,), _SLACK_FLOOR, dtype=dtype)
+        floor = xp.full((m,), _SLACK_FLOOR, dtype=dtype, device=device(g))
         return xp.maximum(-g, floor)
 
     def filter_theta(c: Array, g: Array, s_out: Array) -> float:
@@ -451,7 +454,7 @@ def restore(
                 max_elements=max_elements,
             )
         elif stacked is None:
-            grad = xp.zeros((n,), dtype=dtype)
+            grad = xp.zeros((n,), dtype=dtype, device=device(x))
         else:
             jacobian, _, residual = stacked
             grad = jacobian.rmatvec(residual)

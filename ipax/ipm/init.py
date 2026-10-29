@@ -29,6 +29,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from ipax.backend.namespace import device
+
 if TYPE_CHECKING:
     from ipax.backend.operators import LinearOperator
     from ipax.result import WarmStart
@@ -162,15 +164,15 @@ def initialize(
 
     if m > 0 and ineq_fn is not None:
         g = ineq_fn(x)
-        floor = xp.full((m,), _SLACK_FLOOR, dtype=dtype)
+        floor = xp.full((m,), _SLACK_FLOOR, dtype=dtype, device=device(x))
         if slack_init_scale > 0.0:
             # Room proportional to the constraint magnitude (0-d, broadcast).
             floor = xp.maximum(floor, slack_init_scale * xp.max(xp.abs(g)))
         s = xp.maximum(-g, floor)
         y_ineq = mu_init / s
     else:
-        s = xp.zeros((0,), dtype=dtype)
-        y_ineq = xp.zeros((0,), dtype=dtype)
+        s = xp.zeros((0,), dtype=dtype, device=device(x))
+        y_ineq = xp.zeros((0,), dtype=dtype, device=device(x))
 
     x_minus_l = xp.where(mask_l, x - lower_safe, xp.ones_like(x))
     u_minus_x = xp.where(mask_u, upper_safe - x, xp.ones_like(x))
@@ -181,7 +183,7 @@ def initialize(
     return InitialPoint(
         x=x,
         s=s,
-        y_eq=xp.zeros((0,), dtype=dtype),
+        y_eq=xp.zeros((0,), dtype=dtype, device=device(x)),
         y_ineq=y_ineq,
         z_lower=z_lower,
         z_upper=z_upper,
@@ -206,7 +208,9 @@ def recenter_slacks_duals(
     repair point, with a tight band. Components already consistent with the
     central path (``s·λ ≈ μ``) pass through unchanged.
     """
-    floor = xp.full(g.shape, _RECENTER_SLACK_FRACTION * mu, dtype=g.dtype)
+    floor = xp.full(
+        g.shape, _RECENTER_SLACK_FRACTION * mu, dtype=g.dtype, device=device(g)
+    )
     s = xp.maximum(-g, floor)
     y = xp.clip(y_ineq, mu / (_RECENTER_KAPPA * s), _RECENTER_KAPPA * mu / s)
     return s, y
@@ -244,13 +248,13 @@ def least_squares_duals(
     rows = int(eq_jac.shape[0]) if m_eq is None else int(m_eq)
     dtype = grad.dtype
     if rows == 0:
-        return xp.zeros((0,), dtype=dtype)
+        return xp.zeros((0,), dtype=dtype, device=device(grad))
 
     def normal_matvec(v: Array) -> Array:
         return eq_jac.matvec(eq_jac.rmatvec(v)) + _LSQ_DUAL_REGULARIZATION * v
 
     rhs = -eq_jac.matvec(grad)
-    y = xp.zeros((rows,), dtype=dtype)
+    y = xp.zeros((rows,), dtype=dtype, device=device(grad))
     residual = rhs
     rhs_norm = float(xp.sqrt(xp.sum(rhs * rhs)))
     if rhs_norm == 0.0:  # ∇f ⟂ range(A): y = 0 is exact (the objective-free case)
@@ -275,7 +279,7 @@ def least_squares_duals(
         direction = residual + (rs_new / rs_old) * direction
         rs_old = rs_new
     if not bool(xp.all(xp.isfinite(y))):
-        return xp.zeros((rows,), dtype=dtype)
+        return xp.zeros((rows,), dtype=dtype, device=device(grad))
     return y
 
 
@@ -319,7 +323,7 @@ def apply_warm_start(
     _check("z_lower", warm.z_lower, n)
     _check("z_upper", warm.z_upper, n)
 
-    zero = xp.zeros((n,), dtype=z_lower.dtype)
+    zero = xp.zeros((n,), dtype=z_lower.dtype, device=device(z_lower))
     if warm.s is not None:
         s = _floor_positive(xp, warm.s)
     if warm.y_ineq is not None:

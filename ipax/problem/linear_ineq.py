@@ -126,8 +126,8 @@ def _lower_dense(
         offsets.append(-xp.take(upper, upper_idx))
 
     if not blocks:
-        jac = xp.zeros((0, int(a.shape[1])), dtype=a.dtype)
-        offset = xp.zeros((0,), dtype=a.dtype)
+        jac = xp.zeros((0, int(a.shape[1])), dtype=a.dtype, device=device(a))
+        offset = xp.zeros((0,), dtype=a.dtype, device=device(a))
     else:
         jac = xp.concat(tuple(blocks), axis=0)
         offset = xp.concat(tuple(offsets))

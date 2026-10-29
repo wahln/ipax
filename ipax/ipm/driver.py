@@ -49,6 +49,7 @@ from ipax._logging import (
     format_record,
     logger,
 )
+from ipax.backend.namespace import device
 from ipax.backend.operators import (
     Dense,
     Diagonal,
@@ -586,7 +587,7 @@ class IPMDriver:
 
     def _ineq(self, x: Array) -> Array:
         if not self._has_ineq:
-            return self._xp.zeros((0,), dtype=x.dtype)
+            return self._xp.zeros((0,), dtype=x.dtype, device=device(x))
         return self._cached(
             x,
             "g",
@@ -595,7 +596,7 @@ class IPMDriver:
 
     def _ineq_jac(self, x: Array) -> LinearOperator:
         if not self._has_ineq:
-            return Dense(self._xp.zeros((0, self._n), dtype=x.dtype))
+            return Dense(self._xp.zeros((0, self._n), dtype=x.dtype, device=device(x)))
         return self._cached(
             x,
             "ineq_jac",
@@ -607,7 +608,7 @@ class IPMDriver:
     def _eq(self, x: Array) -> Array:
         """Combined equalities ``c(x)``: nonlinear stacked with ``A x − b``."""
         if not self._has_eq and self._linear_eq_data is None:
-            return self._xp.zeros((0,), dtype=x.dtype)
+            return self._xp.zeros((0,), dtype=x.dtype, device=device(x))
         return self._cached(x, "c", lambda: self._eq_uncached(x))
 
     def _eq_nonlinear(self, x: Array) -> Array:
@@ -627,7 +628,7 @@ class IPMDriver:
             a_op, b = self._linear_eq_data
             parts.append(a_op.matvec(x) - b)
         if not parts:
-            return xp.zeros((0,), dtype=x.dtype)
+            return xp.zeros((0,), dtype=x.dtype, device=device(x))
         if len(parts) == 1:
             return parts[0]
         return xp.concat(tuple(parts))
@@ -635,7 +636,7 @@ class IPMDriver:
     def _eq_jac(self, x: Array) -> LinearOperator:
         """Combined equality Jacobian ``∇c(x)`` as a ``LinearOperator``."""
         if not self._has_eq and self._linear_eq_data is None:
-            return Dense(self._xp.zeros((0, self._n), dtype=x.dtype))
+            return Dense(self._xp.zeros((0, self._n), dtype=x.dtype, device=device(x)))
         return self._cached(x, "eq_jac", lambda: self._eq_jac_uncached(x))
 
     def _eq_jac_uncached(self, x: Array) -> LinearOperator:
@@ -646,7 +647,7 @@ class IPMDriver:
         if self._linear_eq_data is not None:
             ops.append(self._linear_eq_data[0])
         if not ops:
-            return Dense(self._xp.zeros((0, self._n), dtype=x.dtype))
+            return Dense(self._xp.zeros((0, self._n), dtype=x.dtype, device=device(x)))
         if len(ops) == 1:
             return ops[0]
         return VStack(tuple(ops))
@@ -737,21 +738,29 @@ class IPMDriver:
 
     # -- masks / bound bookkeeping ---------------------------------------
 
-    def _masks(self, dtype: object) -> tuple[Array, Array, Array, Array]:
+    def _masks(self, like: Array) -> tuple[Array, Array, Array, Array]:
         xp = self._xp
         n = self._n
         if self._lower is None:
-            mask_l = xp.zeros((n,), dtype=xp.bool)
-            lower_safe = xp.zeros((n,), dtype=dtype)
+            mask_l = xp.zeros((n,), dtype=xp.bool, device=device(like))
+            lower_safe = xp.zeros((n,), dtype=like.dtype, device=device(like))
         else:
             mask_l = xp.isfinite(self._lower)
-            lower_safe = xp.where(mask_l, self._lower, xp.zeros((n,), dtype=dtype))
+            lower_safe = xp.where(
+                mask_l,
+                self._lower,
+                xp.zeros((n,), dtype=like.dtype, device=device(like)),
+            )
         if self._upper is None:
-            mask_u = xp.zeros((n,), dtype=xp.bool)
-            upper_safe = xp.zeros((n,), dtype=dtype)
+            mask_u = xp.zeros((n,), dtype=xp.bool, device=device(like))
+            upper_safe = xp.zeros((n,), dtype=like.dtype, device=device(like))
         else:
             mask_u = xp.isfinite(self._upper)
-            upper_safe = xp.where(mask_u, self._upper, xp.zeros((n,), dtype=dtype))
+            upper_safe = xp.where(
+                mask_u,
+                self._upper,
+                xp.zeros((n,), dtype=like.dtype, device=device(like)),
+            )
         return mask_l, mask_u, lower_safe, upper_safe
 
     # -- KKT error -------------------------------------------------------
@@ -922,7 +931,7 @@ class IPMDriver:
             y_c = (
                 least_squares_duals(eq_jac, grad, xp=xp, m_eq=m_eq)
                 if m_eq > 0
-                else xp.zeros((0,), dtype=dtype)
+                else xp.zeros((0,), dtype=dtype, device=device(x))
             )
         except Exception:  # a certificate must never be the thing that fails
             logger.debug("terminal certificate: evaluation failed", exc_info=True)
@@ -930,7 +939,7 @@ class IPMDriver:
         if m_eq > 0 and not bool(xp.all(xp.isfinite(y_c))):
             logger.debug("terminal certificate: non-finite dual estimate")
             return None
-        lam_c = xp.zeros((m,), dtype=dtype)
+        lam_c = xp.zeros((m,), dtype=dtype, device=device(x))
         z_zero = xp.zeros_like(x)
         try:
             # Also best-effort: ``kkt_error`` applies the Jacobians (``rmatvec``
@@ -985,7 +994,7 @@ class IPMDriver:
         dtype = x0.dtype
         n = self._n
 
-        mask_l, mask_u, lower_safe, upper_safe = self._masks(dtype)
+        mask_l, mask_u, lower_safe, upper_safe = self._masks(x0)
         n_lower = int(xp.sum(xp.astype(mask_l, xp.int64)))
         n_upper = int(xp.sum(xp.astype(mask_u, xp.int64)))
         n_bounds = n_lower + n_upper
@@ -1015,7 +1024,7 @@ class IPMDriver:
         )
         x, s = start.x, start.s
         y_ineq, z_lower, z_upper = start.y_ineq, start.z_lower, start.z_upper
-        y_eq = xp.zeros((m_eq,), dtype=dtype)
+        y_eq = xp.zeros((m_eq,), dtype=dtype, device=device(x))
         if self._restoration_solver_factory is not None:
             self._check_restoration_adjoints(x, m, m_eq)
 
@@ -1115,7 +1124,7 @@ class IPMDriver:
             opts.breedveld.max_soc if use_breedveld else opts.line_search.max_soc
         )
 
-        ones = xp.ones((n,), dtype=dtype)
+        ones = xp.ones((n,), dtype=dtype, device=device(x))
 
         # Persistent L-BFGS history (§4.3). Curvature pairs are pushed at the
         # top of each iteration from the just-completed step, so the Hessian
@@ -1364,7 +1373,9 @@ class IPMDriver:
             if it == opts.max_iter:
                 break
 
-            sigma_s = y_ineq / s if m > 0 else xp.zeros((0,), dtype=dtype)
+            sigma_s = (
+                y_ineq / s if m > 0 else xp.zeros((0,), dtype=dtype, device=device(x))
+            )
             zeros_n = xp.zeros_like(x)
             sigma_l = (
                 xp.where(mask_l, z_lower / x_minus_l, zeros_n) if has_lower else zeros_n
@@ -1378,7 +1389,7 @@ class IPMDriver:
                 else (sigma_l if has_lower else sigma_u)
             )
 
-            r_pi = g + s if m > 0 else xp.zeros((0,), dtype=dtype)
+            r_pi = g + s if m > 0 else xp.zeros((0,), dtype=dtype, device=device(x))
             w = self._hessian(x, y_eq[:m_nonlinear_eq], y_ineq, lbfgs)
 
             def solve_step_timed(
@@ -1886,7 +1897,7 @@ class IPMDriver:
                 base_x, base_s = trial_point(alpha)
                 corr_x = xp.zeros_like(x)
                 corr_s = xp.zeros_like(s)
-                empty_ineq = xp.zeros((0,), dtype=dtype)
+                empty_ineq = xp.zeros((0,), dtype=dtype, device=device(x))
                 own_factor = False  # retained factorization made by this loop
 
                 for _ in range(soc_rounds):
@@ -2579,7 +2590,11 @@ class IPMDriver:
         if sol is None:
             return None
         dx_t = sol[: self._n]
-        dy_t = sol[self._n :] if m_eq > 0 else xp.zeros((0,), dtype=rhs_x.dtype)
+        dy_t = (
+            sol[self._n :]
+            if m_eq > 0
+            else xp.zeros((0,), dtype=rhs_x.dtype, device=device(rhs_x))
+        )
         return recover_eliminated(
             dx_t,
             mu=0.0,
@@ -2772,7 +2787,7 @@ class IPMDriver:
         reg = RegularizationState(delta_w=delta_w_floor)
         sigma_x_op = Diagonal(sigma_x)
         sigma_s_op = Diagonal(sigma_s)
-        empty = xp.zeros((0,), dtype=rhs_x.dtype)
+        empty = xp.zeros((0,), dtype=rhs_x.dtype, device=device(rhs_x))
         # δ_c is escalated on a failed saddle solve only as a *last resort*: δ_w
         # cannot repair a rank-deficient equality Jacobian (which leaves the
         # saddle singular in the (2,2) dual block), only δ_c can (W&B 2006,
@@ -3354,7 +3369,7 @@ class IPMDriver:
             probes.append(("inequality", self._ineq_jac(x), m))
         for name, jacobian, rows in probes:
             try:
-                jacobian.rmatvec(xp.zeros((rows,), dtype=x.dtype))
+                jacobian.rmatvec(xp.zeros((rows,), dtype=x.dtype, device=device(x)))
             except NotImplementedError as exc:
                 raise ValueError(
                     "RestorationOptions(linear_solver='krylov') applies the "
