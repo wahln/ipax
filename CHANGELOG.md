@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-30
+
+### Added
+- **`ipax.interfaces.scipy.minimize_ipax`**, a SciPy-compatible front end: it takes the `scipy.optimize.minimize` arguments (`fun`, `x0`, `args`, `jac` including `jac=True`, `hess`/`hessp`, `Bounds` or `(min, max)` pairs, `LinearConstraint`/`NonlinearConstraint`/dict constraints, `tol`, `callback`, `options`) and returns an `OptimizeResult`. It works standalone and as `minimize(..., method=minimize_ipax)`. Install with the new `ipax[scipy]` extra.
+  - Translation: rows with `lb == ub` become equalities; each finite side of any other row becomes a one-sided inequality. `LinearConstraint` data goes to the constant `linear_eq`/`linear_ineq` blocks, and sparse matrices stay sparse (`CSROperator`). The exact Lagrangian Hessian is used only when the objective and every nonlinear constraint supply one; otherwise ipax uses L-BFGS, with an `OptimizeWarning` when a supplied objective Hessian goes unused. Constraints without a `jac` are differenced individually, so the Jacobians supplied for other constraints are kept.
+  - Result: per-constraint multipliers `v` (`trust-constr` sign convention) and values `constr`, `bound_multipliers`, `constr_violation`, `nit`/`nfev`/`njev`/`nhev`, status codes (`STATUS_CODES`: `0` optimal, `1` iteration limit), and the full `ipax.Result` as `ipax_result`. `maxiter`, `disp`, `tol` and any `Options` field name (or a whole `Options` as `ipax_options`) are accepted as options. A callback can be `callback(intermediate_result)`, trust-constr's `callback(xk, state)` or `callback(xk)`; raising `StopIteration` stops the solve, and so does returning `True` from the `(xk, state)` form, as in trust-constr.
+  - Array backends: the adapter takes the Array-API namespace, device and dtype from `x0` and keeps the solve and every result array in it, so a PyTorch, JAX or CuPy `x0` runs on that backend and device, with autodiff for missing derivatives where the backend has it. SciPy 1.17's `minimize` still converts `x0` to NumPy before calling a custom method; nothing in the adapter relies on that, so `minimize(..., method=minimize_ipax)` keeps working as SciPy moves to the Array API standard. `LinearConstraint`/`Bounds` data (which SciPy casts to float64 NumPy) and `scipy.sparse` input are converted into `x0`'s namespace, device and dtype. Tested on NumPy, PyTorch, array-api-strict and CuPy (GPU).
+  - The front end lives in the new `ipax/interfaces/` adapter directory, allowlisted in the import-purity gate next to `backend/sparse/`; the gate also rejects any import of `ipax.interfaces` from the rest of `ipax`, so `import ipax` never imports SciPy (a test pins this). Docs page: *Coming from SciPy*; example: `examples/scipy_minimize.py`.
+
+### Fixed
+- **Work arrays follow the device of the inputs.** About 90 array-creation calls across the IPM driver, starting point, Newton-step recovery, restoration, L-BFGS, KKT assembly, operators, dense/sparse solvers, scaling, finite differences and the `ipax.testing` problems passed no `device=`, so on a non-default device they were allocated on the backend's default one. A problem with PyTorch tensors on CUDA failed in the first iteration with `RuntimeError: Expected all tensors to be on the same device` (found by pyRadPlan). They now take the device from an input array. The GPU tests `test_krylov_gpu_smoke_torch_cuda` and `test_gpu_end_to_end_stays_on_the_device` pass again; `tests/regression/test_input_device_allocations.py` covers it on CPU through `array-api-strict`'s logical devices.
+- The doctest-collection guard (`tests/regression/test_doctest_collection_adapters.py`) now scans `backend/dense/` and `interfaces/` and sees imports inside a module-level `try`. The guard map now lists NumPy, which `backend/dense/cupy.py` imports at top level.
+
 ## [0.12.0] - 2026-10-17
 
 ### Added
@@ -560,7 +573,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Multi-backend (NumPy + PyTorch in CI; CuPy/JAX supported) with `array-api-strict` as the purity gate; import-purity gate (`scripts/check_purity.py`) enforcing invariants #1/#4.
 - Contract batteries (`tests/contracts/`) plus unit/property/integration/backends/ regression layers; benchmark suite (`benchmarks/`, asv); MkDocs documentation.
 
-[Unreleased]: https://github.com/wahln/ipax/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/wahln/ipax/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/wahln/ipax/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/wahln/ipax/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/wahln/ipax/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/wahln/ipax/compare/v0.10.0...v0.10.1

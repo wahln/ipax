@@ -11,6 +11,15 @@ solver, runs the interior-point loop, and returns a [`Result`](#results-and-diag
 
 ::: ipax.solve.solve
 
+## SciPy front end
+
+`scipy.optimize.minimize`-compatible entry point (needs `ipax[scipy]`); see
+[Coming from SciPy](guide/scipy.md).
+
+::: ipax.interfaces.scipy.minimize_ipax
+
+::: ipax.interfaces.scipy.STATUS_CODES
+
 ## Problem definition
 
 Define a model by subclassing [`Problem`](#ipax.problem.base.Problem), or use one

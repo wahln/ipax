@@ -27,7 +27,7 @@ import math
 import random
 from typing import TYPE_CHECKING, Any
 
-from ipax.backend.namespace import array_namespace
+from ipax.backend.namespace import array_namespace, device
 from ipax.backend.operators import Dense, LinearOperator
 from ipax.problem.base import Problem
 
@@ -120,7 +120,7 @@ class BoundConstrainedQP(Problem):
         sigma: Scalar = 1.0,
     ) -> Array:
         del y_eq, y_ineq
-        return sigma * self.xp.eye(2, dtype=x.dtype)
+        return sigma * self.xp.eye(2, dtype=x.dtype, device=device(x))
 
     def known_solution(self) -> Array:
         return _array(self.xp, [0.0, 1.0])
@@ -158,7 +158,7 @@ class EqualityConstrainedQP(Problem):
         sigma: Scalar = 1.0,
     ) -> Array:
         del y_eq, y_ineq
-        return sigma * self.xp.eye(2, dtype=x.dtype)
+        return sigma * self.xp.eye(2, dtype=x.dtype, device=device(x))
 
     def known_solution(self) -> Array:
         return _array(self.xp, [0.5, 0.5])
@@ -830,7 +830,7 @@ class _DiagPlusLowRank(LinearOperator):
         scale = self._sigma**0.5
         d = self._sigma * self._h
         u = scale * self._C
-        m = -xp.eye(int(self._C.shape[1]), dtype=self._h.dtype)
+        m = -xp.eye(int(self._C.shape[1]), dtype=self._h.dtype, device=device(self._h))
         return d, u, m
 
 
@@ -867,7 +867,9 @@ class SyntheticRTProblem(Problem):
         return self._n
 
     def bounds(self) -> tuple[Array, None]:
-        return self.xp.zeros((self._n,), dtype=self._h.dtype), None
+        return self.xp.zeros(
+            (self._n,), dtype=self._h.dtype, device=device(self._h)
+        ), None
 
     def _hessian_operator(self, sigma: float) -> _DiagPlusLowRank:
         return _DiagPlusLowRank(self._h, self._C, sigma)

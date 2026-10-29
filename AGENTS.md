@@ -65,6 +65,8 @@ ipax/
   linalg/       solver.py, dense.py, krylov.py, regularize.py
   ipm/          barrier, kkt, step, filter_ls, restoration, breedveld_ls,
                 hessian, init, driver
+  interfaces/   scipy.py (minimize_ipax: scipy.optimize.minimize front end;
+                a labeled NumPy/SciPy adapter, never imported by ipax itself)
   testing/      problems.py (analytic oracles), backends.py
 tests/          contracts/, unit/, property/, integration/, backends/, regression/
 examples/       minimal runnable examples for the current implementation surface

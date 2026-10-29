@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from ipax._logging import logger
-from ipax.backend.namespace import _namespace_name, array_namespace
+from ipax.backend.namespace import _namespace_name, array_namespace, device
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -306,7 +306,9 @@ class SparseDirectSolver:
         pad = self._assembled_size - self._logical_size
         if pad:
             xp = array_namespace(rhs)
-            rhs = xp.concat((rhs, xp.zeros((pad,), dtype=rhs.dtype)))
+            rhs = xp.concat(
+                (rhs, xp.zeros((pad,), dtype=rhs.dtype, device=device(rhs)))
+            )
         solution = self._inner.solve(rhs)
         if pad:
             solution = solution[: self._logical_size]

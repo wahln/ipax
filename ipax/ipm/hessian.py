@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ipax.backend.namespace import array_namespace
+from ipax.backend.namespace import array_namespace, device
 from ipax.backend.operators import LinearOperator
 from ipax.linalg.solver import numerical_failure_types
 
@@ -135,11 +135,11 @@ class LBFGSOperator(LinearOperator):
                     "L-BFGS dense matrix requires a template before the first pair"
                 )
             xp = array_namespace(like)
-            return xp.eye(self._n, dtype=like.dtype)
+            return xp.eye(self._n, dtype=like.dtype, device=device(like))
 
         xi, u, m = self.compact_form()
         xp = self._namespace()
-        identity = xp.eye(self._n, dtype=u.dtype)
+        identity = xp.eye(self._n, dtype=u.dtype, device=device(u))
         correction = xp.matmul(u, xp.linalg.solve(m, xp.permute_dims(u, (1, 0))))
         return xi * identity - correction
 
@@ -204,7 +204,7 @@ class LBFGSOperator(LinearOperator):
         if self._s is None or self._y is None or self._m is None:
             if like is not None:
                 xp = array_namespace(like)
-                return xp.ones((self._n,), dtype=like.dtype)
+                return xp.ones((self._n,), dtype=like.dtype, device=device(like))
             raise NotImplementedError(
                 "L-BFGS diagonal is unavailable before the first curvature pair"
             )
@@ -316,7 +316,7 @@ class LBFGSOperator(LinearOperator):
         """
         xi, u, m = self.compact_form()
         xp = self._namespace()
-        d = xi * xp.ones((self._n,), dtype=u.dtype)
+        d = xi * xp.ones((self._n,), dtype=u.dtype, device=device(u))
         return d, u, m
 
     def positive_definite_hint(self) -> bool:
@@ -467,7 +467,9 @@ class LBFGSOperator(LinearOperator):
         self._xi = xi
 
         lower = xp.tril(s_y, k=-1)  # strict lower triangle L
-        d_mat = s_y * xp.eye(k, dtype=s.dtype)  # diag(D)_i = δ_iᵀγ_i = (SᵀY)_ii
+        d_mat = s_y * xp.eye(
+            k, dtype=s.dtype, device=device(s)
+        )  # diag(D)_i = δ_iᵀγ_i = (SᵀY)_ii
 
         top = xp.concat((xi * s_s, lower), axis=1)
         bottom = xp.concat((xp.permute_dims(lower, (1, 0)), -d_mat), axis=1)

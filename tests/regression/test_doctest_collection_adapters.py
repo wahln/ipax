@@ -24,7 +24,12 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_ADAPTER_DIRS = ("ipax/problem/autodiff", "ipax/backend/sparse")
+_ADAPTER_DIRS = (
+    "ipax/problem/autodiff",
+    "ipax/backend/sparse",
+    "ipax/backend/dense",
+    "ipax/interfaces",
+)
 # Mirrors scripts/check_purity.BANNED_TOP_LEVEL plus the sparse-direct natives.
 _CONCRETE_LIBS = {
     "numpy",
@@ -54,7 +59,13 @@ def _load_conftest_requirements() -> dict[str, tuple[str, ...]]:
 def _top_level_concrete_imports(py: Path) -> set[str]:
     tree = ast.parse(py.read_text(encoding="utf-8"))
     libs: set[str] = set()
-    for node in tree.body:  # module-level statements only; lazy imports are safe
+    # Module-level statements only (lazy imports inside functions are safe),
+    # including those guarded by a module-level ``try`` — still executed on import.
+    statements = list(tree.body)
+    for node in tree.body:
+        if isinstance(node, ast.Try):
+            statements.extend(node.body)
+    for node in statements:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".", 1)[0]

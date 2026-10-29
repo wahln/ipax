@@ -74,7 +74,7 @@ import functools
 import math
 from typing import TYPE_CHECKING, Any
 
-from ipax.backend.namespace import array_namespace
+from ipax.backend.namespace import array_namespace, device
 from ipax.linalg.solver import (
     LinearSolveError,
     checked_cholesky,
@@ -620,9 +620,9 @@ class DenseSolver:
         if pad <= 0:
             return rhs
         if len(rhs.shape) == 1:
-            zero = xp.zeros((pad,), dtype=rhs.dtype)
+            zero = xp.zeros((pad,), dtype=rhs.dtype, device=device(rhs))
         else:
-            zero = xp.zeros((pad, rhs.shape[1]), dtype=rhs.dtype)
+            zero = xp.zeros((pad, rhs.shape[1]), dtype=rhs.dtype, device=device(rhs))
         return xp.concat((rhs, zero), axis=0)
 
     @staticmethod
@@ -651,7 +651,7 @@ class DenseSolver:
             except numerical_failure_types() as exc:
                 raise LinearSolveError("dense matrix materialization failed") from exc
 
-        identity = xp.eye(n, dtype=rhs.dtype)
+        identity = xp.eye(n, dtype=rhs.dtype, device=device(rhs))
         try:
             return self._operator.matmat(identity)
         except numerical_failure_types() as exc:
