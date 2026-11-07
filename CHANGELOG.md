@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+- The verification gate no longer fails at random on many-core machines: `scripts/check.py` caps the test gate at 8 xdist workers (`-n auto --maxprocesses=8`; CI's 4-core runners are unchanged), and the property tests in `tests/property/test_derivative_checks.py` no longer use Hypothesis's 200 ms deadline, which the first example's backend warm-up exceeded under full-suite load. The SciPy adapter's `keep_feasible` warning-location test compares paths with `samefile`, so it no longer fails on Windows when the working directory's drive letter is lower-case.
+
 ## [0.13.0] - 2026-10-30
 
 ### Added
