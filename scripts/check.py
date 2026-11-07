@@ -31,13 +31,28 @@ REPO = Path(__file__).resolve().parents[1]
 # Each gate is (argv, extra-env). The multi-backend test gate must exercise
 # NumPy + Torch + the array-api-strict purity backend, exactly as CI does
 # (see .github/workflows/ci.yml, the `test` job).
+#
+# ``-n auto`` starts one worker per core. On a many-core workstation (~24
+# workers) the workers' Torch/CUDA DLL mappings can exhaust Windows' commit
+# limit, so the gate failed randomly (Windows error 1455, numpy
+# ArrayMemoryError) on code that passes. ``--maxprocesses`` caps only ``auto``,
+# so CI's 4-core runners get the same worker count as before.
+MAX_TEST_WORKERS = 8
 GATES: dict[str, tuple[list[str], dict[str, str]]] = {
     "format": (["ruff", "format", "--check", "."], {}),
     "lint": (["ruff", "check", "."], {}),
     "types": (["mypy", "ipax"], {}),
     "purity": ([sys.executable, "scripts/check_purity.py"], {}),
     "test": (
-        [sys.executable, "-m", "pytest", "-q", "-n", "auto"],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-n",
+            "auto",
+            f"--maxprocesses={MAX_TEST_WORKERS}",
+        ],
         {"IPAX_BACKENDS": "numpy,torch,array_api_strict"},
     ),
 }
