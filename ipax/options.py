@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal
 
-from ipax.errors import ConfigurationError
+from ipax.errors import ConfigurationError, OptionTypeError
 
 HessianMode = Literal["auto", "lbfgs", "exact", "autodiff-hvp"]
 LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
@@ -64,13 +64,24 @@ def _validate_optional_positive(
         raise ConfigurationError(f"{name} must be finite and {qualifier}")
 
 
-def _matches(value: object, expected: object) -> bool:
-    """Whether ``value`` conforms to the resolved field annotation ``expected``."""
+def _matches(value: object, expected: object, *, type_only: bool = False) -> bool:
+    """Whether ``value`` conforms to the resolved field annotation ``expected``.
+
+    With ``type_only``, only the kind of value is checked: any string for a
+    choice of strings, NaN for a number. That separates a value of the wrong
+    type (:class:`~ipax.errors.OptionTypeError`) from a bad value of the
+    right type.
+    """
     origin = typing.get_origin(expected)
     if origin is Literal:
-        return isinstance(value, str) and value in typing.get_args(expected)
+        return isinstance(value, str) and (
+            type_only or value in typing.get_args(expected)
+        )
     if origin in (typing.Union, types.UnionType):
-        return any(_matches(value, arg) for arg in typing.get_args(expected))
+        return any(
+            _matches(value, arg, type_only=type_only)
+            for arg in typing.get_args(expected)
+        )
     if expected is type(None):
         return value is None
     if expected is bool:
@@ -88,6 +99,8 @@ def _matches(value: object, expected: object) -> bool:
     if expected is float:
         if not isinstance(value, numbers.Real):
             return False
+        if type_only:
+            return True
         try:
             return not math.isnan(value)
         except OverflowError:  # an integer too large for a float
@@ -127,7 +140,12 @@ def _check_field_types(options: object) -> None:
     for name, expected in field_types:
         value = getattr(options, name)
         if not _matches(value, expected):
-            raise ConfigurationError(
+            error = (
+                ConfigurationError
+                if _matches(value, expected, type_only=True)
+                else OptionTypeError
+            )
+            raise error(
                 f"{cls.__name__}.{name} must be {_describe(expected)}; got {value!r}"
             )
 

@@ -70,7 +70,6 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
-import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -90,6 +89,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without SciPy
 
 from ipax.backend.namespace import array_namespace, device
 from ipax.backend.operators import CSROperator, LinearOperator, MatrixFreeJacobian
+from ipax.errors import warn_external
 from ipax.options import Options
 from ipax.problem.finitediff import jacobian_fd
 from ipax.problem.function import FunctionProblem
@@ -263,12 +263,10 @@ def _host_bounds(value: Any, m: int) -> Any:
 
 def _warn_keep_feasible(con: Any) -> None:
     if np.any(np.asarray(getattr(con, "keep_feasible", False))):
-        warnings.warn(
+        warn_external(
             "keep_feasible is not supported for constraints: the interior-point "
             "iterates keep only the bounds strictly feasible",
             OptimizeWarning,
-            # → _from_*/_normalize_constraints/_translate/minimize_ipax → caller
-            stacklevel=6,
         )
 
 
@@ -666,10 +664,9 @@ def _objective_hessian(
         return scaled
     if hess is not None:
         if isinstance(hess, HessianUpdateStrategy) or hess in _FD_STRINGS:
-            warnings.warn(
+            warn_external(
                 f"hess={hess!r} is replaced by ipax's L-BFGS approximation",
                 OptimizeWarning,
-                stacklevel=4,
             )
             return None
         raise TypeError(f"unsupported hess {hess!r}")
@@ -724,11 +721,10 @@ def _translate(
         # supplied Jacobians are not thrown away.
         has_jac = any(s.jac is not None for s in nonlinear)
         if has_jac and not all(s.jac is not None for s in nonlinear):
-            warnings.warn(
+            warn_external(
                 "some constraints have no callable jac; using central differences "
                 "for those (supply jac for accuracy and speed)",
                 OptimizeWarning,
-                stacklevel=3,
             )
         pieces = [
             s.jac if s.jac is not None else partial(jacobian_fd, s.fun)
@@ -795,12 +791,11 @@ def _translate(
                 space, objective_hessian, nonlinear, layout, n
             )
         else:
-            warnings.warn(
+            warn_external(
                 "a constraint has no callable hess(x, v) (dict constraints never "
                 "do); using ipax's L-BFGS approximation of the whole Lagrangian "
                 "Hessian",
                 OptimizeWarning,
-                stacklevel=3,
             )
 
     problem = FunctionProblem(
@@ -880,10 +875,9 @@ def _build_options(tol: float | None, options: dict[str, Any]) -> Options:
             compl_inf_tol=tol,
         )
     if opts:
-        warnings.warn(
+        warn_external(
             f"Unknown solver options: {', '.join(sorted(opts))}",
             OptimizeWarning,
-            stacklevel=3,
         )
     return dataclasses.replace(base, **changes)
 

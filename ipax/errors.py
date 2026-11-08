@@ -30,6 +30,8 @@ import warnings
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from types import FrameType
+
     from ipax.typing import Array
 
 _IPAX_DIR = os.path.normcase(os.path.dirname(os.path.abspath(__file__))) + os.sep
@@ -39,6 +41,11 @@ _IPAX_DIR = os.path.normcase(os.path.dirname(os.path.abspath(__file__))) + os.se
 _DATACLASSES_FILE = os.path.normcase(
     os.path.abspath(sys.modules["dataclasses"].__file__ or "")
 )
+# Dispatchers that call an ipax front end on the user's behalf:
+# ``scipy.optimize.minimize(..., method=minimize_ipax)`` reaches the SciPy
+# front end from inside SciPy, and the warning should name the line that
+# called ``minimize``. Matched by module name; nothing is imported.
+_DISPATCHER_MODULES = ("scipy.optimize",)
 
 
 class IpaxError(Exception):
@@ -47,6 +54,18 @@ class IpaxError(Exception):
 
 class ConfigurationError(IpaxError, ValueError):
     """An option value, or a combination of options, is invalid."""
+
+
+class OptionTypeError(ConfigurationError, TypeError):
+    """An option has a value of the wrong type.
+
+    For example ``Options(max_iter="10")``, ``Options(enable_autodiff="no")``
+    or ``Options(optimality=None)``. Being a :class:`ConfigurationError` and a
+    :class:`TypeError`, it is caught by ``except ConfigurationError``,
+    ``except ValueError`` and ``except TypeError``. A value of the right type
+    that is not allowed — a misspelled choice, a NaN, a number out of range —
+    raises :class:`ConfigurationError` itself.
+    """
 
 
 class ProblemDefinitionError(IpaxError, ValueError):
@@ -112,9 +131,14 @@ class FiniteDifferenceWarning(IpaxWarning):
     """
 
 
-def _is_internal(filename: str) -> bool:
-    path = os.path.normcase(os.path.abspath(filename))
-    return path.startswith(_IPAX_DIR) or path == _DATACLASSES_FILE
+def _is_internal(frame: FrameType) -> bool:
+    path = os.path.normcase(os.path.abspath(frame.f_code.co_filename))
+    if path.startswith(_IPAX_DIR) or path == _DATACLASSES_FILE:
+        return True
+    module = frame.f_globals.get("__name__", "")
+    return any(
+        module == name or module.startswith(name + ".") for name in _DISPATCHER_MODULES
+    )
 
 
 def warn_external(message: str, category: type[Warning]) -> None:
@@ -122,13 +146,15 @@ def warn_external(message: str, category: type[Warning]) -> None:
 
     A fixed ``stacklevel`` points at the right line only for one call path;
     the same warning can be reached from :func:`ipax.solve`, the SciPy front
-    end or a test. Walking past ipax's own frames (and ``dataclasses.replace``)
-    always names the user's line, so ``warnings`` filters by module and the
-    once-per-location default work as users expect.
+    end (called directly or through ``scipy.optimize.minimize``) or a test.
+    Walking past ipax's own frames, ``dataclasses.replace`` and the
+    dispatchers that call ipax on the user's behalf always names the user's
+    line, so ``warnings`` filters by module and the once-per-location default
+    work as users expect.
     """
     frame = sys._getframe(1)
     level = 2  # stacklevel 2 = the caller of warn_external
-    while frame.f_back is not None and _is_internal(frame.f_code.co_filename):
+    while frame.f_back is not None and _is_internal(frame):
         frame = frame.f_back
         level += 1
     warnings.warn(message, category, stacklevel=level)
@@ -141,6 +167,7 @@ __all__ = [
     "IpaxError",
     "IpaxWarning",
     "LinearSolveError",
+    "OptionTypeError",
     "ProblemDefinitionError",
     "UnsupportedBackendError",
 ]

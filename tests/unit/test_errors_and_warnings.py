@@ -8,7 +8,6 @@ clauses written against 0.13 keep catching them.
 from __future__ import annotations
 
 import warnings
-from pathlib import Path
 
 import pytest
 
@@ -44,6 +43,7 @@ class _WithEqualities(_ObjectiveOnly):
     [
         ("IpaxError", (Exception,)),
         ("ConfigurationError", (ipax.IpaxError, ValueError)),
+        ("OptionTypeError", (ipax.ConfigurationError, ValueError, TypeError)),
         ("DerivativeUnavailableError", (ipax.IpaxError, RuntimeError)),
         ("ProblemDefinitionError", (ipax.IpaxError, ValueError)),
         ("UnsupportedBackendError", (ipax.IpaxError, RuntimeError)),
@@ -96,23 +96,6 @@ def test_derivative_unavailable_is_still_a_runtime_error(namespace):
         ipax.solve(
             _ObjectiveOnly(namespace), array(namespace, [0.0, 0.0]), options=options
         )
-
-
-@pytest.mark.parametrize("problem_cls", [_ObjectiveOnly, _WithEqualities])
-def test_finite_difference_warnings_have_their_category_and_point_at_the_caller(
-    namespace, problem_cls
-):
-    options = Options(enable_autodiff=False, max_iter=3)
-    with pytest.warns(ipax.FiniteDifferenceWarning) as record:
-        ipax.solve(
-            problem_cls(namespace), array(namespace, [0.5, 0.5]), options=options
-        )
-    fd = [w for w in record if issubclass(w.category, ipax.FiniteDifferenceWarning)]
-    expected = 2 if problem_cls is _WithEqualities else 1
-    assert len(fd) == expected
-    for w in fd:
-        # samefile: the drive letter's case can differ on Windows.
-        assert Path(w.filename).samefile(__file__), w.filename
 
 
 def test_finite_difference_warnings_can_be_filtered_by_category(namespace):

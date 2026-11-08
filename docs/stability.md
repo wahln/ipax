@@ -70,13 +70,15 @@ may still raise plain built-ins.
 | Exception | Also a | Raised when |
 |---|---|---|
 | `ConfigurationError` | `ValueError` | an option has an invalid value |
+| `OptionTypeError` | `ConfigurationError`, `TypeError` | an option has a value of the wrong type (`Options(max_iter="10")`) |
 | `ProblemDefinitionError` | `ValueError` | `x0` or the bounds do not match `n_vars`, or `Problem.provides()` names an unknown method |
 | `DerivativeUnavailableError` | `RuntimeError` | a derivative the solve needs cannot be obtained |
 | `UnsupportedBackendError` | `RuntimeError` | the array backend lacks a capability the options need (e.g. `linsolve="sparse"` with no sparse adapter) |
 | `LinearSolveError` | `RuntimeError` | a linear solve failed in a way the solver could not recover from |
 
-An argument of the wrong type, such as an `options` dict, raises a plain
-`TypeError`. Numerical trouble during the iterations is not raised: the solve
+A value of the wrong type raises a `TypeError`: a plain one for an argument
+of `ipax.solve`, such as an `options` dict, and `OptionTypeError` for an
+option field. Numerical trouble during the iterations is not raised: the solve
 returns a `Result` whose `status` says how it ended. An exception raised by
 your own callbacks propagates out of `ipax.solve` unchanged.
 

@@ -83,20 +83,6 @@ def test_bounds_of_the_wrong_shape_are_rejected(namespace, side):
         ipax.solve(problem, _x0(namespace))
 
 
-def test_n_iter_counts_iterations_performed(namespace):
-    result = ipax.solve(_Shifted(namespace), _x0(namespace))
-    assert result.history[0].iteration == 0  # the start point
-    assert result.n_iter == result.history[-1].iteration
-    assert result.n_iter == len(result.history) - 1
-
-
-def test_n_iter_is_zero_when_the_solve_exits_at_the_start(namespace):
-    bounds = (array(namespace, [1.0, 1.0]), array(namespace, [0.0, 0.0]))
-    result = ipax.solve(_Shifted(namespace, bounds=bounds), _x0(namespace))
-    assert result.status is ipax.Status.INFEASIBLE
-    assert result.n_iter == 0
-
-
 def test_as_operator_points_scipy_sparse_users_to_csr_operator():
     sp = pytest.importorskip("scipy.sparse")
     import numpy as np

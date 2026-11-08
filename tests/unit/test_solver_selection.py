@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from ipax.backend.namespace import Capabilities
+from ipax.errors import UnsupportedBackendError
 from ipax.linalg.dense import DenseSolver
 from ipax.linalg.krylov import KrylovSolver
 from ipax.linalg.solver import select_restoration_solver, select_solver
@@ -97,6 +100,18 @@ def test_select_solver_rejects_unavailable_sparse_backend():
         assert "sparse" in str(exc).lower()
     else:
         pytest.fail("expected a RuntimeError when sparse solving is unavailable")
+
+
+def test_select_solver_rejects_dense_without_linalg_solve():
+    no_solve = dataclasses.replace(_caps(), linalg_functions=frozenset({"cholesky"}))
+    with pytest.raises(UnsupportedBackendError, match=r"linalg\.solve"):
+        select_solver(
+            n_vars=10,
+            has_equalities=False,
+            capabilities=no_solve,
+            options=Options(linsolve="dense"),
+        )
+    assert issubclass(UnsupportedBackendError, RuntimeError)  # 0.13 raised this
 
 
 # --- n ≪ m (tall, Gram-capable) auto-selection ------------------------------

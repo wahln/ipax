@@ -64,39 +64,16 @@ def test_configuration_error_is_a_value_error():
 
 @pytest.mark.parametrize(("cls", "name"), list(_fields()))
 def test_every_field_rejects_a_value_of_the_wrong_type(cls, name):
-    with pytest.raises(ipax.ConfigurationError, match=rf"{cls.__name__}\.{name}\b"):
+    with pytest.raises(ipax.OptionTypeError, match=rf"{cls.__name__}\.{name}\b"):
         cls(**{name: object()})
 
 
 @pytest.mark.parametrize(("cls", "name"), list(_literal_fields()))
 def test_every_string_choice_rejects_an_unknown_value(cls, name):
-    with pytest.raises(ipax.ConfigurationError, match=r"one of .*got 'bogus'"):
+    # A string is the right type: a bad choice is a value error, not a TypeError.
+    with pytest.raises(ipax.ConfigurationError, match=r"one of .*got 'bogus'") as err:
         cls(**{name: "bogus"})
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"hessian": "bogus"},
-        {"linsolve": "krylv"},
-        {"globalization": "bogus"},
-        {"mu_schedule": "bogus"},
-        {"scaling": "gradient_based"},
-        {"corrections": "Mehrotra"},
-    ],
-    ids=lambda kw: next(iter(kw)),
-)
-def test_misspelled_top_level_selectors_are_rejected(kwargs):
-    with pytest.raises(ipax.ConfigurationError):
-        ipax.Options(**kwargs)
-
-
-def test_underscore_spelling_of_the_barrier_fallback_is_rejected_not_ignored():
-    # "kkt_error" used to switch the NWW §5.1 safeguard off silently.
-    with pytest.raises(ipax.ConfigurationError, match="'kkt-error'"):
-        ipax.BarrierOptions(fallback="kkt_error")
-    with pytest.raises(ipax.ConfigurationError, match="'obj-constr-filter'"):
-        ipax.LineSearchOptions(free_mode_acceptance="obj_constr_filter")
+    assert not isinstance(err.value, TypeError)
 
 
 @pytest.mark.parametrize(
@@ -107,15 +84,28 @@ def test_underscore_spelling_of_the_barrier_fallback_is_rejected_not_ignored():
         {"max_iter": 5.5},
         {"max_iter": True},
         {"verbose": "x"},
-        {"max_time": float("nan")},
         {"optimality": None},
         {"krylov": ipax.LBFGSOptions()},
     ],
     ids=lambda kw: f"{next(iter(kw))}={next(iter(kw.values()))!r}",
 )
 def test_wrong_types_are_rejected(kwargs):
-    with pytest.raises(ipax.ConfigurationError):
+    with pytest.raises(ipax.OptionTypeError):
         ipax.Options(**kwargs)
+
+
+def test_a_wrong_type_is_also_a_type_error():
+    # 0.13's range checks failed on a string with "'<' not supported", a
+    # TypeError; code catching that still catches the new error.
+    with pytest.raises(TypeError, match=r"Options\.max_iter must be an integer"):
+        ipax.Options(max_iter="10")
+
+
+@pytest.mark.parametrize("value", [float("nan"), 10**400], ids=["nan", "huge-int"])
+def test_a_bad_number_is_a_value_error_not_a_type_error(value):
+    with pytest.raises(ipax.ConfigurationError, match="max_time") as err:
+        ipax.Options(max_time=value)
+    assert not isinstance(err.value, TypeError)
 
 
 def test_numeric_fields_accept_integers_and_numpy_scalars():
@@ -175,8 +165,9 @@ def test_numeric_fields_accept_integers_and_numpy_scalars():
     ),
 )
 def test_out_of_range_values_are_rejected(cls, kwargs):
-    with pytest.raises(ipax.ConfigurationError, match=next(iter(kwargs))):
+    with pytest.raises(ipax.ConfigurationError, match=next(iter(kwargs))) as err:
         cls(**kwargs)
+    assert not isinstance(err.value, TypeError)
 
 
 @pytest.mark.parametrize("cls", OPTION_CLASSES, ids=lambda c: c.__name__)
@@ -208,8 +199,3 @@ def test_verbose_accepts_a_bool_as_tier_0_or_1():
 def test_bool_fields_accept_numpy_bools():
     assert ipax.Options(enable_autodiff=np.True_).enable_autodiff
     assert not ipax.SparseOptions(deterministic=np.False_).deterministic
-
-
-def test_an_integer_too_large_for_a_float_is_a_configuration_error():
-    with pytest.raises(ipax.ConfigurationError, match="max_time"):
-        ipax.Options(max_time=10**400)

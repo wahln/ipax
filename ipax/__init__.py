@@ -33,6 +33,7 @@ from ipax.errors import (
     IpaxError,
     IpaxWarning,
     LinearSolveError,
+    OptionTypeError,
     ProblemDefinitionError,
     UnsupportedBackendError,
 )
@@ -93,6 +94,7 @@ __all__ = [
     "LinearProblem",
     "LinearSolveError",
     "OptimalityConditionOptions",
+    "OptionTypeError",
     "Options",
     "Problem",
     "ProblemDefinitionError",

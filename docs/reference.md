@@ -105,6 +105,8 @@ The documented error conditions raise these classes; each derives from
 
 ::: ipax.errors.ConfigurationError
 
+::: ipax.errors.OptionTypeError
+
 ::: ipax.errors.ProblemDefinitionError
 
 ::: ipax.errors.DerivativeUnavailableError

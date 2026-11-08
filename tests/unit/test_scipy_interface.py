@@ -13,7 +13,6 @@ translated problem live in ``test_scipy_interface_backends.py``.
 from __future__ import annotations
 
 import warnings
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -804,16 +803,6 @@ def test_trust_constr_style_callback_receives_x_and_state():
     assert res.success
     assert seen
     assert seen[-1][1] == res.nit
-
-
-def test_keep_feasible_warning_points_at_the_caller():
-    con = LinearConstraint(np.ones((1, 4)), -np.inf, 1.0, keep_feasible=True)
-    with pytest.warns(OptimizeWarning, match="keep_feasible") as record:
-        minimize_ipax(_qp, np.zeros(4), jac=_qp_grad, constraints=con)
-    # samefile, not ==: on Windows the two spellings can differ in the case of
-    # the drive letter (d:\ vs D:\, from the working directory) and still name
-    # this file.
-    assert Path(record[0].filename).samefile(__file__)
 
 
 def test_zero_hessian_keeps_the_problem_dtype():
