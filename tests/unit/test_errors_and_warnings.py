@@ -45,6 +45,7 @@ class _WithEqualities(_ObjectiveOnly):
         ("IpaxError", (Exception,)),
         ("ConfigurationError", (ipax.IpaxError, ValueError)),
         ("DerivativeUnavailableError", (ipax.IpaxError, RuntimeError)),
+        ("ProblemDefinitionError", (ipax.IpaxError, ValueError)),
         ("LinearSolveError", (ipax.IpaxError, RuntimeError)),
         ("IpaxWarning", (UserWarning,)),
         ("FiniteDifferenceWarning", (ipax.IpaxWarning, UserWarning)),

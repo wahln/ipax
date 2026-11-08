@@ -834,6 +834,62 @@ def forward_gram(
         return op.gram(weights)
 
 
+class ScaledOperator(LinearOperator):
+    """``alpha · A`` for a scalar ``alpha``, keeping ``A``'s capabilities.
+
+    A user Hessian operator must honour the ``sigma`` factor the solver passes
+    to :meth:`~ipax.problem.base.Problem.lagrangian_hessian` (not 1 under the
+    default gradient-based scaling); wrapping it here scales every product and
+    every explicit form (dense matrix, diagonal, COO values) without
+    materializing anything. Hints carry over: symmetry always, positive
+    definiteness only for ``alpha > 0``.
+    """
+
+    def __init__(self, op: LinearOperator, alpha: float) -> None:
+        self._op = op
+        self._alpha = float(alpha)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self._op.shape
+
+    def matvec(self, v: Array) -> Array:
+        return self._alpha * self._op.matvec(v)
+
+    def rmatvec(self, v: Array) -> Array:
+        return self._alpha * self._op.rmatvec(v)
+
+    def matmat(self, V: Array) -> Array:
+        return self._alpha * self._op.matmat(V)
+
+    def rmatmat(self, V: Array) -> Array:
+        return self._alpha * self._op.rmatmat(V)
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        return self._alpha * self._op.dense_matrix(like)
+
+    def diagonal(self, like: Array | None = None) -> Array:
+        return self._alpha * self._op.diagonal(like)
+
+    def to_coo(
+        self, like: Array | None = None
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        rows, cols, values, shape = self._op.to_coo(like)
+        return rows, cols, self._alpha * values, shape
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        return self._alpha * self._op.coo_values(like)
+
+    def coo_pattern_signature(self) -> object | None:
+        return self._op.coo_pattern_signature()
+
+    def symmetry_hint(self) -> bool | None:
+        return self._op.symmetry_hint()
+
+    def positive_definite_hint(self) -> bool:
+        return self._alpha > 0.0 and self._op.positive_definite_hint()
+
+
 class VStack(LinearOperator):
     """Vertical stack of operators sharing the variable (column) dimension.
 
@@ -1653,6 +1709,7 @@ __all__ = [
     "LinearOperator",
     "LowRank",
     "MatrixFreeJacobian",
+    "ScaledOperator",
     "VStack",
     "as_operator",
     "forward_gram",

@@ -32,6 +32,7 @@ from ipax.errors import (
     FiniteDifferenceWarning,
     IpaxError,
     IpaxWarning,
+    ProblemDefinitionError,
 )
 from ipax.linalg.solver import LinearSolveError
 from ipax.options import (
@@ -93,6 +94,7 @@ __all__ = [
     "OptimalityConditionOptions",
     "Options",
     "Problem",
+    "ProblemDefinitionError",
     "QuadraticProblem",
     "RegularizationOptions",
     "RestorationOptions",

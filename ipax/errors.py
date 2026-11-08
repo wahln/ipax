@@ -46,6 +46,15 @@ class ConfigurationError(IpaxError, ValueError):
     """An option value, or a combination of options, is invalid."""
 
 
+class ProblemDefinitionError(IpaxError, ValueError):
+    """A :class:`~ipax.problem.base.Problem`, or the arguments of a solve, are inconsistent.
+
+    For example a start point whose length is not ``n_vars``, bounds of the
+    wrong shape, or :meth:`~ipax.problem.base.Problem.provides` naming a
+    method that does not exist.
+    """
+
+
 class DerivativeUnavailableError(IpaxError, RuntimeError):
     """A derivative the solve needs cannot be obtained.
 
@@ -97,4 +106,5 @@ __all__ = [
     "FiniteDifferenceWarning",
     "IpaxError",
     "IpaxWarning",
+    "ProblemDefinitionError",
 ]

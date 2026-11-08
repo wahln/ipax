@@ -34,12 +34,20 @@ class Problem(ABC):
     """User-facing NLP definition.
 
     Subclass and implement :attr:`n_vars` and :meth:`objective`; everything else
-    is optional. When an optional derivative method is left unimplemented (it
-    raises :class:`NotImplementedError`), the solver fills it by the precedence
-    *analytic → autodiff → finite-difference* for gradients/Jacobians and
-    *analytic → autodiff-HVP → L-BFGS* for the Lagrangian Hessian. Constraint
-    *values* (:meth:`eq_constraints`, :meth:`ineq_constraints`) have no fallback:
-    the constraint exists only if its value method is implemented.
+    is optional. **Overriding an optional method declares that the problem
+    provides it**; a method left as inherited is filled by the solver: the
+    gradient and nonlinear Jacobians by *analytic → autodiff →
+    finite-difference*, the Lagrangian Hessian by the analytic one when
+    supplied, otherwise L-BFGS (autodiff Hessian-vector products only with
+    ``Options(hessian="autodiff-hvp")``). A class that overrides methods it
+    cannot always serve (a delegating wrapper, say) declares what it really
+    provides through :meth:`provides`. Constraint *values*
+    (:meth:`eq_constraints`, :meth:`ineq_constraints`) have no fallback: the
+    constraint exists only if its value method is implemented.
+
+    New optional capabilities arrive as new methods with defaults, never as
+    new parameters of existing methods, so a subclass written against one
+    release keeps working.
 
     Nonlinear and linear constraints are declared through separate methods so
     the constant-data linear blocks (:meth:`linear_eq`, :meth:`linear_ineq`) can
@@ -71,9 +79,23 @@ class Problem(ABC):
     def objective(self, x: Array) -> Scalar:
         """Scalar objective ``f(x)``."""
 
+    # ---- which optional methods are implemented ----
+    def provides(self) -> frozenset[str] | None:
+        """Names of the optional methods this problem implements, or ``None``.
+
+        ``None`` (the default) infers them from which methods the subclass
+        overrides. Return a set to declare them explicitly, e.g.
+        ``frozenset({"gradient", "ineq_constraints"})`` for a wrapper that
+        overrides every method but only delegates some; a method not listed is
+        derived (or, for constraint values, absent) even if overridden. Valid
+        names: ``gradient``, ``eq_constraints``, ``eq_jacobian``,
+        ``ineq_constraints``, ``ineq_jacobian``, ``lagrangian_hessian``.
+        """
+        return None
+
     # ---- objective gradient (optional → autodiff → finite-diff) ----
     def gradient(self, x: Array) -> Array:
-        """``∇f(x)``. Raising signals 'derive it for me'."""
+        """``∇f(x)``. Derived by autodiff or finite differences when not provided."""
         raise NotImplementedError
 
     # ---- NONLINEAR constraints (optional; present only if defined) ----
@@ -136,6 +158,13 @@ class Problem(ABC):
 
         Follows the IPOPT ``eval_h`` convention so a structured/analytic Hessian
         can be supplied as a cheap matvec without ever materializing ``W``.
+
+        The solver always calls it with four positional arguments, so the
+        parameter names are free. ``sigma`` is a Python float that is **not 1**
+        under the default gradient-based scaling: an implementation must scale
+        the objective term by it. ``y_eq`` and ``y_ineq`` hold the multipliers
+        of the *nonlinear* constraints only (linear blocks have no curvature)
+        and are empty arrays, not ``None``, when there are none.
         """
         raise NotImplementedError
 

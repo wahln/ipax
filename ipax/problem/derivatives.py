@@ -14,11 +14,12 @@
 
 """Derivative-precedence resolver.
 
-Inspects which ``Problem`` methods are overridden and what the backend supports,
+Inspects which ``Problem`` methods are provided (``Problem.provides()``, else
+which are overridden) and what the backend supports,
 then binds each derivative to a concrete source:
 
 - gradient / nonlinear Jacobians: analytic → autodiff → finite-difference
-- Lagrangian Hessian: analytic operator → autodiff-HVP → L-BFGS
+- Lagrangian Hessian: analytic operator → L-BFGS (autodiff-HVP on request)
 
 The chosen sources are recorded in :class:`~ipax.result.DerivativeSources`.
 """
@@ -27,9 +28,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ipax._deprecation import warn_deprecated
 from ipax.errors import (
     DerivativeUnavailableError,
     FiniteDifferenceWarning,
+    ProblemDefinitionError,
     warn_external,
 )
 from ipax.problem.autodiff import get_autodiff_adapter
@@ -45,16 +48,52 @@ if TYPE_CHECKING:
     from ipax.typing import Array, Namespace, Scalar
 
 
-def _provides(problem: Problem, name: str) -> bool:
-    """Whether ``problem`` supplies ``name`` (analytic) rather than inheriting it.
+_OPTIONAL_METHODS = frozenset(
+    {
+        "gradient",
+        "eq_constraints",
+        "eq_jacobian",
+        "ineq_constraints",
+        "ineq_jacobian",
+        "lagrangian_hessian",
+    }
+)
 
-    :class:`~ipax.problem.function.FunctionProblem` overrides every optional
-    method, so it advertises what it actually has through a ``_provided`` set;
-    for hand-written subclasses we compare against the abstract base.
+
+def _declared(problem: Problem) -> frozenset[str] | None:
+    """The method names ``problem`` declares through :meth:`Problem.provides`."""
+    declared = problem.provides()
+    if declared is None:
+        legacy = getattr(problem, "_provided", None)
+        if legacy is None:
+            return None
+        # Before 0.14 the resolver read this private attribute; honour it for
+        # one more release so delegating wrappers that set it keep working.
+        warn_deprecated(
+            f"{type(problem).__name__}._provided",
+            "Problem.provides()",
+            since="0.14",
+            remove_in="0.15",
+            category=DeprecationWarning,
+        )
+        declared = frozenset(legacy) - {"objective"}
+    unknown = set(declared) - _OPTIONAL_METHODS - {"objective"}
+    if unknown:
+        raise ProblemDefinitionError(
+            f"{type(problem).__name__}.provides() names unknown methods "
+            f"{sorted(unknown)}; valid names are {sorted(_OPTIONAL_METHODS)}"
+        )
+    return frozenset(declared)
+
+
+def _provides(problem: Problem, declared: frozenset[str] | None, name: str) -> bool:
+    """Whether ``problem`` supplies ``name`` rather than leaving it to the solver.
+
+    An explicit :meth:`~ipax.problem.base.Problem.provides` set decides;
+    otherwise overriding the method counts as providing it.
     """
-    provided = getattr(problem, "_provided", None)
-    if provided is not None:
-        return name in provided
+    if declared is not None:
+        return name in declared
     return getattr(type(problem), name) is not getattr(Problem, name)
 
 
@@ -133,10 +172,11 @@ class ResolvedProblem(Problem):
 
 def _resolve_gradient(
     problem: Problem,
+    declared: frozenset[str] | None,
     adapter: object | None,
     options: Options,
 ) -> tuple[Callable[[Array], Array], str]:
-    if _provides(problem, "gradient"):
+    if _provides(problem, declared, "gradient"):
         return problem.gradient, "analytic"
     if options.enable_autodiff and adapter is not None:
         grad = adapter.grad  # type: ignore[attr-defined]
@@ -156,15 +196,16 @@ def _resolve_gradient(
 
 def _resolve_jacobian(
     problem: Problem,
+    declared: frozenset[str] | None,
     constraints_name: str,
     jacobian_name: str,
     constraints_fn: Callable[[Array], Array],
     adapter: object | None,
     options: Options,
 ) -> tuple[Callable[[Array], Array | LinearOperator] | None, str]:
-    if not _provides(problem, constraints_name):
+    if not _provides(problem, declared, constraints_name):
         return None, "n/a"
-    if _provides(problem, jacobian_name):
+    if _provides(problem, declared, jacobian_name):
         return getattr(problem, jacobian_name), "analytic"
     if options.enable_autodiff and adapter is not None:
         jac = adapter.jacobian  # type: ignore[attr-defined]
@@ -184,6 +225,7 @@ def _resolve_jacobian(
 
 def _resolve_hessian_source(
     problem: Problem,
+    declared: frozenset[str] | None,
     adapter: object | None,
     options: Options,
 ) -> tuple[bool, str]:
@@ -207,7 +249,7 @@ def _resolve_hessian_source(
                 "(PyTorch or JAX); none is available for this namespace"
             )
         return False, "autodiff-hvp"
-    if _provides(problem, "lagrangian_hessian"):
+    if _provides(problem, declared, "lagrangian_hessian"):
         return True, "exact"
     if mode == "exact":
         raise DerivativeUnavailableError(
@@ -231,9 +273,11 @@ def resolve(
     """
     adapter = get_autodiff_adapter(xp) if options.enable_autodiff else None
 
-    gradient_fn, gradient_src = _resolve_gradient(problem, adapter, options)
+    declared = _declared(problem)
+    gradient_fn, gradient_src = _resolve_gradient(problem, declared, adapter, options)
     eq_jacobian_fn, eq_jac_src = _resolve_jacobian(
         problem,
+        declared,
         "eq_constraints",
         "eq_jacobian",
         problem.eq_constraints,
@@ -242,6 +286,7 @@ def resolve(
     )
     ineq_jacobian_fn, ineq_jac_src = _resolve_jacobian(
         problem,
+        declared,
         "ineq_constraints",
         "ineq_jacobian",
         problem.ineq_constraints,
@@ -249,7 +294,7 @@ def resolve(
         options,
     )
     has_analytic_hessian, hessian_src = _resolve_hessian_source(
-        problem, adapter, options
+        problem, declared, adapter, options
     )
 
     sources = DerivativeSources(

@@ -19,7 +19,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ipax.backend.namespace import array_namespace, device
-from ipax.backend.operators import LinearOperator, as_operator
+from ipax.backend.operators import (
+    Diagonal,
+    LinearOperator,
+    ScaledOperator,
+    as_operator,
+)
 from ipax.problem.base import Problem
 
 if TYPE_CHECKING:
@@ -111,22 +116,17 @@ class FunctionProblem(Problem):
         self._objective = objective
         self._gradient = gradient
         # FunctionProblem overrides every optional method (delegating to a
-        # callable that may be None), so the derivative resolver cannot detect
-        # what is "provided" by class-method comparison. Record it explicitly.
-        provided = {"objective"}
-        if gradient is not None:
-            provided.add("gradient")
-        if eq_constraints is not None:
-            provided.add("eq_constraints")
-        if eq_jacobian is not None:
-            provided.add("eq_jacobian")
-        if ineq_constraints is not None:
-            provided.add("ineq_constraints")
-        if ineq_jacobian is not None:
-            provided.add("ineq_jacobian")
-        if lagrangian_hessian is not None:
-            provided.add("lagrangian_hessian")
-        self._provided: frozenset[str] = frozenset(provided)
+        # callable that may be None), so overriding says nothing here:
+        # provides() reports the callables that were actually given.
+        given = {
+            "gradient": gradient,
+            "eq_constraints": eq_constraints,
+            "eq_jacobian": eq_jacobian,
+            "ineq_constraints": ineq_constraints,
+            "ineq_jacobian": ineq_jacobian,
+            "lagrangian_hessian": lagrangian_hessian,
+        }
+        self._given = frozenset(name for name, fn in given.items() if fn is not None)
         self._bounds = bounds
         self._eq_constraints = eq_constraints
         self._eq_jacobian = eq_jacobian
@@ -139,6 +139,24 @@ class FunctionProblem(Problem):
     @property
     def n_vars(self) -> int:
         return self._n_vars
+
+    def provides(self) -> frozenset[str]:
+        """The callables passed to the constructor, plus subclass overrides."""
+        overridden = {
+            name
+            for name in self._OPTIONAL
+            if getattr(type(self), name) is not getattr(FunctionProblem, name)
+        }
+        return self._given | overridden
+
+    _OPTIONAL = (
+        "gradient",
+        "eq_constraints",
+        "eq_jacobian",
+        "ineq_constraints",
+        "ineq_jacobian",
+        "lagrangian_hessian",
+    )
 
     def bounds(self) -> tuple[Array | None, Array | None]:
         return self._bounds
@@ -202,7 +220,7 @@ class QuadraticProblem(Problem):
     Q
         Symmetric ``(n_vars, n_vars)`` Hessian, as a dense array or a
         :class:`~ipax.backend.operators.LinearOperator` (for a matrix-free
-        quadratic). A non-unit ``σ`` is only supported for the dense form.
+        quadratic).
     c
         Rank-1 linear term of length ``n_vars``.
 
@@ -244,9 +262,8 @@ class QuadraticProblem(Problem):
     ) -> Array | LinearOperator:
         del x, y_eq, y_ineq
         if isinstance(self._Q, LinearOperator):
-            if float(sigma) != 1.0:
-                raise NotImplementedError("scaled operator Hessians are not supported")
-            return self._Q
+            # σ ≠ 1 whenever gradient-based scaling is active (the default).
+            return self._Q if float(sigma) == 1.0 else ScaledOperator(self._Q, sigma)
         return sigma * self._Q
 
 
@@ -317,10 +334,11 @@ class LinearProblem(Problem):
         y_eq: Array,
         y_ineq: Array,
         sigma: Scalar = 1.0,
-    ) -> Array:
+    ) -> LinearOperator:
         del y_eq, y_ineq, sigma
+        # An operator, never a dense n×n zero matrix (80 GB at n = 1e5).
         xp = array_namespace(x, self._c)
-        return xp.zeros((self._n_vars, self._n_vars), dtype=x.dtype, device=device(x))
+        return Diagonal(xp.zeros(self._n_vars, dtype=x.dtype, device=device(x)))
 
 
 __all__ = ["FunctionProblem", "LinearProblem", "QuadraticProblem"]
