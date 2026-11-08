@@ -171,3 +171,28 @@ def test_lagrangian_hessian_receives_sigma_positionally_under_scaling(namespace)
     assert result.status is ipax.Status.OPTIMAL
     assert result.routes.scaling == "gradient-based"
     assert seen and all(s != 1.0 for s in seen)
+
+
+def test_constraints_left_out_of_provides_are_absent(namespace):
+    # A wrapper overrides every method; provides() says it has no equalities
+    # or inequalities, so the solve must treat it as unconstrained (it used to
+    # call the overridden values and crash deriving their Jacobians).
+    class Wrapper(_Quadratic):
+        def provides(self):
+            return frozenset({"gradient"})
+
+        def gradient(self, x):
+            return 2.0 * (x - 1.0)
+
+        # The wrapped object would return rows here; unlisted, they are ignored.
+        def eq_constraints(self, x):
+            return x[0:1] - 5.0
+
+        def ineq_constraints(self, x):
+            return x[1:2] + 5.0
+
+    result = ipax.solve(Wrapper(namespace), array(namespace, [0.0, 0.0]))
+    assert result.status is ipax.Status.OPTIMAL
+    assert_allclose(namespace, result.x, array(namespace, [1.0, 1.0]), atol=1e-6)
+    assert result.y_eq is None and result.y_ineq is None
+    assert result.derivative_sources.eq_jacobian == "n/a"

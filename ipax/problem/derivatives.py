@@ -103,7 +103,9 @@ class ResolvedProblem(Problem):
     The IPM driver consumes this, never the raw ``Problem``: it always has a
     gradient, the Jacobians it needs, and a record of how each was obtained.
     Constraint *values* and bounds delegate straight to the underlying problem;
-    only the derivatives are rebound.
+    only the derivatives are rebound. A constraint block the problem does not
+    provide raises :class:`NotImplementedError` here even if its method is
+    overridden, so every later existence check agrees with the resolver.
     """
 
     def __init__(
@@ -115,8 +117,12 @@ class ResolvedProblem(Problem):
         ineq_jacobian: Callable[[Array], Array | LinearOperator] | None,
         sources: DerivativeSources,
         has_analytic_hessian: bool,
+        has_eq_constraints: bool = True,
+        has_ineq_constraints: bool = True,
     ) -> None:
         self._problem = problem
+        self._has_eq_constraints = has_eq_constraints
+        self._has_ineq_constraints = has_ineq_constraints
         self._gradient_fn = gradient
         self._eq_jacobian_fn = eq_jacobian
         self._ineq_jacobian_fn = ineq_jacobian
@@ -137,6 +143,8 @@ class ResolvedProblem(Problem):
         return self._gradient_fn(x)
 
     def eq_constraints(self, x: Array) -> Array:
+        if not self._has_eq_constraints:
+            raise NotImplementedError
         return self._problem.eq_constraints(x)
 
     def eq_jacobian(self, x: Array) -> Array | LinearOperator:
@@ -145,6 +153,8 @@ class ResolvedProblem(Problem):
         return self._eq_jacobian_fn(x)
 
     def ineq_constraints(self, x: Array) -> Array:
+        if not self._has_ineq_constraints:
+            raise NotImplementedError
         return self._problem.ineq_constraints(x)
 
     def ineq_jacobian(self, x: Array) -> Array | LinearOperator:
@@ -310,6 +320,8 @@ def resolve(
         ineq_jacobian=ineq_jacobian_fn,
         sources=sources,
         has_analytic_hessian=has_analytic_hessian,
+        has_eq_constraints=_provides(problem, declared, "eq_constraints"),
+        has_ineq_constraints=_provides(problem, declared, "ineq_constraints"),
     )
 
 

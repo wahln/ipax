@@ -82,7 +82,7 @@ class IterationRecord:
     iteration: int
     objective: float
     mu: float
-    theta: float  # constraint violation ‖(c, g+s)‖₁
+    theta: float  # constraint violation max(‖c‖∞, max(g, 0), bound overshoot)
     kkt_error: float  # scaled KKT ∞-norm
     alpha_primal: float
     alpha_dual: float
@@ -180,9 +180,11 @@ class Routes:
 class Result:
     """Solution and diagnostics returned by :func:`ipax.solve`.
 
-    ``success`` is true for strict :attr:`Status.OPTIMAL` and the explicitly
-    enabled :attr:`Status.ACCEPTABLE` exit. The status itself records the stopping
-    condition; component KKT residuals provide the corresponding diagnostics.
+    ``success`` is true for strict :attr:`Status.OPTIMAL` and for the
+    acceptable-level :attr:`Status.ACCEPTABLE` exit (on by default; see
+    :class:`~ipax.options.AcceptableStoppingOptions`). The status itself records
+    the stopping condition; component KKT residuals provide the corresponding
+    diagnostics.
 
     When an :attr:`Status.ACCEPTABLE` exit came from the terminal KKT
     certificate (a failing run salvaged at its returned best iterate with
