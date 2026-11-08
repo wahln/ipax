@@ -51,7 +51,7 @@ def test_krylov_rtol_is_free_when_adaptive_forcing_is_off():
 
 
 def test_restoration_rejects_unknown_linear_solver():
-    with pytest.raises(ValueError, match="restoration linear solver"):
+    with pytest.raises(ValueError, match=r"RestorationOptions.linear_solver"):
         RestorationOptions(linear_solver="sparse")  # type: ignore[arg-type]
 
 
@@ -156,7 +156,7 @@ def test_krylov_options_accept_supported_methods(method):
 
 @pytest.mark.parametrize("method", ["bicgstab", "qmr"])
 def test_krylov_options_reject_unsupported_methods(method):
-    with pytest.raises(ValueError, match="Krylov method"):
+    with pytest.raises(ValueError, match=r"KrylovOptions.method"):
         KrylovOptions(method=method)  # type: ignore[arg-type]
 
 
@@ -168,7 +168,7 @@ def test_krylov_options_accept_supported_preconditioners(preconditioner):
 
 @pytest.mark.parametrize("preconditioner", ["ilu", "amg"])
 def test_krylov_options_reject_unsupported_preconditioners(preconditioner):
-    with pytest.raises(ValueError, match="Krylov preconditioner"):
+    with pytest.raises(ValueError, match=r"KrylovOptions.preconditioner"):
         KrylovOptions(preconditioner=preconditioner)  # type: ignore[arg-type]
 
 

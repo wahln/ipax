@@ -20,11 +20,17 @@ needs lives here so the algorithm code stays declarative.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import numbers
-import operator
+import types
+import typing
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Literal
+
+from ipax.errors import ConfigurationError
 
 HessianMode = Literal["auto", "lbfgs", "exact", "autodiff-hvp"]
 LinSolveMode = Literal["auto", "dense", "krylov", "sparse"]
@@ -42,6 +48,8 @@ SparseKKTRoute = Literal["auto", "augmented", "normal_equations"]
 ScalingMethod = Literal["none", "gradient-based"]
 CorrectionsMethod = Literal["none", "mehrotra", "gondzio"]
 GondzioVariant = Literal["ipax", "breedveld"]
+SeedFormula = Literal["direct", "scalar1"]
+GramDtype = Literal["auto", "native", "float32"]
 
 
 def _validate_optional_positive(
@@ -53,7 +61,75 @@ def _validate_optional_positive(
     valid_sign = value >= 0.0 if allow_zero else value > 0.0
     if not math.isfinite(value) or not valid_sign:
         qualifier = "non-negative" if allow_zero else "positive"
-        raise ValueError(f"{name} must be finite and {qualifier}")
+        raise ConfigurationError(f"{name} must be finite and {qualifier}")
+
+
+def _matches(value: object, expected: object) -> bool:
+    """Whether ``value`` conforms to the resolved field annotation ``expected``."""
+    origin = typing.get_origin(expected)
+    if origin is Literal:
+        return isinstance(value, str) and value in typing.get_args(expected)
+    if origin in (typing.Union, types.UnionType):
+        return any(_matches(value, arg) for arg in typing.get_args(expected))
+    if expected is type(None):
+        return value is None
+    if expected is bool:
+        return isinstance(value, bool)
+    if isinstance(value, bool):
+        # bool is an int subclass; a bool where a number belongs is a typo.
+        return False
+    if expected is int:
+        return isinstance(value, numbers.Integral)
+    if expected is float:
+        return isinstance(value, numbers.Real) and not math.isnan(value)
+    return isinstance(value, expected)  # type: ignore[arg-type]
+
+
+def _describe(expected: object) -> str:
+    origin = typing.get_origin(expected)
+    if origin is Literal:
+        return "one of " + ", ".join(repr(a) for a in typing.get_args(expected))
+    if origin in (typing.Union, types.UnionType):
+        return " or ".join(_describe(arg) for arg in typing.get_args(expected))
+    names = {
+        type(None): "None",
+        bool: "a bool",
+        int: "an integer",
+        float: "a number (not NaN)",
+    }
+    if expected in names:
+        return names[expected]
+    return f"a {getattr(expected, '__name__', expected)}"
+
+
+def _check_field_types(options: object) -> None:
+    """Check every field of an options dataclass against its annotation.
+
+    Catches what the per-field range checks below cannot: a misspelled
+    string choice (it used to run silently as the default, or turn a
+    safeguard off), a bool or string where a number belongs, and a nested
+    group of the wrong class.
+    """
+    cls = type(options)
+    field_types = _FIELD_TYPES.get(cls)
+    if field_types is None:  # a user subclass
+        field_types = _resolve_field_types(cls)
+    for name, expected in field_types:
+        value = getattr(options, name)
+        if not _matches(value, expected):
+            raise ConfigurationError(
+                f"{cls.__name__}.{name} must be {_describe(expected)}; got {value!r}"
+            )
+
+
+def _resolve_field_types(cls: type) -> tuple[tuple[str, object], ...]:
+    hints = typing.get_type_hints(cls)
+    return tuple((f.name, hints[f.name]) for f in dataclasses.fields(cls))
+
+
+# Resolving annotations costs ~0.1 ms per class, ~100x the rest of building an
+# ``Options``; the table is filled once, read-only, after the classes exist.
+_FIELD_TYPES: Mapping[type, tuple[tuple[str, object], ...]] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -126,18 +202,29 @@ class BarrierOptions:
     probing_sigma: ProbingSigma = "nww"
 
     def __post_init__(self) -> None:
-        if self.probing_sigma not in ("nww", "mehrotra"):
-            raise ValueError("probing_sigma must be 'nww' or 'mehrotra'")
+        _check_field_types(self)
+        for name in ("mu_init", "mu_min"):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value > 0.0):
+                raise ConfigurationError(f"{name} must be finite and positive")
+        # Wächter & Biegler 2006, eq. (7): κ_μ ∈ (0, 1), θ_μ ∈ (1, 2); eq. (8):
+        # τ_min ∈ (0, 1).
+        if not 0.0 < self.kappa_mu < 1.0:
+            raise ConfigurationError("kappa_mu must lie in (0, 1)")
+        if not 1.0 < self.theta_mu < 2.0:
+            raise ConfigurationError("theta_mu must lie in (1, 2)")
+        if not 0.0 < self.tau_min < 1.0:
+            raise ConfigurationError("tau_min must lie in (0, 1)")
         if not 0.0 < self.fallback_kappa < 1.0:
-            raise ValueError("fallback_kappa must lie in (0, 1)")
+            raise ConfigurationError("fallback_kappa must lie in (0, 1)")
         if self.fallback_window < 0:
-            raise ValueError("fallback_window must be non-negative")
+            raise ConfigurationError("fallback_window must be non-negative")
         if self.fallback_mu_factor <= 0.0:
-            raise ValueError("fallback_mu_factor must be positive")
+            raise ConfigurationError("fallback_mu_factor must be positive")
         if not math.isfinite(self.kappa_centrality) or self.kappa_centrality < 0.0:
-            raise ValueError("kappa_centrality must be finite and non-negative")
+            raise ConfigurationError("kappa_centrality must be finite and non-negative")
         if not math.isfinite(self.slack_init_scale) or self.slack_init_scale < 0.0:
-            raise ValueError("slack_init_scale must be finite and non-negative")
+            raise ConfigurationError("slack_init_scale must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -284,15 +371,29 @@ class LineSearchOptions:
     free_filter_max_margin: float = 1.0
 
     def __post_init__(self) -> None:
+        _check_field_types(self)
         # γ_α ≤ 0 would collapse the eq. (23) α_min onto the bare floor,
         # silently disabling the rule the caller just asked for; γ_α ≥ 1 would
         # let α_min reach the switching bound it is meant to sit safely *under*,
         # refusing steps the acceptance tests would still take. IPOPT bounds its
         # equivalent option to the same open interval.
+        if self.max_soc < 0:
+            raise ConfigurationError("max_soc must be a non-negative integer")
+        # Wächter & Biegler 2006, eq. (18): γ_θ, γ_φ ∈ (0, 1); eq. (19):
+        # s_θ > 1, s_φ ≥ 1; eq. (20): η_φ ∈ (0, 1/2).
+        for name in ("gamma_theta", "gamma_phi"):
+            if not 0.0 < getattr(self, name) < 1.0:
+                raise ConfigurationError(f"{name} must lie in (0, 1)")
+        if not (math.isfinite(self.s_theta) and self.s_theta > 1.0):
+            raise ConfigurationError("s_theta must be finite and > 1")
+        if not (math.isfinite(self.s_phi) and self.s_phi >= 1.0):
+            raise ConfigurationError("s_phi must be finite and >= 1")
+        if not 0.0 < self.eta_phi < 0.5:
+            raise ConfigurationError("eta_phi must lie in (0, 1/2)")
         if self.gamma_alpha is not None and not 0.0 < self.gamma_alpha < 1.0:
-            raise ValueError("gamma_alpha must lie in (0, 1) or be None")
+            raise ConfigurationError("gamma_alpha must lie in (0, 1) or be None")
         if not math.isfinite(self.alpha_min_frac) or self.alpha_min_frac <= 0.0:
-            raise ValueError("alpha_min_frac must be finite and positive")
+            raise ConfigurationError("alpha_min_frac must be finite and positive")
         # The interpolated backtrack is clipped into
         # ``[shrink_min·α, shrink_max·α]``: ``shrink_max ≥ 1`` could *grow* a
         # rejected step (the search loop has only the α_min exit, so it would
@@ -303,7 +404,7 @@ class LineSearchOptions:
             and math.isfinite(self.backtrack_shrink_max)
             and 0.0 < self.backtrack_shrink_min <= self.backtrack_shrink_max < 1.0
         ):
-            raise ValueError(
+            raise ConfigurationError(
                 "backtrack_shrink_min/backtrack_shrink_max must satisfy "
                 "0 < backtrack_shrink_min <= backtrack_shrink_max < 1"
             )
@@ -315,17 +416,23 @@ class LineSearchOptions:
         if self.feasible_kkt_progress is not None and not (
             0.0 < self.feasible_kkt_progress < 1.0
         ):
-            raise ValueError("feasible_kkt_progress must lie in (0, 1) or be None")
+            raise ConfigurationError(
+                "feasible_kkt_progress must lie in (0, 1) or be None"
+            )
         if (
             not math.isfinite(self.free_filter_margin_fact)
             or self.free_filter_margin_fact < 0.0
         ):
-            raise ValueError("free_filter_margin_fact must be finite and non-negative")
+            raise ConfigurationError(
+                "free_filter_margin_fact must be finite and non-negative"
+            )
         if (
             not math.isfinite(self.free_filter_max_margin)
             or self.free_filter_max_margin < 0.0
         ):
-            raise ValueError("free_filter_max_margin must be finite and non-negative")
+            raise ConfigurationError(
+                "free_filter_max_margin must be finite and non-negative"
+            )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -392,9 +499,24 @@ class RegularizationOptions:
     equality_dual_repair: float | None = None
 
     def __post_init__(self) -> None:
+        _check_field_types(self)
+        # IPOPT's ranges: first_hessian_perturbation > 0,
+        # perturb_inc_fact > 1, jacobian_regularization_value >= 0.
+        if not (math.isfinite(self.delta_w_init) and self.delta_w_init > 0.0):
+            raise ConfigurationError("delta_w_init must be finite and positive")
+        if self.delta_w_max < self.delta_w_init:
+            raise ConfigurationError("delta_w_max must be >= delta_w_init")
+        if not (math.isfinite(self.delta_w_factor) and self.delta_w_factor > 1.0):
+            raise ConfigurationError("delta_w_factor must be finite and > 1")
+        if not (math.isfinite(self.delta_c) and self.delta_c >= 0.0):
+            raise ConfigurationError("delta_c must be finite and non-negative")
+        if self.delta_c_max < self.delta_c:
+            raise ConfigurationError("delta_c_max must be >= delta_c")
+        if not self.delta_c_trigger > 0.0:
+            raise ConfigurationError("delta_c_trigger must be positive")
         repair = self.equality_dual_repair
         if repair is not None and not (math.isfinite(repair) and repair >= 1.0):
-            raise ValueError(
+            raise ConfigurationError(
                 "equality_dual_repair must be finite and >= 1.0, or None to "
                 "disable the accepted-step multiplier repair"
             )
@@ -471,13 +593,16 @@ class BreedveldOptions:
     max_soc: int = 0
 
     def __post_init__(self) -> None:
-        count = self.max_soc
-        try:
-            valid = not isinstance(count, bool) and operator.index(count) >= 0
-        except TypeError:
-            valid = False
-        if not valid:
-            raise ValueError("max_soc must be a non-negative integer")
+        _check_field_types(self)
+        for name in ("tau", "backtrack", "armijo_c"):
+            if not 0.0 < getattr(self, name) < 1.0:
+                raise ConfigurationError(f"{name} must lie in (0, 1)")
+        if self.max_backtrack < 1:
+            raise ConfigurationError("max_backtrack must be a positive integer")
+        if not self.ratio_limit > 0.0:
+            raise ConfigurationError("ratio_limit must be positive")
+        if self.max_soc < 0:
+            raise ConfigurationError("max_soc must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -507,14 +632,17 @@ class LBFGSOptions:
     # (IPOPT ``limited_memory_initialization``, δᵀγ/δᵀδ) — catastrophically so
     # on badly-scaled least squares (S2MPJ NELSONLS: median ξ 1e20 vs 6e3,
     # freezing every step; GASOIL: 508 stalled iterations vs optimal in 25).
-    seed_formula: Literal["direct", "scalar1"] = "direct"
+    seed_formula: SeedFormula = "direct"
 
     def __post_init__(self) -> None:
+        _check_field_types(self)
+        if self.memory < 1:
+            raise ConfigurationError("memory must be a positive integer")
         ratio = self.damping_skip_ratio
         if ratio is not None and not (math.isfinite(ratio) and ratio > 0.0):
-            raise ValueError("damping_skip_ratio must be a positive finite float")
-        if self.seed_formula not in ("direct", "scalar1"):
-            raise ValueError("seed_formula must be 'direct' or 'scalar1'")
+            raise ConfigurationError(
+                "damping_skip_ratio must be a positive finite float"
+            )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -560,24 +688,21 @@ class KrylovOptions:
 
     def __post_init__(self) -> None:
         """Validate runtime values as well as static Literal hints."""
-        if self.method not in ("cg", "minres", "gmres"):
-            raise ValueError("Krylov method must be 'cg', 'minres', or 'gmres'")
-        if self.preconditioner not in ("none", "jacobi", "lbfgs", "auto"):
-            raise ValueError(
-                "Krylov preconditioner must be 'none', 'jacobi', 'lbfgs', or 'auto'"
-            )
+        _check_field_types(self)
+        if self.max_iter is not None and self.max_iter < 1:
+            raise ConfigurationError("max_iter must be a positive integer or None")
         if self.gmres_restart < 1:
-            raise ValueError("gmres_restart must be a positive integer")
+            raise ConfigurationError("gmres_restart must be a positive integer")
         if not 0.0 < self.auto_switch_ratio <= 1.0:
-            raise ValueError("auto_switch_ratio must lie in (0, 1]")
+            raise ConfigurationError("auto_switch_ratio must lie in (0, 1]")
         if self.adaptive_eta <= 0.0:
-            raise ValueError("adaptive_eta must be positive")
+            raise ConfigurationError("adaptive_eta must be positive")
         # Equal floor/cap is allowed (adaptive collapses to the fixed rtol); the cap
         # must not be below the floor or above 1. The cap only bounds the adaptive
         # forcing, so with it off the fixed ``rtol`` is free of it (the restoration
         # preset advertises an isolated tolerance that may be loosened).
         if self.adaptive_tol and not self.rtol <= self.adaptive_rtol_max <= 1.0:
-            raise ValueError("adaptive_rtol_max must lie in [rtol, 1]")
+            raise ConfigurationError("adaptive_rtol_max must lie in [rtol, 1]")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -667,15 +792,9 @@ class RestorationOptions:
     dense_factorization: RestorationDenseFactorization = "lu"
 
     def __post_init__(self) -> None:
-        if self.linear_solver not in ("auto", "dense", "krylov"):
-            raise ValueError(
-                "restoration linear solver must be 'auto', 'dense' or 'krylov'"
-            )
-        if self.dense_factorization not in ("lu", "cholesky"):
-            raise ValueError("dense_factorization must be 'lu' or 'cholesky'")
-        limit = self.dense_materialize_max_elements
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-            raise ValueError(
+        _check_field_types(self)
+        if self.dense_materialize_max_elements < 1:
+            raise ConfigurationError(
                 "dense_materialize_max_elements must be a positive integer"
             )
 
@@ -761,7 +880,7 @@ class DenseOptions:
 
     kkt_route: DenseKKTRoute = "condensed"
     augmented_max_size: int = 20_000
-    gram_dtype: str = "auto"
+    gram_dtype: GramDtype = "auto"
     refine_tol: float = 1e-10
     refine_accept_tol: float = 1e-6
     refine_max_iters: int = 15
@@ -770,24 +889,21 @@ class DenseOptions:
     pd_hint_failure_limit: int = 3
 
     def __post_init__(self) -> None:
-        if self.kkt_route not in ("condensed", "augmented"):
-            raise ValueError("dense kkt_route must be 'condensed' or 'augmented'")
+        _check_field_types(self)
         if self.augmented_max_size < 1:
-            raise ValueError("augmented_max_size must be a positive integer")
-        if self.gram_dtype not in ("auto", "native", "float32"):
-            raise ValueError("gram_dtype must be 'auto', 'native' or 'float32'")
+            raise ConfigurationError("augmented_max_size must be a positive integer")
         if self.refine_tol <= 0.0:
-            raise ValueError("refine_tol must be positive")
+            raise ConfigurationError("refine_tol must be positive")
         if not self.refine_tol <= self.refine_accept_tol < 1.0:
-            raise ValueError("refine_accept_tol must be in [refine_tol, 1)")
+            raise ConfigurationError("refine_accept_tol must be in [refine_tol, 1)")
         if self.refine_max_iters < 1:
-            raise ValueError("refine_max_iters must be a positive integer")
+            raise ConfigurationError("refine_max_iters must be a positive integer")
         if not 0.0 < self.refine_stall_ratio <= 1.0:
-            raise ValueError("refine_stall_ratio must be in (0, 1]")
+            raise ConfigurationError("refine_stall_ratio must be in (0, 1]")
         if self.refine_failure_limit < 1:
-            raise ValueError("refine_failure_limit must be a positive integer")
+            raise ConfigurationError("refine_failure_limit must be a positive integer")
         if self.pd_hint_failure_limit < 1:
-            raise ValueError("pd_hint_failure_limit must be a positive integer")
+            raise ConfigurationError("pd_hint_failure_limit must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -874,31 +990,15 @@ class SparseOptions:
     deterministic: bool = False
 
     def __post_init__(self) -> None:
-        if self.kkt_route not in ("auto", "augmented", "normal_equations"):
-            raise ValueError(
-                "sparse kkt_route must be 'auto', 'augmented' or 'normal_equations'"
-            )
-        steps = self.perturbed_pivot_refinement_steps
-        try:
-            valid = not isinstance(steps, bool) and operator.index(steps) >= 0
-        except TypeError:
-            valid = False
-        if not valid:
-            raise ValueError(
+        _check_field_types(self)
+        if self.perturbed_pivot_refinement_steps < 0:
+            raise ConfigurationError(
                 "perturbed_pivot_refinement_steps must be a non-negative integer"
             )
-        # Typed ``object``: user code may pass anything (a bool, a string).
-        threshold: object = self.perturbed_pivot_max_residual
-        if (
-            isinstance(threshold, bool)
-            or not isinstance(threshold, numbers.Real)
-            or not 0.0 < float(threshold) < math.inf
-        ):
-            raise ValueError("perturbed_pivot_max_residual must be finite and positive")
-        # Typed ``object``: a truthy non-bool (1, "yes") is a likely typo.
-        deterministic: object = self.deterministic
-        if not isinstance(deterministic, bool):
-            raise ValueError("deterministic must be a bool")
+        if not 0.0 < self.perturbed_pivot_max_residual < math.inf:
+            raise ConfigurationError(
+                "perturbed_pivot_max_residual must be finite and positive"
+            )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -918,12 +1018,11 @@ class ScalingOptions:
     max_gradient: float = 100.0  # IPOPT nlp_scaling_max_gradient
 
     def __post_init__(self) -> None:
-        if self.method not in ("none", "gradient-based"):
-            raise ValueError("scaling method must be 'none' or 'gradient-based'")
+        _check_field_types(self)
         if not math.isfinite(self.max_gradient):
-            raise ValueError("scaling max_gradient must be finite")
+            raise ConfigurationError("scaling max_gradient must be finite")
         if self.max_gradient <= 0.0:
-            raise ValueError("scaling max_gradient must be positive")
+            raise ConfigurationError("scaling max_gradient must be positive")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -971,16 +1070,11 @@ class CorrectionsOptions:
     gondzio_variant: GondzioVariant = "ipax"
 
     def __post_init__(self) -> None:
-        if self.method not in ("none", "mehrotra", "gondzio"):
-            raise ValueError(
-                "corrections method must be 'none', 'mehrotra', or 'gondzio'"
-            )
-        if self.gondzio_variant not in ("ipax", "breedveld"):
-            raise ValueError("gondzio_variant must be 'ipax' or 'breedveld'")
+        _check_field_types(self)
         if self.gondzio_max_corrections < 0:
-            raise ValueError("gondzio_max_corrections must be non-negative")
+            raise ConfigurationError("gondzio_max_corrections must be non-negative")
         if not 0.0 < self.gondzio_gamma < 1.0:
-            raise ValueError("gondzio_gamma must lie in (0, 1)")
+            raise ConfigurationError("gondzio_gamma must lie in (0, 1)")
 
 
 def _validate_condition_tols(
@@ -1033,6 +1127,7 @@ class OptimalityConditionOptions:
     compl_inf_tol: float | None = 1e-8
 
     def __post_init__(self) -> None:
+        _check_field_types(self)
         _validate_condition_tols(
             self.f_tol,
             self.f_rel_change_tol,
@@ -1048,7 +1143,7 @@ class OptimalityConditionOptions:
             self.compl_inf_tol,
         )
         if all(value is None for value in enabled):
-            raise ValueError(
+            raise ConfigurationError(
                 "at least one optimality condition must be enabled "
                 "(f_tol, f_rel_change_tol, dual_inf_tol, constr_viol_tol or "
                 "compl_inf_tol)"
@@ -1102,6 +1197,7 @@ class AcceptableStoppingOptions:
     n_iter: int = 15
 
     def __post_init__(self) -> None:
+        _check_field_types(self)
         _validate_condition_tols(
             self.f_tol,
             self.f_rel_change_tol,
@@ -1110,7 +1206,7 @@ class AcceptableStoppingOptions:
             self.compl_inf_tol,
         )
         if self.n_iter < 1:
-            raise ValueError("n_iter must be a positive integer")
+            raise ConfigurationError("n_iter must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1218,14 +1314,19 @@ class Options:
 
     def __post_init__(self) -> None:
         """Validate limits and normalize shorthand option values."""
+        _check_field_types(self)
         _validate_optional_positive("max_time", self.max_time, allow_zero=False)
         _validate_optional_positive(
             "diverging_iterates_tol", self.diverging_iterates_tol, allow_zero=False
         )
         if self.max_iter < 1:
-            raise ValueError("max_iter must be a positive integer")
+            raise ConfigurationError("max_iter must be a positive integer")
         if self.max_stall_iter is not None and self.max_stall_iter < 1:
-            raise ValueError("max_stall_iter must be a positive integer or None")
+            raise ConfigurationError(
+                "max_stall_iter must be a positive integer or None"
+            )
+        if self.verbose < 0:
+            raise ConfigurationError("verbose must be a non-negative integer")
         if isinstance(self.scaling, str):
             object.__setattr__(self, "scaling", ScalingOptions(method=self.scaling))
         if isinstance(self.corrections, str):
@@ -1233,6 +1334,28 @@ class Options:
                 self, "corrections", CorrectionsOptions(method=self.corrections)
             )
 
+
+_FIELD_TYPES = MappingProxyType(
+    {
+        cls: _resolve_field_types(cls)
+        for cls in (
+            AcceptableStoppingOptions,
+            BarrierOptions,
+            BreedveldOptions,
+            CorrectionsOptions,
+            DenseOptions,
+            KrylovOptions,
+            LBFGSOptions,
+            LineSearchOptions,
+            OptimalityConditionOptions,
+            Options,
+            RegularizationOptions,
+            RestorationOptions,
+            ScalingOptions,
+            SparseOptions,
+        )
+    }
+)
 
 __all__ = [
     "AcceptableStoppingOptions",
@@ -1245,6 +1368,7 @@ __all__ = [
     "FreeModeAcceptance",
     "Globalization",
     "GondzioVariant",
+    "GramDtype",
     "HessianMode",
     "KrylovMethod",
     "KrylovOptions",
@@ -1263,6 +1387,7 @@ __all__ = [
     "RestorationOptions",
     "ScalingMethod",
     "ScalingOptions",
+    "SeedFormula",
     "SparseKKTRoute",
     "SparseOptions",
 ]
