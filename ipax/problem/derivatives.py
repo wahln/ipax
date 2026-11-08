@@ -25,9 +25,13 @@ The chosen sources are recorded in :class:`~ipax.result.DerivativeSources`.
 
 from __future__ import annotations
 
-import warnings
 from typing import TYPE_CHECKING
 
+from ipax.errors import (
+    DerivativeUnavailableError,
+    FiniteDifferenceWarning,
+    warn_external,
+)
 from ipax.problem.autodiff import get_autodiff_adapter
 from ipax.problem.base import Problem
 from ipax.problem.finitediff import gradient_fd, jacobian_fd
@@ -138,13 +142,13 @@ def _resolve_gradient(
         grad = adapter.grad  # type: ignore[attr-defined]
         return (lambda x: grad(problem.objective, x)), "autodiff"
     if options.enable_finite_diff:
-        warnings.warn(
+        warn_external(
             "objective gradient resolved by finite differences; supply an "
             "analytic gradient or an autodiff backend for accuracy and speed",
-            stacklevel=3,
+            FiniteDifferenceWarning,
         )
         return (lambda x: gradient_fd(problem.objective, x)), "finite-diff"
-    raise RuntimeError(
+    raise DerivativeUnavailableError(
         "no gradient source available: the problem defines no analytic "
         "gradient and both autodiff and finite differences are disabled"
     )
@@ -166,13 +170,13 @@ def _resolve_jacobian(
         jac = adapter.jacobian  # type: ignore[attr-defined]
         return (lambda x: jac(constraints_fn, x)), "autodiff"
     if options.enable_finite_diff:
-        warnings.warn(
+        warn_external(
             f"{constraints_name} Jacobian resolved by finite differences; this "
             "is dense and only appropriate for small problems",
-            stacklevel=3,
+            FiniteDifferenceWarning,
         )
         return (lambda x: jacobian_fd(constraints_fn, x)), "finite-diff"
-    raise RuntimeError(
+    raise DerivativeUnavailableError(
         f"no Jacobian source available for {constraints_name}: define "
         f"{jacobian_name}, or enable autodiff / finite differences"
     )
@@ -198,7 +202,7 @@ def _resolve_hessian_source(
         return False, "lbfgs"
     if mode == "autodiff-hvp":
         if adapter is None:
-            raise RuntimeError(
+            raise DerivativeUnavailableError(
                 "hessian='autodiff-hvp' requires an autodiff-capable backend "
                 "(PyTorch or JAX); none is available for this namespace"
             )
@@ -206,7 +210,7 @@ def _resolve_hessian_source(
     if _provides(problem, "lagrangian_hessian"):
         return True, "exact"
     if mode == "exact":
-        raise RuntimeError(
+        raise DerivativeUnavailableError(
             "hessian='exact' requires problem.lagrangian_hessian; use "
             "hessian='auto' (or omit it) to fall back to L-BFGS, or "
             "hessian='autodiff-hvp' on an autodiff-capable backend"
@@ -221,7 +225,8 @@ def resolve(
 ) -> ResolvedProblem:
     """Bind every derivative the solver needs, honoring precedence.
 
-    Raises ``RuntimeError`` if a required derivative cannot be produced (e.g.
+    Raises :class:`~ipax.errors.DerivativeUnavailableError` (a
+    ``RuntimeError``) if a required derivative cannot be produced (e.g.
     autodiff disabled and finite-diff disabled with no analytic gradient).
     """
     adapter = get_autodiff_adapter(xp) if options.enable_autodiff else None

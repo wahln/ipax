@@ -6,8 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+- **Exception and warning hierarchy** (`ipax.errors`, all exported from `ipax`): `IpaxError` is the base of every exception ipax raises on purpose. Each subclass also derives from the built-in ipax raised before, so existing `except` clauses keep working: `ConfigurationError(IpaxError, ValueError)` for invalid options, `DerivativeUnavailableError(IpaxError, RuntimeError)` when a needed derivative cannot be obtained (no gradient source; `hessian="exact"` without `lagrangian_hessian`; `hessian="autodiff-hvp"` without an autodiff backend), and `LinearSolveError(IpaxError, RuntimeError)`, now exported. Warnings derive from `IpaxWarning(UserWarning)`; the finite-difference warnings are `FiniteDifferenceWarning`, so they can be filtered by category.
+- **Deprecation helpers** (`ipax/_deprecation.py`, internal): renamed public names keep working with a warning for at least one minor release — `FutureWarning` for user-facing names, `DeprecationWarning` for extension-author hooks. A field-rename decorator for the frozen option dataclasses lets the old keyword win, so `dataclasses.replace(options, old_name=...)` keeps working.
+
 ### Fixed
 - The verification gate no longer fails at random on many-core machines: `scripts/check.py` caps the test gate at 8 xdist workers (`-n auto --maxprocesses=8`; CI's 4-core runners are unchanged), and the property tests in `tests/property/test_derivative_checks.py` no longer use Hypothesis's 200 ms deadline, which the first example's backend warm-up exceeded under full-suite load. The SciPy adapter's `keep_feasible` warning-location test compares paths with `samefile`, so it no longer fails on Windows when the working directory's drive letter is lower-case.
+- The finite-difference warnings name the line that called `ipax.solve` (or `minimize_ipax`) instead of `ipax/solve.py`, so per-module `warnings` filters and the once-per-location default apply to the user's code. Warnings walk past ipax's own frames instead of using a fixed `stacklevel`.
 
 ## [0.13.0] - 2026-10-30
 

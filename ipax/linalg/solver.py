@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from ipax.errors import IpaxError
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -55,7 +57,7 @@ _TALL_DENSE_MIN_DENSITY = 0.05
 _TALL_SPARSE_NE_MAX_FILL = 0.01
 
 
-class LinearSolveError(RuntimeError):
+class LinearSolveError(IpaxError, RuntimeError):
     """Backend-neutral numerical failure from a linear solve.
 
     The IPM regularization loop catches this type and retries with a larger

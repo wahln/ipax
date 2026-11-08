@@ -26,6 +26,14 @@ from ipax.backend.operators import (
     CSCOperator,
     CSROperator,
 )
+from ipax.errors import (
+    ConfigurationError,
+    DerivativeUnavailableError,
+    FiniteDifferenceWarning,
+    IpaxError,
+    IpaxWarning,
+)
+from ipax.linalg.solver import LinearSolveError
 from ipax.options import (
     AcceptableStoppingOptions,
     BarrierOptions,
@@ -64,10 +72,15 @@ __all__ = [
     "COOOperator",
     "CSCOperator",
     "CSROperator",
+    "ConfigurationError",
     "CorrectionsOptions",
     "DenseOptions",
     "DerivativeSources",
+    "DerivativeUnavailableError",
+    "FiniteDifferenceWarning",
     "FunctionProblem",
+    "IpaxError",
+    "IpaxWarning",
     "IterationCallback",
     "IterationInfo",
     "IterationRecord",
@@ -76,6 +89,7 @@ __all__ = [
     "LBFGSOptions",
     "LineSearchOptions",
     "LinearProblem",
+    "LinearSolveError",
     "OptimalityConditionOptions",
     "Options",
     "Problem",
