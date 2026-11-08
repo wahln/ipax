@@ -56,7 +56,7 @@ def _validate_optional_positive(
         raise ValueError(f"{name} must be finite and {qualifier}")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class BarrierOptions:
     """μ schedule and complementarity targets (Wächter & Biegler §3.1)."""
 
@@ -140,7 +140,7 @@ class BarrierOptions:
             raise ValueError("slack_init_scale must be finite and non-negative")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class LineSearchOptions:
     """Filter line-search constants (Wächter & Biegler 2006, §2.3/§4.1).
 
@@ -328,7 +328,7 @@ class LineSearchOptions:
             raise ValueError("free_filter_max_margin must be finite and non-negative")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RegularizationOptions:
     """Friedlander–Orban primal–dual regularization + Breedveld δ_w bumping (§4.4)."""
 
@@ -400,7 +400,7 @@ class RegularizationOptions:
             )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class BreedveldOptions:
     """Alternative step controller (Breedveld 2017 §2, eqs. 34–36).
 
@@ -480,7 +480,7 @@ class BreedveldOptions:
             raise ValueError("max_soc must be a non-negative integer")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class LBFGSOptions:
     """Limited-memory Hessian (compact, Powell-damped) — invariant of PD (§4.3).
 
@@ -517,7 +517,7 @@ class LBFGSOptions:
             raise ValueError("seed_formula must be 'direct' or 'scalar1'")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class KrylovOptions:
     """Matrix-free solver tolerances (§5.2)."""
 
@@ -580,7 +580,7 @@ class KrylovOptions:
             raise ValueError("adaptive_rtol_max must lie in [rtol, 1]")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RestorationOptions:
     """Feasibility-restoration linear algebra.
 
@@ -680,7 +680,7 @@ class RestorationOptions:
             )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class DenseOptions:
     """Dense-route KKT materialization: condensed vs. augmented.
 
@@ -790,7 +790,7 @@ class DenseOptions:
             raise ValueError("pd_hint_failure_limit must be a positive integer")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SparseOptions:
     """Sparse-direct KKT assembly: augmented vs. sparse normal equations.
 
@@ -901,7 +901,7 @@ class SparseOptions:
             raise ValueError("deterministic must be a bool")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ScalingOptions:
     """NLP auto-scaling (IPOPT ``nlp_scaling_method``; Wächter & Biegler 2006 §3.8).
 
@@ -926,7 +926,7 @@ class ScalingOptions:
             raise ValueError("scaling max_gradient must be positive")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class CorrectionsOptions:
     """Higher-order predictor–corrector step corrections.
 
@@ -1003,7 +1003,7 @@ def _validate_condition_tols(
     _validate_optional_positive("f_rel_change_tol", f_rel_change_tol, allow_zero=True)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class OptimalityConditionOptions:
     """Single-iteration optimality test → :attr:`Status.OPTIMAL`.
 
@@ -1069,7 +1069,7 @@ class OptimalityConditionOptions:
         return min(residual_tols) if residual_tols else 1e-8
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class AcceptableStoppingOptions:
     """Multi-iteration acceptable-level termination → :attr:`Status.ACCEPTABLE`.
 
@@ -1113,7 +1113,7 @@ class AcceptableStoppingOptions:
             raise ValueError("n_iter must be a positive integer")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Options:
     """Top-level solver options.
 
