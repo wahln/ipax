@@ -55,7 +55,13 @@ Pass `callback=` to `solve` to receive a read-only
 iteration. It carries the iteration `record` (the same one appended to
 `res.history`) plus the current primal/dual iterate (`x`, `s`, `y_eq`,
 `y_ineq`, `z_lower`, `z_upper`; `None` for absent blocks), all in the original
-problem's units.
+problem's units. So is `record.objective`; `record.mu`, `record.theta`,
+`record.kkt_error` and its components stay scaled-space diagnostics when
+problem scaling is active (the default).
+
+The callback runs once for the start point (iteration 0) and once per
+iteration after. An exception raised inside it is not caught:
+it propagates out of `solve`, and the partial result is lost.
 
 ```python
 def monitor(info):
@@ -68,7 +74,10 @@ res = ipax.solve(problem, x0, callback=monitor)
 ### Custom stopping
 
 Returning a **truthy** value from the callback stops the solve early with
-[`Status.STOPPED`](results.md#status). This implements arbitrary stopping rules —
+[`Status.STOPPED`](results.md#status) — unless another termination test
+(optimality, acceptable, unbounded, `max_time`) fires on the same iteration,
+which takes precedence. This implements arbitrary
+stopping rules —
 a wall-clock budget, a target objective, an external cancellation flag:
 
 ```python

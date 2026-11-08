@@ -14,8 +14,9 @@ else:
 ## Did it converge?
 
 Check `res.success` first — it is `True` only for
-[`Status.OPTIMAL`](#status) and the explicitly enabled
-[`Status.ACCEPTABLE`](#status). The `status` enum then tells you *which*
+[`Status.OPTIMAL`](#status) and the acceptable-level
+[`Status.ACCEPTABLE`](#status) exit, which is on by default
+(`ipax.AcceptableStoppingOptions`). The `status` enum then tells you *which*
 stopping condition fired, and `message` carries a short human-readable note.
 
 ```python
@@ -68,8 +69,8 @@ $$
 
 Inequality and bound multipliers are non-negative; a (near-)zero entry means
 that constraint is inactive, a strictly positive entry means it is active and
-gives its shadow price. With [scaling](options.md#problem-scaling) enabled the
-multipliers are still reported in original units.
+gives its shadow price. With [scaling](options.md#problem-scaling) active (the
+default) the multipliers are still reported in original units.
 
 ```python
 active = res.y_ineq > 1e-6  # which inequalities bind at the solution
@@ -83,7 +84,7 @@ active = res.y_ineq > 1e-6  # which inequalities bind at the solution
 | `dual_infeasibility` | scaled stationarity residual component |
 | `primal_infeasibility` | scaled constraint-violation component |
 | `complementarity` | scaled complementarity component |
-| `constraint_violation` | scaled `‖(c, g+s)‖` feasibility measure |
+| `constraint_violation` | ∞-norm violation at the returned `x`: the max of `‖c‖∞`, `max(g, 0)` and the bound overshoot (no slacks), in scaled units when problem scaling is active |
 
 `kkt_error` is the maximum of the three component residuals; comparing the three
 tells you *which* condition is limiting. A solve that stalls at a large
@@ -95,10 +96,12 @@ These remain **scaled-space** quantities when problem scaling is on.
 
 | Field | Meaning |
 |---|---|
-| `n_iter` | outer interior-point iterations taken |
+| `n_iter` | outer interior-point iterations performed (`history[-1].iteration`; history row 0 is the start point, iteration 0) |
 | `solve_time` | total wall-clock seconds for the whole `solve` call |
 | `linear_solver` | the solver route actually used, e.g. `"dense"`, `"krylov (cg, pc=jacobi)"`, `"sparse [Feral LDL^T (CPU)]"` |
+| `device` | device the solve ran on, e.g. `"cpu"` |
 | `derivative_sources` | how each derivative was obtained (see below) |
+| `routes` | a [`Routes`](../reference.md#ipax.result.Routes) record of what each auto-selectable mechanism actually took (linear solver, KKT form, Hessian source, globalization, μ schedule, scaling, corrections), next to the `*_requested` option values; `None` when the solve exited before any was selected |
 
 [`derivative_sources`](../reference.md#ipax.result.DerivativeSources) is worth a
 look on a first run — it confirms whether your analytic derivatives were picked
@@ -114,7 +117,9 @@ print(res.derivative_sources)
 
 `res.history` is a tuple of
 [`IterationRecord`](../reference.md#ipax.result.IterationRecord)s, one per
-iteration, holding the objective, `mu`, `theta` (constraint violation), the KKT
+iteration plus row 0 for the start point (`iteration == 0`), holding the
+objective, `mu`, `theta` (the same ∞-norm constraint violation as
+`Result.constraint_violation`, at that row's iterate), the KKT
 error and its components, step lengths, applied regularization, per-row
 timing splits, and whether the row was a restoration jump (`restored`) or a
 second-order-corrected point (`used_soc`; `soc_attempted` marks that a

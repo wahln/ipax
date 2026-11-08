@@ -33,6 +33,7 @@ nav:
       - TROTS radiotherapy: benchmarks/trots.md
   - Architecture & invariants: architecture.md
   - API reference: reference.md
+  - Public API and stability: stability.md
   - Contributing:
       - Contributor guide: contributing.md
       - Performance proposals: development/performance.md

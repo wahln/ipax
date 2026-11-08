@@ -7,8 +7,11 @@ All configuration goes through a single frozen
 res = ipax.solve(problem, x0, options=ipax.Options(hessian="exact"))
 ```
 
-`Options` is immutable and validated on construction (bad values raise
-`ValueError` immediately rather than failing deep in the loop). The defaults are
+`Options` and every nested options group are immutable and validated field
+by field on construction: a bad value — out of range, a misspelled string
+choice, a bool or string where a number belongs — raises
+`ipax.ConfigurationError` (a `ValueError`) naming the field and what it
+accepts, rather than failing deep in the loop. The defaults are
 tuned for RT-scale problems and solve most cases unchanged; this page covers the
 knobs you are most likely to touch. Every field is documented in the
 [API reference](../reference.md#ipax.options.Options).
@@ -70,9 +73,11 @@ in seconds (default `None`, disabled) reports `Status.MAX_TIME`. Both are
 checked at iteration boundaries.
 
 **Unbounded detection.** `diverging_iterates_tol` (default `1e20`) stops the
-solve with [`Status.UNBOUNDED`](results.md#status) once `‖x‖∞` exceeds it while
-the point stays feasible — an IPOPT-style diverging-iterates test that catches
-an objective running away to `-∞` and reports it honestly instead of letting
+solve with [`Status.UNBOUNDED`](results.md#status) once `‖x‖∞` exceeds it *and*
+the objective has fallen to `f ≤ −diverging_iterates_tol` (no feasibility
+check) — an IPOPT-style diverging-iterates test; requiring both signals keeps a
+convergent run whose iterates merely wander far from being misreported. It
+catches an objective running away to `-∞` and reports it honestly instead of letting
 the runaway iterate eventually overflow to a misleading `NUMERICAL_ERROR`. Set
 to `None` to disable.
 
@@ -101,14 +106,16 @@ call the problem locally infeasible.
 
 | Value | Behavior |
 |---|---|
-| `"lbfgs"` *(default)* | compact, Powell-damped L-BFGS. Works on every backend and keeps the condensed system positive definite. |
-| `"exact"` | use the problem's `lagrangian_hessian` (analytic). |
+| `"auto"` *(default)* | the problem's analytic `lagrangian_hessian` when it provides one, otherwise L-BFGS. |
+| `"lbfgs"` | always compact, Powell-damped L-BFGS, even when an analytic Hessian exists. Works on every backend and keeps the condensed system positive definite. |
+| `"exact"` | the problem's analytic `lagrangian_hessian`; an error if it has none. |
 | `"autodiff-hvp"` | exact Hessian-vector products via backend autodiff (PyTorch/JAX). |
 
-L-BFGS is the universal default because it needs no second derivatives and
-makes the condensed Newton matrix positive definite, which removes the need for
-an inertia oracle. Switch to `"exact"` or `"autodiff-hvp"` when accurate
-curvature meaningfully cuts iterations (typically convex/structured problems).
+L-BFGS is the fallback because it needs no second derivatives and makes the
+condensed Newton matrix positive definite, which removes the need for an
+inertia oracle. Supply an analytic Hessian, or request `"autodiff-hvp"`, when
+accurate curvature meaningfully cuts iterations (typically convex/structured
+problems); force `"lbfgs"` to ignore an analytic one.
 Tune the memory and damping through
 [`LBFGSOptions`](../reference.md#ipax.options.LBFGSOptions) (`memory`,
 `powell_damping`, `initial_scaling`).
@@ -216,14 +223,15 @@ measured cost.
 
 ## Problem scaling
 
-Badly scaled problems converge faster with gradient-based auto-scaling (IPOPT's
-`nlp_scaling_method`). Enable it with the shorthand string:
+Gradient-based auto-scaling (IPOPT's `nlp_scaling_method`) is **on by
+default** (`ScalingOptions(method="gradient-based")`), so badly scaled problems
+need no setting. Disable it with the shorthand string:
 
 ```python
-ipax.Options(scaling="gradient-based")
+ipax.Options(scaling="none")
 ```
 
-This rescales the objective and each constraint once at `x0` so their gradients
+It rescales the objective and each constraint once at `x0` so their gradients
 have an ∞-norm of at most `max_gradient` (default `100`); variables and bounds
 are left unscaled. The returned `x`, objective, and multipliers are reported in
 the **original** problem's units, while `kkt_error`/`constraint_violation`
@@ -342,8 +350,7 @@ dense below 10 000 variables, Krylov at and above it. Force either route
 explicitly when you want it regardless of size:
 
 ```python
-from ipax import Options
-from ipax.options import RestorationOptions
+from ipax import Options, RestorationOptions
 
 options = Options(
     restoration=RestorationOptions(linear_solver="krylov"),
@@ -442,6 +449,22 @@ reference. Neither a looser `rtol` nor holding or raising the damping after
 a truncated accept helps — the budget is the lever. On a problem this small
 the dense default is the right route; raise the cap when the matrix-free
 route shows this pattern at a size where dense is not an option.
+
+Raise it by replacing the field on the restoration preset, not by building a
+fresh `KrylovOptions`: the default `RestorationOptions().krylov` is
+`KrylovOptions(rtol=1e-8, max_iter=200, preconditioner="jacobi",
+adaptive_tol=False)`, and `RestorationOptions(krylov=KrylovOptions(max_iter=1000))`
+would silently swap that preset for the main solver's general defaults
+(`rtol=1e-10`, `adaptive_tol=True`).
+
+```python
+import dataclasses
+
+from ipax import Options, RestorationOptions
+
+krylov = dataclasses.replace(RestorationOptions().krylov, max_iter=1000)
+options = Options(restoration=RestorationOptions(krylov=krylov))
+```
 
 !!! tip "Radiotherapy-scale planning: start from `slack_init_scale=0.1`"
     On large, deeply-infeasible-at-start dose-optimization problems (TROTS-scale:
