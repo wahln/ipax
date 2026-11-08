@@ -141,6 +141,7 @@ def test_numeric_fields_accept_integers_and_numpy_scalars():
         (ipax.BarrierOptions, {"tau_min": 1.0}),
         # Wächter & Biegler 2006, eqs. (18)-(20).
         (ipax.LineSearchOptions, {"max_soc": -1}),
+        (ipax.LineSearchOptions, {"alpha_min_frac": 0.0}),
         (ipax.LineSearchOptions, {"gamma_theta": 0.0}),
         (ipax.LineSearchOptions, {"gamma_theta": 1.0}),
         (ipax.LineSearchOptions, {"gamma_phi": 0.0}),

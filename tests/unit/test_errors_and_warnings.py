@@ -122,3 +122,28 @@ def test_finite_difference_warnings_can_be_filtered_by_category(namespace):
         ipax.solve(
             _ObjectiveOnly(namespace), array(namespace, [0.5, 0.5]), options=options
         )
+
+
+def test_no_jacobian_source_raises_derivative_unavailable(namespace):
+    options = Options(enable_autodiff=False, enable_finite_diff=False)
+
+    class Constrained(_WithEqualities):
+        def gradient(self, x):
+            return 2.0 * (x - 1.0)
+
+    with pytest.raises(ipax.DerivativeUnavailableError, match="eq_constraints"):
+        ipax.solve(
+            Constrained(namespace), array(namespace, [0.5, 0.5]), options=options
+        )
+
+
+def test_autodiff_hvp_without_an_autodiff_backend_raises(namespace):
+    from ipax.problem.autodiff import get_autodiff_adapter
+
+    if get_autodiff_adapter(namespace) is not None:
+        pytest.skip("this backend has autodiff")
+    options = Options(hessian="autodiff-hvp")
+    with pytest.raises(ipax.DerivativeUnavailableError, match="autodiff-hvp"):
+        ipax.solve(
+            _ObjectiveOnly(namespace), array(namespace, [0.5, 0.5]), options=options
+        )

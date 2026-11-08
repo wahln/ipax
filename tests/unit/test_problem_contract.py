@@ -196,3 +196,38 @@ def test_constraints_left_out_of_provides_are_absent(namespace):
     assert_allclose(namespace, result.x, array(namespace, [1.0, 1.0]), atol=1e-6)
     assert result.y_eq is None and result.y_ineq is None
     assert result.derivative_sources.eq_jacobian == "n/a"
+
+
+def test_scaled_operator_scales_every_explicit_form(namespace):
+    from ipax.backend.operators import Diagonal, ScaledOperator
+
+    xp = namespace
+    base = Diagonal(array(xp, [2.0, -3.0]))
+    op = ScaledOperator(base, -0.5)
+    V = array(xp, [[1.0, 0.0], [0.0, 1.0]])
+    assert_allclose(xp, op.rmatmat(V), -0.5 * base.rmatmat(V))
+    assert_allclose(xp, op.diagonal(), array(xp, [-1.0, 1.5]))
+    rows, cols, values, shape = op.to_coo()
+    base_rows, base_cols, base_values, base_shape = base.to_coo()
+    assert shape == base_shape
+    assert_allclose(xp, values, -0.5 * base_values)
+    assert bool(xp.all(rows == base_rows)) and bool(xp.all(cols == base_cols))
+    assert_allclose(xp, op.coo_values(), -0.5 * base.coo_values())
+    assert op.coo_pattern_signature() == base.coo_pattern_signature()
+    assert op.symmetry_hint() == base.symmetry_hint()
+
+
+def test_scaled_operator_keeps_positive_definiteness_only_for_positive_alpha():
+    from ipax.backend.operators import LinearOperator, ScaledOperator
+
+    class PD(LinearOperator):
+        shape = (1, 1)
+
+        def matvec(self, v):
+            return v
+
+        def positive_definite_hint(self):
+            return True
+
+    assert ScaledOperator(PD(), 2.0).positive_definite_hint()
+    assert not ScaledOperator(PD(), -2.0).positive_definite_hint()
