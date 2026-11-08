@@ -32,9 +32,10 @@ from ipax.errors import (
     FiniteDifferenceWarning,
     IpaxError,
     IpaxWarning,
+    LinearSolveError,
     ProblemDefinitionError,
+    UnsupportedBackendError,
 )
-from ipax.linalg.solver import LinearSolveError
 from ipax.options import (
     AcceptableStoppingOptions,
     BarrierOptions,
@@ -103,6 +104,7 @@ __all__ = [
     "ScalingOptions",
     "SparseOptions",
     "Status",
+    "UnsupportedBackendError",
     "WarmStart",
     "solve",
 ]

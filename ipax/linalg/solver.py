@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from ipax.errors import IpaxError
+from ipax.errors import LinearSolveError, UnsupportedBackendError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -55,25 +55,6 @@ _TALL_DENSE_MIN_DENSITY = 0.05
 # scattered sparsity of the same nnz saturates the Gram (fill → 1), where a
 # sparse factorization of the near-dense n×n block would be hopeless.
 _TALL_SPARSE_NE_MAX_FILL = 0.01
-
-
-class LinearSolveError(IpaxError, RuntimeError):
-    """Backend-neutral numerical failure from a linear solve.
-
-    The IPM regularization loop catches this type and retries with a larger
-    primal regularization. Configuration errors, unsupported features, shape
-    errors, and user/operator callback bugs should propagate as their original
-    exceptions instead of being reclassified as numerical trouble.
-
-    ``iterate`` optionally carries the solver's last approximate solution when
-    the failure is a work limit rather than a breakdown (an iterative solver's
-    truncated iterate). The KKT driver ignores it and escalates ``δ_w``;
-    feasibility restoration uses it as a truncated-Newton trial direction.
-    """
-
-    def __init__(self, message: str = "", *, iterate: Array | None = None) -> None:
-        super().__init__(message)
-        self.iterate = iterate
 
 
 def numerical_failure_types() -> tuple[type[BaseException], ...]:
@@ -285,7 +266,9 @@ def select_solver(
     mode = options.linsolve
     if mode == "dense":
         if not has_dense_solve():
-            raise RuntimeError("dense linear solving requires xp.linalg.solve")
+            raise UnsupportedBackendError(
+                "linsolve='dense' requires xp.linalg.solve, which this backend lacks"
+            )
         return DenseSolver(options.dense)
 
     if mode == "krylov":
@@ -293,7 +276,9 @@ def select_solver(
 
     if mode == "sparse":
         if not capabilities.has_sparse_adapter:
-            raise RuntimeError("sparse linear solving is unavailable for this backend")
+            raise UnsupportedBackendError(
+                "linsolve='sparse' needs a sparse adapter, which this backend lacks"
+            )
         form = options.sparse.kkt_route
         if form == "auto":
             # Same tall gate and measured thresholds as the linsolve="auto"

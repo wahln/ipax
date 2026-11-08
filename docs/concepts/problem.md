@@ -22,9 +22,9 @@ derivative-precedence chain.
 
 Overriding an optional method declares it provided; `provides()` returning a
 set of method names overrides that inference (for delegating wrappers).
-`lagrangian_hessian` is always called with four positional arguments; `σ` is
-not 1 under the default gradient-based scaling and must scale the objective
-term.
+`lagrangian_hessian` is always called with four positional arguments; `σ`
+may differ from 1 (it does whenever the default gradient-based scaling
+rescales the objective), so always scale the objective term by it.
 
 ## Declared separately
 

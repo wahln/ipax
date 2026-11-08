@@ -839,14 +839,18 @@ def forward_gram(
 
 
 class ScaledOperator(LinearOperator):
-    """``alpha · A`` for a scalar ``alpha``, keeping ``A``'s capabilities.
+    """``alpha · A`` for a scalar ``alpha``.
 
     A user Hessian operator must honour the ``sigma`` factor the solver passes
-    to :meth:`~ipax.problem.base.Problem.lagrangian_hessian` (not 1 under the
-    default gradient-based scaling); wrapping it here scales every product and
-    every explicit form (dense matrix, diagonal, COO values) without
-    materializing anything. Hints carry over: symmetry always, positive
-    definiteness only for ``alpha > 0``.
+    to :meth:`~ipax.problem.base.Problem.lagrangian_hessian` (it differs from 1
+    whenever gradient-based scaling rescales the objective); wrapping it here
+    scales the products (``matvec``, ``rmatvec``, ``matmat``, ``rmatmat``) and
+    the explicit forms (dense matrix, diagonal, COO) without materializing
+    anything. The symmetry hint carries over, and positive definiteness for
+    ``alpha > 0``. Other capabilities — the Gram family,
+    ``dense_matrix_with_gram``, ``row_inf_norms`` — are not forwarded; a
+    Hessian that fuses with the inequality Gram must apply ``sigma`` inside
+    ``dense_matrix_with_gram`` itself.
     """
 
     def __init__(self, op: LinearOperator, alpha: float) -> None:

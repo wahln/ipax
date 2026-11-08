@@ -78,7 +78,7 @@ benchmarks/     generators/, corpus/, harness, runners, reports
   `eq/ineq_constraints` + Jacobians, and `lagrangian_hessian`. Overriding an
   optional method declares it provided; `Problem.provides()` overrides that
   inference. `lagrangian_hessian(x, y_eq, y_ineq, sigma)` is always called with
-  four positional arguments, `sigma ≠ 1` under the default scaling; new
+  four positional arguments, `sigma` may differ from 1 (scaling); new
   capabilities arrive as new methods, never new parameters. **Linear constraints
   are declared separately** (`linear_eq`/`linear_ineq`, constant data) from nonlinear
   ones — constant Jacobian, no Hessian term, assembled once. Derivative precedence:

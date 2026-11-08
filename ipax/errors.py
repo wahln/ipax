@@ -14,13 +14,12 @@
 
 """Exceptions and warnings raised by ipax.
 
-Every exception derives from :class:`IpaxError` *and* from the built-in type
-ipax raised for the same condition before 0.14, so existing ``except
-ValueError`` / ``except RuntimeError`` clauses keep working. Numerical trouble
-inside a solve is not raised: it is reported through
-:class:`~ipax.result.Status`. A linear-solve failure the solver cannot recover
-from surfaces as :class:`~ipax.linalg.solver.LinearSolveError`, also a subclass
-of :class:`IpaxError`.
+The exceptions defined here are raised for ipax's documented error conditions.
+Each derives from :class:`IpaxError` *and* from the built-in type ipax raised
+for the same condition before 0.14, so existing ``except ValueError`` /
+``except RuntimeError`` clauses keep working. Internal consistency checks may
+still raise plain built-ins. Numerical trouble inside a solve is not raised:
+it is reported through :class:`~ipax.result.Status`.
 """
 
 from __future__ import annotations
@@ -28,6 +27,10 @@ from __future__ import annotations
 import os
 import sys
 import warnings
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ipax.typing import Array
 
 _IPAX_DIR = os.path.normcase(os.path.dirname(os.path.abspath(__file__))) + os.sep
 # ``dataclasses.replace`` calls the class from inside the stdlib; a warning
@@ -39,7 +42,7 @@ _DATACLASSES_FILE = os.path.normcase(
 
 
 class IpaxError(Exception):
-    """Base class of every exception ipax raises on purpose."""
+    """Base class of the exceptions defined in :mod:`ipax.errors`."""
 
 
 class ConfigurationError(IpaxError, ValueError):
@@ -65,8 +68,39 @@ class DerivativeUnavailableError(IpaxError, RuntimeError):
     """
 
 
+class UnsupportedBackendError(IpaxError, RuntimeError):
+    """The array backend lacks a capability the requested options need.
+
+    For example ``Options(linsolve="dense")`` on a namespace without
+    ``linalg.solve``, or ``linsolve="sparse"`` where ipax has no sparse adapter.
+    """
+
+
+class LinearSolveError(IpaxError, RuntimeError):
+    """Backend-neutral numerical failure from a linear solve.
+
+    The IPM regularization loop catches this type and retries with a larger
+    primal regularization. Configuration errors, unsupported features, shape
+    errors, and user/operator callback bugs should propagate as their original
+    exceptions instead of being reclassified as numerical trouble.
+
+    ``iterate`` optionally carries the solver's last approximate solution when
+    the failure is a work limit rather than a breakdown (an iterative solver's
+    truncated iterate). The KKT driver ignores it and escalates ``δ_w``;
+    feasibility restoration uses it as a truncated-Newton trial direction.
+    """
+
+    def __init__(self, message: str = "", *, iterate: Array | None = None) -> None:
+        super().__init__(message)
+        self.iterate = iterate
+
+
 class IpaxWarning(UserWarning):
-    """Base class of the warnings ipax emits."""
+    """Base class of the warnings defined in :mod:`ipax.errors`.
+
+    Adapters may warn with their ecosystem's category instead (the SciPy front
+    end uses ``scipy.optimize.OptimizeWarning``).
+    """
 
 
 class FiniteDifferenceWarning(IpaxWarning):
@@ -106,5 +140,7 @@ __all__ = [
     "FiniteDifferenceWarning",
     "IpaxError",
     "IpaxWarning",
+    "LinearSolveError",
     "ProblemDefinitionError",
+    "UnsupportedBackendError",
 ]

@@ -262,7 +262,7 @@ class QuadraticProblem(Problem):
     ) -> Array | LinearOperator:
         del x, y_eq, y_ineq
         if isinstance(self._Q, LinearOperator):
-            # σ ≠ 1 whenever gradient-based scaling is active (the default).
+            # σ ≠ 1 whenever gradient-based scaling rescales the objective.
             return self._Q if float(sigma) == 1.0 else ScaledOperator(self._Q, sigma)
         return sigma * self._Q
 

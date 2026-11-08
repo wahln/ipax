@@ -160,9 +160,10 @@ class Problem(ABC):
         can be supplied as a cheap matvec without ever materializing ``W``.
 
         The solver always calls it with four positional arguments, so the
-        parameter names are free. ``sigma`` is a Python float that is **not 1**
-        under the default gradient-based scaling: an implementation must scale
-        the objective term by it. ``y_eq`` and ``y_ineq`` hold the multipliers
+        parameter names are free. ``sigma`` is a Python float that may differ
+        from 1 — it does whenever the default gradient-based scaling rescales
+        the objective (‖∇f(x0)‖∞ > ``ScalingOptions.max_gradient``) — so an
+        implementation must always scale the objective term by it. ``y_eq`` and ``y_ineq`` hold the multipliers
         of the *nonlinear* constraints only (linear blocks have no curvature)
         and are empty arrays, not ``None``, when there are none.
         """

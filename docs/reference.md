@@ -97,8 +97,8 @@ What a solve returns, plus the per-iteration snapshot passed to a callback.
 
 ## Errors and warnings
 
-Every exception ipax raises on purpose derives from `IpaxError` and from the
-built-in it raised before 0.14 (see
+The documented error conditions raise these classes; each derives from
+`IpaxError` and from the built-in ipax raised before 0.14 (see
 [Public API and stability](stability.md#errors-and-warnings)).
 
 ::: ipax.errors.IpaxError
@@ -109,7 +109,9 @@ built-in it raised before 0.14 (see
 
 ::: ipax.errors.DerivativeUnavailableError
 
-::: ipax.linalg.solver.LinearSolveError
+::: ipax.errors.UnsupportedBackendError
+
+::: ipax.errors.LinearSolveError
 
 ::: ipax.errors.IpaxWarning
 

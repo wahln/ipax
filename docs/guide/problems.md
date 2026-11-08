@@ -94,8 +94,10 @@ is usually cheap to write.
     `Options(hessian="exact")` additionally makes a missing one an error, and
     `hessian="lbfgs"` ignores it. The solver always calls
     `lagrangian_hessian(x, y_eq, y_ineq, sigma)` with four positional
-    arguments: `sigma` is a Python float, **not 1** under the default
-    gradient-based scaling, and must scale the objective term; `y_eq`/`y_ineq`
+    arguments: `sigma` is a Python float that may differ from 1 — it does
+    whenever the default gradient-based scaling rescales the objective
+    (‖∇f(x0)‖∞ > `ScalingOptions.max_gradient`) — so always scale the
+    objective term by it; `y_eq`/`y_ineq`
     are the *nonlinear*-constraint multipliers only (empty arrays when there
     are none). See [Configuring the solver](options.md#hessian).
 
@@ -303,6 +305,11 @@ accepted directly (`TypeError`); wrap it as
 [The linear-algebra layer](../concepts/linalg.md).
 
 ### Fusing the Hessian with the inequality Gram (optional)
+
+Apply `sigma` inside `dense_matrix_with_gram` rather than wrapping the Hessian
+in `ScaledOperator`: the wrapper does not forward this method (`σW + JᵀΣJ` is
+not `σ(W + JᵀΣJ)`), so a wrapped Hessian silently falls back to the two-pass
+assembly below.
 
 On the dense route the solver forms the condensed block
 `N = W + ∇gᵀ Σ_s ∇g + Σ_x` in two passes: `W.dense_matrix()` and the

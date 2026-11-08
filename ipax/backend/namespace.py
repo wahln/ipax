@@ -102,7 +102,7 @@ def _namespace_name(xp: Namespace) -> str:
     return module_name.split(".", 1)[0] or "unknown"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Capabilities:
     """What the current namespace/device supports (§5.4)."""
 

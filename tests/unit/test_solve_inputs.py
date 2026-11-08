@@ -116,3 +116,29 @@ def test_matrix_free_jacobian_without_rmatvec_says_what_to_pass(namespace):
     op = MatrixFreeJacobian((2, 3), matvec=lambda v: v[:2])
     with pytest.raises(NotImplementedError, match=r"rmatvec="):
         op.rmatvec(array(namespace, [1.0, 1.0]))
+
+
+def test_a_problem_that_is_not_a_problem_raises_type_error(namespace):
+    with pytest.raises(TypeError, match=r"problem must be an ipax\.Problem"):
+        ipax.solve(lambda x: x, _x0(namespace))
+
+
+def test_a_bound_that_is_not_an_array_is_rejected(namespace):
+    problem = _Shifted(namespace, bounds=([0.0, 0.0], None))
+    with pytest.raises(
+        ipax.ProblemDefinitionError, match="lower bound must be an array"
+    ):
+        ipax.solve(problem, _x0(namespace))
+
+
+def test_sparse_route_without_a_sparse_adapter_raises_unsupported_backend():
+    xps = pytest.importorskip("array_api_strict")
+    from ipax.backend.namespace import capabilities
+
+    x0 = xps.asarray([0.0, 0.0])
+    if capabilities(xps).has_sparse_adapter:
+        pytest.skip("array_api_strict gained a sparse adapter")
+    with pytest.raises(ipax.UnsupportedBackendError, match="sparse adapter"):
+        ipax.solve(_Shifted(xps), x0, options=ipax.Options(linsolve="sparse"))
+    with pytest.raises(RuntimeError):  # 0.13 code caught RuntimeError here
+        ipax.solve(_Shifted(xps), x0, options=ipax.Options(linsolve="sparse"))

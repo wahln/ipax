@@ -198,3 +198,18 @@ def test_a_subclass_of_an_option_class_is_validated_too():
     MyBarrier(extra=3)
     with pytest.raises(ipax.ConfigurationError, match=r"MyBarrier\.extra"):
         MyBarrier(extra="x")
+
+
+def test_verbose_accepts_a_bool_as_tier_0_or_1():
+    assert ipax.Options(verbose=True).verbose == 1
+    assert ipax.Options(verbose=False).verbose == 0
+
+
+def test_bool_fields_accept_numpy_bools():
+    assert ipax.Options(enable_autodiff=np.True_).enable_autodiff
+    assert not ipax.SparseOptions(deterministic=np.False_).deterministic
+
+
+def test_an_integer_too_large_for_a_float_is_a_configuration_error():
+    with pytest.raises(ipax.ConfigurationError, match="max_time"):
+        ipax.Options(max_time=10**400)

@@ -74,14 +74,24 @@ def _matches(value: object, expected: object) -> bool:
     if expected is type(None):
         return value is None
     if expected is bool:
-        return isinstance(value, bool)
+        # NumPy's bool scalar (numpy.bool, numpy.bool_ before NumPy 2) is not a
+        # bool subclass; a value read from an array or config is still a bool.
+        kind = type(value)
+        return isinstance(value, bool) or (
+            kind.__module__ == "numpy" and kind.__name__ in ("bool", "bool_")
+        )
     if isinstance(value, bool):
         # bool is an int subclass; a bool where a number belongs is a typo.
         return False
     if expected is int:
         return isinstance(value, numbers.Integral)
     if expected is float:
-        return isinstance(value, numbers.Real) and not math.isnan(value)
+        if not isinstance(value, numbers.Real):
+            return False
+        try:
+            return not math.isnan(value)
+        except OverflowError:  # an integer too large for a float
+            return False
     return isinstance(value, expected)  # type: ignore[arg-type]
 
 
@@ -372,11 +382,6 @@ class LineSearchOptions:
 
     def __post_init__(self) -> None:
         _check_field_types(self)
-        # γ_α ≤ 0 would collapse the eq. (23) α_min onto the bare floor,
-        # silently disabling the rule the caller just asked for; γ_α ≥ 1 would
-        # let α_min reach the switching bound it is meant to sit safely *under*,
-        # refusing steps the acceptance tests would still take. IPOPT bounds its
-        # equivalent option to the same open interval.
         if self.max_soc < 0:
             raise ConfigurationError("max_soc must be a non-negative integer")
         # Wächter & Biegler 2006, eq. (18): γ_θ, γ_φ ∈ (0, 1); eq. (19):
@@ -390,6 +395,11 @@ class LineSearchOptions:
             raise ConfigurationError("s_phi must be finite and >= 1")
         if not 0.0 < self.eta_phi < 0.5:
             raise ConfigurationError("eta_phi must lie in (0, 1/2)")
+        # γ_α ≤ 0 would collapse the eq. (23) α_min onto the bare floor,
+        # silently disabling the rule the caller just asked for; γ_α ≥ 1 would
+        # let α_min reach the switching bound it is meant to sit safely *under*,
+        # refusing steps the acceptance tests would still take. IPOPT bounds its
+        # equivalent option to the same open interval.
         if self.gamma_alpha is not None and not 0.0 < self.gamma_alpha < 1.0:
             raise ConfigurationError("gamma_alpha must lie in (0, 1) or be None")
         if not math.isfinite(self.alpha_min_frac) or self.alpha_min_frac <= 0.0:
@@ -512,6 +522,7 @@ class RegularizationOptions:
             raise ConfigurationError("delta_c must be finite and non-negative")
         if self.delta_c_max < self.delta_c:
             raise ConfigurationError("delta_c_max must be >= delta_c")
+        # The trigger is a threshold on δ_w; only a positive one is meaningful.
         if not self.delta_c_trigger > 0.0:
             raise ConfigurationError("delta_c_trigger must be positive")
         repair = self.equality_dual_repair
@@ -594,6 +605,11 @@ class BreedveldOptions:
 
     def __post_init__(self) -> None:
         _check_field_types(self)
+        # The domains of the Breedveld et al. (2017) step controller's
+        # formulas (no published ranges): τ is a fraction-to-boundary factor
+        # and the backtrack a step-shrink factor, both in (0, 1); the Armijo
+        # constant c of a sufficient-decrease test lies in (0, 1); eq. (36)
+        # bounds a positive ratio, so its limit must be positive.
         for name in ("tau", "backtrack", "armijo_c"):
             if not 0.0 < getattr(self, name) < 1.0:
                 raise ConfigurationError(f"{name} must lie in (0, 1)")
@@ -636,6 +652,8 @@ class LBFGSOptions:
 
     def __post_init__(self) -> None:
         _check_field_types(self)
+        # Counts: an L-BFGS memory, iteration caps and similar limits of zero
+        # would leave nothing to run.
         if self.memory < 1:
             raise ConfigurationError("memory must be a positive integer")
         ratio = self.damping_skip_ratio
@@ -1314,6 +1332,8 @@ class Options:
 
     def __post_init__(self) -> None:
         """Validate limits and normalize shorthand option values."""
+        if isinstance(self.verbose, bool):  # verbose=True means tier 1
+            object.__setattr__(self, "verbose", int(self.verbose))
         _check_field_types(self)
         _validate_optional_positive("max_time", self.max_time, allow_zero=False)
         _validate_optional_positive(

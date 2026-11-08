@@ -76,8 +76,13 @@ def _declared(problem: Problem) -> frozenset[str] | None:
             remove_in="0.15",
             category=DeprecationWarning,
         )
-        declared = frozenset(legacy) - {"objective"}
-    unknown = set(declared) - _OPTIONAL_METHODS - {"objective"}
+        return frozenset(legacy) - {"objective"}
+    if not isinstance(declared, (set, frozenset)):
+        raise ProblemDefinitionError(
+            f"{type(problem).__name__}.provides() must return a frozenset of "
+            f"method names or None, got {type(declared).__name__}"
+        )
+    unknown = set(declared) - _OPTIONAL_METHODS
     if unknown:
         raise ProblemDefinitionError(
             f"{type(problem).__name__}.provides() names unknown methods "

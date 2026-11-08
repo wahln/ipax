@@ -58,6 +58,7 @@ from ipax.backend.operators import (
     VStack,
     as_operator,
 )
+from ipax.errors import ProblemDefinitionError
 from ipax.ipm.barrier import (
     FreeModeMonitor,
     adaptive_mu,
@@ -2334,7 +2335,7 @@ class IPMDriver:
         logger.debug(
             "driver finished: status=%s after %d iteration(s)",
             status.value,
-            len(history),
+            history[-1].iteration if history else 0,
         )
 
         return Result(
@@ -3372,7 +3373,7 @@ class IPMDriver:
             try:
                 jacobian.rmatvec(xp.zeros((rows,), dtype=x.dtype, device=device(x)))
             except NotImplementedError as exc:
-                raise ValueError(
+                raise ProblemDefinitionError(
                     "RestorationOptions(linear_solver='krylov') applies the "
                     f"{name} Jacobian through matvec and rmatvec, but this "
                     f"problem's {name} Jacobian has no adjoint: {exc}"

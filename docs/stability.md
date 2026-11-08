@@ -16,8 +16,8 @@ promise.
 - The extension points documented in the [API reference](reference.md), at
   the import path shown there: `LinearOperator` and its documented methods,
   `as_operator`, `MatrixFreeJacobian` and `ScaledOperator` in
-  `ipax.backend.operators`; the `LinearSolver` protocol, `LinearSolveError`
-  and `numerical_failure_types` in `ipax.linalg.solver`; `array_namespace`,
+  `ipax.backend.operators`; the `LinearSolver` protocol and
+  `numerical_failure_types` in `ipax.linalg.solver`; `array_namespace`,
   `capabilities` and `Capabilities` in `ipax.backend.namespace`.
 
 ## What is not
@@ -61,15 +61,18 @@ listed under *Changed* with what code needs to do.
 
 ## Errors and warnings
 
-Everything ipax raises on purpose derives from `ipax.IpaxError` and from the
-built-in exception it raised before 0.14, so existing `except` clauses keep
-working:
+The error conditions below raise these classes, each derived from
+`ipax.IpaxError` and from the built-in exception ipax raised for the same
+condition before 0.14, so existing `except` clauses keep working. Other
+failures — internal consistency checks, and errors inside backend adapters —
+may still raise plain built-ins.
 
 | Exception | Also a | Raised when |
 |---|---|---|
 | `ConfigurationError` | `ValueError` | an option has an invalid value |
 | `ProblemDefinitionError` | `ValueError` | `x0` or the bounds do not match `n_vars`, or `Problem.provides()` names an unknown method |
 | `DerivativeUnavailableError` | `RuntimeError` | a derivative the solve needs cannot be obtained |
+| `UnsupportedBackendError` | `RuntimeError` | the array backend lacks a capability the options need (e.g. `linsolve="sparse"` with no sparse adapter) |
 | `LinearSolveError` | `RuntimeError` | a linear solve failed in a way the solver could not recover from |
 
 An argument of the wrong type, such as an `options` dict, raises a plain
@@ -77,6 +80,9 @@ An argument of the wrong type, such as an `options` dict, raises a plain
 returns a `Result` whose `status` says how it ended. An exception raised by
 your own callbacks propagates out of `ipax.solve` unchanged.
 
-Warnings derive from `ipax.IpaxWarning`. `ipax.FiniteDifferenceWarning`
-reports a derivative approximated by finite differences; silence it with
-`warnings.simplefilter("ignore", ipax.FiniteDifferenceWarning)`.
+`ipax.FiniteDifferenceWarning` (an `ipax.IpaxWarning`) reports a derivative
+approximated by finite differences; silence it with
+`warnings.simplefilter("ignore", ipax.FiniteDifferenceWarning)`. Adapters warn
+in their ecosystem's category instead: the SciPy front end with
+`scipy.optimize.OptimizeWarning`, the CuPy sparse adapter with
+`RuntimeWarning`.

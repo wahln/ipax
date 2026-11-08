@@ -42,6 +42,7 @@ from ipax.ipm.driver import IPMDriver
 from ipax.ipm.init import relax_fixed_bounds
 from ipax.linalg.solver import select_restoration_solver, select_solver
 from ipax.options import Options, ScalingOptions
+from ipax.problem.base import Problem
 from ipax.problem.derivatives import resolve
 from ipax.problem.linear_ineq import lower_linear_inequalities
 from ipax.problem.scaling import ProblemScaling, ScaledProblem, compute_scaling
@@ -56,7 +57,6 @@ from ipax.result import (
 
 if TYPE_CHECKING:
     from ipax.backend.operators import LinearOperator
-    from ipax.problem.base import Problem
     from ipax.result import IterationCallback
     from ipax.typing import Array, Namespace
 
@@ -91,6 +91,11 @@ def _check_arguments(
     a start point or bounds that do not match ``problem`` raise
     :class:`~ipax.errors.ProblemDefinitionError`.
     """
+    if not isinstance(problem, Problem):
+        raise TypeError(
+            f"problem must be an ipax.Problem, got {type(problem).__name__}; "
+            "wrap callables with ipax.FunctionProblem"
+        )
     if options is not None and not isinstance(options, Options):
         raise TypeError(
             f"options must be an ipax.Options, got {type(options).__name__}; "
@@ -117,7 +122,14 @@ def _check_arguments(
             f"x0 has {int(x0.shape[0])} entries but the problem has n_vars = {n}"
         )
     for name, bound in zip(("lower", "upper"), problem.bounds(), strict=True):
-        if bound is not None and tuple(bound.shape) != (n,):
+        if bound is None:
+            continue
+        if not hasattr(bound, "shape"):
+            raise ProblemDefinitionError(
+                f"{name} bound must be an array in x0's namespace or None, got "
+                f"{type(bound).__name__}"
+            )
+        if tuple(bound.shape) != (n,):
             raise ProblemDefinitionError(
                 f"{name} bound has shape {tuple(bound.shape)}, expected ({n},) "
                 "(use None for an unbounded side)"

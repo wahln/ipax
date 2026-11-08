@@ -14,6 +14,7 @@ import warnings
 import pytest
 
 import ipax
+from ipax.backend.namespace import device
 from ipax.backend.operators import LinearOperator, as_operator
 from ipax.options import Options
 from ipax.problem.base import Problem
@@ -63,6 +64,25 @@ def test_provides_declares_absence_of_an_overridden_method(namespace):
         )
     assert result.derivative_sources.gradient == "finite-diff"
     assert result.status is ipax.Status.OPTIMAL
+
+
+@pytest.mark.parametrize("declared", ["gradient", ["gradient"]], ids=["str", "list"])
+def test_provides_must_return_a_set(namespace, declared):
+    class Wrong(_Quadratic):
+        def provides(self):
+            return declared
+
+    with pytest.raises(ipax.ProblemDefinitionError, match="must return a frozenset"):
+        resolve(Wrong(namespace), namespace, _quiet())
+
+
+def test_provides_rejects_objective_as_a_name(namespace):
+    class WithObjective(_Quadratic):
+        def provides(self):
+            return frozenset({"objective"})
+
+    with pytest.raises(ipax.ProblemDefinitionError, match="objective"):
+        resolve(WithObjective(namespace), namespace, _quiet())
 
 
 def test_provides_rejects_unknown_method_names(namespace):
@@ -165,7 +185,7 @@ def test_lagrangian_hessian_receives_sigma_positionally_under_scaling(namespace)
         def lagrangian_hessian(self, x, mult_eq, mult_ineq, obj_factor):
             seen.append(float(obj_factor))
             xp = self._xp
-            return obj_factor * 2e4 * xp.eye(2, dtype=x.dtype)
+            return obj_factor * 2e4 * xp.eye(2, dtype=x.dtype, device=device(x))
 
     result = ipax.solve(Renamed(namespace), array(namespace, [-1.0, 3.0]))
     assert result.status is ipax.Status.OPTIMAL
