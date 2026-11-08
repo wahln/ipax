@@ -717,7 +717,11 @@ class MatrixFreeJacobian(LinearOperator):
 
     def rmatvec(self, v: Array) -> Array:
         if self._rmatvec is None:
-            raise NotImplementedError("matrix-free adjoint callback is not available")
+            raise NotImplementedError(
+                "this MatrixFreeJacobian has no adjoint: constraint Jacobians and "
+                "linear_ineq operators need A.T @ v, so construct it with "
+                "MatrixFreeJacobian(shape, matvec=..., rmatvec=...)"
+            )
         return self._rmatvec(v)
 
     def row_inf_norms(self, like: Array | None = None) -> Array:
@@ -1691,8 +1695,20 @@ def as_operator(obj: Array | LinearOperator) -> LinearOperator:
     """Normalize a rank-2 dense array or existing operator."""
     if isinstance(obj, LinearOperator):
         return obj
-    if not hasattr(obj, "shape"):
-        raise TypeError("expected an Array-API array or LinearOperator")
+    try:
+        array_namespace(obj)
+    except TypeError as exc:
+        hint = ""
+        if hasattr(obj, "tocsr"):  # a scipy.sparse matrix or array
+            hint = (
+                "; wrap a scipy.sparse matrix A as "
+                "ipax.CSROperator(A.indptr, A.indices, A.data, A.shape) "
+                "(after A = A.tocsr())"
+            )
+        raise TypeError(
+            f"cannot use {type(obj).__name__} as an operator: expected an "
+            f"Array-API array or an ipax LinearOperator{hint}"
+        ) from exc
     if len(obj.shape) != 2:
         raise ValueError("only rank-2 dense arrays can be normalized as operators")
     return Dense(obj)

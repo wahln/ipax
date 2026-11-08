@@ -184,10 +184,8 @@ def test_result_exposes_ipax_result_and_status_name():
     res = minimize_ipax(_qp, np.zeros(4), jac=_qp_grad)
     assert res.ipax_status == "optimal"
     assert res.ipax_result.status.value == "optimal"
-    # Result.n_iter counts history rows incl. the starting point; SciPy's nit
-    # counts iterations performed.
-    assert res.nit == res.ipax_result.history[-1].iteration
-    assert res.ipax_result.n_iter == res.nit + 1
+    # Both count iterations performed; the history also holds the start point.
+    assert res.nit == res.ipax_result.n_iter == res.ipax_result.history[-1].iteration
 
 
 # ---------------------------------------------------------------------------

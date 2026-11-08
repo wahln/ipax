@@ -202,7 +202,7 @@ class Result:
     z_lower: Array | None = None
     z_upper: Array | None = None
 
-    n_iter: int = 0
+    n_iter: int = 0  # iterations performed (``history`` also holds the start)
     kkt_error: float = float("inf")
     constraint_violation: float = float("inf")
     solve_time: float = 0.0  # total wall-clock seconds for the solve

@@ -37,6 +37,7 @@ from ipax._logging import (
     logger,
 )
 from ipax.backend.namespace import array_namespace, capabilities
+from ipax.errors import ProblemDefinitionError
 from ipax.ipm.driver import IPMDriver
 from ipax.ipm.init import relax_fixed_bounds
 from ipax.linalg.solver import select_restoration_solver, select_solver
@@ -75,6 +76,53 @@ def _count_inequalities(problem: Problem, x: Array) -> int:
     except NotImplementedError:
         return 0
     return int(values.shape[0])
+
+
+def _check_arguments(
+    problem: Problem,
+    x0: Array,
+    options: Options | None,
+    callback: IterationCallback | None,
+    warm_start: WarmStart | None,
+) -> Namespace:
+    """Reject malformed arguments before they fail deep inside the solve.
+
+    Returns the namespace of ``x0``. Wrong argument types raise ``TypeError``;
+    a start point or bounds that do not match ``problem`` raise
+    :class:`~ipax.errors.ProblemDefinitionError`.
+    """
+    if options is not None and not isinstance(options, Options):
+        raise TypeError(
+            f"options must be an ipax.Options, got {type(options).__name__}; "
+            "build one with ipax.Options(...)"
+        )
+    if warm_start is not None and not isinstance(warm_start, WarmStart):
+        raise TypeError(
+            f"warm_start must be an ipax.WarmStart, got {type(warm_start).__name__}"
+        )
+    if callback is not None and not callable(callback):
+        raise TypeError(f"callback must be callable, got {type(callback).__name__}")
+    try:
+        xp = array_namespace(x0)
+    except TypeError as exc:
+        raise TypeError(
+            "x0 must be an array of an Array-API backend (NumPy, PyTorch, CuPy, "
+            f"JAX, ...), got {type(x0).__name__}"
+        ) from exc
+    n = problem.n_vars
+    if len(x0.shape) != 1:
+        raise ProblemDefinitionError(f"x0 must be 1-D, got shape {tuple(x0.shape)}")
+    if int(x0.shape[0]) != n:
+        raise ProblemDefinitionError(
+            f"x0 has {int(x0.shape[0])} entries but the problem has n_vars = {n}"
+        )
+    for name, bound in zip(("lower", "upper"), problem.bounds(), strict=True):
+        if bound is not None and tuple(bound.shape) != (n,):
+            raise ProblemDefinitionError(
+                f"{name} bound has shape {tuple(bound.shape)}, expected ({n},) "
+                "(use None for an unbounded side)"
+            )
+    return xp
 
 
 def _bound_violation(
@@ -143,12 +191,12 @@ def solve(
     ``Status.ACCEPTABLE``), and the top-level ``max_iter`` / ``max_time`` limits.
     """
     start_time = perf_counter()
+    xp = _check_arguments(problem, x0, options, callback, warm_start)
     opts = Options() if options is None else options
     scaling_options = opts.scaling
     if not isinstance(scaling_options, ScalingOptions):  # normalized by Options
         raise RuntimeError("scaling options were not normalized")
     configure_verbosity(opts.verbose)
-    xp = array_namespace(x0)
     lower, upper = problem.bounds()
 
     if lower is not None and upper is not None and bool(xp.any(lower > upper)):

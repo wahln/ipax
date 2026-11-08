@@ -150,7 +150,6 @@ def test_descent_enforcement_reuses_step_when_already_descent(namespace, monkeyp
     )
 
     assert result.status is Status.OPTIMAL
-    # One solve per non-terminal iteration on the plain monotone path (the
-    # final iteration converges before solving): no corrector and no descent
-    # re-solves on a convex QP.
-    assert calls["n"] == result.n_iter - 1
+    # One solve per iteration performed on the plain monotone path: no
+    # corrector and no descent re-solves on a convex QP.
+    assert calls["n"] == result.n_iter

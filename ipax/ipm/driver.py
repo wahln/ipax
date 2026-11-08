@@ -2345,7 +2345,8 @@ class IPMDriver:
             y_ineq=y_ineq if m > 0 else None,
             z_lower=z_lower if self._lower is not None else None,
             z_upper=z_upper if self._upper is not None else None,
-            n_iter=len(history),
+            # Iterations performed: row 0 of the history is the start point.
+            n_iter=history[-1].iteration if history else 0,
             kkt_error=final_kkt,
             dual_infeasibility=final_dual_inf,
             primal_infeasibility=final_primal_inf,

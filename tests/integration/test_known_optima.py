@@ -257,7 +257,7 @@ def test_result_history_tracks_monotone_kkt_progress(namespace):
         result = solve(problem, array(namespace, [10.0, -10.0]), options=Options())
 
     errors = [record.kkt_error for record in result.history]
-    assert result.n_iter == len(result.history)
+    assert result.n_iter == len(result.history) - 1  # row 0 is the start point
     assert errors
     assert_scalar_close(errors[-1], result.kkt_error, rtol=0.0, atol=1e-12)
     assert errors[-1] <= errors[0]

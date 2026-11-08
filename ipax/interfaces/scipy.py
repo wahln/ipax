@@ -1003,9 +1003,7 @@ def _to_optimize_result(result: Result, translation: _Translation) -> OptimizeRe
         "success": result.success,
         "status": STATUS_CODES[result.status.value],
         "message": result.message or result.status.value,
-        # SciPy's nit counts iterations performed; Result.n_iter counts history
-        # rows, which include the starting point (iteration 0).
-        "nit": result.history[-1].iteration if result.history else 0,
+        "nit": result.n_iter,
         "nfev": translation.counts.nfev,
         "njev": translation.counts.njev,
         "nhev": translation.counts.nhev,
