@@ -23,6 +23,17 @@ from tests._helpers import array, assert_allclose, implemented, transpose
 hypothesis = pytest.importorskip("hypothesis")
 st = pytest.importorskip("hypothesis.strategies")
 
+# Shared by every property test here. The first example pays the backend's
+# lazy-import/warm-up cost, which under full-suite load exceeded the 200 ms
+# default deadline and flaked as hypothesis.errors.FlakyFailure (339 ms first
+# call, 0.1 ms replay) -- first on the scaling test, then on the Torch adjoint
+# test in the v0.13.0 release gate. The deadline measures machine load here,
+# not the code, so it is off.
+_SETTINGS = hypothesis.settings(
+    suppress_health_check=[hypothesis.HealthCheck.function_scoped_fixture],
+    deadline=None,
+)
+
 
 @hypothesis.given(
     a=st.floats(min_value=0.25, max_value=10.0, allow_nan=False, allow_infinity=False),
@@ -30,9 +41,7 @@ st = pytest.importorskip("hypothesis.strategies")
     x0=st.floats(min_value=-5.0, max_value=5.0, allow_nan=False, allow_infinity=False),
     x1=st.floats(min_value=-5.0, max_value=5.0, allow_nan=False, allow_infinity=False),
 )
-@hypothesis.settings(
-    suppress_health_check=[hypothesis.HealthCheck.function_scoped_fixture]
-)
+@_SETTINGS
 def test_gradient_fd_matches_random_diagonal_quadratics(namespace, a, b, x0, x1):
     Q = array(namespace, [[a, 0.0], [0.0, b]])
     linear = array(namespace, [1.5, -0.25])
@@ -62,9 +71,7 @@ def test_gradient_fd_matches_random_diagonal_quadratics(namespace, a, b, x0, x1)
         max_size=2,
     ),
 )
-@hypothesis.settings(
-    suppress_health_check=[hypothesis.HealthCheck.function_scoped_fixture]
-)
+@_SETTINGS
 def test_operator_adjoint_identity_over_random_vectors(namespace, entries, vec, covec):
     A = array(namespace, [entries[:3], entries[3:]])
     v = array(namespace, vec)
@@ -169,13 +176,7 @@ def test_hs_oracle_derivatives_match_finite_differences(namespace, problem_cls, 
         min_value=0.25, max_value=10.0, allow_nan=False, allow_infinity=False
     )
 )
-@hypothesis.settings(
-    suppress_health_check=[hypothesis.HealthCheck.function_scoped_fixture],
-    # The first example pays the backend's lazy-import/warm-up cost, which
-    # under full-suite load exceeded the 200 ms default deadline and flaked
-    # as hypothesis.errors.FlakyFailure (339 ms first call, 0.1 ms replay).
-    deadline=None,
-)
+@_SETTINGS
 def test_quadratic_solution_is_invariant_to_positive_objective_scaling(
     namespace, scale
 ):
