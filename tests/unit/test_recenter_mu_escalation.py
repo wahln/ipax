@@ -35,7 +35,16 @@ def _driver(namespace, opts):
 def _stalled_record(mu):
     # kkt_error far above tolerance and inf components (defaults) so the
     # handler cannot take the "stall at an essentially optimal iterate" exit.
-    return IterationRecord(7, 1.0, mu, 0.0, 1e-4, 1.0, 1.0, 0.0)
+    return IterationRecord(
+        iteration=7,
+        objective=1.0,
+        mu=mu,
+        theta=0.0,
+        kkt_error=1e-4,
+        alpha_primal=1.0,
+        alpha_dual=1.0,
+        regularization=0.0,
+    )
 
 
 def _handle(driver, namespace, *, mu, rstate, record=None):

@@ -717,7 +717,11 @@ class MatrixFreeJacobian(LinearOperator):
 
     def rmatvec(self, v: Array) -> Array:
         if self._rmatvec is None:
-            raise NotImplementedError("matrix-free adjoint callback is not available")
+            raise NotImplementedError(
+                "this MatrixFreeJacobian has no adjoint: constraint Jacobians and "
+                "linear_ineq operators need A.T @ v, so construct it with "
+                "MatrixFreeJacobian(shape, matvec=..., rmatvec=...)"
+            )
         return self._rmatvec(v)
 
     def row_inf_norms(self, like: Array | None = None) -> Array:
@@ -832,6 +836,66 @@ def forward_gram(
         if not _gram_rejects_keywords(exc):
             raise
         return op.gram(weights)
+
+
+class ScaledOperator(LinearOperator):
+    """``alpha · A`` for a scalar ``alpha``.
+
+    A user Hessian operator must honour the ``sigma`` factor the solver passes
+    to :meth:`~ipax.problem.base.Problem.lagrangian_hessian` (it differs from 1
+    whenever gradient-based scaling rescales the objective); wrapping it here
+    scales the products (``matvec``, ``rmatvec``, ``matmat``, ``rmatmat``) and
+    the explicit forms (dense matrix, diagonal, COO) without materializing
+    anything. The symmetry hint carries over, and positive definiteness for
+    ``alpha > 0``. Other capabilities — the Gram family,
+    ``dense_matrix_with_gram``, ``row_inf_norms`` — are not forwarded; a
+    Hessian that fuses with the inequality Gram must apply ``sigma`` inside
+    ``dense_matrix_with_gram`` itself.
+    """
+
+    def __init__(self, op: LinearOperator, alpha: float) -> None:
+        self._op = op
+        self._alpha = float(alpha)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self._op.shape
+
+    def matvec(self, v: Array) -> Array:
+        return self._alpha * self._op.matvec(v)
+
+    def rmatvec(self, v: Array) -> Array:
+        return self._alpha * self._op.rmatvec(v)
+
+    def matmat(self, V: Array) -> Array:
+        return self._alpha * self._op.matmat(V)
+
+    def rmatmat(self, V: Array) -> Array:
+        return self._alpha * self._op.rmatmat(V)
+
+    def dense_matrix(self, like: Array | None = None) -> Array:
+        return self._alpha * self._op.dense_matrix(like)
+
+    def diagonal(self, like: Array | None = None) -> Array:
+        return self._alpha * self._op.diagonal(like)
+
+    def to_coo(
+        self, like: Array | None = None
+    ) -> tuple[Array, Array, Array, tuple[int, int]]:
+        rows, cols, values, shape = self._op.to_coo(like)
+        return rows, cols, self._alpha * values, shape
+
+    def coo_values(self, like: Array | None = None) -> Array:
+        return self._alpha * self._op.coo_values(like)
+
+    def coo_pattern_signature(self) -> object | None:
+        return self._op.coo_pattern_signature()
+
+    def symmetry_hint(self) -> bool | None:
+        return self._op.symmetry_hint()
+
+    def positive_definite_hint(self) -> bool:
+        return self._alpha > 0.0 and self._op.positive_definite_hint()
 
 
 class VStack(LinearOperator):
@@ -1635,8 +1699,20 @@ def as_operator(obj: Array | LinearOperator) -> LinearOperator:
     """Normalize a rank-2 dense array or existing operator."""
     if isinstance(obj, LinearOperator):
         return obj
-    if not hasattr(obj, "shape"):
-        raise TypeError("expected an Array-API array or LinearOperator")
+    try:
+        array_namespace(obj)
+    except TypeError as exc:
+        hint = ""
+        if hasattr(obj, "tocsr"):  # a scipy.sparse matrix or array
+            hint = (
+                "; wrap a scipy.sparse matrix A as "
+                "ipax.CSROperator(A.indptr, A.indices, A.data, A.shape) "
+                "(after A = A.tocsr())"
+            )
+        raise TypeError(
+            f"cannot use {type(obj).__name__} as an operator: expected an "
+            f"Array-API array or an ipax LinearOperator{hint}"
+        ) from exc
     if len(obj.shape) != 2:
         raise ValueError("only rank-2 dense arrays can be normalized as operators")
     return Dense(obj)
@@ -1653,6 +1729,7 @@ __all__ = [
     "LinearOperator",
     "LowRank",
     "MatrixFreeJacobian",
+    "ScaledOperator",
     "VStack",
     "as_operator",
     "forward_gram",

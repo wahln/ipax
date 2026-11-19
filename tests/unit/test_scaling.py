@@ -252,14 +252,14 @@ def test_row_scaled_gram_folds_scaling_into_weights(namespace, tol):
 
 
 def test_scaling_options_validation():
-    with pytest.raises(ValueError, match="scaling method"):
+    with pytest.raises(ValueError, match=r"ScalingOptions.method"):
         ScalingOptions(method="bogus")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="max_gradient"):
         ScalingOptions(method="gradient-based", max_gradient=0.0)
     for value in (math.nan, math.inf, -math.inf):
-        with pytest.raises(ValueError, match="finite"):
+        with pytest.raises(ValueError, match="max_gradient"):
             ScalingOptions(method="gradient-based", max_gradient=value)
-    with pytest.raises(ValueError, match="scaling method"):
+    with pytest.raises(ValueError, match=r"Options\.scaling"):
         Options(scaling="bogus")  # type: ignore[arg-type]
 
 

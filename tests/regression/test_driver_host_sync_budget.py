@@ -53,5 +53,6 @@ def test_host_syncs_per_iteration_bounded(namespace, make, x0, budget, options):
     if not counter.available:
         pytest.skip(f"scalar-sync counting unavailable for {type(x)!r}")
     assert result.status in (Status.OPTIMAL, Status.ACCEPTABLE)
-    per_iter = counter.count / max(1, result.n_iter)
+    # Per history row (the start point included), as the budgets were calibrated.
+    per_iter = counter.count / max(1, len(result.history))
     assert per_iter <= budget, f"{per_iter:.1f} host syncs/iter (budget {budget})"

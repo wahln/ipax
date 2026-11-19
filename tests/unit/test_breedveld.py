@@ -286,12 +286,12 @@ def test_common_step_is_inert_under_the_filter_line_search(namespace):
 # option's default value, not the code path. A future algorithmic change that
 # moves these counts should re-pin them, not blame this option.
 _FINGERPRINTS = {
-    ("HS71", "breedveld"): ("OPTIMAL", 10),
-    ("HS43", "breedveld"): ("OPTIMAL", 10),
-    ("HS35", "breedveld"): ("OPTIMAL", 6),
-    ("HS21", "breedveld"): ("OPTIMAL", 6),
-    ("HS71", "filter"): ("OPTIMAL", 9),
-    ("HS43", "filter"): ("OPTIMAL", 11),
+    ("HS71", "breedveld"): ("OPTIMAL", 9),
+    ("HS43", "breedveld"): ("OPTIMAL", 9),
+    ("HS35", "breedveld"): ("OPTIMAL", 5),
+    ("HS21", "breedveld"): ("OPTIMAL", 5),
+    ("HS71", "filter"): ("OPTIMAL", 8),
+    ("HS43", "filter"): ("OPTIMAL", 10),
 }
 _STARTS = {
     "HS71": (HS71, [1.0, 5.0, 5.0, 1.0]),

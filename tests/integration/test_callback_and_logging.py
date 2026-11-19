@@ -37,13 +37,13 @@ def test_callback_is_invoked_once_per_recorded_iteration(namespace):
         )
 
     # One call per appended history row, in order, carrying the same records.
-    assert len(seen) == result.n_iter
+    assert len(seen) == len(result.history) == result.n_iter + 1
     assert [info.record for info in seen] == list(result.history)
-    assert [info.record.iteration for info in seen] == list(range(result.n_iter))
+    assert [info.record.iteration for info in seen] == list(range(result.n_iter + 1))
     assert all(record.problem_time >= 0.0 for record in result.history)
     assert all(record.step_solve_time >= 0.0 for record in result.history)
     assert result.history[0].problem_time > 0.0
-    if result.n_iter > 1:
+    if result.n_iter > 0:
         assert any(record.step_solve_time > 0.0 for record in result.history[1:])
     # Bounded problem: the snapshot exposes the live bound multipliers.
     assert seen[0].z_lower is not None
@@ -74,7 +74,7 @@ def test_callback_truthy_return_requests_stop(namespace):
     assert not result.success
     assert "callback" in result.message
     assert calls == 2
-    assert result.n_iter == 2
+    assert result.n_iter == 1  # iterations performed
 
 
 def test_acceptable_stopping_is_integrated_with_the_driver(namespace):
@@ -101,7 +101,7 @@ def test_acceptable_stopping_is_integrated_with_the_driver(namespace):
 
     assert result.status is Status.ACCEPTABLE
     assert result.success
-    assert result.n_iter == 1
+    assert result.n_iter == 0  # iterations performed
     assert "acceptable" in result.message
     assert result.kkt_error == max(
         result.dual_infeasibility,
@@ -148,7 +148,7 @@ def test_wall_time_stopping_is_integrated_with_the_driver(namespace):
 
     assert result.status is Status.MAX_TIME
     assert not result.success
-    assert result.n_iter == 1
+    assert result.n_iter == 0  # iterations performed
 
 
 def test_objective_stagnation_is_guarded_and_skips_the_initial_record(namespace):
@@ -183,7 +183,7 @@ def test_objective_stagnation_is_guarded_and_skips_the_initial_record(namespace)
         )
 
     assert result.status is Status.ACCEPTABLE
-    assert result.n_iter == 2
+    assert result.n_iter == 1  # iterations performed
     assert result.kkt_error <= 1.0
 
 

@@ -59,12 +59,14 @@ Override (or pass to `FunctionProblem`) any of `gradient`,
 | Quantity | Resolution order |
 |---|---|
 | gradient, Jacobians | analytic → autodiff → finite-difference |
-| Lagrangian Hessian | analytic → autodiff-HVP → **L-BFGS** |
+| Lagrangian Hessian | analytic → **L-BFGS** (default `hessian="auto"`) |
 
 Autodiff is only attempted on backends that support it (PyTorch, JAX); on
-NumPy/CuPy the chain falls through to finite differences. The Hessian default is
-L-BFGS on every backend. Whatever was actually used is reported back on the
-result:
+NumPy/CuPy the chain falls through to finite differences. The Hessian never
+falls back to autodiff: without an analytic `lagrangian_hessian` it is L-BFGS
+on every backend, and autodiff Hessian-vector products are used only when
+requested with `Options(hessian="autodiff-hvp")`. Whatever was actually used is
+reported back on the result:
 
 ```python
 res = ipax.solve(problem, x0)
@@ -72,14 +74,32 @@ print(res.derivative_sources)
 # DerivativeSources(gradient='finite-diff', ..., hessian='lbfgs')
 ```
 
+Overriding an optional method is what declares it provided; a method left as
+inherited is derived. A class that overrides methods it cannot always serve (a
+delegating wrapper, say) lists what it really provides with `provides()` — a
+derivative not listed is derived even if overridden, and an unknown name raises
+`ipax.ProblemDefinitionError`:
+
+```python
+def provides(self):
+    return frozenset({"gradient", "ineq_constraints"})
+```
+
 Providing an analytic gradient is the single highest-value derivative to supply:
 it removes `n+1` extra objective evaluations per finite-difference gradient and
 is usually cheap to write.
 
 !!! tip "Exact Hessian"
-    Supply `lagrangian_hessian` and pass `Options(hessian="exact")` to use it.
-    The default `hessian="lbfgs"` ignores an analytic Hessian; see
-    [Configuring the solver](options.md#hessian).
+    Supply `lagrangian_hessian` and the default `hessian="auto"` uses it;
+    `Options(hessian="exact")` additionally makes a missing one an error, and
+    `hessian="lbfgs"` ignores it. The solver always calls
+    `lagrangian_hessian(x, y_eq, y_ineq, sigma)` with four positional
+    arguments: `sigma` is a Python float that may differ from 1 — it does
+    whenever the default gradient-based scaling rescales the objective
+    (‖∇f(x0)‖∞ > `ScalingOptions.max_gradient`) — so always scale the
+    objective term by it; `y_eq`/`y_ineq`
+    are the *nonlinear*-constraint multipliers only (empty arrays when there
+    are none). See [Configuring the solver](options.md#hessian).
 
 ## Sharing work between the objective and the gradient
 
@@ -179,11 +199,15 @@ class Constrained(ipax.Problem):
         return x[0] ** 2 + x[1] ** 2
 
     def eq_constraints(self, x):  # c(x) = 0
-        return x[0] + x[1] - 1.0  # returns a length-1 array-like
+        return x[0:1] + x[1:2] - 1.0  # a rank-1 array of shape (1,)
 
     def ineq_constraints(self, x):  # g(x) ≤ 0
-        return x[0] ** 2 - x[1]  # i.e. x[1] ≥ x[0]²
+        return x[0:1] ** 2 - x[1:2]  # i.e. x[1] ≥ x[0]²
 ```
+
+Constraint values must be rank-1 arrays in `x`'s namespace, even for a single
+constraint (slicing, as here, keeps the backend; `x[0] + x[1] - 1.0` would be
+0-d).
 
 Use the sign convention exactly: equalities are `c(x) = 0`, inequalities are
 `g(x) ≤ 0`. Rewrite `h(x) ≥ 0` as `-h(x) ≤ 0`.
@@ -244,26 +268,48 @@ def linear_ineq(self):
 
 Any Jacobian or the Hessian may return a
 [`LinearOperator`](../concepts/linalg.md) rather than a dense array. This is the
-recommended path at `1e4`–`1e5` scale: the operator exposes a `matvec` (and
-optionally `rmatvec`), so the matrix-free Krylov route never forms an `n×n`
-object. The same `Problem` then runs dense, matrix-free, or sparse with no code
-change — only the [linear-solver choice](options.md#linear-solver) differs.
+recommended path at `1e4`–`1e5` scale: the operator exposes a `matvec`, so the
+matrix-free Krylov route never forms an `n×n` object. A constraint Jacobian or
+a `linear_ineq` operator must also provide `rmatvec` (`Aᵀv`); a
+`MatrixFreeJacobian` built without one raises when the solver needs it. The
+same `Problem` then runs dense, matrix-free, or sparse with no code change —
+only the [linear-solver choice](options.md#linear-solver) differs.
 
 ```python
 from ipax.backend.operators import MatrixFreeJacobian
 
 
-def lagrangian_hessian(self, x, y_eq, y_ineq, sigma=1.0):
+def lagrangian_hessian(self, x, y_eq, y_ineq, sigma):
     n = self.n_vars
-    return MatrixFreeJacobian((n, n), matvec=lambda v: self._hess_prod(x, v))
+
+    # W = σ∇²f + Σ y·∇²(constraints). This objective-only model has no
+    # constraint curvature, so the multipliers drop out; σ must not.
+    def hv(v):
+        return sigma * self._hess_prod(x, v)
+
+    return MatrixFreeJacobian((n, n), matvec=hv, rmatvec=hv)
 ```
 
+An existing operator `H` for `∇²f` can be returned as `ScaledOperator(H, sigma)`
+(`ipax.backend.operators`), which scales every product and explicit form
+without materializing anything.
+
 For sparse-direct factorization the operator additionally exposes COO structure;
-the built-in `Dense`, `Diagonal`, and `Identity` operators already do, and the
-`SparseOperator` adapter wraps a backend sparse matrix. See
+the built-in `Dense`, `Diagonal`, and `Identity` operators already do, and
+`ipax.COOOperator` / `ipax.CSROperator` / `ipax.CSCOperator` carry a sparse
+matrix as Array-API index/value vectors. A `scipy.sparse` matrix is not
+accepted directly (`TypeError`); wrap it as
+`ipax.CSROperator(A.indptr, A.indices, A.data, A.shape)` after `A = A.tocsr()`
+— note the order is `(indptr, indices, data)`, the reverse of SciPy's
+`csr_matrix((data, indices, indptr))`. See
 [The linear-algebra layer](../concepts/linalg.md).
 
 ### Fusing the Hessian with the inequality Gram (optional)
+
+Apply `sigma` inside `dense_matrix_with_gram` rather than wrapping the Hessian
+in `ScaledOperator`: the wrapper does not forward this method (`σW + JᵀΣJ` is
+not `σ(W + JᵀΣJ)`), so a wrapped Hessian silently falls back to the two-pass
+assembly below.
 
 On the dense route the solver forms the condensed block
 `N = W + ∇gᵀ Σ_s ∇g + Σ_x` in two passes: `W.dense_matrix()` and the
@@ -317,7 +363,7 @@ lp = ipax.LinearProblem(
 ```
 
 `QuadraticProblem` reports an exact gradient (`Qx + c`) and Hessian (`Q`), so
-`hessian="exact"` uses them directly. `Q` may be a `LinearOperator` for a
+the default `hessian="auto"` uses them directly. `Q` may be a `LinearOperator` for a
 matrix-free quadratic.
 
 ## Next steps

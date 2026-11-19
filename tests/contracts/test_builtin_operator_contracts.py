@@ -13,6 +13,7 @@ from ipax.backend.operators import (
     Identity,
     LowRank,
     MatrixFreeJacobian,
+    ScaledOperator,
     VStack,
 )
 from ipax.backend.sparse import get_sparse_adapter
@@ -36,6 +37,23 @@ class TestDiagonalOperator(LinearOperatorContract):
 
     def make_operator(self, namespace):
         return Diagonal(array(namespace, [2.0, -3.0, 4.0]))
+
+
+class TestScaledDenseOperator(LinearOperatorContract):
+    def make_dense(self, namespace):
+        return array(namespace, [[-1.0, 0.5, -0.25], [0.0, -1.5, -2.0]])
+
+    def make_operator(self, namespace):
+        base = Dense(array(namespace, [[2.0, -1.0, 0.5], [0.0, 3.0, 4.0]]))
+        return ScaledOperator(base, -0.5)
+
+
+class TestScaledDiagonalOperator(LinearOperatorContract):
+    def make_dense(self, namespace):
+        return array(namespace, [[0.5, 0.0, 0.0], [0.0, -0.75, 0.0], [0.0, 0.0, 1.0]])
+
+    def make_operator(self, namespace):
+        return ScaledOperator(Diagonal(array(namespace, [2.0, -3.0, 4.0])), 0.25)
 
 
 class TestIdentityOperator(LinearOperatorContract):
