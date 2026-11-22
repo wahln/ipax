@@ -18,7 +18,13 @@ derivative-precedence chain.
 | `gradient(x)` | analytic → autodiff → finite-difference |
 | `eq_constraints` / `eq_jacobian` | analytic → autodiff → finite-difference |
 | `ineq_constraints` / `ineq_jacobian` | analytic → autodiff → finite-difference |
-| `lagrangian_hessian(x, y_eq, y_ineq, σ)` | analytic → autodiff-HVP → **L-BFGS** |
+| `lagrangian_hessian(x, y_eq, y_ineq, σ)` | analytic → **L-BFGS** (default `hessian="auto"`); autodiff-HVP only with `hessian="autodiff-hvp"` |
+
+Overriding an optional method declares it provided; `provides()` returning a
+set of method names overrides that inference (for delegating wrappers).
+`lagrangian_hessian` is always called with four positional arguments; `σ`
+may differ from 1 (it does whenever the default gradient-based scaling
+rescales the objective), so always scale the objective term by it.
 
 ## Declared separately
 

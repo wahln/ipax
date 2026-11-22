@@ -14,20 +14,27 @@
 
 """Derivative-precedence resolver.
 
-Inspects which ``Problem`` methods are overridden and what the backend supports,
+Inspects which ``Problem`` methods are provided (``Problem.provides()``, else
+which are overridden) and what the backend supports,
 then binds each derivative to a concrete source:
 
 - gradient / nonlinear Jacobians: analytic → autodiff → finite-difference
-- Lagrangian Hessian: analytic operator → autodiff-HVP → L-BFGS
+- Lagrangian Hessian: analytic operator → L-BFGS (autodiff-HVP on request)
 
 The chosen sources are recorded in :class:`~ipax.result.DerivativeSources`.
 """
 
 from __future__ import annotations
 
-import warnings
 from typing import TYPE_CHECKING
 
+from ipax._deprecation import warn_deprecated
+from ipax.errors import (
+    DerivativeUnavailableError,
+    FiniteDifferenceWarning,
+    ProblemDefinitionError,
+    warn_external,
+)
 from ipax.problem.autodiff import get_autodiff_adapter
 from ipax.problem.base import Problem
 from ipax.problem.finitediff import gradient_fd, jacobian_fd
@@ -41,16 +48,57 @@ if TYPE_CHECKING:
     from ipax.typing import Array, Namespace, Scalar
 
 
-def _provides(problem: Problem, name: str) -> bool:
-    """Whether ``problem`` supplies ``name`` (analytic) rather than inheriting it.
+_OPTIONAL_METHODS = frozenset(
+    {
+        "gradient",
+        "eq_constraints",
+        "eq_jacobian",
+        "ineq_constraints",
+        "ineq_jacobian",
+        "lagrangian_hessian",
+    }
+)
 
-    :class:`~ipax.problem.function.FunctionProblem` overrides every optional
-    method, so it advertises what it actually has through a ``_provided`` set;
-    for hand-written subclasses we compare against the abstract base.
+
+def _declared(problem: Problem) -> frozenset[str] | None:
+    """The method names ``problem`` declares through :meth:`Problem.provides`."""
+    declared = problem.provides()
+    if declared is None:
+        legacy = getattr(problem, "_provided", None)
+        if legacy is None:
+            return None
+        # Before 0.14 the resolver read this private attribute; honour it for
+        # one more release so delegating wrappers that set it keep working.
+        warn_deprecated(
+            f"{type(problem).__name__}._provided",
+            "Problem.provides()",
+            since="0.14",
+            remove_in="0.15",
+            category=DeprecationWarning,
+        )
+        return frozenset(legacy) - {"objective"}
+    if not isinstance(declared, (set, frozenset)):
+        raise ProblemDefinitionError(
+            f"{type(problem).__name__}.provides() must return a frozenset of "
+            f"method names or None, got {type(declared).__name__}"
+        )
+    unknown = set(declared) - _OPTIONAL_METHODS
+    if unknown:
+        raise ProblemDefinitionError(
+            f"{type(problem).__name__}.provides() names unknown methods "
+            f"{sorted(unknown)}; valid names are {sorted(_OPTIONAL_METHODS)}"
+        )
+    return frozenset(declared)
+
+
+def _provides(problem: Problem, declared: frozenset[str] | None, name: str) -> bool:
+    """Whether ``problem`` supplies ``name`` rather than leaving it to the solver.
+
+    An explicit :meth:`~ipax.problem.base.Problem.provides` set decides;
+    otherwise overriding the method counts as providing it.
     """
-    provided = getattr(problem, "_provided", None)
-    if provided is not None:
-        return name in provided
+    if declared is not None:
+        return name in declared
     return getattr(type(problem), name) is not getattr(Problem, name)
 
 
@@ -60,7 +108,9 @@ class ResolvedProblem(Problem):
     The IPM driver consumes this, never the raw ``Problem``: it always has a
     gradient, the Jacobians it needs, and a record of how each was obtained.
     Constraint *values* and bounds delegate straight to the underlying problem;
-    only the derivatives are rebound.
+    only the derivatives are rebound. A constraint block the problem does not
+    provide raises :class:`NotImplementedError` here even if its method is
+    overridden, so every later existence check agrees with the resolver.
     """
 
     def __init__(
@@ -72,8 +122,12 @@ class ResolvedProblem(Problem):
         ineq_jacobian: Callable[[Array], Array | LinearOperator] | None,
         sources: DerivativeSources,
         has_analytic_hessian: bool,
+        has_eq_constraints: bool = True,
+        has_ineq_constraints: bool = True,
     ) -> None:
         self._problem = problem
+        self._has_eq_constraints = has_eq_constraints
+        self._has_ineq_constraints = has_ineq_constraints
         self._gradient_fn = gradient
         self._eq_jacobian_fn = eq_jacobian
         self._ineq_jacobian_fn = ineq_jacobian
@@ -94,6 +148,8 @@ class ResolvedProblem(Problem):
         return self._gradient_fn(x)
 
     def eq_constraints(self, x: Array) -> Array:
+        if not self._has_eq_constraints:
+            raise NotImplementedError
         return self._problem.eq_constraints(x)
 
     def eq_jacobian(self, x: Array) -> Array | LinearOperator:
@@ -102,6 +158,8 @@ class ResolvedProblem(Problem):
         return self._eq_jacobian_fn(x)
 
     def ineq_constraints(self, x: Array) -> Array:
+        if not self._has_ineq_constraints:
+            raise NotImplementedError
         return self._problem.ineq_constraints(x)
 
     def ineq_jacobian(self, x: Array) -> Array | LinearOperator:
@@ -129,22 +187,23 @@ class ResolvedProblem(Problem):
 
 def _resolve_gradient(
     problem: Problem,
+    declared: frozenset[str] | None,
     adapter: object | None,
     options: Options,
 ) -> tuple[Callable[[Array], Array], str]:
-    if _provides(problem, "gradient"):
+    if _provides(problem, declared, "gradient"):
         return problem.gradient, "analytic"
     if options.enable_autodiff and adapter is not None:
         grad = adapter.grad  # type: ignore[attr-defined]
         return (lambda x: grad(problem.objective, x)), "autodiff"
     if options.enable_finite_diff:
-        warnings.warn(
+        warn_external(
             "objective gradient resolved by finite differences; supply an "
             "analytic gradient or an autodiff backend for accuracy and speed",
-            stacklevel=3,
+            FiniteDifferenceWarning,
         )
         return (lambda x: gradient_fd(problem.objective, x)), "finite-diff"
-    raise RuntimeError(
+    raise DerivativeUnavailableError(
         "no gradient source available: the problem defines no analytic "
         "gradient and both autodiff and finite differences are disabled"
     )
@@ -152,27 +211,28 @@ def _resolve_gradient(
 
 def _resolve_jacobian(
     problem: Problem,
+    declared: frozenset[str] | None,
     constraints_name: str,
     jacobian_name: str,
     constraints_fn: Callable[[Array], Array],
     adapter: object | None,
     options: Options,
 ) -> tuple[Callable[[Array], Array | LinearOperator] | None, str]:
-    if not _provides(problem, constraints_name):
+    if not _provides(problem, declared, constraints_name):
         return None, "n/a"
-    if _provides(problem, jacobian_name):
+    if _provides(problem, declared, jacobian_name):
         return getattr(problem, jacobian_name), "analytic"
     if options.enable_autodiff and adapter is not None:
         jac = adapter.jacobian  # type: ignore[attr-defined]
         return (lambda x: jac(constraints_fn, x)), "autodiff"
     if options.enable_finite_diff:
-        warnings.warn(
+        warn_external(
             f"{constraints_name} Jacobian resolved by finite differences; this "
             "is dense and only appropriate for small problems",
-            stacklevel=3,
+            FiniteDifferenceWarning,
         )
         return (lambda x: jacobian_fd(constraints_fn, x)), "finite-diff"
-    raise RuntimeError(
+    raise DerivativeUnavailableError(
         f"no Jacobian source available for {constraints_name}: define "
         f"{jacobian_name}, or enable autodiff / finite differences"
     )
@@ -180,6 +240,7 @@ def _resolve_jacobian(
 
 def _resolve_hessian_source(
     problem: Problem,
+    declared: frozenset[str] | None,
     adapter: object | None,
     options: Options,
 ) -> tuple[bool, str]:
@@ -198,15 +259,15 @@ def _resolve_hessian_source(
         return False, "lbfgs"
     if mode == "autodiff-hvp":
         if adapter is None:
-            raise RuntimeError(
+            raise DerivativeUnavailableError(
                 "hessian='autodiff-hvp' requires an autodiff-capable backend "
                 "(PyTorch or JAX); none is available for this namespace"
             )
         return False, "autodiff-hvp"
-    if _provides(problem, "lagrangian_hessian"):
+    if _provides(problem, declared, "lagrangian_hessian"):
         return True, "exact"
     if mode == "exact":
-        raise RuntimeError(
+        raise DerivativeUnavailableError(
             "hessian='exact' requires problem.lagrangian_hessian; use "
             "hessian='auto' (or omit it) to fall back to L-BFGS, or "
             "hessian='autodiff-hvp' on an autodiff-capable backend"
@@ -221,14 +282,17 @@ def resolve(
 ) -> ResolvedProblem:
     """Bind every derivative the solver needs, honoring precedence.
 
-    Raises ``RuntimeError`` if a required derivative cannot be produced (e.g.
+    Raises :class:`~ipax.errors.DerivativeUnavailableError` (a
+    ``RuntimeError``) if a required derivative cannot be produced (e.g.
     autodiff disabled and finite-diff disabled with no analytic gradient).
     """
     adapter = get_autodiff_adapter(xp) if options.enable_autodiff else None
 
-    gradient_fn, gradient_src = _resolve_gradient(problem, adapter, options)
+    declared = _declared(problem)
+    gradient_fn, gradient_src = _resolve_gradient(problem, declared, adapter, options)
     eq_jacobian_fn, eq_jac_src = _resolve_jacobian(
         problem,
+        declared,
         "eq_constraints",
         "eq_jacobian",
         problem.eq_constraints,
@@ -237,6 +301,7 @@ def resolve(
     )
     ineq_jacobian_fn, ineq_jac_src = _resolve_jacobian(
         problem,
+        declared,
         "ineq_constraints",
         "ineq_jacobian",
         problem.ineq_constraints,
@@ -244,7 +309,7 @@ def resolve(
         options,
     )
     has_analytic_hessian, hessian_src = _resolve_hessian_source(
-        problem, adapter, options
+        problem, declared, adapter, options
     )
 
     sources = DerivativeSources(
@@ -260,6 +325,8 @@ def resolve(
         ineq_jacobian=ineq_jacobian_fn,
         sources=sources,
         has_analytic_hessian=has_analytic_hessian,
+        has_eq_constraints=_provides(problem, declared, "eq_constraints"),
+        has_ineq_constraints=_provides(problem, declared, "ineq_constraints"),
     )
 
 

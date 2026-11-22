@@ -57,8 +57,10 @@ the entire solve runs in PyTorch.
 
 Override any of `gradient`, `eq_constraints`/`eq_jacobian`,
 `ineq_constraints`/`ineq_jacobian`, `lagrangian_hessian`. Anything you omit is
-resolved automatically (analytic → autodiff → finite-difference; Hessian →
-autodiff-HVP → L-BFGS). The chosen source is reported in `res.derivative_sources`.
+resolved automatically (analytic → autodiff → finite-difference; the Hessian is
+the analytic one when supplied, otherwise L-BFGS — autodiff Hessian-vector
+products only with `Options(hessian="autodiff-hvp")`). The chosen source is
+reported in `res.derivative_sources`.
 
 ## Linear vs nonlinear constraints
 

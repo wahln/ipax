@@ -72,7 +72,7 @@ def test_active_flags():
 
 
 def test_corrections_options_validation():
-    with pytest.raises(ValueError, match="corrections method"):
+    with pytest.raises(ValueError, match=r"CorrectionsOptions.method"):
         CorrectionsOptions(method="bogus")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="gondzio_max_corrections"):
         CorrectionsOptions(gondzio_max_corrections=-1)

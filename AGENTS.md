@@ -57,7 +57,7 @@ instead of working around it.
 
 ```
 ipax/
-  typing.py options.py result.py solve.py
+  typing.py options.py result.py solve.py errors.py _deprecation.py
   problem/      base.py (Problem ABC), function.py, derivatives.py,
                 finitediff.py, autodiff/{jax,torch}.py
   backend/      namespace.py, operators.py,
@@ -75,14 +75,21 @@ benchmarks/     generators/, corpus/, harness, runners, reports
 
 - **`Problem`** (`problem/base.py`): user-facing ABC. Required: `n_vars`,
   `objective`. Optional (resolved by `derivatives.py`): `gradient`, nonlinear
-  `eq/ineq_constraints` + Jacobians, and `lagrangian_hessian`. **Linear constraints
+  `eq/ineq_constraints` + Jacobians, and `lagrangian_hessian`. Overriding an
+  optional method declares it provided; `Problem.provides()` overrides that
+  inference. `lagrangian_hessian(x, y_eq, y_ineq, sigma)` is always called with
+  four positional arguments, `sigma` may differ from 1 (scaling); new
+  capabilities arrive as new methods, never new parameters. **Linear constraints
   are declared separately** (`linear_eq`/`linear_ineq`, constant data) from nonlinear
   ones — constant Jacobian, no Hessian term, assembled once. Derivative precedence:
-  analytic → autodiff → finite-diff (grads/Jacobians); analytic → autodiff-HVP →
-  **L-BFGS** (Hessian). Never form a dense Hessian at scale.
+  analytic → autodiff → finite-diff (grads/Jacobians); analytic → **L-BFGS**
+  (Hessian, default `hessian="auto"`; autodiff-HVP only when requested). Never
+  form a dense Hessian at scale.
 - **`LinearOperator`** (`backend/operators.py`): `matvec`/`rmatvec`/`matmat`;
-  subclasses `Dense, Diagonal, LowRank, LBFGSOperator, MatrixFreeJacobian,
-  SparseOperator, Composite`. All `Problem` Jacobians/Hessians normalize to these.
+  subclasses `Dense, Diagonal, Identity, LowRank, MatrixFreeJacobian,
+  ScaledOperator, Composite, VStack, COOOperator/CSROperator/CSCOperator` there,
+  `LBFGSOperator` in `ipm/hessian.py`, per-backend `SparseOperator`s in
+  `backend/sparse/`. All `Problem` Jacobians/Hessians normalize to these.
 - **`LinearSolver`** (`linalg/solver.py`): `DenseSolver` (Cholesky/solve),
   `KrylovSolver` (CG/MINRES/GMRES, matrix-free — default at scale), and
   `SparseDirectSolver` (per-backend). Auto-selected by size/density/capabilities.
@@ -92,13 +99,16 @@ benchmarks/     generators/, corpus/, harness, runners, reports
 ## Math conventions (match the code to these)
 
 - Standard form uses slacks: `g(x)+s=0, s≥0`. Multipliers: `y` (equalities),
-  `λ` (inequalities/slacks), `z_L,z_U` (bounds). `diag(v)=V`; `e`=all-ones.
+  `λ` (inequalities/slacks), `z_L,z_U` (bounds) — in code and in `Result`:
+  `y_eq`, `y_ineq`, `z_lower`, `z_upper`. `diag(v)=V`; `e`=all-ones.
 - Two KKT solve routes: the **condensed normal-equations** route (Array-API-native,
   default for dense & matrix-free; PD via Powell-damped L-BFGS + primal–dual
   regularization, so **no inertia oracle required**) and the **indefinite augmented**
   route (sparse-direct backends with LDLᵀ inertia only).
 - Regularization: Friedlander–Orban primal–dual (`δ_w` on (1,1), `−δ_c` on (2,2));
-  on Cholesky failure escalate `δ_w` from `1e-6`, doubling, per Breedveld.
+  on Cholesky failure escalate `δ_w` from `1e-6` by
+  `RegularizationOptions.delta_w_factor` (default 8, IPOPT's `perturb_inc_fact`;
+  Breedveld doubles).
 - Convergence: scaled KKT ∞-norm ≤ `ε_tol` (default `1e-8`), IPOPT scaling
   `s_d, s_c`.
 
@@ -115,6 +125,13 @@ Sigma_s, N, mu, tau, alpha, theta, phi`).
 - Formatting/lint: `ruff` (format + lint) and `mypy` clean before commit.
 - Pure functions where practical; no hidden global state; explicit `xp`/device
   threading.
+- Raise the classes in `ipax/errors.py` (each also subclasses the built-in it
+  replaced); emit warnings with `errors.warn_external` so they name the user's
+  line. A renamed public name keeps working for ≥1 minor release via
+  `ipax/_deprecation.py` (`FutureWarning` for user-facing names,
+  `DeprecationWarning` for extension hooks). What counts as public is defined
+  in `docs/stability.md`, and `tests/test_public_api.py` keeps it in step with
+  `docs/reference.md` and `ipax.__all__`.
 - Floats are `float64` by default; never hard-code a dtype — read it from inputs.
 
 ---
@@ -132,7 +149,9 @@ Sigma_s, N, mu, tau, alpha, theta, phi`).
 - **Oracles:** verify KKT conditions at the solution; closed-form QP/LP optima,
   Hock–Schittkowski set, cross-check vs `scipy.optimize` and `cyipopt` when installed.
 - **Derivative harness:** FD vs analytic vs autodiff grad/Jacobian + Hessian-vector
-  checks (also a public utility usable on any user `Problem`).
+  checks (`tests/property/test_derivative_checks.py`). There is no public
+  derivative-check utility yet; one usable on any user `Problem` is a proposed
+  feature, not part of the API.
 - **Benchmarks are separate** (`benchmarks/`, not `tests/`): synthetic RT-like
   generators (`1e3`–`1e5` vars, 5–50% density) + standard sets, tracked over commits
   with `asv`; run nightly, not per-PR.
@@ -216,7 +235,12 @@ dose-matrix Gram and grouped exact Hessian (Breedveld 2017; van Haveren &
 Breedveld 2019). Such code must reach the solver only through those
 protocols (an operator supplying its own `gram`, a `Problem` supplying its
 own Hessian), never through changes to `ipax/`; it is the reference for what a
-downstream RT layer would look like, not part of the solver's API.
+downstream RT layer would look like, not part of the solver's API. One
+exception is known: the TROTS loader's tiled Gram subclasses `CSROperator`
+and writes its private state (`_SparseStructured` fields, `_expand_indptr`).
+That is a benchmark-side shortcut a downstream layer must not copy — the
+public subclassing contract for `COOOperator`/`CSROperator`/`CSCOperator` is
+to override public methods only.
 
 ---
 
@@ -234,8 +258,9 @@ gated on these exit criteria (the day-to-day work below is *how* we get there, n
 new feature list):
 
 1. **API stability.** The public surface — `solve`, `Problem`, `Options`, `Result`,
-   and the `LinearOperator`/`LinearSolver` protocols — holds stable across the `0.x`
-   series, with any deprecations carried for at least one minor release.
+   and the `LinearOperator`/`LinearSolver` protocols, as defined in
+   `docs/stability.md` — holds stable across the `0.x` series, with any
+   deprecations carried for at least one minor release.
 2. **Published documentation.** The MkDocs site (`docs/`: API reference + guides) is
    built and published.
 3. **GPU & sparse-direct verification.** The CuPy/cuDSS and Torch/JAX-CUDA sparse

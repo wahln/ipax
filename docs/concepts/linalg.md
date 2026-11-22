@@ -5,14 +5,21 @@ sparsity-related lives behind them.
 
 ## `LinearOperator`
 
-A backend-agnostic `matvec` (+ optional `rmatvec`/`matmat`). Subclasses:
-`Dense`, `Diagonal`, `Identity`, `LowRank`, `LBFGSOperator`,
-`MatrixFreeJacobian`, `SparseOperator`, `Composite`. Every `Problem`
-Jacobian/Hessian normalizes into one of these.
+A backend-agnostic `matvec` (+ optional `rmatvec`/`matmat`). Every `Problem`
+Jacobian/Hessian normalizes into one:
+
+| Where | Classes |
+|---|---|
+| `backend/operators.py` (public) | `Dense`, `Diagonal`, `Identity`, `LowRank`, `MatrixFreeJacobian`, `Composite`, `ScaledOperator`, `VStack`, `COOOperator` / `CSROperator` / `CSCOperator` |
+| `ipm/hessian.py` (internal) | `LBFGSOperator` — the compact L-BFGS Hessian |
+| `backend/sparse/` (per-backend adapters) | `SparseOperator` — wraps a backend sparse matrix; never seen by the IPM |
 
 ## `LinearSolver`
 
-`solve(K, rhs) -> step` for the augmented or condensed KKT operator.
+`factor(K)` prepares (factors, or for Krylov binds) the augmented or condensed
+KKT operator; `solve(rhs)` then returns the step, and one `factor` serves
+several `solve` calls (second-order and centrality corrections re-solve
+without re-factoring).
 
 | Solver | Use | Purity |
 |---|---|---|
@@ -22,12 +29,16 @@ Jacobian/Hessian normalizes into one of these.
 
 Selection is automatic (size, constraint shape, Jacobian density, estimated
 Gram fill, namespace capabilities) and user-overridable via `Options.linsolve`.
-Adding a solver never touches `ipm/driver.py` (invariant #3).
+Adding an in-tree solver never touches `ipm/driver.py` (invariant #3). There is
+currently no public way to pass a custom `LinearSolver` to `solve()`; that is
+planned before 1.0.
 
-Beyond `factor`/`solve`, the protocol has optional hooks the driver reads
-through duck typing: `set_outer_residual` (inexact-Newton forcing for
-iterative solvers), `describe`/`kkt_form` (reported in `Result.routes`), and
-`is_direct` — formally the separate `SolverKind` capability protocol, so a
+The protocol's third member, `set_outer_residual(residual)`, is required: the
+driver calls it on every iteration (inexact-Newton forcing for iterative
+solvers; a direct solver makes it a no-op). Beyond those three, the driver
+reads optional hooks through duck typing: `describe`/`kkt_form` (reported in
+`Result.linear_solver` / `Result.routes`), `inertia_or_none` (the factor's
+inertia, for inertia-guided δ_w correction), and `is_direct` — formally the separate `SolverKind` capability protocol, so a
 solver written against the plain `LinearSolver` protocol keeps satisfying it —
 `True` when `factor` does the work and `solve` back-substitutes,
 `False` when every `solve` is a Krylov run (a solver without it counts as

@@ -55,9 +55,9 @@ def _run(backend: str, x0: Any) -> None:
             f"dispatched sparse adapter): {e}"
         )
         hvp = ipax.Result(
-            ipax.Status.NUMERICAL_ERROR,
-            xp.full_like(x0, float("nan")),
-            float("nan"),
+            status=ipax.Status.NUMERICAL_ERROR,
+            x=xp.full_like(x0, float("nan")),
+            objective=float("nan"),
             kkt_error=float("nan"),
             n_iter=0,
             derivative_sources=ipax.DerivativeSources(gradient=None, hessian=None),

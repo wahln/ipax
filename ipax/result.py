@@ -49,7 +49,7 @@ class Status(Enum):
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class KKTResiduals:
     """Scaled components whose maximum is the solver's KKT error."""
 
@@ -70,7 +70,7 @@ class KKTResiduals:
         return max(components)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class IterationRecord:
     """One row of the iteration log.
 
@@ -82,7 +82,7 @@ class IterationRecord:
     iteration: int
     objective: float
     mu: float
-    theta: float  # constraint violation ‖(c, g+s)‖₁
+    theta: float  # constraint violation max(‖c‖∞, max(g, 0), bound overshoot)
     kkt_error: float  # scaled KKT ∞-norm
     alpha_primal: float
     alpha_dual: float
@@ -104,7 +104,7 @@ class IterationRecord:
     soc_attempted: bool = False
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True, eq=False)
 class IterationInfo:
     """Read-only snapshot handed to a user iteration callback each iteration.
 
@@ -133,7 +133,7 @@ class IterationInfo:
 IterationCallback = Callable[["IterationInfo"], "bool | None"]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class DerivativeSources:
     """How each derivative was obtained (§3.3) — surfaced for transparency."""
 
@@ -143,7 +143,7 @@ class DerivativeSources:
     hessian: str = "lbfgs"  # exact | autodiff-hvp | lbfgs
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Routes:
     """Which route each auto-selectable mechanism actually took.
 
@@ -176,13 +176,15 @@ class Routes:
     corrections: str = ""  # none | mehrotra | gondzio
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True, eq=False)
 class Result:
     """Solution and diagnostics returned by :func:`ipax.solve`.
 
-    ``success`` is true for strict :attr:`Status.OPTIMAL` and the explicitly
-    enabled :attr:`Status.ACCEPTABLE` exit. The status itself records the stopping
-    condition; component KKT residuals provide the corresponding diagnostics.
+    ``success`` is true for strict :attr:`Status.OPTIMAL` and for the
+    acceptable-level :attr:`Status.ACCEPTABLE` exit (on by default; see
+    :class:`~ipax.options.AcceptableStoppingOptions`). The status itself records
+    the stopping condition; component KKT residuals provide the corresponding
+    diagnostics.
 
     When an :attr:`Status.ACCEPTABLE` exit came from the terminal KKT
     certificate (a failing run salvaged at its returned best iterate with
@@ -202,7 +204,7 @@ class Result:
     z_lower: Array | None = None
     z_upper: Array | None = None
 
-    n_iter: int = 0
+    n_iter: int = 0  # iterations performed (``history`` also holds the start)
     kkt_error: float = float("inf")
     constraint_violation: float = float("inf")
     solve_time: float = 0.0  # total wall-clock seconds for the solve
@@ -217,7 +219,6 @@ class Result:
     complementarity: float = float("inf")
     # The resolved auto-selection routes, or ``None`` when the solve exited
     # before any machinery was selected (e.g. infeasible bounds at x0).
-    # Appended last so positional construction of older Results stays valid.
     routes: Routes | None = None
 
     @property
@@ -225,7 +226,7 @@ class Result:
         return self.status.is_success
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True, eq=False)
 class WarmStart:
     """Initial slacks/multipliers seeding a solve.
 

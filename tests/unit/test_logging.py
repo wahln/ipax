@@ -108,7 +108,18 @@ def test_header_uses_log_scaled_mu_and_reg_columns():
 
 def test_format_record_log_scales_mu_and_regularization():
     # mu = 1e-8 → lg(mu) = -8.0; reg = 1e-6 → lg(rg) = -6.0.
-    record = IterationRecord(3, 1.0, 1e-8, 1e-9, 1e-9, 1.0, 1.0, 1e-6, 0.0, 0.0)
+    record = IterationRecord(
+        iteration=3,
+        objective=1.0,
+        mu=1e-8,
+        theta=1e-9,
+        kkt_error=1e-9,
+        alpha_primal=1.0,
+        alpha_dual=1.0,
+        regularization=1e-6,
+        problem_time=0.0,
+        step_solve_time=0.0,
+    )
     row = format_record(record)
     assert "-8.0" in row
     assert "-6.0" in row
@@ -119,7 +130,18 @@ def test_format_record_dashes_zero_regularization():
     # δ_w = 0 is the common case; log10(0) is -inf, so it prints a dash, not a
     # misleading "0.00e+00" that hides whether any regularization happened.
     # Nonzero timing fields so the only possible "0.00e+00" would be the reg col.
-    record = IterationRecord(3, 1.0, 1e-8, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.5, 0.25)
+    record = IterationRecord(
+        iteration=3,
+        objective=1.0,
+        mu=1e-8,
+        theta=1e-9,
+        kkt_error=1e-9,
+        alpha_primal=1.0,
+        alpha_dual=1.0,
+        regularization=0.0,
+        problem_time=0.5,
+        step_solve_time=0.25,
+    )
     row = format_record(record)
     assert "0.00e+00" not in row  # reg column is a dash, not scientific zero
     assert " - " in f" {row} "  # a standalone dash marks the reg column
@@ -127,7 +149,18 @@ def test_format_record_dashes_zero_regularization():
 
 
 def test_format_record_marks_acceptable_iterates():
-    record = IterationRecord(3, 1.0, 1e-9, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.0, 0.0)
+    record = IterationRecord(
+        iteration=3,
+        objective=1.0,
+        mu=1e-9,
+        theta=1e-9,
+        kkt_error=1e-9,
+        alpha_primal=1.0,
+        alpha_dual=1.0,
+        regularization=0.0,
+        problem_time=0.0,
+        step_solve_time=0.0,
+    )
     plain = format_record(record)
     marked = format_record(record, acceptable=True)
     assert not plain.endswith("*")
@@ -136,7 +169,17 @@ def test_format_record_marks_acceptable_iterates():
 
 def test_format_record_reports_line_search_trials():
     record = IterationRecord(
-        3, 1.0, 1e-9, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.0, 0.0, line_search_iters=4
+        iteration=3,
+        objective=1.0,
+        mu=1e-9,
+        theta=1e-9,
+        kkt_error=1e-9,
+        alpha_primal=1.0,
+        alpha_dual=1.0,
+        regularization=0.0,
+        problem_time=0.0,
+        step_solve_time=0.0,
+        line_search_iters=4,
     )
     row = format_record(record)
     assert "   4 " in row  # right-justified "ls" column
@@ -144,7 +187,17 @@ def test_format_record_reports_line_search_trials():
 
 def test_format_record_marks_restored_iterates():
     record = IterationRecord(
-        3, 1.0, 1e-9, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.0, 0.0, restored=True
+        iteration=3,
+        objective=1.0,
+        mu=1e-9,
+        theta=1e-9,
+        kkt_error=1e-9,
+        alpha_primal=1.0,
+        alpha_dual=1.0,
+        regularization=0.0,
+        problem_time=0.0,
+        step_solve_time=0.0,
+        restored=True,
     )
     row = format_record(record)
     assert row.rstrip().endswith("R")
@@ -152,7 +205,17 @@ def test_format_record_marks_restored_iterates():
 
 def test_format_record_combines_restored_and_acceptable_tags():
     record = IterationRecord(
-        3, 1.0, 1e-9, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.0, 0.0, restored=True
+        iteration=3,
+        objective=1.0,
+        mu=1e-9,
+        theta=1e-9,
+        kkt_error=1e-9,
+        alpha_primal=1.0,
+        alpha_dual=1.0,
+        regularization=0.0,
+        problem_time=0.0,
+        step_solve_time=0.0,
+        restored=True,
     )
     row = format_record(record, acceptable=True)
     assert row.rstrip().endswith("R *")
@@ -160,7 +223,17 @@ def test_format_record_combines_restored_and_acceptable_tags():
 
 def test_format_record_marks_second_order_corrected_iterates():
     record = IterationRecord(
-        3, 1.0, 1e-9, 1e-9, 1e-9, 1.0, 1.0, 0.0, 0.0, 0.0, used_soc=True
+        iteration=3,
+        objective=1.0,
+        mu=1e-9,
+        theta=1e-9,
+        kkt_error=1e-9,
+        alpha_primal=1.0,
+        alpha_dual=1.0,
+        regularization=0.0,
+        problem_time=0.0,
+        step_solve_time=0.0,
+        used_soc=True,
     )
     row = format_record(record)
     assert row.rstrip().endswith("C")
@@ -168,16 +241,16 @@ def test_format_record_marks_second_order_corrected_iterates():
 
 def test_format_record_combines_all_tags():
     record = IterationRecord(
-        3,
-        1.0,
-        1e-9,
-        1e-9,
-        1e-9,
-        1.0,
-        1.0,
-        0.0,
-        0.0,
-        0.0,
+        iteration=3,
+        objective=1.0,
+        mu=1e-9,
+        theta=1e-9,
+        kkt_error=1e-9,
+        alpha_primal=1.0,
+        alpha_dual=1.0,
+        regularization=0.0,
+        problem_time=0.0,
+        step_solve_time=0.0,
         restored=True,
         used_soc=True,
     )
@@ -228,8 +301,30 @@ def test_format_result_reports_status_and_sources():
 
 def test_format_timing_sums_history():
     history = (
-        IterationRecord(0, 1.0, 0.1, 0.0, 1.0, 1.0, 1.0, 0.0, 0.5, 0.25),
-        IterationRecord(1, 1.0, 0.1, 0.0, 1.0, 1.0, 1.0, 0.0, 0.5, 0.75),
+        IterationRecord(
+            iteration=0,
+            objective=1.0,
+            mu=0.1,
+            theta=0.0,
+            kkt_error=1.0,
+            alpha_primal=1.0,
+            alpha_dual=1.0,
+            regularization=0.0,
+            problem_time=0.5,
+            step_solve_time=0.25,
+        ),
+        IterationRecord(
+            iteration=1,
+            objective=1.0,
+            mu=0.1,
+            theta=0.0,
+            kkt_error=1.0,
+            alpha_primal=1.0,
+            alpha_dual=1.0,
+            regularization=0.0,
+            problem_time=0.5,
+            step_solve_time=0.75,
+        ),
     )
     text = format_timing(history)
     assert "1.000e+00s" in text  # problem-callbacks total

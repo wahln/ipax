@@ -1,8 +1,12 @@
 # API reference
 
 Generated from docstrings via [`mkdocstrings`](https://mkdocstrings.github.io/).
-Everything documented here is importable directly from the top-level `ipax`
-package; the fully-qualified module path is shown for reference only.
+Everything documented here is public (see
+[Public API and stability](stability.md)). Names exported from the top-level
+package are imported as `ipax.<name>` — e.g. `ipax.Result`, whose entry below
+shows its defining module `ipax.result`. The SciPy front end, the
+linear-algebra extension points and the backend introspection are imported
+from the module shown in their entry.
 
 ## Entry point
 
@@ -65,6 +69,8 @@ validated on construction.
 
 ::: ipax.options.BreedveldOptions
 
+::: ipax.options.DenseOptions
+
 ## Results and diagnostics
 
 What a solve returns, plus the per-iteration snapshot passed to a callback.
@@ -77,6 +83,8 @@ What a solve returns, plus the per-iteration snapshot passed to a callback.
 
 ::: ipax.result.DerivativeSources
 
+::: ipax.result.Routes
+
 ::: ipax.result.IterationRecord
 
 ::: ipax.result.IterationInfo
@@ -87,11 +95,48 @@ What a solve returns, plus the per-iteration snapshot passed to a callback.
 
 ::: ipax.result.WarmStart
 
+## Errors and warnings
+
+The documented error conditions raise these classes; each derives from
+`IpaxError` and from the built-in ipax raised before 0.14 (see
+[Public API and stability](stability.md#errors-and-warnings)).
+
+::: ipax.errors.IpaxError
+
+::: ipax.errors.ConfigurationError
+
+::: ipax.errors.OptionTypeError
+
+::: ipax.errors.ProblemDefinitionError
+
+::: ipax.errors.DerivativeUnavailableError
+
+::: ipax.errors.UnsupportedBackendError
+
+::: ipax.errors.LinearSolveError
+
+::: ipax.errors.IpaxWarning
+
+::: ipax.errors.FiniteDifferenceWarning
+
+## Sparse operators
+
+Jacobians or constraint matrices with explicit sparsity, from COO triplets or
+compressed rows/columns. A `scipy.sparse` matrix `A` becomes
+`ipax.CSROperator(A.indptr, A.indices, A.data, A.shape)` after `A = A.tocsr()`
+(note the argument order differs from SciPy's `csr_matrix((data, indices,
+indptr))`).
+
+::: ipax.backend.operators.COOOperator
+
+::: ipax.backend.operators.CSROperator
+
+::: ipax.backend.operators.CSCOperator
+
 ## Linear-algebra extension points
 
-Advanced surface for supplying structured/matrix-free operators or custom solve
-strategies. The core only ever sees these protocol types — see
-[invariants #1–#4](architecture.md).
+Advanced surface for supplying structured or matrix-free operators. The core
+only ever sees these protocol types — see [invariants #1–#4](architecture.md).
 
 ::: ipax.backend.operators.LinearOperator
     options:
@@ -99,13 +144,13 @@ strategies. The core only ever sees these protocol types — see
 
 ::: ipax.backend.operators.as_operator
 
+::: ipax.backend.operators.MatrixFreeJacobian
+
+::: ipax.backend.operators.ScaledOperator
+
 ::: ipax.linalg.solver.LinearSolver
 
-::: ipax.linalg.solver.LinearSolveError
-
 ::: ipax.linalg.solver.numerical_failure_types
-
-::: ipax.linalg.solver.select_solver
 
 ## Backend introspection
 
